@@ -39,7 +39,7 @@ mod matching;
 mod source;
 use source::application::{
     default_keyword, dedup_items, is_url, learn_alias, make_item_from_input, ItemKind, LaunchItem,
-    TabMode,
+    LearnRank, SpaceRun, TabMode,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1162,19 +1162,30 @@ impl LauncherApp {
                                 .small(),
                             );
                             ui.separator();
-                            // FR-ACT-01 `space_to_run`（2026-10-18 用户要求：两种口径都做，选哪种由用户定）。
+                            // FR-ACT-01 `space_to_run`（批次 J，2026-10-18 用户裁定：bool 扩成四档，
+                            // 默认「打全名才执行」；旧 settings.json 里的 false/true 仍读成 off/always）。
                             ui.label(egui::RichText::new("空格执行选中项").strong());
                             let mut space = self.prefs.space_to_run;
-                            let resp = ui.checkbox(&mut space, "空格直接执行选中项（Delphi 版 ALTRun 的做法）");
-                            if resp.changed() {
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut space, SpaceRun::Word, "打全名才执行（默认）");
+                                ui.selectable_value(&mut space, SpaceRun::Unique, "结果唯一才执行");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut space, SpaceRun::Off, "只在框为空时");
+                                ui.selectable_value(&mut space, SpaceRun::Always, "任何时候都执行");
+                            });
+                            if space != self.prefs.space_to_run {
                                 self.prefs.space_to_run = space;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!("设置页：space_to_run = {space}（已写 settings.json）");
+                                eprintln!(
+                                    "设置页：space_to_run = {}（已写 settings.json）",
+                                    space.as_str()
+                                );
                                 ui.ctx().request_repaint();
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "关（默认）＝只有搜索框为空时空格才执行，含空格的查询词不受影响。\n开＝空格任何时候都执行选中项，代价是查询里打不出空格。",
+                                    "打全名才执行（默认）＝查询整串正好等于高亮行的名称、或等于它别名表里的一个词时空格执行（jsb→记事本、Task Scheduler→自己）；只是前缀（tas、task sch）时空格仍当文本输入，想确认就 Tab 补全后按空格，或直接回车。\n结果唯一才执行＝筛选到只剩一条，空格即执行；代价是「唯一但还没打完」的查询里那个空格要用 Shift+空格 插。\n只在框为空时＝最保守，多词查询的空格完全不受影响，单手流仍要按回车。\n任何时候都执行＝空格永远是确认，代价是查询里打不出空格。\nShift+空格 在四档下都表示\"这个空格要真的打出来\"。",
                                 )
                                 .weak()
                                 .small(),
@@ -1201,6 +1212,31 @@ impl LauncherApp {
                             ui.label(
                                 egui::RichText::new(
                                     "补全优先＝只有当「能被这个查询补长的候选恰好一条」时 Tab 才补全整词（如 jsq→计算器）；候选多于一条说明歧义没消，Tab 改为循环下一项，绝不替你猜第一条。\n专职导航＝Tab 下一项、Shift+Tab 上一项（Delphi 版 ALTRun 的做法），代价是没有补全。\n两种口径都保留 ↑↓ 翻页与 PgUp/PgDn；Tab 导航到头回绕，↑↓ 仍是钳位不动。想要一条不被补全抢走的稳定导航，用 Ctrl+J / Ctrl+K。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            // FR-SRC-19 `learn_rank`（批次 K，2026-10-18 用户裁定：甲乙都做、默认甲）。
+                            // 两种口径都只作用于同一匹配档位之内，档位本身仍是第一主键。
+                            ui.label(egui::RichText::new("同档位内的学习排序").strong());
+                            let mut rank = self.prefs.learn_rank;
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut rank, LearnRank::Count, "次数优先（默认）");
+                                ui.selectable_value(&mut rank, LearnRank::Decay, "次数 + 时间衰减");
+                            });
+                            if rank != self.prefs.learn_rank {
+                                self.prefs.learn_rank = rank;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：learn_rank = {}（已写 settings.json）",
+                                    rank.as_str()
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "这一层只在两条目的匹配档位相同时才决定先后，匹配更准的那条永远在前。\n次数优先（默认）＝执行次数多的在前，次数相同才看最近一次。刚用过一次的东西不会把用了几十次的老项挤下去。\n次数 + 时间衰减＝比 log2(1+次数) × 0.5^(距上次使用天数 / 7)：次数照旧计权重但被 log2 压过量级，一条项整整 7 天没用热度掉一半，所以\"上周用过一次的\"不会长期赖在前面。\n置顶（Ctrl+P）永远压过这一层；想钉住某个条目就用它，不用靠改口径绕。",
                                 )
                                 .weak()
                                 .small(),
@@ -1382,6 +1418,15 @@ impl Default for LauncherApp {
         let (t4, _r4) = mpsc::channel();
         let (_t5, r5) = mpsc::channel();
         Self::new(r1, r2, r3, t4, r5, None, StartupIntent { visible: true, ..Default::default() })
+    }
+}
+
+impl LauncherApp {
+    /// 当前查询的结果次序：匹配档位是第一主键，同档位内按设置页 `learn_rank` 选的口径比
+    /// （甲＝累计次数→最近一次，乙＝热度 log2(1+次数)×半衰期衰减）。
+    /// 时间戳只喂学习位序这一层，不参与打分、也不参与档位闸门。
+    fn results(&mut self) -> Vec<usize> {
+        self.index.search(&self.query, &self.items, self.prefs.learn_rank, now_ms())
     }
 }
 
@@ -1575,8 +1620,8 @@ impl eframe::App for LauncherApp {
         // Ctrl+J/Ctrl+K=恒为循环下/上一项（2026-10-18 用户点名 Emacs 的 next/prev line；
         // 因 Ctrl+N=新建、Ctrl+P=置顶 已占用，用户改选这一对空闲键），
         // 1-9/0 与 Ctrl+1-9/0=执行第 N 行（FR-ACT-10，2026-10-17）。
-        // Space=执行选中项（FR-ACT-01 的 space_to_run，2026-10-18 用户要求对标 Delphi 版）：
-        // 默认只在输入框为空时接管，设置页「空格直接执行」开关可让它无条件接管（代价见设置页文案）。
+        // Space=执行选中项（FR-ACT-01 的 space_to_run，四档 off/word/unique/always，默认 word；
+        // 判据与各自代价见设置页「空格执行选中项」）。Shift+空格 恒为插入真空格，不受档位影响。
         // 鼠标中键不再执行任何条目（2026-10-18 用户裁定废弃），移动窗口改由「左键拖空白」承担，见下方同名注释块。
         // consume_key 精确匹配修饰键并吃掉事件，防与 TextEdit/其他控件的键位打架。
         if self.visible && self.dialog.is_none() && self.confirm.is_none() {
@@ -1658,12 +1703,47 @@ impl eframe::App for LauncherApp {
                             None
                         }
                     });
-                // 空格执行（FR-ACT-01 `space_to_run`）：默认只在搜索框为空时接管——
-                // 有输入时空格是多词查询的组成部分，抢了就打不出「visual studio」；
-                // 设置页开关可改成无条件接管（Delphi 版行为，代价由用户自己认）。
-                let space_takes = self.prefs.space_to_run || self.query.trim().is_empty();
+                // 空格执行（FR-ACT-01 `space_to_run`，批次 J 2026-10-18 用户裁定扩成四档）：
+                // 判据全在 matching::space_executes，只看当帧可观测状态（档位/查询/结果集/选中行）。
+                // Shift+空格 ＝ 逃生门，恒为"插入一个真空格"：必须先按 SHIFT 消费键事件，
+                // 因为 consume_key(NONE, ·) 对 shift 只查"模式要而实际没有"，会把 Shift 组合一起吃掉
+                // （同一坑见批次 F 的 Shift+Tab）。键事件被吃不影响字符事件，空格照样进 TextEdit。
+                let space_down = ui.input(|i| i.key_pressed(egui::Key::Space));
+                let hit_shift_space =
+                    space_down && ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space));
+                if hit_shift_space {
+                    eprintln!(
+                        "快捷键 Shift+空格：按档位 {:?} 本会执行，改判为插入真空格",
+                        self.prefs.space_to_run
+                    );
+                }
+                // `results()` 要 `&mut self`（缓存键表），与下面 `&self.query`/`&self.items`
+                // 冲突，所以先落一个局部副本；只在真的按下空格时才算这一次过滤。
+                let space_results = if space_down && !hit_shift_space {
+                    self.results()
+                } else {
+                    Vec::new()
+                };
+                let space_takes = space_down
+                    && !hit_shift_space
+                    && matching::space_executes(
+                        self.prefs.space_to_run,
+                        &self.query,
+                        &self.items,
+                        &space_results,
+                        self.selected,
+                    );
                 let hit_space = space_takes
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+                if space_down && !hit_shift_space && !hit_space {
+                    // 反向判据也要留痕：注入实测要看的就是"这一按空格到底进没进输入框"。
+                    let n = self.results().len();
+                    eprintln!(
+                        "空格未接管（档位 {}，查询 {:?}，结果 {n} 条）：键事件留给输入框当文本",
+                        self.prefs.space_to_run.as_str(),
+                        self.query
+                    );
+                }
 
                 if hit_n {
                     self.dialog = Some(DialogState::blank());
@@ -1678,7 +1758,7 @@ impl eframe::App for LauncherApp {
                     ui.ctx().request_repaint_after(TOAST_TTL);
                     eprintln!("快捷键 Ctrl+I：批量导入全部 已触发（后台扫描开始菜单/桌面）");
                 } else if hit_e || hit_cd || hit_del || hit_csd || hit_cp {
-                    let results = self.index.search(&self.query, &self.items);
+                    let results = self.results();
                     let idx = self.selected.min(results.len().saturating_sub(1));
                     // search 返回下标而不是引用：调用方接下来要改 self.items。
                     let sel = results.get(idx).map(|i| self.items[*i].clone());
@@ -1736,7 +1816,7 @@ impl eframe::App for LauncherApp {
                         }
                     }
                 } else if hit_pgup || hit_pgdn {
-                    let len = self.index.search(&self.query, &self.items).len();
+                    let len = self.results().len();
                     if len > 0 {
                         let rows = page_rows(ui.available_height());
                         self.selected = page_target(self.selected, rows, len, hit_pgdn);
@@ -1750,7 +1830,7 @@ impl eframe::App for LauncherApp {
                     // 与 Tab/Shift+Tab 同口径（回绕循环，不是 ↑↓ 的钳位），差别只有一点：
                     // 这对键**永远只导航**，不会被 tab_mode=Complete 的补全抢走 ——
                     // 补全优先模式下想要一条稳定的「下一条/上一条」通道就靠它。
-                    let len = self.index.search(&self.query, &self.items).len();
+                    let len = self.results().len();
                     if len > 0 {
                         let cur = self.selected.min(len - 1);
                         self.selected = if hit_ctrl_k {
@@ -1778,7 +1858,7 @@ impl eframe::App for LauncherApp {
                     // Shift+Tab 恒为上一项（两种模式一致）。导航用回绕，与 ↑↓ 的钳位口径不同：
                     // ↑↓ 已复测定型不动，Tab 这一对按 Delphi 的「循环」语义走。
                     self.focus_query = true; // egui 把 Tab/Shift+Tab 判给下一个/上一个控件，焦点会跳一帧
-                    let results = self.index.search(&self.query, &self.items);
+                    let results = self.results();
                     let len = results.len();
                     if len > 0 {
                         let cur = self.selected.min(len - 1);
@@ -1824,7 +1904,7 @@ impl eframe::App for LauncherApp {
                         eprintln!("快捷键 Tab：当前查询无结果，忽略");
                     }
                 } else if let Some(digit) = hit_digit {
-                    let results = self.index.search(&self.query, &self.items);
+                    let results = self.results();
                     match digit_index(digit, results.len()) {
                         Some(idx) => {
                             let item = self.items[results[idx]].clone();
@@ -1840,7 +1920,7 @@ impl eframe::App for LauncherApp {
                         ),
                     }
                 } else if hit_space {
-                    let results = self.index.search(&self.query, &self.items);
+                    let results = self.results();
                     let idx = self.selected.min(results.len().saturating_sub(1));
                     if let Some(&h) = results.get(idx) {
                         let item = self.items[h].clone();
@@ -1988,7 +2068,7 @@ impl eframe::App for LauncherApp {
             ui.separator();
 
             let q = self.query.trim().to_lowercase();
-            let results = self.index.search(&self.query, &self.items);
+            let results = self.results();
             if results.is_empty() {
                 if q.is_empty() {
                     ui.label("清单为空——按 Ctrl+N 或点右上「＋」新建，或按 Ctrl+I 批量导入。");

@@ -7,13 +7,15 @@
 //! - [`MatchIndex::search`]：FR-QRY-03 七档打分 + FR-SRC-19 学习位序 + 稳定排序 + 截断 50。
 //!
 //! 排序口径（2026-10-17 与 FR-SRC-19/FR-QRY-07 对齐）：**档位是闸门**，
-//! 学习位序（置顶→最近→次数）只在同档内生效，档内的位置/长度惩罚只作末名次键；
+//! 学习位序只在同档内生效，档内的位置/长度惩罚只作末名次键；
 //! 时间戳不参与打分、不参与门槛，符合 FR-QRY-07 裁定 a。
+//! 学习位序本身有两种口径（批次 K，`LearnRank`）：默认甲＝次数优先、次数相同看最近一次；
+//! 乙＝热度 `log2(1+次数) × 0.5^(天数/半衰期)`。两者都不越过硬闸门去动档位。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::source::application::LaunchItem;
+use crate::source::application::{LaunchItem, LearnRank, SpaceRun};
 
 /// FR-QRY-07 结果上限。
 const MAX_RESULTS: usize = 50;
@@ -137,7 +139,14 @@ impl MatchIndex {
     }
 
     /// 返回按最终次序排列的 `items` 下标（不返回引用：调用方随后还要改 `self.items`）。
-    pub fn search(&mut self, raw: &str, items: &[LaunchItem]) -> Vec<usize> {
+    /// `rank` 与 `now_ms` 只喂学习位序那一层，档位闸门与打分都不看它们。
+    pub fn search(
+        &mut self,
+        raw: &str,
+        items: &[LaunchItem],
+        rank: LearnRank,
+        now_ms: i64,
+    ) -> Vec<usize> {
         let p = parse(raw);
         self.ensure(items);
         let keys = &self.keys;
@@ -146,7 +155,7 @@ impl MatchIndex {
         // 不截断——这是「浏览整张清单」，不是搜索结果；截 50 会把用户已有的项静默藏掉。
         if p.words.is_empty() {
             let mut v: Vec<usize> = (0..items.len()).collect();
-            v.sort_by(|a, b| learns_before(&items[*a], &items[*b]));
+            v.sort_by(|a, b| learns_before(&items[*a], &items[*b], rank, now_ms));
             return v;
         }
 
@@ -158,7 +167,7 @@ impl MatchIndex {
         }
         hits.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| learns_before(&items[a.2], &items[b.2]))
+                .then_with(|| learns_before(&items[a.2], &items[b.2], rank, now_ms))
                 .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
                 .then_with(|| keys[a.2].name_chars().cmp(&keys[b.2].name_chars()))
         });
@@ -167,14 +176,37 @@ impl MatchIndex {
     }
 }
 
-/// FR-SRC-19 学习位序：置顶 → 最近使用 → 使用次数（三键全降序）。
-pub fn learns_before(a: &LaunchItem, b: &LaunchItem) -> std::cmp::Ordering {
-    a.pinned
-        .cmp(&b.pinned)
-        .then(a.last_used_ms.cmp(&b.last_used_ms))
-        .then(a.use_count.cmp(&b.use_count))
-        .reverse()
+/// FR-SRC-19 学习位序：置顶永远第一，其后按 `rank` 选的口径（全部降序）。
+/// 甲（默认）＝累计次数 → 最近一次；乙＝热度 [`learn_heat`]，同分再退回到最近一次。
+pub fn learns_before(
+    a: &LaunchItem,
+    b: &LaunchItem,
+    rank: LearnRank,
+    now_ms: i64,
+) -> std::cmp::Ordering {
+    let learn = match rank {
+        LearnRank::Count => a
+            .use_count
+            .cmp(&b.use_count)
+            .then_with(|| a.last_used_ms.cmp(&b.last_used_ms)),
+        LearnRank::Decay => learn_heat(a, now_ms)
+            .partial_cmp(&learn_heat(b, now_ms))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.last_used_ms.cmp(&b.last_used_ms)),
+    };
+    a.pinned.cmp(&b.pinned).then_with(|| learn).reverse()
 }
+
+/// 乙档的热度：**累计次数被 `log2` 压过量级，再按距上次使用的天数做真半衰期衰减**。
+/// `log2(1+N)` 让 8 次（3.0）只是 1 次（1.0）的三倍权重，避免次数把匹配质量顶掉；
+/// 用 `0.5^(days/H)` 而非 `e^(-days/H)`——后者名义 H 天的实际半衰期是 1.44H 天（旧公式踩过）。
+pub fn learn_heat(item: &LaunchItem, now_ms: i64) -> f32 {
+    let days = (now_ms - item.last_used_ms).max(0) as f32 / 86_400_000.0;
+    (item.use_count as f32 + 1.0).log2() * 0.5f32.powf(days / HEAT_HALF_LIFE_DAYS)
+}
+
+/// 热度衰减的半衰期（天）：一条项恰好 N 天没用，热度掉一半。
+pub const HEAT_HALF_LIFE_DAYS: f32 = 7.0;
 
 /// 一个条目对整次查询的打分：名称与别名取优（别名是刻意设置的触发码，等同名称参与匹配）。
 fn score_item(p: &Parsed, keys: &MatchKeys) -> Option<(u8, f32)> {
@@ -222,6 +254,55 @@ pub fn unique_completion(raw: &str, items: &[LaunchItem], results: &[usize]) -> 
         }
     }
     found
+}
+
+/// 批次 J（丙案判据）：查询去掉首尾空白后，是否与这一行的**名称整串相等**，
+/// 或等于它**别名表里的某一个词**（`keyword` 按空格分词，与 FR-SRC-19 学习别名同一词表）。
+/// 只认整串相等，不认前缀：`tas` 是 `Task Manager` 的前缀但不是全名 ⇒ false，
+/// 那一下空格就该继续当文本（或交给 Tab 补全去消歧）。空查询返回 false ——
+/// 空框那一档由 [`space_executes`] 自己判，不混进这里。
+pub fn query_is_full_word(raw: &str, item: &LaunchItem) -> bool {
+    let q = raw.trim().to_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+    q == item.name.trim().to_lowercase()
+        || item
+            .keyword
+            .split_whitespace()
+            .any(|a| a.to_lowercase() == q)
+}
+
+/// 空格这一按到底执行不执行（FR-ACT-01 批次 J，四档判据全在这里，纯函数可单测）。
+/// 五个入参全是当帧可观测状态（档位 / 查询 / 清单 / 结果集 / 选中行），**不看按键历史**
+/// —— 与 Tab 甲案同一条已入档判据。`selected` 越界时按最后一行钳位，与执行分支同一口径；
+/// off/word 在结果集为空时返回 false（没条目可执行），always 保持老口径恒为 true，
+/// 由调用方那侧"取不到条目就什么都不做"兜住。
+pub fn space_executes(
+    mode: SpaceRun,
+    raw: &str,
+    items: &[LaunchItem],
+    results: &[usize],
+    selected: usize,
+) -> bool {
+    match mode {
+        // 旧口径原样保留（批次 F）：off＝trim 后为空才执行，always＝任何时候都执行。
+        SpaceRun::Off => raw.trim().is_empty() && !results.is_empty(),
+        SpaceRun::Always => true,
+        // 新口径只认"框里一个字符都没有"为空格框。用 `Shift+空格` 故意插进去的空白
+        // 不算空框 —— 否则逃生门会变成陷阱：插完空格，下一次按空格就直接把程序启动了。
+        SpaceRun::Unique => raw.is_empty() || results.len() == 1,
+        SpaceRun::Word => {
+            if raw.is_empty() {
+                return !results.is_empty();
+            }
+            let last = results.len().saturating_sub(1);
+            match results.get(selected.min(last)) {
+                Some(&idx) => query_is_full_word(raw, &items[idx]),
+                None => false,
+            }
+        }
+    }
 }
 
 /// 单串规则与多词规则取优：`"visual studio"` 既应命中整段包含（60 档），
@@ -312,12 +393,22 @@ mod tests {
         }
     }
 
-    fn order(items: &[LaunchItem], q: &str) -> Vec<String> {
+    /// 测试里的"现在"。学习位序专项用例拿它当基准算天数，其余用例只要保证
+    /// `last_used_ms` 全在它之下、不会溢出成负数即可。
+    const NOW: i64 = 1_000_000_000;
+    const DAY: i64 = 86_400_000;
+
+    fn order_at(items: &[LaunchItem], q: &str, rank: LearnRank, now_ms: i64) -> Vec<String> {
         MatchIndex::default()
-            .search(q, items)
+            .search(q, items, rank, now_ms)
             .into_iter()
             .map(|i| items[i].name.clone())
             .collect()
+    }
+
+    /// 默认走甲档：绝大多数用例只验证档位与打分，学习层保持清单原口径最省事。
+    fn order(items: &[LaunchItem], q: &str) -> Vec<String> {
+        order_at(items, q, LearnRank::Count, NOW)
     }
 
     fn hit(items: &[LaunchItem], q: &str) -> (u8, f32) {
@@ -409,13 +500,79 @@ mod tests {
     }
 
     #[test]
-    fn learn_keys_are_pinned_then_recent_then_count() {
+    fn learn_keys_are_pinned_then_count_then_recent() {
         let items = vec![
             item("ax", "", "a", false, 0, 100),
             item("bx", "", "b", false, 99, 200),
             item("cx", "", "c", true, 0, 0),
         ];
         assert_eq!(order(&items, "x"), ["cx", "bx", "ax"]);
+    }
+
+    /// 批次 K 甲档（默认）的核心诉求：次数压过「刚刚用过」。
+    /// 复刻用户 2026-10-18 报的场景 —— 记事本执行 8 次，命令提示符只执行过 1 次
+    /// 但那次更晚，旧口径（最近一次优先）把它顶到了前面。
+    #[test]
+    fn count_rank_keeps_the_frequently_used_item_ahead() {
+        let items = vec![
+            item("axx", "", "a", false, 8, 1_000),
+            item("bxx", "", "b", false, 1, NOW),
+        ];
+        assert_eq!(order(&items, "xx"), ["axx", "bxx"], "同档位内先比次数，后比最近一次");
+        assert_eq!(order(&items, ""), ["axx", "bxx"], "空输入的浏览视图同判据");
+    }
+
+    /// 批次 K 乙档：热度 = log2(1+次数) × 0.5^(天数/半衰期)。
+    /// 8 次但搁了整整一个半衰期（7 天）⇒ 1.585，输给三天前只用过 3 次、今天刚用的 2.00。
+    #[test]
+    fn decay_rank_lets_a_stale_hot_item_lose_to_a_fresh_one() {
+        let items = vec![
+            item("axx", "", "a", false, 8, NOW - 7 * DAY),
+            item("bxx", "", "b", false, 3, NOW),
+        ];
+        let ha = learn_heat(&items[0], NOW);
+        let hb = learn_heat(&items[1], NOW);
+        assert!((ha - 1.58496).abs() < 1e-4, "log2(9)×0.5 = {ha}");
+        assert!((hb - 2.0).abs() < 1e-6, "log2(4)×1 = {hb}");
+        assert_eq!(order_at(&items, "xx", LearnRank::Decay, NOW), ["bxx", "axx"]);
+        assert_eq!(
+            order_at(&items, "xx", LearnRank::Count, NOW),
+            ["axx", "bxx"],
+            "同一份数据两档结论相反 ⇒ 配置确实在决定次序，不是巧合"
+        );
+    }
+
+    #[test]
+    fn learn_heat_uses_a_true_half_life() {
+        let heat = |count: u32, days: i64| {
+            learn_heat(&item("x", "", "p", false, count, NOW - days * DAY), NOW)
+        };
+        assert_eq!(heat(0, 0), 0.0, "0 次 ⇒ log2(1)=0，学习层闭嘴，交给档位与打分");
+        assert!((heat(1, 0) - 1.0).abs() < 1e-6, "1 次 = log2(2)");
+        assert!((heat(3, 0) - 2.0).abs() < 1e-6, "3 次 = log2(4)：次数被压成对数量级");
+        assert!((heat(1, 7) - 0.5).abs() < 1e-6, "恰好一个半衰期 ⇒ 掉一半");
+        assert!((heat(1, 14) - 0.25).abs() < 1e-6, "两个半衰期 ⇒ 四分之一");
+        assert!(heat(1, 70).abs() < 1e-3, "10 个半衰期后基本归零");
+        assert_eq!(
+            learn_heat(&item("x", "", "p", false, 1, NOW + 10 * DAY), NOW),
+            1.0,
+            "时钟回拨（last_used 在未来）天数按 0 算，不能让热度爆表"
+        );
+    }
+
+    #[test]
+    fn pinned_beats_heat_in_both_ranks() {
+        let items = vec![
+            item("axx", "", "a", false, 8, NOW),
+            item("bxx", "", "b", true, 0, NOW - 7 * DAY),
+        ];
+        for rank in [LearnRank::Count, LearnRank::Decay] {
+            assert_eq!(
+                order_at(&items, "xx", rank, NOW),
+                ["bxx", "axx"],
+                "{rank:?} 档下置顶仍是硬第一键，衰减只作用于其后那一层"
+            );
+        }
     }
 
     #[test]
@@ -443,12 +600,15 @@ mod tests {
 
     #[test]
     fn empty_query_sorts_by_recency() {
+        // 次数全 0 ⇒ 甲档第一键（次数）平手，退到最近一次；乙档热度也全为 0，
+        // 同样退到最近一次。两档在这份数据上结论一致。
         let items = vec![
             item("甲", "", "a", false, 0, 5),
             item("乙", "", "b", false, 0, 9),
             item("丙", "", "c", false, 0, 7),
         ];
         assert_eq!(order(&items, ""), ["乙", "丙", "甲"]);
+        assert_eq!(order_at(&items, "", LearnRank::Decay, NOW), ["乙", "丙", "甲"]);
     }
 
     // ---- FR-QRY-07 截断与稳定性 ----
@@ -457,9 +617,9 @@ mod tests {
     fn results_are_truncated_to_50() {
         let items: Vec<LaunchItem> =
             (0..200).map(|i| item(&format!("项{i}"), "", &i.to_string(), false, 0, 0)).collect();
-        let r = MatchIndex::default().search("项", &items);
+        let r = MatchIndex::default().search("项", &items, LearnRank::Count, NOW);
         assert_eq!(r.len(), 50);
-        let again = MatchIndex::default().search("项", &items);
+        let again = MatchIndex::default().search("项", &items, LearnRank::Count, NOW);
         assert_eq!(r, again, "同一输入两次结果序列必须完全一致");
     }
 
@@ -467,13 +627,13 @@ mod tests {
     fn index_rebuilds_when_list_changes() {
         let mut items = vec![item("记事本", "jsb", "a", false, 0, 0)];
         let mut idx = MatchIndex::default();
-        assert_eq!(idx.search("jsb", &items).len(), 1);
+        assert_eq!(idx.search("jsb", &items, LearnRank::Count, NOW).len(), 1);
         items.push(item("计算器", "jsq", "b", false, 0, 0));
-        assert_eq!(idx.search("jsq", &items).len(), 1, "清单变化后新项的别名必须立即可搜");
+        assert_eq!(idx.search("jsq", &items, LearnRank::Count, NOW).len(), 1, "清单变化后新项的别名必须立即可搜");
         // 只改别名（条目数不变）也必须触发重算 —— 这是用内容指纹而不是长度比较的理由
         items[0].keyword = "jbb".to_string();
-        assert_eq!(idx.search("jbb", &items).len(), 1);
-        assert!(idx.search("jsb", &items).is_empty(), "旧别名不应继续命中");
+        assert_eq!(idx.search("jbb", &items, LearnRank::Count, NOW).len(), 1);
+        assert!(idx.search("jsb", &items, LearnRank::Count, NOW).is_empty(), "旧别名不应继续命中");
     }
 
     #[test]
@@ -481,7 +641,7 @@ mod tests {
         // 截断 50 只作用于搜索结果；空输入的「浏览整张清单」必须看得到全部项。
         let items: Vec<LaunchItem> =
             (0..120).map(|i| item(&format!("项{i}"), "", &i.to_string(), false, 0, 0)).collect();
-        assert_eq!(MatchIndex::default().search("", &items).len(), 120);
+        assert_eq!(MatchIndex::default().search("", &items, LearnRank::Count, NOW).len(), 120);
     }
 
     // ---- FR-ACT-06 别名多键与 Tab 补全判据 ----
@@ -525,7 +685,7 @@ mod tests {
             item("Tutorials", "", "d", false, 0, 0),
         ];
         let mut idx = MatchIndex::default();
-        let results = idx.search("tas", &items);
+        let results = idx.search("tas", &items, LearnRank::Count, NOW);
         assert_eq!(results.len(), 4, "四条都该在结果里");
         assert_eq!(
             unique_completion("tas", &items, &results),
@@ -534,7 +694,7 @@ mod tests {
         );
 
         // 打到只剩一条时照常补（这一步结果集只有一条，可补全即唯一）
-        let results = idx.search("task sch", &items);
+        let results = idx.search("task sch", &items, LearnRank::Count, NOW);
         assert_eq!(results.len(), 1);
         assert_eq!(unique_completion("task sch", &items, &results), Some(0));
 
@@ -543,7 +703,7 @@ mod tests {
             item("计算器", "jsq", "a", false, 0, 0),
             item("控制面板", "kzmb", "b", false, 0, 0),
         ];
-        let results = MatchIndex::default().search("jsq", &cn);
+        let results = MatchIndex::default().search("jsq", &cn, LearnRank::Count, NOW);
         assert_eq!(unique_completion("jsq", &cn, &results), Some(0), "jsq→计算器 仍该补");
 
         // 兄弟别名撞前缀时两边都不补：`js` 既冠 jsq(计算器) 又冠名称「记事本」
@@ -551,8 +711,73 @@ mod tests {
             item("计算器", "jsq", "a", false, 0, 0),
             item("记事本", "jsb", "b", false, 0, 0),
         ];
-        let results = MatchIndex::default().search("js", &cn2);
+        let results = MatchIndex::default().search("js", &cn2, LearnRank::Count, NOW);
         assert_eq!(unique_completion("js", &cn2, &results), None);
+    }
+
+    /// 批次 J（丙案）判据的整串相等口径：只认名称整串或别名表里的**某一个词**，
+    /// 前缀、后缀、多词拼接都不算 —— 否则「打到一半就误启动」回来了。
+    #[test]
+    fn full_word_needs_exact_name_or_one_alias() {
+        let note = item("记事本", "jsb", "a", false, 0, 0);
+        let task = item("Task Manager", "tas task ta", "b", false, 0, 0);
+        assert!(query_is_full_word("jsb", &note));
+        assert!(query_is_full_word("记事本", &note));
+        assert!(query_is_full_word("  JSB  ", &note), "首尾空白与大小写不参与判断");
+        assert!(!query_is_full_word("js", &note), "前缀不是全名");
+        assert!(!query_is_full_word("jsbx", &note));
+        assert!(!query_is_full_word("", &note), "空框由 space_executes 自己判");
+        assert!(query_is_full_word("task", &task));
+        assert!(
+            !query_is_full_word("Task Scheduler", &task),
+            "别人的名称不是它的别名"
+        );
+        assert!(
+            !query_is_full_word("tas task", &task),
+            "整串必须是词表里的一个词，多词拼接不赦（这种查询本来就还需要接着打）"
+        );
+    }
+
+    /// 四档的分派表。每条断言都可复述成一句人话，方便设置页文案与需求书对齐口径。
+    #[test]
+    fn space_executes_dispatches_on_observable_state_only() {
+        let items = vec![
+            item("记事本", "jsb", "a", false, 0, 0),
+            item("计算器", "jsq", "b", false, 0, 0),
+        ];
+        let mut idx = MatchIndex::default();
+        let r_all = idx.search("", &items, LearnRank::Count, NOW); // 2 条
+        let r_two = idx.search("js", &items, LearnRank::Count, NOW); // 2 条（js 冠 jsb 与 jsq）
+        let r_one = idx.search("jsb", &items, LearnRank::Count, NOW); // 1 条
+        assert_eq!((r_all.len(), r_two.len(), r_one.len()), (2, 2, 1));
+        let none: Vec<usize> = Vec::new();
+        let run = |m: SpaceRun, q: &str, r: &[usize]| space_executes(m, q, &items, r, 0);
+
+        // off ＝ 批次 F 的老口径，一个字都不改
+        assert!(run(SpaceRun::Off, "", &r_all));
+        assert!(!run(SpaceRun::Off, "jsb", &r_one));
+        assert!(run(SpaceRun::Off, " ", &r_all), "off 档按 trim 判空框（旧行为保留）");
+        assert!(!run(SpaceRun::Off, "", &none), "没有结果就没有可执行的东西");
+
+        // word ＝ 丙案默认档：空框，或查询整串＝名称/别名
+        assert!(run(SpaceRun::Word, "", &r_all));
+        assert!(run(SpaceRun::Word, "jsb", &r_one), "别名整词 ⇒ 空格即执行");
+        assert!(run(SpaceRun::Word, "记事本", &r_one));
+        assert!(!run(SpaceRun::Word, "js", &r_two), "前缀阶段空格仍是文本，能接着打");
+        assert!(
+            !run(SpaceRun::Word, " ", &r_all),
+            "Shift+空格 插出来的真空格不算空框，否则下一按空格就误启动"
+        );
+        assert!(!run(SpaceRun::Word, "jsb", &none));
+
+        // unique ＝ 乙案：结果集塌到一条即可确认
+        assert!(run(SpaceRun::Unique, "jsb", &r_one));
+        assert!(!run(SpaceRun::Unique, "js", &r_two));
+        assert!(run(SpaceRun::Unique, "", &r_all));
+
+        // always ＝ 原 true：恒执行（打不出空格，代价由用户自己认）
+        assert!(run(SpaceRun::Always, "js", &r_two));
+        assert!(run(SpaceRun::Always, "", &none));
     }
 
     /// FR-QRY-06 验收（NFR-01 首字符 ≤16ms）：1000 条清单的单次过滤计时。
@@ -564,11 +789,11 @@ mod tests {
             .map(|i| item(&format!("工具{i} Terminal"), &format!("g{i}"), &i.to_string(), false, 0, 0))
             .collect();
         let mut idx = MatchIndex::default();
-        idx.search("", &items); // 预热：建表
+        idx.search("", &items, LearnRank::Count, NOW); // 预热：建表
         let mut worst = 0f64;
         for q in ["工", "工具5", "term", "g500", "具5 Terminal"] {
             let t = std::time::Instant::now();
-            let n = idx.search(q, &items).len();
+            let n = idx.search(q, &items, LearnRank::Count, NOW).len();
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             eprintln!("FR-QRY-06：1000 条 query={q:?} 命中 {n} 用时 {ms:.3} ms");
             worst = worst.max(ms);

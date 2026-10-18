@@ -201,14 +201,85 @@ pub fn save_user_items(items: &[LaunchItem]) {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct AppSettings {
     /// 空格执行选中项（FR-ACT-01 的 `space_to_run`，Delphi 版 ALTRun 同名字段）。
-    /// false（默认）＝只在搜索框为空时接管，保住多词查询里的空格；
-    /// true＝任何时候空格都执行选中项，代价是查询里打不出空格。
+    /// 批次 J（2026-10-18 用户裁定）由 bool 扩成四档，见 [`SpaceRun`]。
     #[serde(default)]
-    pub space_to_run: bool,
+    pub space_to_run: SpaceRun,
 
     /// Tab 键语义（FR-ACT-06，2026-10-18 用户要求两种口径都做实、由设置页二选一）。
     #[serde(default)]
     pub tab_mode: TabMode,
+
+    /// 同一匹配档位之内谁排前面（FR-SRC-19 的学习位序，批次 K：甲乙都做、默认甲）。
+    #[serde(default)]
+    pub learn_rank: LearnRank,
+}
+
+/// 空格执行的四种判据。**为什么不是开关**：bool 只能表达"只有空框才执行"和"永远执行"
+/// 两个极端，而"这个空格该执行还是该当文本"取决于此刻的查询与结果集，中间那些规则
+/// 一个 bool 表达不了；扩成档位之后，默认档（[`SpaceRun::Word`]）才能既给单手确认、
+/// 又保住多词查询里的空格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpaceRun {
+    /// 只在搜索框为空时执行（原 `false`）：多词查询完全不受影响，但单手流要按回车。
+    Off,
+    /// 默认（丙案）：框为空，**或**查询整串等于高亮行的名称／别名表里的某个词 ⇒ 执行。
+    /// `jsb`（记事本别名）→ 空格执行；`visual` 不是任何条目的完整名称 → 空格是文本。
+    #[default]
+    Word,
+    /// 乙案：框为空，**或**当前结果集只剩一条 ⇒ 执行。打到唯一候选即可确认，
+    /// 但"唯一"不等于"打完"，想接着补词要用 `Shift+空格` 插空格。
+    Unique,
+    /// 任何时候空格都执行选中项（原 `true`，参考项目口径），代价是查询里打不出空格。
+    Always,
+}
+
+impl SpaceRun {
+    /// 落盘与设置页用的档位名（与 `TabMode` 的 snake_case 口径一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Word => "word",
+            Self::Unique => "unique",
+            Self::Always => "always",
+        }
+    }
+
+    fn from_name(s: &str) -> Option<Self> {
+        Some(match s {
+            "off" => Self::Off,
+            "word" => Self::Word,
+            "unique" => Self::Unique,
+            "always" => Self::Always,
+            _ => return None,
+        })
+    }
+}
+
+/// 读盘时先按"旧 bool、后新档位名"两种写法试：`settings.json` 是用户手也能动过的文件，
+/// 加字段之前的 `false`/`true` 必须照读且含义不变（false＝仅空框，true＝始终执行）。
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum SpaceRunWire {
+    Legacy(bool),
+    Name(String),
+}
+
+impl serde::Serialize for SpaceRun {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SpaceRun {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match SpaceRunWire::deserialize(d)? {
+            SpaceRunWire::Legacy(b) => Ok(if b { Self::Always } else { Self::Off }),
+            SpaceRunWire::Name(n) => {
+                Self::from_name(&n).ok_or_else(|| D::Error::custom(format!("未知的 space_to_run 档位：{n:?}")))
+            }
+        }
+    }
 }
 
 /// Tab 键的两种口径。旧 `settings.json` 缺这个字段 ⇒ `#[serde(default)]` 回 [`TabMode::Complete`]。
@@ -220,6 +291,32 @@ pub enum TabMode {
     Complete,
     /// 专职导航（Delphi 版 ALTRun 口径）：Tab=下一项、Shift+Tab=上一项，补全不占键位。
     Navigate,
+}
+
+/// 匹配档位相同之后，学习位序怎么比（FR-SRC-19，批次 K 起因：默认档里"最近一次"完全压过
+/// "累计次数"，实测 8 次的记事本被 117 秒前用过的 3 次命令提示符超到后面）。
+/// **两种口径都只作用在同档位之内**：匹配质量永远是第一主键，次数不许去撬动它
+/// （需求书 §2.5 已入档判据「学习排序只作用于排名，不直接加总分」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearnRank {
+    /// 甲（默认）：累计次数多的在前，次数相同才看最近一次。
+    #[default]
+    Count,
+    /// 乙：比热度 `log2(1 + 次数) × 0.5^(距上次使用的天数 / 半衰期)`。
+    /// 取 `log2` 是为了压住量级——8 次不该是 1 次的 8 倍权重；
+    /// 半衰期用 `0.5^(days/H)` 而不是 `e^(-days/H)`，后者名义 H 天的实际半衰期是 1.44H 天。
+    Decay,
+}
+
+impl LearnRank {
+    /// 落盘与设置页用的口径名（与 `SpaceRun`/`TabMode` 同口径）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Decay => "decay",
+        }
+    }
 }
 
 /// 偏好文件与清单同目录（复用 `user_list_path` 已解析好的便携判定）。
@@ -745,14 +842,47 @@ mod dedup_tests {
     }
 
     /// 加 `tab_mode` 之前的旧 settings.json 必须照读，且回到默认口径（补全优先）。
+    /// 批次 J 把 `space_to_run` 扩成四档后，"旧文件照读"这条更要紧：缺字段 ⇒ 新默认 `word`，
+    /// 显式写了 `false`/`true` ⇒ 按老字面意思落进 `off`/`always`，绝不把用户当初选的改掉。
     #[test]
     fn legacy_settings_without_tab_mode_load() {
         let s: AppSettings =
             serde_json::from_str(r#"{"space_to_run":true}"#).expect("旧偏好应可解析");
-        assert!(s.space_to_run);
+        assert_eq!(s.space_to_run, SpaceRun::Always);
         assert_eq!(s.tab_mode, TabMode::Complete);
+        assert_eq!(s.learn_rank, LearnRank::Count, "旧偏好没有 learn_rank ⇒ 默认甲");
         let empty: AppSettings = serde_json::from_str("{}").expect("空偏好应可解析");
-        assert_eq!((empty.space_to_run, empty.tab_mode), (false, TabMode::Complete));
+        assert_eq!(
+            (empty.space_to_run, empty.tab_mode),
+            (SpaceRun::Word, TabMode::Complete)
+        );
+        let off: AppSettings =
+            serde_json::from_str(r#"{"space_to_run":false}"#).expect("旧 false 应可解析");
+        assert_eq!(off.space_to_run, SpaceRun::Off);
+    }
+
+    /// 新档位名照写照读；未知档位名要报错（坏配置由 `load_settings` 兜底成默认值，
+    /// 但报错本身必须发生，否则"档位拼错了却静默当成默认"这种故障查不出来）。
+    #[test]
+    fn space_run_modes_round_trip_and_reject_unknown() {
+        let s: AppSettings = serde_json::from_str(
+            r#"{"space_to_run":"word","tab_mode":"navigate","learn_rank":"decay"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (s.space_to_run, s.tab_mode, s.learn_rank),
+            (SpaceRun::Word, TabMode::Navigate, LearnRank::Decay)
+        );
+        let json = serde_json::to_string(&AppSettings {
+            space_to_run: SpaceRun::Unique,
+            tab_mode: TabMode::Navigate,
+            ..Default::default()
+        })
+        .expect("档位应能序列化");
+        assert!(json.contains(r#""space_to_run":"unique""#), "实际写盘：{json}");
+        assert!(json.contains(r#""learn_rank":"count""#), "实际写盘：{json}");
+        assert!(serde_json::from_str::<AppSettings>(r#"{"space_to_run":"wod"}"#).is_err());
+        assert!(serde_json::from_str::<AppSettings>(r#"{"learn_rank":"decayy"}"#).is_err());
     }
 
     #[test]
