@@ -1,0 +1,43 @@
+自注入开始：20 轮 Ctrl+Alt+Space（显示）→ Ctrl+Alt+R（隐藏），间隔 700ms
+round 1: WM_HOTKEY 送达（唤醒主线程 0.5ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.3ms（按下时前台=0x5102c4）
+round 2: WM_HOTKEY 送达（唤醒主线程 0.9ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.7ms（按下时前台=0x5102c4）
+round 3: WM_HOTKEY 送达（唤醒主线程 0.8ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.6ms（按下时前台=0x5102c4）
+round 4: WM_HOTKEY 送达（唤醒主线程 1.7ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.4ms（按下时前台=0x5102c4）
+round 5: WM_HOTKEY 送达（唤醒主线程 1.1ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.2ms（按下时前台=0x5102c4）
+round 6: WM_HOTKEY 送达（唤醒主线程 0.7ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.5ms（按下时前台=0x5102c4）
+round 7: WM_HOTKEY 送达（唤醒主线程 0.6ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.4ms（按下时前台=0x5102c4）
+round 8: WM_HOTKEY 送达（唤醒主线程 0.4ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.1ms（按下时前台=0x5102c4）
+round 9: WM_HOTKEY 送达（唤醒主线程 0.8ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.5ms（按下时前台=0x5102c4）
+round 10: WM_HOTKEY 送达（唤醒主线程 0.5ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.2ms（按下时前台=0x5102c4）
+round 11: WM_HOTKEY 送达（唤醒主线程 1.4ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.2ms（按下时前台=0x5102c4）
+round 12: WM_HOTKEY 送达（唤醒主线程 0.6ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.3ms（按下时前台=0x5102c4）
+round 13: WM_HOTKEY 送达（唤醒主线程 1.5ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.6ms（按下时前台=0x5102c4）
+round 14: WM_HOTKEY 送达（唤醒主线程 1.2ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.0ms（按下时前台=0x5102c4）
+round 15: WM_HOTKEY 送达（唤醒主线程 0.8ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.6ms（按下时前台=0x5102c4）
+round 16: WM_HOTKEY 送达（唤醒主线程 0.7ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.5ms（按下时前台=0x5102c4）
+round 17: WM_HOTKEY 送达（唤醒主线程 1.2ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.1ms（按下时前台=0x5102c4）
+round 18: WM_HOTKEY 送达（唤醒主线程 0.9ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.7ms（按下时前台=0x5102c4）
+round 19: WM_HOTKEY 送达（唤醒主线程 0.8ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.6ms（按下时前台=0x5102c4）
+round 20: WM_HOTKEY 送达（唤醒主线程 0.6ms，按下时前台=0x5102c4）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.5ms（按下时前台=0x5102c4）
+模式：park(移出屏幕)
+汇总[park(移出屏幕)]：送达 39 轮，焦点抢占成功 20 次；唤醒延迟 min/median/max = 0.4/ 1.7/ 15.6 ms；端到端 min/median/max = 1.1/ 1.6/ 2.6 ms

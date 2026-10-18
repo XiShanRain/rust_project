@@ -1,0 +1,47 @@
+winprobe hotkey rounds=20 park=false physical=true
+物理按键模式开始：请把焦点放在别的应用（浏览器/编辑器/终端都行），然后交替按 Ctrl+Alt+Space（显示+抢焦点）→ Ctrl+Alt+R（隐藏），共 20 轮；中途不想按了就 Ctrl+Alt+F9 出汇总。窗口初始是隐藏的，看不见是正常的。
+round 1: WM_HOTKEY 送达（唤醒主线程 0.3ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 9.4ms（按下时前台=0x10676）
+round 2: WM_HOTKEY 送达（唤醒主线程 100.5ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 118.7ms（按下时前台=0x10676）
+round 3: WM_HOTKEY 送达（唤醒主线程 100.6ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 122.5ms（按下时前台=0x10676）
+round 4: WM_HOTKEY 送达（唤醒主线程 101.7ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 132.3ms（按下时前台=0x10676）
+round 5: WM_HOTKEY 送达（唤醒主线程 100.7ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 120.5ms（按下时前台=0x10676）
+round 6: WM_HOTKEY 送达（唤醒主线程 101.2ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 119.4ms（按下时前台=0x10676）
+round 7: WM_HOTKEY 送达（唤醒主线程 100.8ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 118.3ms（按下时前台=0x10676）
+round 8: WM_HOTKEY 送达（唤醒主线程 100.8ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 117.5ms（按下时前台=0x10676）
+round 9: WM_HOTKEY 送达（唤醒主线程 100.7ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 118.4ms（按下时前台=0x10676）
+round 10: WM_HOTKEY 送达（唤醒主线程 100.7ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 119.2ms（按下时前台=0x10676）
+round 11: WM_HOTKEY 送达（唤醒主线程 100.8ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 116.6ms（按下时前台=0x10676）
+round 11: WM_HOTKEY 送达（唤醒主线程 9.5ms，按下时前台=0x220df6）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 12.5ms（按下时前台=0x220df6）
+round 11: WM_HOTKEY 送达（唤醒主线程 6.0ms，按下时前台=0x220df6）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 6.8ms（按下时前台=0x220df6）
+round 12: WM_HOTKEY 送达（唤醒主线程 101.2ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 117.4ms（按下时前台=0x10676）
+round 13: WM_HOTKEY 送达（唤醒主线程 101.0ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 117.4ms（按下时前台=0x10676）
+round 14: WM_HOTKEY 送达（唤醒主线程 100.8ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 117.4ms（按下时前台=0x10676）
+round 15: WM_HOTKEY 送达（唤醒主线程 100.6ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 114.8ms（按下时前台=0x10676）
+round 16: WM_HOTKEY 送达（唤醒主线程 101.0ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 135.0ms（按下时前台=0x10676）
+round 17: WM_HOTKEY 送达（唤醒主线程 100.5ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 115.8ms（按下时前台=0x10676）
+round 18: WM_HOTKEY 送达（唤醒主线程 100.5ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 118.8ms（按下时前台=0x10676）
+round 19: WM_HOTKEY 送达（唤醒主线程 101.2ms，按下时前台=0x10676）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 117.3ms（按下时前台=0x10676）
+看门狗触发：60 秒无新按键，提前收尾（已采 18/20 轮）
+模式：physical(真人按热键)
+汇总[physical(真人按热键)]：送达 39 轮，焦点抢占成功 21 次；唤醒延迟 min/median/max = 0.3/ 15.4/ 101.7 ms；端到端 min/median/max = 6.8/ 117.5/ 135.0 ms

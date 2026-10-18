@@ -1,0 +1,8 @@
+{
+    "code-runner.executorMap": {
+        "rust": "cd $dir; cd ..; cargo run --bin $fileNameWithoutExt"
+    },
+    "code-runner.runInTerminal": true,
+    "github.copilot.chat.reviewSelection.instructions": [],
+    "chat.disableAIFeatures": false
+}

@@ -1,0 +1,24 @@
+winprobe hotkey rounds=20 park=true physical=true
+探针窗口 hwnd=0x3c0d5e（若某轮"按下时前台"等于它，则该轮是先验成立）
+物理按键模式（park：窗口全程可见、隐藏=挪出屏幕）开始。注意 park 模式下"隐藏"不改变焦点归属，窗口可能一直握着前台焦点 ⇒ 每轮按 Ctrl+Alt+R 之后，请先点一下别的应用把焦点交出去，再按 Ctrl+Alt+Space；没交出去的那些轮会被标成"按下时前台已是自己"并从命中率里剔除。中止：Ctrl+Alt+F9。
+round 1: WM_HOTKEY 送达（唤醒主线程 0.4ms，按下时前台=0x3c0d5e）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 33.9ms（按下时前台=0x3c0d5e）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 2: WM_HOTKEY 送达（唤醒主线程 0.3ms，按下时前台=0x3c0d5e）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 0.9ms（按下时前台=0x3c0d5e）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 3: WM_HOTKEY 送达（唤醒主线程 11.2ms，按下时前台=0xb0100）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 58.4ms（按下时前台=0xb0100）
+round 4: WM_HOTKEY 送达（唤醒主线程 0.5ms，按下时前台=0xb0100）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 24.8ms（按下时前台=0xb0100）
+round 5: WM_HOTKEY 送达（唤醒主线程 0.3ms，按下时前台=0xb0900）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 14.9ms（按下时前台=0xb0900）
+round 6: WM_HOTKEY 送达（唤醒主线程 0.3ms，按下时前台=0xb0100）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 14.7ms（按下时前台=0xb0100）
+round 7: WM_HOTKEY 送达（唤醒主线程 0.3ms，按下时前台=0xb0100）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 12.2ms（按下时前台=0xb0100）
+round 8: WM_HOTKEY 送达（唤醒主线程 0.3ms，按下时前台=0xb0100）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 14.6ms（按下时前台=0xb0100）
+round 9: WM_HOTKEY 送达（唤醒主线程 0.3ms，按下时前台=0xc0f9e）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 12.3ms（按下时前台=0xc0f9e）
+看门狗触发：60 秒无新按键，提前收尾（已采 7/20 轮）
+模式：physical × park(真人按 / 移出屏幕隐藏)
+汇总[physical × park(真人按 / 移出屏幕隐藏)]：显示按下并测得 9 次，其中 2 次按下时前台已是自己（先验成立，剔除），有效 7 次 ⇒ 抢焦点成功 7 次；隐藏键送达 7 次；唤醒延迟 min/median/max = 0.3/ 2.0/ 15.5 ms；端到端 min/median/max = 0.9/ 14.7/ 58.4 ms

@@ -1,0 +1,29 @@
+# ===== Rust 相关 =====
+/target/*
+**/*.rs.bk
+*.pdb
+
+# ===== 编辑器/IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+
+# ===== 环境/配置 =====
+.env
+.env.local
+*.local
+
+# ===== 测试/覆盖率 =====
+/coverage/
+*.profraw
+*.profdata
+tarpaulin-report.*
+
+# ===== 构建工具 =====
+# 如果使用 cargo-make / just 等，一般不用忽略配置

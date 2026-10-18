@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$/rust_000/dinner_philosophers" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rust_000/fn_pointer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rust_000/guessting_game" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rust_000/variables_type_data" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rust_01" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rust_07" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/rust_08" vcs="Git" />
+  </component>
+</project>

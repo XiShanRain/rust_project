@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"d:/D10-Project/Personal/Github_XiShanRain/Rust_Project\" ls-files egui-launcher/target)"
+    ]
+  }
+}

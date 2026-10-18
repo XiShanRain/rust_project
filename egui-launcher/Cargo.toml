@@ -1,0 +1,44 @@
+[package]
+name = "egui-launcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.36.2"
+egui = "0.36.2"
+# 与 epaint 0.36.2 同一个字体解析器（Cargo.lock 已含 skrifa 0.44.0，由 epaint/glifo 引入），
+# 特性声明照抄 epaint，避免 feature 统一把额外编译面带进来。
+skrifa = { version = "0.44.0", default-features = false, features = ["std", "autohint_shaping"] }
+# global-hotkey = "0.8"
+# E-06 托盘：tray-icon 提供系统托盘图标，muda 提供菜单项。两者配合实现 FR-SYS-01。
+tray-icon = "0.19"
+muda = "0.15"
+# E-05：从 eframe CreationContext 的 window_handle() 取本机顶层 HWND（RawWindowHandle::Win32），
+# 用于对自己的窗口发 WM_IME_CONTROL 切英文模式。0.6.2 已在依赖树中，不引入新编译面。
+raw-window-handle = "0.6"
+# FR-SRC-02 app_index.json 缓存：serde 序列化扫描结果，serde_json 落盘。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pinyin = "0.11.0"
+
+# 与 Cargo.lock 里 accesskit_windows / gpu-allocator / wgpu-hal 已用的主版本一致，不引入第二个 windows 大版本。
+[target.'cfg(windows)'.dependencies.windows]
+version = "=0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+

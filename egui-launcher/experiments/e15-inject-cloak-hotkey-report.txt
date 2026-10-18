@@ -1,0 +1,126 @@
+winprobe hotkey rounds=20 park=false physical=false cloak=true
+探针窗口 hwnd=0x510e2（若某轮"按下时前台"等于它，则该轮是先验成立）
+自注入开始：20 轮 Ctrl+Alt+Space（显示）→ Ctrl+Alt+R（隐藏），间隔 700ms
+round 1: WM_HOTKEY 送达（唤醒主线程 7.1ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 8.6ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 25.4ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 26.7ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 2: WM_HOTKEY 送达（唤醒主线程 5.4ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 7.1ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 20.6ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 19.1ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 3: WM_HOTKEY 送达（唤醒主线程 1.7ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 4.7ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 9.0ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 28.1ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 4: WM_HOTKEY 送达（唤醒主线程 0.7ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 3.4ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 7.1ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 23.5ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 5: WM_HOTKEY 送达（唤醒主线程 0.1ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 1.8ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 6.3ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 19.1ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 6: WM_HOTKEY 送达（唤醒主线程 0.9ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 2.8ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 7.4ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 28.7ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 7: WM_HOTKEY 送达（唤醒主线程 3.3ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 5.7ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 21.6ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 19.4ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 8: WM_HOTKEY 送达（唤醒主线程 0.3ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 2.6ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 8.0ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 29.7ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 9: WM_HOTKEY 送达（唤醒主线程 1.6ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 4.3ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 8.0ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 27.6ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 10: WM_HOTKEY 送达（唤醒主线程 1.4ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 4.7ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 10.8ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 25.7ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 11: WM_HOTKEY 送达（唤醒主线程 0.6ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 2.2ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 5.4ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 23.9ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 12: WM_HOTKEY 送达（唤醒主线程 0.6ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 2.2ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 6.3ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 19.7ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 13: WM_HOTKEY 送达（唤醒主线程 0.8ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 3.9ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 9.6ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 15.1ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 14: WM_HOTKEY 送达（唤醒主线程 3.0ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 7.0ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 14.7ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 19.8ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 15: WM_HOTKEY 送达（唤醒主线程 1.0ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 3.3ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 10.1ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 31.8ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 16: WM_HOTKEY 送达（唤醒主线程 2.9ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 6.1ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 11.9ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 28.5ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 17: WM_HOTKEY 送达（唤醒主线程 1.3ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 4.1ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 9.9ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 25.5ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 18: WM_HOTKEY 送达（唤醒主线程 1.1ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 3.1ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 6.7ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 18.0ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 19: WM_HOTKEY 送达（唤醒主线程 1.5ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 3.3ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 8.1ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+       ◇ 遮蔽：下发后 30.5ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+round 20: WM_HOTKEY 送达（唤醒主线程 1.3ms，按下时前台=0x510e2）
+       ↑ show: 解除遮蔽下发 Ok(())（计时起点=热键按下）
+       → visible=true cloaked=0 foreground_is_ours=true 热键→可见+焦点 3.4ms（按下时前台=0x510e2）  [按下时前台已是自己 ⇒ 不计入命中率]
+       ◇ 解除遮蔽：下发后 9.9ms 回读 DWMWA_CLOAKED=0 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]
+       ← hide: 遮蔽下发 Ok(())（不挪位置、不发 Visible 命令）
+模式：注入 × cloak(DWM 遮蔽隐藏，窗口不挪位)
+汇总[注入 × cloak(DWM 遮蔽隐藏，窗口不挪位)]：显示按下并测得 20 次，其中 20 次按下时前台已是自己（先验成立，剔除），有效 0 次 ⇒ 抢焦点成功 0 次；隐藏键送达 20 次；唤醒延迟 min/median/max = 0.1/ 3.3/ 15.2 ms；端到端(仅有效轮次) min/median/max = n/a/ n/a/ n/a ms
+汇总[cloak 生效性]：遮蔽成功 19 次 / 600ms 内未生效 0 次，隐藏键→藏住 min/median/max = 15.1/ 25.5/ 31.8 ms；解除遮蔽成功 20 次 / 未生效 0 次，显示键→露出 min/median/max = 5.4/ 9.6/ 25.4 ms（这两组与焦点无关，先验成立的轮次同样计入）
+       ◇ 遮蔽：下发后 29.0ms 回读 DWMWA_CLOAKED=1 IsWindowVisible=true 前台=0x510e2 [焦点仍在本窗口]

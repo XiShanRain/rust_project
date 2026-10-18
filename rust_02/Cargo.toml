@@ -1,0 +1,20 @@
+[package]
+name = "rust_02"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+
+[[bin]]
+name="main-函数"
+path="src/main-函数.rs"
+
+[[bin]]
+name="main-1"
+path="src/main-1.rs"
+
+
+[[bin]]
+name="russt-ai-pointer"
+path="src/bin/rust-ai-pointer.rs"

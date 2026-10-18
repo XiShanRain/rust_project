@@ -1,0 +1,28 @@
+[package]
+name = "fn_pointer"
+version = "0.1.0"
+edition = "2024"
+
+[build]
+target-dir = "build-output"
+
+[dependencies]
+[[bin]]
+name = "fn_pointer"
+path = "src/main.rs"
+
+[[bin]]
+name = "enumerate方法"
+path = "src/enumerate_test.rs"
+
+[[bin]]
+name = "循环标签"
+path = "src/循环标签.rs"
+
+[[bin]]
+name = "vector_test"
+path = "src/vector_test.rs"
+
+[[bin]]
+name = "Ownership_move"
+path = "src/Ownership_move.rs"

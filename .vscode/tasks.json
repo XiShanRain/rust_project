@@ -1,0 +1,15 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build current bin",
+            "type": "shell",
+            "command": "$d = Split-Path '${file}'; while ($d -and !(Test-Path (Join-Path $d 'Cargo.toml'))) { $d = Split-Path $d } if ($d) { cd $d; cargo build --bin ${fileBasenameNoExtension} } else { Write-Error 'Cargo.toml not found' }",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": ["$rustc"],
+            "group": "build"
+        }
+    ]
+}

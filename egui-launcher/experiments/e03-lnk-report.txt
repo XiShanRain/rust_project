@@ -1,0 +1,84 @@
+CoInitializeEx(STA) on thread ThreadId(2) -> HRESULT(0x00000000)
+--- ALTRun.lnk
+    file     : C:/Users/baoqi/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/ALTRun.lnk
+    target   : D:\GreenTool\00-启动与搜索\ALTRun_v2026.10.12\ALTRun.exe [exists=true]
+    args     : 
+    workdir  : D:\GreenTool\00-启动与搜索\ALTRun_v2026.10.12
+    desc     : ALTRun - 轻量的 Windows 启动器
+    icon     :  (#0)
+    showcmd  : 1
+--- File Explorer.lnk
+    file     : C:/Users/baoqi/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/File Explorer.lnk
+    target   :  [exists=false]
+    args     : 
+    workdir  : 
+    desc     : 显示你计算机上的文件和文件夹。
+    icon     : %windir%\explorer.exe (#0)
+    showcmd  : 1
+--- Qoder CN.lnk
+    file     : C:/Users/baoqi/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Qoder CN.lnk
+    target   : C:\Users\baoqi\AppData\Local\Qoder CN\Qoder CN Launcher\Qoder CN Launcher.exe [exists=true]
+    args     : 
+    workdir  : C:\Users\baoqi\AppData\Local\Programs\Qoder CN\.qoder-versions\0.4.4
+    desc     : Qoder CN
+    icon     : C:\Users\baoqi\AppData\Roaming\com.qodercn.app.stable\application-icons\06b8baf63e2bc06d10a0f5e5a67eed9e3dbc8012e317972009164e0f1324d873.ico (#0)
+    showcmd  : 1
+--- Siyuan.lnk
+    file     : C:/Users/baoqi/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Siyuan.lnk
+    target   : D:\GreenTool\01-办公效率\[笔记]SiYuan-3.8.5\SiYuan.exe [exists=true]
+    args     : 
+    workdir  : D:\GreenTool\01-办公效率\[笔记]SiYuan-3.8.5
+    desc     : From thought to insight, with agents
+    icon     : D:\GreenTool\01-办公效率\[笔记]SiYuan-3.8.5\SiYuan.exe (#0)
+    showcmd  : 1
+--- Anki.lnk
+    file     : C:/Users/baoqi/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Anki.lnk
+    target   : C:\Anki\anki.exe [exists=true]
+    args     : 
+    workdir  : C:\Anki
+    desc     : 
+    icon     :  (#0)
+    showcmd  : 1
+--- Microsoft Edge.lnk
+    file     : C:/Users/Public/Desktop/Microsoft Edge.lnk
+    target   : C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe [exists=true]
+    args     : 
+    workdir  : C:\Program Files (x86)\Microsoft\Edge\Application
+    desc     : 浏览 Web
+    icon     : C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe (#0)
+    showcmd  : 1
+--- i北理.lnk
+    file     : C:/Users/Public/Desktop/i北理.lnk
+    target   : C:\Program Files (x86)\DingDing\DingtalkLauncher.exe [exists=true]
+    args     : 
+    workdir  : C:\Program Files (x86)\DingDing
+    desc     : 
+    icon     : C:\Program Files (x86)\DingDing\logo.ico (#0)
+    showcmd  : 1
+--- 微信.lnk
+    file     : C:/Users/Public/Desktop/微信.lnk
+    target   : C:\Program Files\Tencent\Weixin\Weixin.exe [exists=true]
+    args     : --scene=desktop
+    workdir  : C:\Program Files\Tencent\Weixin
+    desc     : 
+    icon     :  (#0)
+    showcmd  : 1
+--- 坚果云.lnk
+    file     : C:/Users/Public/Desktop/坚果云.lnk
+    target   : C:\Program Files\Nutstore\Nutstore.exe [exists=true]
+    args     : 
+    workdir  : C:\Program Files\Nutstore\
+    desc     : 启动坚果云
+    icon     :  (#0)
+    showcmd  : 1
+--- VMware Workstation Pro.lnk
+    file     : C:/Users/Public/Desktop/VMware Workstation Pro.lnk
+    target   : C:\Program Files (x86)\VMware\VMware Workstation\vmware.exe [exists=true]
+    args     : 
+    workdir  : C:\Program Files (x86)\VMware\VMware Workstation\
+    desc     : 
+    icon     :  (#0)
+    showcmd  : 1
+--- Startup
+    ERROR    : IPersistFile::Load: 拒绝访问。 (0x80070005)
+# parsed 11 .lnk files

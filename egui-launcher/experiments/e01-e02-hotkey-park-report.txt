@@ -1,0 +1,45 @@
+winprobe hotkey rounds=20 park=true physical=false
+探针窗口 hwnd=0x90fda（若某轮"按下时前台"等于它，则该轮是先验成立）
+自注入开始：20 轮 Ctrl+Alt+Space（显示）→ Ctrl+Alt+R（隐藏），间隔 700ms
+round 1: WM_HOTKEY 送达（唤醒主线程 5.4ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 6.0ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 2: WM_HOTKEY 送达（唤醒主线程 2.8ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 3.6ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 3: WM_HOTKEY 送达（唤醒主线程 0.8ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.6ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 4: WM_HOTKEY 送达（唤醒主线程 1.8ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 3.3ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 5: WM_HOTKEY 送达（唤醒主线程 1.5ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.2ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 6: WM_HOTKEY 送达（唤醒主线程 1.1ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.7ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 7: WM_HOTKEY 送达（唤醒主线程 0.7ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.4ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 8: WM_HOTKEY 送达（唤醒主线程 1.1ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.8ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 9: WM_HOTKEY 送达（唤醒主线程 1.1ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.1ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 10: WM_HOTKEY 送达（唤醒主线程 3.8ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 4.5ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 11: WM_HOTKEY 送达（唤醒主线程 0.9ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.6ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 12: WM_HOTKEY 送达（唤醒主线程 3.5ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 4.4ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 13: WM_HOTKEY 送达（唤醒主线程 1.2ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.0ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 14: WM_HOTKEY 送达（唤醒主线程 0.9ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.8ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 15: WM_HOTKEY 送达（唤醒主线程 0.8ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.5ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 16: WM_HOTKEY 送达（唤醒主线程 1.2ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.1ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 17: WM_HOTKEY 送达（唤醒主线程 1.9ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 3.6ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 18: WM_HOTKEY 送达（唤醒主线程 1.8ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.7ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 19: WM_HOTKEY 送达（唤醒主线程 1.2ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 2.1ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+round 20: WM_HOTKEY 送达（唤醒主线程 0.8ms，按下时前台=0x90fda）
+       → visible=true foreground_is_ours=true 热键→可见+焦点 1.5ms（按下时前台=0x90fda）  [按下时前台已是自己 ⇒ 不计入命中率]
+模式：注入 × park(移出屏幕隐藏)
+汇总[注入 × park(移出屏幕隐藏)]：显示按下并测得 20 次，其中 20 次按下时前台已是自己（先验成立，剔除），有效 0 次 ⇒ 抢焦点成功 0 次；隐藏键送达 20 次；唤醒延迟 min/median/max = 0.7/ 3.5/ 14.8 ms；端到端 min/median/max = 1.4/ 2.1/ 6.0 ms
