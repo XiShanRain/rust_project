@@ -1,5 +1,13 @@
+// 本程序是 GUI 应用 ⇒ 声明成「窗口子系统」。默认的控制台子系统会让系统在每次「没有继承到
+// 控制台」的启动（登录自启、资源管理器双击）时替它新建一个控制台窗，把 87 条 eprintln! 日志
+// 刷在一个黑窗里；关掉那个黑窗还会顺带把进程一起终止。改成窗口子系统后不再有黑窗，
+// 日志改由 redirect_stderr_if_orphan() 兜到 launcher.log。
+#![windows_subsystem = "windows"]
+
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::os::windows::io::AsRawHandle;
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,6 +21,7 @@ use windows::Win32::Foundation::{
     POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
@@ -2586,7 +2595,41 @@ fn init_tray() -> (TrayIcon, mpsc::Receiver<TrayEvent>) {
     (tray, rx)
 }
 
+/// 单次日志上限：超过就先滚一份 `launcher.log.old`（只留一代，不做轮转编号）。
+/// 自启意味着每次登录都追加一次，不封顶就会写成无限大的文件。
+const LOG_ROTATE_BYTES: u64 = 512 * 1024;
+
+/// 句柄的生命周期：`SetStdHandle` 只换指针、不接管所有权，`File` 一 drop 句柄就悬空，
+/// 所以文件必须活到进程结束——放进 `static` 即可，不必 `mem::forget`。
+static LOG_FILE: OnceLock<std::fs::File> = OnceLock::new();
+
+/// 没有控制台可看日志时，把 stderr 接到 `launcher.log`（与清单同目录，便携优先）。
+///
+/// 只换标准错误句柄 ⇒ 87 处 `eprintln!` 调用点一行不动，panic 信息也一起进文件。
+/// 判据是「没人听」：GUI 子系统进程从登录自启/资源管理器启动时 `GetStdHandle` 直接报
+/// 错（句柄为 NULL/INVALID），日志会全部落空 ⇒ 这时才接管；从终端启动或被外部重定向
+/// 捕获时句柄有效 ⇒ 一个字都不动，保住实时日志这条取证通道。两条分支均在本机实测。
+fn redirect_stderr_if_orphan() {
+    if unsafe { GetStdHandle(STD_ERROR_HANDLE) }.is_ok() {
+        return;
+    }
+    let path = source::application::log_path();
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_ROTATE_BYTES) {
+        let old = path.with_extension("log.old");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&path, &old);
+    }
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return; // 日志文件打不开也要照常启动，不因记不了日志而退出
+    };
+    let file = LOG_FILE.get_or_init(|| file);
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, HANDLE(file.as_raw_handle())) }.is_ok() {
+        eprintln!("log: 本次启动没有控制台，stderr 已接到 {}", path.display());
+    }
+}
+
 fn main() -> eframe::Result {
+    redirect_stderr_if_orphan(); // 必须在第一条日志之前：换句柄只管之后的写
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = cli::parse(&args);
 

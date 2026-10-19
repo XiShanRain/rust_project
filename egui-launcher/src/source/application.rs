@@ -324,6 +324,13 @@ fn settings_path() -> PathBuf {
     user_list_path().with_file_name("settings.json")
 }
 
+/// 日志文件路径：同样跟着清单走（便携目录可写就在 exe 旁边，否则退到 `%LOCALAPPDATA%`）。
+/// 本程序是窗口子系统 ⇒ 没有控制台可刷日志，`src/main.rs` 的 `redirect_stderr_if_orphan()`
+/// 只在「没人听 stderr」时把标准错误接到这里。
+pub fn log_path() -> PathBuf {
+    user_list_path().with_file_name("launcher.log")
+}
+
 /// 读取偏好；文件缺失或解析失败一律回默认值（NFR-04：坏配置不得影响启动）。
 pub fn load_settings() -> AppSettings {
     match std::fs::read(settings_path()) {
