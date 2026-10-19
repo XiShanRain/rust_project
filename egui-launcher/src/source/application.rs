@@ -802,6 +802,143 @@ unsafe fn read_link_target(path: &Path) -> Option<(String, String)> {
     }
 }
 
+// ---- FR-WIN-11 ① 开机自启开关（启动夹 .lnk 带 -Startup）----
+
+const STARTUP_LINK_NAME: &str = "egui-launcher.lnk";
+/// FR-WIN-08 已规定的静默启动参数：登录后由启动夹拉起，但不弹窗口。
+pub const STARTUP_ARGS: &str = "-Startup";
+
+fn startup_link_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(
+        Path::new(&appdata)
+            .join(r"Microsoft\Windows\Start Menu\Programs\Startup")
+            .join(STARTUP_LINK_NAME),
+    )
+}
+
+/// 归属判据（纯函数，便于单测）：target 必须是本 exe，参数必须恰好是 `-Startup`。
+/// 二者缺一律视为「别人建的文件」——既不认作已安装，也拒绝删除（需求书安全规则）。
+fn is_our_startup_link(exe: &str, target: &str, args: &str) -> bool {
+    target == exe && args.trim() == STARTUP_ARGS
+}
+
+pub fn startup_installed() -> bool {
+    let Some(link) = startup_link_path() else { return false };
+    if !link.exists() {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let exe = exe.to_string_lossy().into_owned();
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let owned = unsafe { read_link_target(&link) }
+        .map(|(t, a)| is_our_startup_link(&exe, &t, &a))
+        .unwrap_or(false);
+    if hr.is_ok() {
+        unsafe { CoUninitialize() };
+    }
+    owned
+}
+
+/// 关闭开关=删除启动夹入口。解析不出归属一律拒删。
+pub fn uninstall_startup() -> Result<String, String> {
+    let link = startup_link_path().ok_or("缺 APPDATA 环境变量")?;
+    if !link.exists() {
+        return Ok("开机自启入口本就不存在，无需删除".to_string());
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("current_exe 失败: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    let dir = link.parent().ok_or("启动夹路径异常")?.to_path_buf();
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let r = (|| -> Result<String, String> {
+        let (target, args) =
+            unsafe { read_link_target(&link) }.ok_or("解析既有 .lnk 失败，无法确认归属，未删除")?;
+        if !is_our_startup_link(&exe, &target, &args) {
+            return Err(format!(
+                "「{}」（target={target} 参数={args}）不是本程序创建的开机自启项，按安全规则不删除",
+                link.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            ));
+        }
+        std::fs::remove_file(&link).map_err(|e| format!("删除失败: {e}"))?;
+        notify_shell(&link, &dir);
+        Ok("开机自启项已删除（归属已验证）".to_string())
+    })();
+    if hr.is_ok() {
+        unsafe { CoUninitialize() };
+    }
+    r
+}
+
+/// 设置页开关「开」：后台线程写启动夹 `.lnk`，结果经 `tx` 回报主线程做 Toast。
+pub fn spawn_startup_install(tx: mpsc::Sender<Result<String, String>>) {
+    thread::spawn(move || {
+        let result = install_startup_link();
+        let _ = tx.send(result);
+    });
+}
+
+fn install_startup_link() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("current_exe 失败: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    let appdata = std::env::var_os("APPDATA").ok_or("缺 APPDATA 环境变量")?;
+    let dir = Path::new(&appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建启动夹目录失败: {e}"))?;
+    let link_path = dir.join(STARTUP_LINK_NAME);
+
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let r = unsafe { write_startup_link(&exe, &link_path) };
+    if r.is_ok() {
+        notify_shell(&link_path, &dir);
+    }
+    if hr.is_ok() {
+        unsafe { CoUninitialize() };
+    }
+    r
+}
+
+/// 外部进程往启动夹/SendTo 写的文件，shell 不一定即时感知，主动通知条目+目录刷新。
+fn notify_shell(item: &Path, dir: &Path) {
+    let witem = wide_null(&item.to_string_lossy());
+    let wdir = wide_null(&dir.to_string_lossy());
+    unsafe {
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, Some(witem.as_ptr().cast()), None);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, Some(wdir.as_ptr().cast()), None);
+    }
+}
+
+unsafe fn write_startup_link(exe: &str, link_path: &Path) -> Result<String, String> {
+    unsafe {
+        // 未变不重写：同 SendTo 那套规则，启动路径上的任何 IO 都要有理由。
+        if link_path.exists() {
+            if let Some((target, args)) = read_link_target(link_path) {
+                if is_our_startup_link(exe, &target, &args) {
+                    return Ok(format!(
+                        "开机自启项已存在且未变化，未重写: {}",
+                        link_path.display()
+                    ));
+                }
+            }
+        }
+        let shell: IShellLinkW = CoCreateInstance(&CLSID_SHELL_LINK, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| format!("CoCreateInstance(ShellLink) 失败: {e}"))?;
+        let wexe = wide_null(exe);
+        shell.SetPath(PCWSTR(wexe.as_ptr())).map_err(|e| format!("SetPath: {e}"))?;
+        let wargs = wide_null(STARTUP_ARGS);
+        shell.SetArguments(PCWSTR(wargs.as_ptr())).map_err(|e| format!("SetArguments: {e}"))?;
+        shell.SetIconLocation(PCWSTR(wexe.as_ptr()), 0).map_err(|e| format!("SetIconLocation: {e}"))?;
+        let wdesc = wide_null("登录时静默启动 egui-launcher（不弹窗口）");
+        shell.SetDescription(PCWSTR(wdesc.as_ptr())).map_err(|e| format!("SetDescription: {e}"))?;
+        let pf: IPersistFile = shell.cast().map_err(|e| format!("cast IPersistFile: {e}"))?;
+        let wlink = wide_null(&link_path.to_string_lossy());
+        pf.Save(PCWSTR(wlink.as_ptr()), true).map_err(|e| format!("Save: {e}"))?;
+        Ok(format!("开机自启项已写入：{}（参数 {STARTUP_ARGS}，登录后托盘常驻、不弹窗口）", link_path.display()))
+    }
+}
+
 #[cfg(test)]
 mod dedup_tests {
     use super::*;
@@ -904,5 +1041,89 @@ mod dedup_tests {
             LaunchItem { name: "Notepad".to_string(), keyword: String::new(), ..Default::default() };
         assert!(learn_alias(&mut bare, "np"));
         assert_eq!(bare.keyword, "np", "原本无别名时直接落第一个词");
+    }
+
+    /// FR-WIN-11 开机自启的归属判据（安全规则的可测部分）：target 与参数**两个都得对**，
+    /// 否则一律视为别人建的文件——既不认作"已安装"，卸载时也会拒绝碰它。
+    #[test]
+    fn startup_ownership_needs_both_target_and_startup_arg() {
+        assert!(is_our_startup_link("C:\\a\\egui-launcher.exe", "C:\\a\\egui-launcher.exe", "-Startup"));
+        assert!(
+            is_our_startup_link("C:\\a\\e.exe", "C:\\a\\e.exe", " -Startup "),
+            "启动夹里的参数串可能带首尾空格，不参与判断"
+        );
+        assert!(!is_our_startup_link("C:\\a\\e.exe", "C:\\a\\e.exe", ""), "无参数＝不是本项");
+        assert!(!is_our_startup_link("C:\\a\\e.exe", "C:\\a\\e.exe", "-PREFERENCES"));
+        assert!(
+            !is_our_startup_link("C:\\a\\e.exe", "C:\\b\\other.exe", "-Startup"),
+            "target 不是本 exe ⇒ 别人的快捷方式"
+        );
+        assert!(
+            !is_our_startup_link("C:\\a\\e.exe", "C:\\A\\E.EXE", "-Startup"),
+            "路径按字面比较（同 SendTo 那套口径），大小写不同即不认领"
+        );
+    }
+
+    /// 开机自启的「写入 → 归属 → 未变不重写 → 删除 → 拒删别人的」整条往返。
+    /// 走的是真实 COM + `IShellLinkW`，但把 `APPDATA` 指到临时目录 ⇒ 替用户挡掉
+    /// "为了验证就往真启动夹写文件、还要注销登录一次"的成本，同时真验了落盘与解析。
+    #[test]
+    fn startup_link_round_trip_only_touches_temp_appdata() {
+        let base = std::env::temp_dir().join(format!("egui-launcher-startup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let old = std::env::var_os("APPDATA");
+        // SAFETY: 本进程里只有 sendto/startup 两个前缀读 `APPDATA`，都不在这条测试之外被调用；
+        // 结束即还原（含失败路径），不污染同进程其它测试线程。
+        unsafe { std::env::set_var("APPDATA", &base) };
+        let r = (|| -> Result<(), String> {
+            let startup_dir =
+                base.join(r"Microsoft\Windows\Start Menu\Programs\Startup");
+            let link = startup_dir.join(STARTUP_LINK_NAME);
+
+            let first = install_startup_link()?;
+            if !link.exists() {
+                return Err(format!("写完了但启动夹里没有 .lnk: {first}"));
+            }
+            if !startup_installed() {
+                return Err("刚写完就判未安装 ⇒ 归属判据与实际写入不一致".to_string());
+            }
+            let again = install_startup_link()?;
+            if !again.contains("未重写") {
+                return Err(format!("第二次应命中「未变不重写」，实得：{again}"));
+            }
+
+            uninstall_startup()?;
+            if link.exists() {
+                return Err("删除后文件还在".to_string());
+            }
+            if startup_installed() {
+                return Err("删除后仍判已安装".to_string());
+            }
+
+            // 别人的快捷方式（target 不是本 exe）：既不认作已安装，也拒绝删。
+            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            let foreign = "C:\\Windows\\System32\\notepad.exe";
+            unsafe { write_startup_link(foreign, &link) }?;
+            if startup_installed() {
+                return Err("target 不是本 exe 却判已安装".to_string());
+            }
+            let msg = uninstall_startup().err().ok_or("别人的快捷方式居然被删了")?;
+            if !msg.contains("不是本程序创建") {
+                return Err(format!("拒删理由不对：{msg}"));
+            }
+            if !link.exists() {
+                return Err("口头上拒删、实际把文件删了".to_string());
+            }
+            if hr.is_ok() {
+                unsafe { CoUninitialize() };
+            }
+            Ok(())
+        })();
+        match old {
+            Some(v) => unsafe { std::env::set_var("APPDATA", v) },
+            None => unsafe { std::env::remove_var("APPDATA") },
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        r.unwrap();
     }
 }

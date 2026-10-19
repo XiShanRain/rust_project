@@ -24,12 +24,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, ShellExecuteExW, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowThreadProcessId, PostQuitMessage,
-    RegisterClassExW, SendMessageTimeoutW, SetWindowPos, ShowWindow, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE, MSG, SMTO_ABORTIFHUNG, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_COPYDATA, WM_DESTROY, WM_HOTKEY,
-    WNDCLASSEXW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    FindWindowW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
+    GetWindowThreadProcessId, PostQuitMessage, RegisterClassExW, SendMessageTimeoutW, SetWindowPos,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE, MSG,
+    MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    SW_SHOWNORMAL, WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
 const HOTKEY_TOGGLE: i32 = 1;
@@ -795,6 +795,13 @@ fn spawn_hotkey_thread(tx: mpsc::Sender<()>) {
             return;
         }
         eprintln!("hotkey: Ctrl+Alt+Space registered");
+        // FR-WIN-11：本实例若以管理员运行，普通权限的次进程（再双击 exe、资源管理器「发送到」）
+        // 发来的 WM_COPYDATA 会被 UIPI 静默丢弃 ⇒ 只对该消息窗放行 WM_COPYDATA 这一条，
+        // 不放开其它消息、不改完整性级别（放行范围＝这个 hwnd 的消息队列）。
+        match ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, None) {
+            Ok(()) => eprintln!("ipc: 已对本消息窗放行 WM_COPYDATA（管理员实例可收普通权限次进程）"),
+            Err(e) => eprintln!("ipc: WM_COPYDATA 放行失败（不影响同级实例间转发）: {e}"),
+        }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -1157,6 +1164,39 @@ impl LauncherApp {
                             ui.label(
                                 egui::RichText::new(
                                     "开＝写 egui-launcher.lnk 到 SendTo 目录；关＝删除它（只删本程序创建的文件，同名他人文件不动）。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            // FR-WIN-11 开机自启（批次 L，2026-10-19 用户裁定「默认关，由我手动打开」
+                            // ⇒ 程序不主动往启动夹写文件；需求书原文「默认开」已按此更正）。
+                            ui.label(egui::RichText::new("开机自启").strong());
+                            let mut auto = source::application::startup_installed();
+                            let resp = ui.checkbox(&mut auto, "登录时静默启动（托盘常驻，不弹窗口）");
+                            if resp.changed() {
+                                if auto {
+                                    source::application::spawn_startup_install(self.notify_tx.clone());
+                                    eprintln!("设置页：开机自启 开关→开，后台写启动夹（结果走 Toast）");
+                                } else {
+                                    let (text, color) = match source::application::uninstall_startup() {
+                                        Ok(s) => {
+                                            eprintln!("设置页：开机自启 开关→关，{s}");
+                                            (format!("✓ {s}"), TOAST_OK)
+                                        }
+                                        Err(s) => {
+                                            eprintln!("设置页：开机自启 卸载失败：{s}");
+                                            (format!("⚠ {s}"), TOAST_ERR)
+                                        }
+                                    };
+                                    self.toast = Some((text, Instant::now() + TOAST_TTL, color));
+                                    ui.ctx().request_repaint_after(TOAST_TTL);
+                                }
+                                ui.ctx().request_repaint(); // 开关态下一帧重读磁盘真实状态
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "开＝写 egui-launcher.lnk 到「启动」文件夹、参数 -Startup（登录后不弹窗口）；关＝删除它（只删本程序创建、参数确为 -Startup 的文件）。默认关。",
                                 )
                                 .weak()
                                 .small(),
