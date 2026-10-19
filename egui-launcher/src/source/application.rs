@@ -504,15 +504,24 @@ pub fn spawn_batch_import(tx: mpsc::Sender<Vec<LaunchItem>>) {    thread::spawn(
         files.dedup();
         let total = files.len();
         let mut apps = Vec::new();
+        let exe_key = self_exe_key();
+        let mut skipped_self = 0usize;
         for file in &files {
             if let Some(app) = unsafe { resolve_lnk(file) } {
+                // 自排除：target 规范化后就是本 exe（含我们自己写的启动夹快捷方式）。
+                if exe_key.as_deref().is_some_and(|key| is_self_target(&app.path, key)) {
+                    skipped_self += 1;
+                    eprintln!("source: 批量导入自排除（target 即本 exe）：{}", file.display());
+                    continue;
+                }
                 apps.push(app);
             } // 解析失败 / 空 target：跳过不中断（约束 4）
         }
         eprintln!(
-            "source: 批量扫描 {} 个 .lnk，解析出 {} 条（线程 {:?}，CoInit={hr:?}）",
+            "source: 批量扫描 {} 个 .lnk，解析出 {} 条，自排除 {} 条（线程 {:?}，CoInit={hr:?}）",
             total,
             apps.len(),
+            skipped_self,
             thread::current().id()
         );
         unsafe { CoUninitialize() };
@@ -555,6 +564,26 @@ fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// 批量导入的自排除判据：`.lnk` 的 target 规范化后就是本 exe ⇒ 不收进清单。
+/// 起因是开机自启写的 `Programs\Startup\egui-launcher.lnk` 正落在默认扫描根（`Programs`，深度 2）
+/// 里，"程序把自己当一条启动项导入"是必然发生而非偶然。
+///
+/// 判据既不写死文件名、也不用字符串相等：exe 改名或搬家后 `current_exe()` 自己会跟着变，而快捷方式
+/// 里存的大小写、短名（`PROGRA~1`）、分隔符都可能与它不一致 ⇒ 两侧都取 `canonicalize` 后的长路径，
+/// 再做大小写不敏感比较。任一侧规范化失败一律**不跳过**：把别的程序误判成"自己"而沉默丢一条，
+/// 代价比多收一条大得多。
+fn is_self_target(target: &str, exe_key: &str) -> bool {
+    match Path::new(target).canonicalize() {
+        Ok(canon) => canon.to_string_lossy().eq_ignore_ascii_case(exe_key),
+        Err(_) => false,
+    }
+}
+
+/// 本 exe 的规范化字符串键；取不到就视为没有自排除项（同上一条"宁多勿漏"的取向）。
+fn self_exe_key() -> Option<String> {
+    Some(std::env::current_exe().ok()?.canonicalize().ok()?.to_string_lossy().into_owned())
 }
 
 fn from_wide(buf: &[u16]) -> String {
@@ -1061,6 +1090,26 @@ mod dedup_tests {
         assert!(
             !is_our_startup_link("C:\\a\\e.exe", "C:\\A\\E.EXE", "-Startup"),
             "路径按字面比较（同 SendTo 那套口径），大小写不同即不认领"
+        );
+    }
+
+    /// 自排除判据必须跟着**正在运行的这个 exe** 走，不能写死文件名：改名或搬家后 `current_exe()`
+    /// 自然变，判据也就跟着变。这里直接拿本测试自己的可执行文件当 target，顺带验大小写差异
+    /// 与"规范化失败就不跳过"。
+    #[test]
+    fn self_exclusion_follows_the_running_exe_not_a_hardcoded_name() {
+        let exe = std::env::current_exe().unwrap();
+        let key = exe.canonicalize().unwrap().to_string_lossy().into_owned();
+        let plain = exe.to_string_lossy().into_owned();
+        assert!(is_self_target(&plain, &key), "本 exe 必须被判成自己");
+        assert!(is_self_target(&plain.to_uppercase(), &key), "快捷方式里大小写不同也要认出来");
+        assert!(
+            !is_self_target(r"C:\no-such-dir-here\zzz.exe", &key),
+            "规范化失败 ⇒ 不跳过（宁可多收一条，不误判成自己）"
+        );
+        assert!(
+            !is_self_target(r"C:\Windows\System32\notepad.exe", &key),
+            "别的程序不能被判成自己"
         );
     }
 
