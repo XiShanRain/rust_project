@@ -925,6 +925,9 @@ fn vk_from_egui_key(k: egui::Key) -> Option<u32> {
 /// 录制态吃掉本帧所有按键事件并返回第一个"按下"的原始键。
 /// 必须清理事件而不是只读：egui 的 `key_pressed`／`consume_key` 都查 `events`
 /// （`input_state/mod.rs:753`），留着下面的快捷键分支和 Esc 链就会同时响应同一次按键。
+/// 【2026-10-19 实测过再来动这里：不需要"跳过修饰键自身的按下事件"。真机上和弦的 Ctrl 按下
+/// 与主键按下不会落在同一帧（`Ctrl+I`、`Ctrl+F13` 都一次落定），而录制时"按了没反应"是因为
+/// 那个组合被别的全局热键整条吞掉 ⇒ 窗口收不到任何键，只能继续等（卡片文案已写明这件事）。】
 fn take_record_press(ui: &mut egui::Ui) -> Option<(egui::Key, egui::Modifiers)> {
     let mut hit = None;
     ui.input_mut(|i| {
@@ -1544,8 +1547,12 @@ impl LauncherApp {
                     // 免得用户只是按了一下 PgDn 就被提示一次。
                     return;
                 };
-                self.hotkey_recording = false;
-                self.request_hotkey(spec);
+                // 只有真正投递出去（换键）才算这次录制落定；本地判据拒绝时**留在录制态**，
+                // 因为那几条 Toast 写的是「换一个」「请再录一次」。【2026-10-20 真机实测：原来这里
+                // 无条件退出录制 ⇒ 按 `Ctrl+I` 撞上本程序键表后紧接着按 `Ctrl+F13`，第二次按键被当
+                // 普通按键丢掉（日志只有冲突那一行，没有投递行），用户必须再点一次「录制新热键」，
+                // 提示语与行为自相矛盾。】
+                self.hotkey_recording = !self.request_hotkey(spec);
             }
         }
     }
@@ -1553,29 +1560,32 @@ impl LauncherApp {
     /// 录制落定：合法性 → 本程序键表预检 → 投给热键线程试注册。
     /// 三级里前两级是本地判据（不碰系统），最后一级只有 Windows 知道答案，结果走回执；
     /// **只有注册成功才写 settings.json**（用户 2026-10-19 口径「立即生效、失败回滚旧热键」）。
-    fn request_hotkey(&mut self, spec: HotkeySpec) {
+    /// 返回值 = "这次录制到此为止"：`true` 只给真正投递成功那一条，其余（含"与当前一致"）都是
+    /// `false` ⇒ 调用方留在录制态，让用户照着提示语直接按下一个组合。
+    fn request_hotkey(&mut self, spec: HotkeySpec) -> bool {
         let show = spec.display();
         if let Err(msg) = spec.check() {
             self.hotkey_note(&format!("⚠ {show}：{msg}"), false);
             eprintln!("设置页：热键 {show} 未采纳（{msg}），当前仍是 {}", self.hotkey_active.display());
-            return;
+            return false;
         }
         if spec.conflicts_local(LOCAL_TAKEN) {
             self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
             eprintln!("设置页：热键 {show} 与本程序键表冲突，未采纳");
-            return;
+            return false;
         }
         if spec == self.hotkey_active {
             self.hotkey_note(&format!("ℹ {show} 就是当前热键，未改动"), true);
             eprintln!("设置页：热键 {show} 与当前一致，未改动");
-            return;
+            return false;
         }
         if !post_hotkey_request(spec) {
             self.hotkey_note("⚠ 热键线程还没就绪，请再录一次", false);
-            return;
+            return false;
         }
         self.hotkey_awaiting = Some(spec);
         eprintln!("设置页：热键换键请求已投递 → {show}（等注册结果）");
+        true
     }
 
     /// 热键相关的一条回执提示：统一走 Toast（沿用各操作的 TTL 与配色）。
