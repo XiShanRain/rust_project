@@ -212,6 +212,136 @@ pub struct AppSettings {
     /// 同一匹配档位之内谁排前面（FR-SRC-19 的学习位序，批次 K：甲乙都做、默认甲）。
     #[serde(default)]
     pub learn_rank: LearnRank,
+
+    /// 全局呼出 / 隐藏热键（FR-WIN-02 + FR-CFG-05，批次 Q 2026-10-19：此前写死在
+    /// `src/main.rs` 的注册调用里）。存的是 Windows 原始数值，见 [`HotkeySpec`]。
+    #[serde(default)]
+    pub toggle_hotkey: HotkeySpec,
+}
+
+// ---- FR-WIN-02 全局呼出热键（批次 Q）----
+//
+// 位值与 Virtual-Key 码在这里重述一遍，而不是从 `windows` crate 引：判据（[`HotkeySpec::check`]）
+// 和展示名（[`HotkeySpec::display`]）必须是纯函数，才能在 `cargo test` 里跑满而不碰系统；
+// `src/main.rs` 那边用的是 windows 的同名常量，两边是同一套数。
+
+pub const HKF_ALT: u32 = 0x0001;
+pub const HKF_CONTROL: u32 = 0x0002;
+pub const HKF_WIN: u32 = 0x0008;
+pub const HKF_SHIFT: u32 = 0x0010;
+/// 按住不放不连发。老版本写死在注册调用里，批次 Q 起恒带上（没有配置它的入口）。
+pub const HKF_NOREPEAT: u32 = 0x4000;
+
+pub const VK_BACK: u32 = 0x08;
+pub const VK_RETURN: u32 = 0x0D;
+pub const VK_SPACE: u32 = 0x20;
+/// `0`–`9` 与 `A`–`Z` 的 VK 就是 ASCII 大写。
+pub const VK_0: u32 = 0x30;
+pub const VK_9: u32 = 0x39;
+pub const VK_A: u32 = 0x41;
+pub const VK_Z: u32 = 0x5A;
+pub const VK_F1: u32 = 0x70;
+pub const VK_F24: u32 = 0x87;
+pub const VK_DELETE: u32 = 0x2E;
+
+/// `RegisterHotKey` 失败码：组合已被系统或别的程序占走。这是"全局冲突"唯一的实测途径
+/// （Windows 没有枚举别人热键的 API），所以判据只能是"试注册"。
+/// 值取自 `windows-0.62.2` 绑定源（`Foundation/mod.rs:2677` = `1409u32`），与需求书附录 E
+/// E-01 当年实测的 `HRESULT 0x80070581` 同数（低字 `0x581` = 1409）。**不是 1410**
+/// （1410 = `ERROR_CLASS_ALREADY_EXISTS`，同一份绑定源 `:1374`）——写错只会让"已被占用"
+/// 那句提示永远不显示、退化成裸错误码。
+pub const ERROR_HOTKEY_ALREADY_REGISTERED: u32 = 1409;
+
+/// 全局热键的组合。存数值而不存 `egui::Key`：后者没有显式判别值（`src/data/key.rs` 里
+/// 枚举按声明顺序自动编号），依赖一升级就可能漂，而这两个数要直接喂给 `RegisterHotKey`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeySpec {
+    /// `fsModifiers` 位掩码（[`HKF_ALT`] 等几个常量相或，含 [`HKF_NOREPEAT`]）。
+    pub mods: u32,
+    /// Virtual-Key 码。
+    pub vk: u32,
+}
+
+impl HotkeySpec {
+    /// 出厂值 = `Ctrl+Alt+Space`。用 const 而不只是 [`Default::default`]，
+    /// 好让 `static` 里的 `Mutex::new` 能在 const 上下文初始化。
+    pub const DEFAULT: Self = Self {
+        mods: HKF_CONTROL | HKF_ALT | HKF_NOREPEAT,
+        vk: VK_SPACE,
+    };
+
+    /// 去掉 [`HKF_NOREPEAT`]：它是行为位，不是键名的一部分，比对与展示都要剥掉它。
+    pub fn mods_named(&self) -> u32 {
+        self.mods & !HKF_NOREPEAT
+    }
+
+    /// 设置页与日志共用同一份实现，避免两处口径漂移。
+    pub fn display(&self) -> String {
+        let m = self.mods_named();
+        let mut s = String::new();
+        if m & HKF_CONTROL != 0 {
+            s.push_str("Ctrl+");
+        }
+        if m & HKF_ALT != 0 {
+            s.push_str("Alt+");
+        }
+        if m & HKF_SHIFT != 0 {
+            s.push_str("Shift+");
+        }
+        if m & HKF_WIN != 0 {
+            s.push_str("Win+");
+        }
+        s.push_str(&vk_name(self.vk));
+        s
+    }
+
+    /// 录制落定前的合法性判据。只管"这个组合能不能当全局键"，冲突另判（本程序键表预检 +
+    /// 试注册失败码），因为冲突的一半只有 Windows 知道。
+    pub fn check(&self) -> Result<(), &'static str> {
+        let function = (VK_F1..=VK_F24).contains(&self.vk);
+        let textable = matches!(
+            self.vk,
+            VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN
+        );
+        if !(function || textable) {
+            return Err("只收字母、数字、空格、回车与 F1–F24");
+        }
+        // 非 F 键必须带 Ctrl / Alt / Win 之一：裸 A、Shift+A 都只是打字，
+        // 挂成全局键等于"敲到就弹窗"。F 键有专职身份，允许单独用。
+        if !function && self.mods_named() & (HKF_CONTROL | HKF_ALT | HKF_WIN) == 0 {
+            return Err("这个键要当全局热键，至少得带 Ctrl、Alt 或 Win");
+        }
+        Ok(())
+    }
+
+    /// 撞上本程序自己的键表（新建 / 编辑 / 删除 / 导航 / 数字行…）。
+    pub fn conflicts_local(&self, table: &[(u32, u32)]) -> bool {
+        let mine = (self.mods_named(), self.vk);
+        table.iter().any(|(m, v)| (*m & !HKF_NOREPEAT, *v) == mine)
+    }
+}
+
+impl Default for HotkeySpec {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// VK → 展示名。范围外的码原样写成 `VK#xNN`，让日志里看得见"没映射到"而不是显示空白。
+/// 键名用英文（Space / Enter）：设置页那张快捷键表一直这么写，且启动日志那行
+/// `hotkey: Ctrl+Alt+Space registered` 从批次 A 起就是原文，复测判据直接抄它——
+/// 改成「空格」会让同一份判据对不上号。
+fn vk_name(vk: u32) -> String {
+    match vk {
+        VK_A..=VK_Z => char::from_u32(vk).unwrap_or('?').to_string(),
+        VK_0..=VK_9 => char::from_u32(vk).unwrap_or('?').to_string(),
+        VK_SPACE => "Space".to_string(),
+        VK_RETURN => "Enter".to_string(),
+        VK_BACK => "Backspace".to_string(),
+        VK_DELETE => "Delete".to_string(),
+        VK_F1..=VK_F24 => format!("F{}", vk - VK_F1 + 1),
+        other => format!("VK#{other:02X}"),
+    }
 }
 
 /// 空格执行的四种判据。**为什么不是开关**：bool 只能表达"只有空框才执行"和"永远执行"
@@ -329,6 +459,122 @@ fn settings_path() -> PathBuf {
 /// 只在「没人听 stderr」时把标准错误接到这里。
 pub fn log_path() -> PathBuf {
     user_list_path().with_file_name("launcher.log")
+}
+
+/// 单文件封顶：超过就先归档（批次 O 立的数，本批沿用）。自启＝每次登录追加，不封顶就是无限大。
+pub const LOG_ROTATE_BYTES: u64 = 512 * 1024;
+
+/// 归档保留份数（不含正在写的 `launcher.log`）⇒ 自启场景下等于"最近 4 天"的启动日志。
+pub const LOG_KEEP_ARCHIVES: usize = 3;
+
+/// 文件首行的日期锚。归档要用"这份内容属于哪一天"命名，而这个日期由日志自己记在第一行——
+/// 不走 mtime 换算：`FileTimeToSystemTime` 一类转换在本项目现有 feature 下三条路径实测全部不可达，
+/// 手搓公历换算不是这一格该背的复杂度。锚读不出来就当没有日期归档，绝不猜一个填上去。
+pub const LOG_DATE_TAG: &str = "# log 日期: ";
+
+/// 今天的本地日期时间 `YYYY-MM-DD HH:MM`。`GetLocalTime` 是不引日期库就能拿到本地历日的唯一路子
+/// （为此打开 `Win32_System_SystemInformation` feature——批次 O 之后第二次动 feature 列表）。
+pub fn local_now_stamp() -> String {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
+}
+
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
+/// 从日志首行取日期锚里的 `YYYY-MM-DD`；缺失、越界、非数字一律 None。
+fn log_content_date(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 128];
+    let n = std::fs::File::open(path).ok().and_then(|mut f| f.read(&mut buf).ok())?;
+    let head = std::str::from_utf8(&buf[..n]).ok()?;
+    let first_line = head.lines().next()?;
+    let date = first_line.strip_prefix(LOG_DATE_TAG)?.get(..10)?.to_string();
+    is_iso_date(&date).then_some(date)
+}
+
+/// 跨天或超长时把 `launcher.log` 滚成 `launcher-<内容日期>.log`，再把归档裁到 `LOG_KEEP_ARCHIVES` 份，
+/// 返回本次启动该写的横幅尾巴（调用方负责在换句柄**之后**写进去，见 `main.rs`）。
+pub fn rotate_log_and_stamp() -> String {
+    let stamp = local_now_stamp();
+    let today = stamp.get(..10).unwrap_or_default().to_string();
+    rotate_at(&log_path(), &today);
+    stamp
+}
+
+/// 归档判据本身：不取系统时间、不碰真实清单目录 ⇒ 能在临时目录里跑完整往返（单测走这条）。
+/// 首行没有日期锚的旧文件（批次 O 的产物）归成 `launcher-无日期.log`，这种归类每台机器只会发生一次。
+fn rotate_at(path: &Path, today: &str) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    let dated = log_content_date(path);
+    let stale = dated.as_deref() != Some(today);
+    if stale || meta.len() > LOG_ROTATE_BYTES {
+        archive_log(path, dated.as_deref().unwrap_or("无日期"));
+    }
+}
+
+/// 重命名归档；同名已存在时加 `.2`、`.3`…（同一天两次超长会走到这里）。
+fn archive_log(path: &Path, date: &str) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    let stem = format!("launcher-{date}");
+    let mut target = dir.join(format!("{stem}.log"));
+    for n in 2..=99 {
+        if !target.exists() {
+            break;
+        }
+        target = dir.join(format!("{stem}.{n}.log"));
+    }
+    std::fs::rename(path, &target).ok()?;
+    prune_archives(dir);
+    Some(target)
+}
+
+/// 这个文件名是不是本程序自己写的归档？判据是**完整的名字形状**，不是前缀：
+/// `launcher-<YYYY-MM-DD>.log` 或 `launcher-<YYYY-MM-DD>.<1..99>.log`，外加旧文件那格 `launcher-无日期.log`。
+/// 只按 `launcher-` 前缀认会把用户放在同一目录里的 `launcher-notes.log` 之类的文件删掉——
+/// 与批次 N「宁多收一条也不误判」、批次 L「归属不明一律不认领」是同一条取向。
+fn is_our_archive(name: &str) -> bool {
+    let Some(body) = name.strip_prefix("launcher-").and_then(|b| b.strip_suffix(".log")) else {
+        return false;
+    };
+    let mut parts = body.split('.');
+    let stem = parts.next().unwrap_or("");
+    if !(is_iso_date(stem) || stem == "无日期") {
+        return false;
+    }
+    // 后缀序号必须是纯数字（`launcher-2026-01-01.a.log` 不是我们写的）。
+    let tail: Vec<&str> = parts.collect();
+    tail.iter().all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// 裁归档。**只删自己写的文件**：名字必须严格是 `launcher-*.log`，`launcher.log` 本身、
+/// 批次 O 留下的 `launcher.log.old`、以及任何别人的东西一概不进这个列表。
+fn prune_archives(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut list: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            if !is_our_archive(&name.to_string_lossy()) {
+                return None;
+            }
+            Some((e.metadata().ok()?.modified().ok()?, e.path()))
+        })
+        .collect();
+    if list.len() <= LOG_KEEP_ARCHIVES {
+        return;
+    }
+    list.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in list.iter().skip(LOG_KEEP_ARCHIVES) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// 读取偏好；文件缺失或解析失败一律回默认值（NFR-04：坏配置不得影响启动）。
@@ -1181,5 +1427,216 @@ mod dedup_tests {
         }
         let _ = std::fs::remove_dir_all(&base);
         r.unwrap();
+    }
+
+    /// 批次 P 单测的临时目录：每次调用带测试名 + pid，避免同进程并行线程互相踩。
+    fn temp_log_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("egui-launcher-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 轮转的判据是「文件首行日期锚 ≠ 今天」，不是 mtime。这条同时钉住两件事：
+    /// 锚是唯一真相（读不出就归「无日期」，绝不拿 mtime 猜一天），以及同日的多次启动
+    /// 必须合并进同一份文件（否则自启一天重启三次就把历史冲掉三份）。
+    #[test]
+    fn log_rotation_keys_on_the_date_anchor_not_on_mtime() {
+        let dir = temp_log_dir("rotate");
+        let log = dir.join("launcher.log");
+
+        // ① 批次 O 留下的旧格式（首行没有锚）⇒ 归成「无日期」，不假装知道它是哪天。
+        std::fs::write(&log, "log: 本次启动没有控制台，stderr 已接到 X\nhotkey: ok\n").unwrap();
+        rotate_at(&log, "2026-10-19");
+        assert!(!log.exists(), "无锚的旧文件应当被归档走");
+        assert!(dir.join("launcher-无日期.log").exists());
+
+        // ② 有锚且是昨天 ⇒ 按锚里的日期归档。
+        std::fs::write(&log, format!("{LOG_DATE_TAG}2026-10-18 22:07 ｜ 昨天的\n")).unwrap();
+        rotate_at(&log, "2026-10-19");
+        assert!(dir.join("launcher-2026-10-18.log").exists(), "跨天要按锚里的 2026-10-18 归档");
+        assert!(!log.exists());
+
+        // ③ 锚就是今天 ⇒ 一个字都不动（同日重启合进同一份）。
+        std::fs::write(&log, format!("{LOG_DATE_TAG}2026-10-19 08:00 ｜ 今天的\n")).unwrap();
+        rotate_at(&log, "2026-10-19");
+        assert!(log.exists(), "同一天的日志不该被归档");
+        assert!(!dir.join("launcher-2026-10-19.log").exists());
+
+        // ④ 锚坏了 ⇒ 走「无日期」分支，而它第一次已被占用 ⇒ 必须落到 `.2`，不能覆盖已有归档。
+        std::fs::write(&log, format!("{LOG_DATE_TAG}昨天 ｜ 坏锚\n")).unwrap();
+        rotate_at(&log, "2026-10-19");
+        assert!(!log.exists());
+        assert!(dir.join("launcher-无日期.2.log").exists(), "同名归档该加序号，不该覆盖");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 裁归档只认"完整的归档名形状"。前缀判据会把用户放在同一目录里的文件当自己的删掉，
+    /// 所以这里专门放三件不该被动东西：正在写的日志、批次 O 的 `.old`、以及两个像我们但不是的名字。
+    #[test]
+    fn log_prune_keeps_newest_three_and_never_touches_foreign_names() {
+        let dir = temp_log_dir("prune");
+        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for i in 0..5u64 {
+            let p = dir.join(format!("launcher-2026-01-0{}.log", i + 1));
+            std::fs::write(&p, format!("第 {} 份", i + 1)).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(i * 86_400)).unwrap();
+        }
+        // 01-01 最旧、01-05 最新 ⇒ 留 03/04/05。
+        std::fs::write(dir.join("launcher.log"), "live").unwrap();
+        std::fs::write(dir.join("launcher.log.old"), "legacy").unwrap();
+        std::fs::write(dir.join("launcher-notes.log"), "foreign").unwrap();
+        std::fs::write(dir.join("launcher-2026-01-0a.log"), "shaped-but-not").unwrap();
+
+        prune_archives(&dir);
+
+        assert!(!dir.join("launcher-2026-01-01.log").exists(), "最旧的两份该被裁掉");
+        assert!(!dir.join("launcher-2026-01-02.log").exists());
+        for i in 3..=5 {
+            assert!(dir.join(format!("launcher-2026-01-0{i}.log")).exists(), "最近 3 份要留住");
+        }
+        for (name, body) in [
+            ("launcher.log", "live"),
+            ("launcher.log.old", "legacy"),
+            ("launcher-notes.log", "foreign"),
+            ("launcher-2026-01-0a.log", "shaped-but-not"),
+        ] {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), body, "{name} 不该被动");
+        }
+
+        // 归属判据本体的边界：名字形状。
+        assert!(is_our_archive("launcher-2026-01-01.log"));
+        assert!(is_our_archive("launcher-2026-01-01.7.log"));
+        assert!(is_our_archive("launcher-无日期.log"));
+        assert!(!is_our_archive("launcher.log"));
+        assert!(!is_our_archive("launcher-notes.log"));
+        assert!(!is_our_archive("launcher-2026-1-1.log"));
+        assert!(!is_our_archive("launcher-2026-01-01.log.bak"));
+        assert!(!is_our_archive("mylauncher-2026-01-01.log"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 批次 P 的归档名要从 `local_now_stamp()` 的前 10 个字符切出来 ⇒ 格式一变就切错，
+    /// 这条把形状钉住（月/日/时/分都补零）。
+    #[test]
+    fn local_stamp_is_iso_prefixed() {
+        let s = local_now_stamp();
+        assert!(is_iso_date(&s[..10]), "前 10 字符必须是 YYYY-MM-DD，实得：{s}");
+        let b = s.as_bytes();
+        assert!(b[10] == b' ' && b[13] == b':' && b[11..13].iter().all(|c| c.is_ascii_digit()));
+        assert_eq!(s.len(), 16, "完整横幅应为 YYYY-MM-DD HH:MM，实得：{s}");
+    }
+}
+
+/// 批次 Q（FR-WIN-02 热键可配置）的判据测试。刻意全部走纯函数：`RegisterHotKey` 那一半
+/// 只有真机能验（占用与否取决于本机装了什么），不放进单元测试冒充已证。
+#[cfg(test)]
+mod hotkey_tests {
+    use super::*;
+
+    /// A–Z / 0–9 的 VK 就是 ASCII 大写；生产端由录制映射给出，这里只为测试写得动。
+    fn vk(ch: char) -> u32 {
+        ch.to_ascii_uppercase() as u32
+    }
+
+    /// F 键按偏移算（只定义了 `VK_F1`/`VK_F24` 两个端点）。
+    fn vk_f(n: u32) -> u32 {
+        VK_F1 + n - 1
+    }
+
+    #[test]
+    fn default_is_the_hardcoded_ctrl_alt_space() {
+        // 这条钉住"批次 Q 之前写死的那一组数"= 出厂值，改了它等于偷偷换了用户认识的键。
+        assert_eq!(HotkeySpec::DEFAULT.mods, HKF_CONTROL | HKF_ALT | HKF_NOREPEAT);
+        assert_eq!(HotkeySpec::DEFAULT.vk, VK_SPACE);
+        assert_eq!(HotkeySpec::default(), HotkeySpec::DEFAULT);
+        assert!(HotkeySpec::DEFAULT.check().is_ok());
+        assert_eq!(HotkeySpec::DEFAULT.display(), "Ctrl+Alt+Space");
+    }
+
+    #[test]
+    fn display_orders_modifiers_and_names_vks() {
+        let show = |mods, code| HotkeySpec { mods, vk: code }.display();
+        assert_eq!(show(HKF_CONTROL | HKF_ALT, VK_A), "Ctrl+Alt+A");
+        // NOREPEAT 是行为位，不进键名。
+        assert_eq!(show(HKF_CONTROL | HKF_NOREPEAT, vk_f(5)), "Ctrl+F5");
+        // 顺序恒为 Ctrl→Alt→Shift→Win，与录制端无关。
+        assert_eq!(
+            show(HKF_WIN | HKF_SHIFT | HKF_ALT | HKF_CONTROL, vk('7')),
+            "Ctrl+Alt+Shift+Win+7"
+        );
+        assert_eq!(show(HKF_ALT, VK_RETURN), "Alt+Enter");
+        assert_eq!(show(HKF_CONTROL, VK_F24), "Ctrl+F24");
+        // 范围外的码必须显式露出来，不能显示成空白让人以为"没设键"。
+        assert_eq!(show(HKF_CONTROL, VK_BACK), "Ctrl+Backspace");
+        assert_eq!(show(HKF_CONTROL, 0x6A), "Ctrl+VK#6A");
+    }
+
+    #[test]
+    fn check_requires_a_strong_modifier_for_textable_keys() {
+        let ok = |mods, code| HotkeySpec { mods, vk: code }.check().is_ok();
+        // 字母/数字/空格/回车：带 Ctrl、Alt 或 Win 才行；Shift 单键只是打字，不收。
+        assert!(ok(HKF_CONTROL, VK_A));
+        assert!(ok(HKF_ALT, VK_SPACE));
+        assert!(ok(HKF_WIN, vk('E')));
+        assert!(!ok(HKF_SHIFT, VK_A), "Shift+A 就是打大写 A，不能当全局键");
+        assert!(!ok(0, VK_A));
+        assert!(!ok(HKF_NOREPEAT, vk('1')), "NOREPEAT 不算修饰键");
+        // F 键有专职身份，允许单独用。
+        assert!(ok(0, VK_F1));
+        assert!(ok(HKF_CONTROL, vk_f(13)));
+        // 不支持的码段一律拒（录制端本就不产这些，这里是第二道）。
+        assert!(!ok(HKF_CONTROL, VK_BACK), "Backspace 不是可录制目标");
+        assert!(!ok(HKF_CONTROL, 0x6A), "小键盘键不在本批口径内");
+        assert!(!ok(HKF_CONTROL, VK_F24 + 1));
+    }
+
+    #[test]
+    fn local_conflict_table_matches_on_mods_ignoring_norepeat() {
+        // 判据表里存的 mods 带不带 NOREPEAT 都必须认得出来（注册端恒带、录制端不带）。
+        let table = [
+            (HKF_CONTROL | HKF_NOREPEAT, vk('I')),
+            (HKF_CONTROL | HKF_SHIFT, vk('D')),
+        ];
+        assert!(HotkeySpec { mods: HKF_CONTROL, vk: vk('I') }.conflicts_local(&table));
+        assert!(
+            HotkeySpec { mods: HKF_CONTROL | HKF_NOREPEAT, vk: vk('I') }.conflicts_local(&table)
+        );
+        assert!(HotkeySpec { mods: HKF_CONTROL | HKF_SHIFT, vk: vk('D') }.conflicts_local(&table));
+        // Shift 是实义修饰键，不能和 Ctrl+D 混为一谈。
+        assert!(!HotkeySpec { mods: HKF_CONTROL, vk: vk('D') }.conflicts_local(&table));
+        assert!(!HotkeySpec { mods: HKF_CONTROL, vk: vk('J') }.conflicts_local(&table));
+    }
+
+    #[test]
+    fn settings_field_defaults_when_absent_and_round_trips() {
+        // 旧 settings.json 没有这个字段 ⇒ #[serde(default)] 必须兜住，不能整份解析失败。
+        let old = br#"{"space_to_run":"word","tab_mode":"navigate","learn_rank":"count"}"#;
+        let s: AppSettings = serde_json::from_slice(old).expect("旧文件应能解析");
+        assert_eq!(s.toggle_hotkey, HotkeySpec::DEFAULT);
+
+        let custom = AppSettings {
+            toggle_hotkey: HotkeySpec { mods: HKF_ALT | HKF_NOREPEAT, vk: vk_f(6) },
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&custom).unwrap();
+        // 存的是裸数（十进制），不引入枚举/字符串编码。
+        assert!(json.contains("\"toggle_hotkey\":{\"mods\":"), "应为数值对，实得：{json}");
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.toggle_hotkey, custom.toggle_hotkey);
+    }
+
+    /// 这个码本批写错过一次（我先填的是 1410），所以它必须由**两条独立来源**钉住，而不是照抄自己的记忆。
+    #[test]
+    fn already_registered_code_is_the_measured_hresult_low_word() {
+        // 来源一：windows-0.62.2 绑定源 `Foundation/mod.rs:2677`。
+        assert_eq!(ERROR_HOTKEY_ALREADY_REGISTERED, 1409);
+        // 来源二：需求书附录 E E-01 在真机实测到的 `RegisterHotKey` 失败 HRESULT。
+        assert_eq!(ERROR_HOTKEY_ALREADY_REGISTERED, 0x8007_0581 & 0xFFFF, "低字就是 Win32 码");
+        // 1410 是 ERROR_CLASS_ALREADY_EXISTS：写错的后果不是崩，而是"已被系统或其它程序占用"
+        // 那句提示永远不显示，退化成裸错误码——静默的错，所以这条断言留着。
+        assert_ne!(ERROR_HOTKEY_ALREADY_REGISTERED, 1410);
     }
 }
