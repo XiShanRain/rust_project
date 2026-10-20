@@ -28,21 +28,27 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
+    HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY,
+    MAPVK_VK_TO_CHAR,
 };
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, ShellExecuteExW, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    FindWindowW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
-    GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageTimeoutW,
-    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE,
-    MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
-    SW_SHOWNORMAL, WM_APP, WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW, WINDOW_EX_STYLE,
-    WINDOW_STYLE,
+    FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
+    GetWindowThreadProcessId, KillTimer, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SendMessageTimeoutW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_APP, WM_COPYDATA, WM_DESTROY,
+    WM_HOTKEY, WM_TIMER, WNDCLASSEXW, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
+/// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
+/// id 必须分开：`WM_HOTKEY` 的 `wparam` 就是它，靠它区分"该呼出窗口"还是"该补一个字符"。
 const HOTKEY_TOGGLE: i32 = 1;
+/// 补字符热键（批次 R，2026-10-20 用户追加需求）：按下它把被裸键吞掉的那个字符投给焦点窗口。
+const HOTKEY_TYPEBACK: i32 = 2;
 
 mod cli;
 mod matching;
@@ -53,13 +59,13 @@ use source::application::{
 };
 // FR-WIN-02（批次 Q）：热键的位值与 VK 码用 application 侧的那套常量，判据与展示名才能
 // 在纯函数里单测；调 RegisterHotKey 时再包成 HOT_KEY_MODIFIERS。
-// 这里**不含** `HKF_WIN`：录制路径产不出那一位（`spec_from_press` 只读 ctrl/alt/shift），
-// 需要它的只有 `nav_tests` 里那两条断言，故在测试模块内单独引入。
+// 批次 R 起 `HKF_WIN` 运行期也要用了：补字符键的四个复选框（照 Delphi 版 frmConfig 的形态）
+// 是这台机器上唯一能把 Win 位设进去的入口——录制路径产不出它，见 `spec_from_press` 的注释。
 use source::application::{
     ERROR_HOTKEY_ALREADY_REGISTERED, HotkeySpec, HKF_ALT, HKF_CONTROL, HKF_NOREPEAT, HKF_SHIFT,
-    VK_0, VK_9, VK_A, VK_F1, VK_F24, VK_RETURN, VK_SPACE, VK_Z,
+    HKF_WIN, VK_0, VK_9, VK_A, VK_F1, VK_F24, VK_OEM_3, VK_RETURN, VK_SPACE, VK_Z,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -539,6 +545,20 @@ struct LauncherApp {
     hotkey_awaiting: Option<HotkeySpec>,
     /// 启动以来的第一条热键回执（含启动退回）。只在首帧取一次，用来 Toast 告知"你设的键没生效"。
     hotkey_synced: bool,
+    // ---- 批次 R：补字符热键（把被裸键吞掉的那个字符打回去）----
+    /// 系统里此刻真正装着的补字符键（显示口径）。`None` = 没启用，或启用但没注册上。
+    typeback_active: Option<HotkeySpec>,
+    /// 卡片上的草稿：键框 + 四个复选框改的就是它。`mods` 只放实义修饰位（不带 NOREPEAT），
+    /// 投递时才补上 NOREPEAT ⇒ 复选框的状态与草稿的数值是同一个数，不用再做一次换算。
+    typeback_draft: Option<HotkeySpec>,
+    /// 已投递、还没拿到回执的补字符组合（这段时间禁用"应用/清除"，与主热键同一口径）。
+    typeback_awaiting: Option<HotkeySpec>,
+    /// 补字符的键框正在等一次按键（与主热键的"录制中"互斥，见 `hotkey_frame`）。
+    typeback_armed: bool,
+    /// UI 侧的镜像位：「暂停请求发出去了没有」。真值在热键线程的 `HOTKEY_SUSPENDED` 里，
+    /// 这里只用来保证边沿检测不重复发消息——兜底定时器可能已经把真值改回 false 了，
+    /// 那种情况下多发一条 resume 是无害的（`resume_hotkey` 幂等）。
+    keypick_suspended: bool,
 }
 
 fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths: Vec<String>) {
@@ -764,26 +784,80 @@ static CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 /// 所以槽必须由一条消息去踢它。UI 线程取不到回执也无所谓——`HOTKEY_RESULT` 会一直留着，
 /// 下一帧读走即可。
 const WM_APP_RELOAD_HOTKEY: u32 = WM_APP + 1;
+/// 批次 R：设置页正在等一次按键（录制主热键 / 给补字符键选键）⇒ 临时注销主热键。
+/// 不注销的话，用户按下的那个键会被系统整条吞掉，窗口一个事件都收不到 ⇒ 裸 `` ` `` 根本录不进来。
+const WM_APP_SUSPEND_HOTKEY: u32 = WM_APP + 2;
+/// 退出等键（成功 / 取消 / Esc / 关窗 / 隐藏）⇒ 把主热键装回去。
+const WM_APP_RESUME_HOTKEY: u32 = WM_APP + 3;
+/// 「清除补字符热键」。注销也得在热键线程做（`UnregisterHotKey` 按 hwnd 找登记，hwnd 归属
+/// 那条老规矩对注销同样成立），所以 UI 侧同样只能投消息。
+const WM_APP_CLEAR_TYPEBACK: u32 = WM_APP + 4;
+/// 暂停的兜底定时器 id 与时长：注销状态一旦漏掉恢复（比如窗口隐藏后 eframe 不再跑 `ui()`，
+/// UI 侧那条边沿检测就永远不执行），全局呼出会一直不可用。定时器挂在消息窗上，
+/// 由热键线程自己的消息循环驱动 ⇒ 与窗口可见与否无关，这条兜底才是真兜底。
+const HOTKEY_SUSPEND_TIMER: usize = 0x5EED;
+const HOTKEY_SUSPEND_TIMEOUT: u32 = 30_000;
+
+/// 系统里最多同时装着两个热键，用 id 区分。槽位这个概念只存在于本文件：
+/// 落盘的是两份 `HotkeySpec`（`toggle_hotkey` / `typeback_hotkey`），没有"槽"这个字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeySlot {
+    Toggle,
+    Typeback,
+}
+
+impl HotkeySlot {
+    fn id(self) -> i32 {
+        match self {
+            Self::Toggle => HOTKEY_TOGGLE,
+            Self::Typeback => HOTKEY_TYPEBACK,
+        }
+    }
+
+    /// 日志与 Toast 里怎么称呼这个槽。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Toggle => "全局呼出热键",
+            Self::Typeback => "补字符热键",
+        }
+    }
+
+    /// 系统里此刻真正装着的那一组存在哪个槽里（`None` = 这个键当前没装）。
+    fn active(self) -> &'static Mutex<Option<HotkeySpec>> {
+        match self {
+            Self::Toggle => &HOTKEY_ACTIVE,
+            Self::Typeback => &TYPEBACK_ACTIVE,
+        }
+    }
+}
 
 /// 消息窗句柄。`HWND` 是裸指针、不 `Sync`，这里存它的数值（进程内句柄值恒定，只在消息循环前写一次）。
 static HOTKEY_HWND: AtomicUsize = AtomicUsize::new(0);
-/// UI → 热键线程：待注册的新组合（`take` 之后立即清空，避免重复处理）。
-static HOTKEY_REQUEST: Mutex<Option<HotkeySpec>> = Mutex::new(None);
+/// UI → 热键线程：待注册的新组合 + 它属于哪个槽（`take` 之后立即清空，避免重复处理）。
+static HOTKEY_REQUEST: Mutex<Option<(HotkeySlot, HotkeySpec)>> = Mutex::new(None);
 /// 热键线程 → UI：系统里此刻真正装着的是哪一组（`None` = 一次都没注册上，全局呼出不可用）。
 /// 设置页显示它、回执也按它回滚，而不是显示"用户想要的那一份"。
 static HOTKEY_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
-static HOTKEY_RESULT: Mutex<Option<HotkeyOutcome>> = Mutex::new(None);
+/// 补字符热键的同一份口径（`None` = 没启用，或启用但注册失败）。
+static TYPEBACK_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
+/// 回执队列而不是单格：批次 R 之后一次启动就可能同时产出两条（主热键退回 + 补字符注册失败），
+/// 单格会互相覆盖，UI 就看不见其中一条。
+static HOTKEY_RESULT: Mutex<Vec<HotkeyOutcome>> = Mutex::new(Vec::new());
+/// 主热键当前是否处于"录制期临时注销"状态。只有热键线程写它（在 wndproc 里），
+/// UI 侧另有一个"我发过消息没有"的镜像位，两者不互相依赖。
+static HOTKEY_SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 /// 一次换键的结果（回执给 UI，由 UI 决定要不要写 settings.json）。
 #[derive(Debug, Clone, Copy)]
 enum HotkeyOutcome {
     /// 新组合注册成功，`on` 即系统里现在装着的。
-    Applied { on: HotkeySpec },
+    Applied { slot: HotkeySlot, on: HotkeySpec },
     /// 新组合注册失败（`err` = `GetLastError`）。`now_active` = 尝试之后系统里真正装着的：
     /// `Some(旧值)` 表示回滚成功，`None` 表示连旧组合也没能装回去 ⇒ 全局呼出不可用，只能走托盘。
-    Rejected { tried: HotkeySpec, err: u32, now_active: Option<HotkeySpec> },
+    Rejected { slot: HotkeySlot, tried: HotkeySpec, err: u32, now_active: Option<HotkeySpec> },
     /// 启动时读的 `tried` 被占用，退回出厂值 `fell_back_to`（这条不改 settings.json：
-    /// 冲突多半是"那会儿别的程序正开着"，不该把用户的选择冲掉）。
+    /// 冲突多半是"那会儿别的程序正开着"，不该把用户的选择冲掉）。只有主热键有出厂值可退，
+    /// 补字符键失败就是失败（退回一个用户没要的键更糟），所以这条不带槽位。
     StartupFallback { tried: HotkeySpec, fell_back_to: HotkeySpec, err: u32 },
 }
 
@@ -800,8 +874,12 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// 挡掉系统里其实空着的组合（Ctrl+A 这种本程序压根没绑）。
 ///
 /// 刻意不在表里的：`Ctrl+,`、`Ctrl+=`、`Ctrl+-`（`Comma/Equals/Minus` 不在可录集合，永远撞不上）、
-/// 裸 `Delete`/`Space`/`Tab`/`Enter`/`PgUp`/`PgDn`/`Esc`（[`HotkeySpec::check`] 已经要求非 F 键
-/// 带 Ctrl/Alt/Win，裸键录不进来）、`Shift+Space`/`Shift+Tab`（Shift 单修饰同样过不了 check）。
+/// 裸 `Delete`/`Space`/`Tab`/`Enter`/`PgUp`/`PgDn`/`Esc`、`Shift+Space`/`Shift+Tab`
+/// （[`HotkeySpec::check`] 挡住"不带修饰"与"单带 Shift"这两类，本程序绑的裸键因此录不进来）。
+/// 【2026-10-20 批次 R 更正：上一句里"挡住不带修饰"从此**不再对 `` ` `` 成立**——裸 `` ` `` 是
+/// 用户点名放开的唯一例外。表里仍然不加条目，因为本程序压根没绑过 `` ` ``：
+/// `grep -rn "Backtick\|VK_OEM_3\|0xC0" src/` 的 27 处命中全在映射、判据、展示名和测试里，
+/// 没有一处是 `consume_key`。】
 /// 表里的修饰键一律不带 `HKF_NOREPEAT`（比对时两边都剥）。
 const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_CONTROL, 0x44), // Ctrl+D 打开所在目录
@@ -883,6 +961,9 @@ fn vk_from_egui_key(k: egui::Key) -> Option<u32> {
         // （写成 Return 时它变成一个"匹配任意值"的绑定，把 F1–F24 全部吃掉）。
         Space => 0x20,
         Enter => 0x0D,
+        // 批次 R：`` ` `` 进可录集合（egui 那边这个变体叫 `Backtick`，winit 的 `Backquote` 映射到它）。
+        // 和上面两条同一个理由写数字字面量，不写 `VK_OEM_3`：模式位上的单标识符是新绑定。
+        Backtick => 0xC0,
         F1 => 0x70,
         F2 => 0x71,
         F3 => 0x72,
@@ -915,6 +996,7 @@ fn vk_from_egui_key(k: egui::Key) -> Option<u32> {
         || (VK_F1..=VK_F24).contains(&code)
         || code == VK_SPACE
         || code == VK_RETURN
+        || code == VK_OEM_3
     {
         Some(code)
     } else {
@@ -972,87 +1054,262 @@ fn spec_from_press(key: egui::Key, m: egui::Modifiers) -> Option<HotkeySpec> {
 }
 
 /// 把换键请求交给热键线程；句柄还没建立（启动极早期）时返回 false，由调用方给出"稍后再试"。
-fn post_hotkey_request(spec: HotkeySpec) -> bool {
+/// 槽位随 `HOTKEY_REQUEST` 一起带过去，不另用 `wparam` 传：一份数据只留一个来源。
+fn post_hotkey_request(slot: HotkeySlot, spec: HotkeySpec) -> bool {
     let raw = HOTKEY_HWND.load(Ordering::Relaxed);
     if raw == 0 {
-        eprintln!("hotkey: 消息窗还没建立，本次换键请求作废");
+        eprintln!("hotkey: 消息窗还没建立，本次{}换键请求作废", slot.label());
         return false;
     }
-    *hotkey_lock(&HOTKEY_REQUEST) = Some(spec);
+    *hotkey_lock(&HOTKEY_REQUEST) = Some((slot, spec));
     match unsafe { PostMessageW(Some(HWND(raw as *mut _)), WM_APP_RELOAD_HOTKEY, WPARAM(0), LPARAM(0)) }
     {
         Ok(()) => true,
         Err(e) => {
             *hotkey_lock(&HOTKEY_REQUEST) = None;
-            eprintln!("hotkey: 换键请求投递失败：{e}");
+            eprintln!("hotkey: {}换键请求投递失败：{e}", slot.label());
             false
         }
     }
 }
 
-/// 在指定消息窗上换成 `spec`：先注销再注册（同一个 `HOTKEY_TOGGLE` id、同一个 hwnd）。
+/// 只要"踢热键线程一下"、不带数据的消息（暂停 / 恢复）走这里。
+/// 投递失败不做重试：暂停没送到 = 那个键还吞着按键，用户按了没反应，卡片文案已经写明这件事；
+/// 恢复没送到 = 兜底定时器会补上。两条都不值得为它做一套状态机。
+fn post_hotkey_signal(msg: u32, what: &str) {
+    let raw = HOTKEY_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        eprintln!("hotkey: 消息窗还没建立，本次{what}作废");
+        return;
+    }
+    if let Err(e) = unsafe { PostMessageW(Some(HWND(raw as *mut _)), msg, WPARAM(0), LPARAM(0)) } {
+        eprintln!("hotkey: {what}投递失败：{e}");
+    }
+}
+
+/// 在指定消息窗上把 `slot` 这一格换成 `spec`：先注销再注册（同一个 id、同一个 hwnd）。
 /// 返回 `Err(GetLastError)`；`ERROR_HOTKEY_ALREADY_REGISTERED`（1409）= 组合已被系统或别的程序占走。
 /// 做成 safe fn（内部一个 `unsafe` 块）：调用点在 `hotkey_wndproc` 的 `unsafe {}` 里，
 /// 再套一层 `unsafe` 就是多余警告，本项目的口径是零警告。
-fn apply_hotkey(hwnd: HWND, spec: HotkeySpec) -> Result<(), u32> {
+fn apply_hotkey(hwnd: HWND, slot: HotkeySlot, spec: HotkeySpec) -> Result<(), u32> {
     unsafe {
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
-        match RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE, HOT_KEY_MODIFIERS(spec.mods), spec.vk) {
+        let _ = UnregisterHotKey(Some(hwnd), slot.id());
+        match RegisterHotKey(Some(hwnd), slot.id(), HOT_KEY_MODIFIERS(spec.mods), spec.vk) {
             Ok(()) => Ok(()),
             Err(_) => Err(GetLastError().0),
         }
     }
 }
 
-unsafe extern "system" fn hotkey_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+/// 批次 R：设置页要等一次真实按键 ⇒ 先把主热键从系统里摘掉。
+/// 不摘的话，用户按下的那个键会被系统整条吞掉（这正是全局热键的工作方式），本程序窗口
+/// 一个 `Event::Key` 都收不到 ⇒ 裸 `` ` `` 永远录不进来。只动 `Toggle` 那一格：
+/// 补字符键不是"要被录进框里的键"，摘它没有收益，反而多一个装不回来的东西。
+fn suspend_hotkey(hwnd: HWND) {
     unsafe {
-        if msg == WM_HOTKEY {
-            if wparam.0 as i32 == HOTKEY_TOGGLE {
-                if let Some(tx) = HOTKEY_TX.get() {
-                    let _ = tx.send(());
-                }
+        if !HOTKEY_SUSPENDED.swap(true, Ordering::Relaxed) {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
+            match *hotkey_lock(&HOTKEY_ACTIVE) {
+                Some(k) => eprintln!(
+                    "hotkey: 取键期间临时注销 {}（退出取键或 {}ms 后装回）",
+                    k.display(),
+                    HOTKEY_SUSPEND_TIMEOUT
+                ),
+                None => eprintln!("hotkey: 取键期间没有装着的全局键可注销"),
+            }
+        }
+        // 每次都重起表：连着两次取键（录完主热键又去点补字符的框）不该让第二次的窗口期变短。
+        SetTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER, HOTKEY_SUSPEND_TIMEOUT, None);
+    }
+}
+
+/// 退出取键 ⇒ 把 `HOTKEY_ACTIVE` 里那一份装回去。幂等：没在暂停中就直接返回。
+/// 装不回去是这条设计里最坏的分支（全局呼出没了），所以它必须产出回执让 UI 说给人听，
+/// 而不是只在日志里留一行——窗口可能正开着设置页，用户看得见 Toast。
+fn resume_hotkey(hwnd: HWND, why: &str) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER);
+        if !HOTKEY_SUSPENDED.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let Some(k) = *hotkey_lock(&HOTKEY_ACTIVE) else {
+            eprintln!("hotkey: 退出取键（{why}），本来就没有装着的全局键");
+            return;
+        };
+        match apply_hotkey(hwnd, HotkeySlot::Toggle, k) {
+            Ok(()) => eprintln!("hotkey: 退出取键（{why}）⇒ 已装回 {}", k.display()),
+            Err(err) => {
+                *hotkey_lock(&HOTKEY_ACTIVE) = None;
+                hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
+                    slot: HotkeySlot::Toggle,
+                    tried: k,
+                    err,
+                    now_active: None,
+                });
+                eprintln!(
+                    "hotkey: 退出取键（{why}）时装回 {} 失败（{err}）⇒ 全局呼出不可用，请用托盘",
+                    k.display()
+                );
                 if let Some(ctx) = CTX.get() {
                     ctx.request_repaint();
                 }
             }
+        }
+    }
+}
+
+/// vk → 这个键在**当前键盘布局**下不带修饰打出的字符。用 `MapVirtualKeyW` 而不是写死一张表：
+/// 用户丢掉的字符由布局决定，跟着系统走才不会补错。两种"没有字符"的返回都要挡：
+/// 0 = 这个键不产生字符；最高位（0x8000）= 死键（要连按两下才出字那种）。
+fn typeback_char_for(vk: u32) -> Option<char> {
+    let raw = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) };
+    if raw == 0 || raw & 0x8000 != 0 {
+        return None;
+    }
+    char::from_u32(raw & 0xFFFF)
+}
+
+/// 补字符热键按下时干的事：把主热键那个字符投给此刻的焦点窗口。
+///
+/// 为什么走 `KEYEVENTF_UNICODE` 而不是"注销自己 → 发 VK → 再注册"：`RegisterHotKey` 匹配的是
+/// VK + 修饰键，而 Unicode 注入不带 VK（`wVk = 0`、字符放 `wScan`）⇒ 它不会被自家那条裸 `` ` ``
+/// 注册再吞一次，也不用给注销/注册留一个"这期间用户真按了 `` ` ``"的空窗。
+/// 【2026-10-20：这条理由是本批的设计假设，**不是实测结论**。记事本 / Edge / VS Code /
+/// Windows Terminal / 中文输入法五处的真实表现要靠真机复测清单验收，见发布说明那一节。】
+fn inject_typeback_char() {
+    let Some(toggle) = *hotkey_lock(&HOTKEY_ACTIVE) else {
+        eprintln!("typeback: 主热键当前没装着，不知道该补哪个字符");
+        return;
+    };
+    // 只有**裸键**注册才真的吞掉打字：带修饰的呼出键（Ctrl+Alt+Space）压根不影响 Space 键，
+    // 这时候再按补字符键往焦点窗口塞一个空格就是凭空多出来的动作。所以这里挡住，
+    // 让这一格的语义与卡片文案「打出被呼出键吞掉的那个字符」一致。
+    if toggle.mods_named() != 0 {
+        eprintln!(
+            "typeback: 呼出键 {} 带修饰，那个字符本来就打得出 ⇒ 本次不补（补字符键只在呼出键是裸键时才有事做）",
+            toggle.display()
+        );
+        return;
+    }
+    let vk = toggle.vk;
+    let Some(ch) = typeback_char_for(vk) else {
+        eprintln!("typeback: vk 0x{vk:02X} 在当前键盘布局下映射不到可输入字符，本次不补");
+        return;
+    };
+    let key = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: ch as u16,
+                dwFlags: if up { KEYEVENTF_UNICODE | KEYEVENTF_KEYUP } else { KEYEVENTF_UNICODE },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let sent =
+        unsafe { SendInput(&[key(false), key(true)], std::mem::size_of::<INPUT>() as i32) };
+    // 日志记 vk 码而不记字符本身：批次 P 那条"不记用户敲的原文"的口径延伸——补进去的字符
+    // 由配置决定、本来不是用户输入，但记成 0xC0 一样够定位问题。前台窗口只记 hwnd + 类名，
+    // 不记标题：标题里经常带着用户正在编辑的正文（隐私口径同上）。
+    let fg = unsafe { GetForegroundWindow() };
+    let fg_info = if fg.0.is_null() {
+        "前台=无".to_string()
+    } else {
+        let mut buf = [0u16; 256];
+        let n = unsafe { GetClassNameW(fg, &mut buf) };
+        let cls = String::from_utf16_lossy(&buf[..n as usize]);
+        format!("前台=0x{:x}({})", fg.0 as usize, cls)
+    };
+    eprintln!("typeback: 已向焦点窗口补入 vk 0x{vk:02X} 对应的字符（SendInput {sent}/2，{fg_info}）");
+}
+
+unsafe extern "system" fn hotkey_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if msg == WM_HOTKEY {
+            // 批次 R 起系统里最多装着两个键，`wparam` 就是注册时那个 id ⇒ 必须按 id 分派，
+            // 否则按下补字符键会把窗口弹出来（用户要的是打一个字符）。
+            match wparam.0 as i32 {
+                HOTKEY_TOGGLE => {
+                    if let Some(tx) = HOTKEY_TX.get() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(ctx) = CTX.get() {
+                        ctx.request_repaint();
+                    }
+                }
+                HOTKEY_TYPEBACK => inject_typeback_char(),
+                _ => {}
+            }
+            return LRESULT(0);
+        }
+        // 批次 R：兜底恢复。正常情况下退出取键由 UI 投 `WM_APP_RESUME_HOTKEY`，但"窗口一隐藏
+        // eframe 就不再跑 `ui()`"这条（见需求书 E 附录）会让 UI 侧的边沿检测永远等不到下一帧，
+        // 全局呼出就会一直停在注销状态。定时器挂在消息窗上、由本线程驱动 ⇒ 与可见性无关。
+        if msg == WM_TIMER && wparam.0 as usize == HOTKEY_SUSPEND_TIMER {
+            resume_hotkey(hwnd, "兜底超时");
+            return LRESULT(0);
+        }
+        if msg == WM_APP_SUSPEND_HOTKEY {
+            suspend_hotkey(hwnd);
+            return LRESULT(0);
+        }
+        if msg == WM_APP_RESUME_HOTKEY {
+            resume_hotkey(hwnd, "退出取键");
+            return LRESULT(0);
+        }
+        if msg == WM_APP_CLEAR_TYPEBACK {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TYPEBACK);
+            *hotkey_lock(&TYPEBACK_ACTIVE) = None;
+            eprintln!("typeback: 已注销补字符热键（设置页「清除」）");
             return LRESULT(0);
         }
         // FR-WIN-02（批次 Q）：换键。注册/注销只在本线程发生（hwnd 归属），UI 线程只投消息。
         if msg == WM_APP_RELOAD_HOTKEY {
-            let Some(tried) = hotkey_lock(&HOTKEY_REQUEST).take() else {
+            let Some((slot, tried)) = hotkey_lock(&HOTKEY_REQUEST).take() else {
                 return LRESULT(0);
             };
-            let outcome = match apply_hotkey(hwnd, tried) {
+            // 主热键这一格的换键做完之后系统里必然装着点什么（新键，或回滚成功的旧键），
+            // 所以"取键期间暂停"的状态到此作废；补字符格的换键不动这个状态，
+            // 主热键还欠着一次恢复，那条恢复只能由 resume 或定时器来做。
+            if slot == HotkeySlot::Toggle {
+                let _ = KillTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER);
+                HOTKEY_SUSPENDED.store(false, Ordering::Relaxed);
+            }
+            let outcome = match apply_hotkey(hwnd, slot, tried) {
                 Ok(()) => {
-                    *hotkey_lock(&HOTKEY_ACTIVE) = Some(tried);
-                    eprintln!("hotkey: 换键成功 → {}（原组合已注销）", tried.display());
-                    HotkeyOutcome::Applied { on: tried }
+                    *hotkey_lock(slot.active()) = Some(tried);
+                    eprintln!("hotkey: {} 换键成功 → {}（原组合已注销）", slot.label(), tried.display());
+                    HotkeyOutcome::Applied { slot, on: tried }
                 }
                 Err(err) => {
-                    let kept = *hotkey_lock(&HOTKEY_ACTIVE);
+                    let kept = *hotkey_lock(slot.active());
                     let restored = match kept {
                         // 没有"仍在系统里的旧组合"可回滚（启动即失败过）：保持无键，照实报。
                         None => false,
-                        Some(k) => apply_hotkey(hwnd, k).is_ok(),
+                        Some(k) => apply_hotkey(hwnd, slot, k).is_ok(),
                     };
                     let now_active = if restored { kept } else { None };
-                    *hotkey_lock(&HOTKEY_ACTIVE) = now_active;
+                    *hotkey_lock(slot.active()) = now_active;
                     match now_active {
                         Some(k) => eprintln!(
-                            "hotkey: {} 注册失败（{err}={}），已回到 {}",
+                            "hotkey: {} {} 注册失败（{err}={}），已回到 {}",
+                            slot.label(),
                             tried.display(),
                             if err == ERROR_HOTKEY_ALREADY_REGISTERED { "已被占用" } else { "其它原因" },
                             k.display()
                         ),
                         None => eprintln!(
-                            "hotkey: {} 注册失败（{err}）且旧组合也装不回去 ⇒ 全局呼出当前不可用，请用托盘",
+                            "hotkey: {} {} 注册失败（{err}）且原来的键也没装回去 ⇒ 该功能当前不可用",
+                            slot.label(),
                             tried.display()
                         ),
                     }
-                    HotkeyOutcome::Rejected { tried, err, now_active }
+                    HotkeyOutcome::Rejected { slot, tried, err, now_active }
                 }
             };
-            *hotkey_lock(&HOTKEY_RESULT) = Some(outcome);
+            hotkey_lock(&HOTKEY_RESULT).push(outcome);
             if let Some(ctx) = CTX.get() {
                 ctx.request_repaint();
             }
@@ -1098,7 +1355,11 @@ unsafe extern "system" fn hotkey_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
     }
 }
 
-fn spawn_hotkey_thread(tx: mpsc::Sender<()>, configured: HotkeySpec) {
+fn spawn_hotkey_thread(
+    tx: mpsc::Sender<()>,
+    configured: HotkeySpec,
+    typeback: Option<HotkeySpec>,
+) {
     HOTKEY_TX.set(tx).ok();
     thread::spawn(move || unsafe {
         let module = GetModuleHandleW(None).expect("GetModuleHandleW");
@@ -1135,18 +1396,18 @@ fn spawn_hotkey_thread(tx: mpsc::Sender<()>, configured: HotkeySpec) {
         // 批次 Q：注册的是配置里的组合。失败不再 `return`——那个 `return` 会把消息窗一起丢掉，
         // 连带 SendTo / 单实例转发全废（老版本只在写死的热键下才无害）。现在退回出厂值，
         // 出厂值也失败就保留消息窗、只是没有全局键，托盘照常用。
-        match apply_hotkey(hwnd, configured) {
+        match apply_hotkey(hwnd, HotkeySlot::Toggle, configured) {
             Ok(()) => {
                 *hotkey_lock(&HOTKEY_ACTIVE) = Some(configured);
                 eprintln!("hotkey: {} registered", configured.display());
             }
             Err(err) => {
                 let fallback = HotkeySpec::DEFAULT;
-                match apply_hotkey(hwnd, fallback) {
+                match apply_hotkey(hwnd, HotkeySlot::Toggle, fallback) {
                     Ok(()) => {
                         *hotkey_lock(&HOTKEY_ACTIVE) = Some(fallback);
-                        *hotkey_lock(&HOTKEY_RESULT) =
-                            Some(HotkeyOutcome::StartupFallback { tried: configured, fell_back_to: fallback, err });
+                        hotkey_lock(&HOTKEY_RESULT)
+                            .push(HotkeyOutcome::StartupFallback { tried: configured, fell_back_to: fallback, err });
                         eprintln!(
                             "hotkey: {} 注册失败（{err}={}），本次退回 {}；settings.json 不改动",
                             configured.display(),
@@ -1155,14 +1416,42 @@ fn spawn_hotkey_thread(tx: mpsc::Sender<()>, configured: HotkeySpec) {
                         );
                     }
                     Err(err2) => {
-                        *hotkey_lock(&HOTKEY_RESULT) =
-                            Some(HotkeyOutcome::Rejected { tried: configured, err: err2, now_active: None });
+                        hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
+                            slot: HotkeySlot::Toggle,
+                            tried: configured,
+                            err: err2,
+                            now_active: None,
+                        });
                         eprintln!(
                             "hotkey: {} 与出厂值 {} 都注册失败（{err} / {err2}）⇒ 全局呼出不可用，消息窗仍在线（SendTo/单实例不受影响）",
                             configured.display(),
                             fallback.display()
                         );
                     }
+                }
+            }
+        }
+        // 批次 R：补字符热键。它没有"出厂值"可退——退成一个用户没要的键比没有这个键更糟，
+        // 所以失败就是失败：记一行 + 推一条回执（`now_active: None` = 系统里没装着），
+        // settings.json 照旧不动（下次启动还会照配置再试一次）。
+        if let Some(tb) = typeback {
+            match apply_hotkey(hwnd, HotkeySlot::Typeback, tb) {
+                Ok(()) => {
+                    *hotkey_lock(&TYPEBACK_ACTIVE) = Some(tb);
+                    eprintln!("typeback: {} registered（按下补入呼出键那个字符）", tb.display());
+                }
+                Err(err) => {
+                    hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
+                        slot: HotkeySlot::Typeback,
+                        tried: tb,
+                        err,
+                        now_active: None,
+                    });
+                    eprintln!(
+                        "typeback: {} 注册失败（{err}={}）⇒ 本次不启用补字符，字符仍然打不出来",
+                        tb.display(),
+                        if err == ERROR_HOTKEY_ALREADY_REGISTERED { "已被占用" } else { "其它原因" }
+                    );
                 }
             }
         }
@@ -1179,6 +1468,8 @@ fn spawn_hotkey_thread(tx: mpsc::Sender<()>, configured: HotkeySpec) {
             DispatchMessageW(&msg);
         }
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TYPEBACK);
+        let _ = KillTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER);
         let _ = DestroyWindow(hwnd);
     });
 }
@@ -1242,6 +1533,15 @@ impl LauncherApp {
             hotkey_active: prefs.toggle_hotkey,
             hotkey_awaiting: None,
             hotkey_synced: false,
+            // 批次 R：补字符键。同一套"先按配置显示、第一帧按系统真值校正"的口径。
+            // 草稿把 NOREPEAT 剥掉：四个复选框读写的是实义修饰位，注册时才补回 NOREPEAT。
+            typeback_active: prefs.typeback_hotkey,
+            typeback_draft: prefs
+                .typeback_hotkey
+                .map(|s| HotkeySpec { mods: s.mods_named(), vk: s.vk }),
+            typeback_awaiting: None,
+            typeback_armed: false,
+            keypick_suspended: false,
         };
         // 立即为已有项起图标加载器（source_path 为空的种子会被 extract 自然跳过）。
         let source_paths: Vec<String> =
@@ -1455,42 +1755,76 @@ impl LauncherApp {
         self.win_drag = Some(DragAnchor { hwnd, cursor, origin, size, edge });
     }
 
-    /// FR-WIN-02（批次 Q）每帧处理：① 取热键线程的回执；② 首帧把显示口径对齐到"系统里真正
-    /// 装着的那一组"（启动时可能退回过出厂值，甚至一个都没注册上）；③ 录制态独占按键。
+    /// FR-WIN-02（批次 Q）+ 批次 R 的每帧处理：① 取热键线程的回执（两个槽共用一条队列）；
+    /// ② 首帧把显示口径对齐到"系统里真正装着的那两组"；③ 取键（录主热键 / 给补字符键选键）
+    /// 独占本帧按键；④ 把"取键期间临时注销全局键"这条边沿发给热键线程。
     /// 必须排在快捷键分支之前——否则录制时按 Ctrl+I 会先被「批量导入」抢走。
     fn hotkey_frame(&mut self, ui: &mut egui::Ui) {
-        let outcome = {
-            let mut slot = hotkey_lock(&HOTKEY_RESULT);
-            slot.take()
-        };
-        if let Some(o) = outcome {
+        // 先 take 出来再遍历：`for o in std::mem::take(&mut *hotkey_lock(..))` 会把那个 MutexGuard
+        // 存活到整个循环体结束（for 的 scrutinee 临时量就是循环作用域），期间热键线程想 push 一条
+        // 新回执只能等着。不至于死锁（线程从不反向等 UI 的锁），但没必要留这个窗口。
+        let outcomes = std::mem::take(&mut *hotkey_lock(&HOTKEY_RESULT));
+        for o in outcomes {
             match o {
-                HotkeyOutcome::Applied { on } => {
-                    self.hotkey_active = on;
-                    self.hotkey_awaiting = None;
-                    if self.prefs.toggle_hotkey != on {
-                        self.prefs.toggle_hotkey = on;
-                        source::application::save_settings(&self.prefs);
+                HotkeyOutcome::Applied { slot, on } => match slot {
+                    HotkeySlot::Toggle => {
+                        self.hotkey_active = on;
+                        self.hotkey_awaiting = None;
+                        if self.prefs.toggle_hotkey != on {
+                            self.prefs.toggle_hotkey = on;
+                            source::application::save_settings(&self.prefs);
+                        }
+                        self.hotkey_note(&format!("✓ 全局热键已改为 {}", on.display()), true);
                     }
-                    self.hotkey_note(&format!("✓ 全局热键已改为 {}", on.display()), true);
-                }
-                HotkeyOutcome::Rejected { tried, err, now_active } => {
-                    self.hotkey_awaiting = None;
-                    self.hotkey_active = match now_active {
-                        // prefs 不动：失败的那一份从没写进 settings.json。
-                        Some(k) => k,
-                        None => self.prefs.toggle_hotkey,
-                    };
+                    HotkeySlot::Typeback => {
+                        self.typeback_active = Some(on);
+                        self.typeback_awaiting = None;
+                        // 草稿跟着注册成功的那一份走：复选框显示的永远是"系统里真装着的"，
+                        // 不是"用户刚才点过但没装上的"。
+                        self.typeback_draft =
+                            Some(HotkeySpec { mods: on.mods_named(), vk: on.vk });
+                        if self.prefs.typeback_hotkey != Some(on) {
+                            self.prefs.typeback_hotkey = Some(on);
+                            source::application::save_settings(&self.prefs);
+                        }
+                        self.hotkey_note(&format!("✓ 补字符热键已设为 {}", on.display()), true);
+                    }
+                },
+                HotkeyOutcome::Rejected { slot, tried, err, now_active } => {
                     let why = if err == ERROR_HOTKEY_ALREADY_REGISTERED {
                         "已被系统或其它程序占用".to_string()
                     } else {
                         format!("注册失败（错误码 {err}）")
                     };
-                    let tail = match now_active {
-                        Some(k) => format!("，当前仍是 {}", k.display()),
-                        None => "，且原来的键也没能装回去 ⇒ 暂时只能用托盘呼出".to_string(),
-                    };
-                    self.hotkey_note(&format!("⚠ {} {why}{tail}", tried.display()), false);
+                    match slot {
+                        HotkeySlot::Toggle => {
+                            self.hotkey_awaiting = None;
+                            self.hotkey_active = match now_active {
+                                // prefs 不动：失败的那一份从没写进 settings.json。
+                                Some(k) => k,
+                                None => self.prefs.toggle_hotkey,
+                            };
+                            let tail = match now_active {
+                                Some(k) => format!("，当前仍是 {}", k.display()),
+                                None => {
+                                    "，且原来的键也没能装回去 ⇒ 暂时只能用托盘呼出".to_string()
+                                }
+                            };
+                            self.hotkey_note(&format!("⚠ {} {why}{tail}", tried.display()), false);
+                        }
+                        HotkeySlot::Typeback => {
+                            self.typeback_awaiting = None;
+                            self.typeback_active = now_active;
+                            let tail = match now_active {
+                                Some(k) => format!("，当前仍是 {}", k.display()),
+                                None => " ⇒ 这个字符还是打不出来".to_string(),
+                            };
+                            self.hotkey_note(
+                                &format!("⚠ 补字符热键 {} {why}{tail}", tried.display()),
+                                false,
+                            );
+                        }
+                    }
                 }
                 HotkeyOutcome::StartupFallback { tried, fell_back_to, err } => {
                     self.hotkey_active = fell_back_to;
@@ -1514,19 +1848,54 @@ impl LauncherApp {
             if let Some(active) = *hotkey_lock(&HOTKEY_ACTIVE) {
                 self.hotkey_active = active;
             }
+            // 补字符这一格反过来：`None` 也是有效信息（没启用，或启用但注册失败被回执说过了），
+            // 所以直接照抄，不做 `if let Some`。
+            self.typeback_active = *hotkey_lock(&TYPEBACK_ACTIVE);
         }
 
-        // ③ 录制态。
-        if !self.hotkey_recording {
+        // ③ 取键，④ 边沿通知。
+        self.take_keypick(ui);
+        self.sync_keypick_suspend();
+    }
+
+    /// 取键态下吃掉本帧按键并分派给两个入口之一。互斥是结构自带的：`take_record_press` 会把
+    /// 整帧的 Key 事件清空，一帧只可能有一个框拿到键，所以先判谁在等就够了。
+    fn take_keypick(&mut self, ui: &mut egui::Ui) {
+        if !self.hotkey_recording && !self.typeback_armed {
             return;
         }
-        // 换键请求还悬着（回执未到）时不接受第二次录制，否则会覆盖 REQUEST 槽里的组合。
-        if self.hotkey_awaiting.is_some() {
+        // 换键请求还悬着（回执未到）时不接受第二次取键，否则会覆盖 REQUEST 槽里的组合。
+        if self.hotkey_awaiting.is_some() || self.typeback_awaiting.is_some() {
             return;
         }
         let Some((key, m)) = take_record_press(ui) else {
             return;
         };
+        if self.typeback_armed {
+            // 补字符的键框只取主键——修饰键来自那四个复选框（照 Delphi 版 frmConfig 的分工：
+            // 「[键] + ☐Windows ☑Alt / ☐Ctrl ☐Shift」）。所以这里刻意无视 `m`。
+            match key {
+                egui::Key::Escape | egui::Key::Tab => {
+                    self.typeback_armed = false;
+                    eprintln!("设置页：补字符键选键取消（按 Esc / Tab）");
+                }
+                _ => {
+                    let Some(vk) = vk_from_egui_key(key) else {
+                        return; // 方向键之类：继续等，不提示
+                    };
+                    let shown = HotkeySpec { mods: 0, vk }.display();
+                    // 已有草稿 ⇒ 只换主键，四个复选框选出来的修饰键保留；没有草稿（第一次设）
+                    // ⇒ 连修饰键一起从"空"开始，由用户勾。
+                    match &mut self.typeback_draft {
+                        Some(d) => d.vk = vk,
+                        None => self.typeback_draft = Some(HotkeySpec { mods: 0, vk }),
+                    }
+                    self.typeback_armed = false;
+                    eprintln!("设置页：补字符键的键框收到 {shown}（修饰键看四个复选框）");
+                }
+            }
+            return;
+        }
         match key {
             egui::Key::Escape | egui::Key::Tab => {
                 self.hotkey_recording = false;
@@ -1557,6 +1926,23 @@ impl LauncherApp {
         }
     }
 
+    /// 批次 R：进出取键态 ⇒ 通知热键线程注销 / 装回主热键。
+    /// 为什么这件事必须由 UI 侧发边沿、线程侧动手：注销与注册只发生在热键线程（hwnd 归属），
+    /// 而"什么时候算退出取键"只有 UI 知道（落定、Esc、取消按钮、切页、关窗、隐藏）。
+    /// 调用点两处：`hotkey_frame` 末尾（正常路径）与 `on_hide`——窗口一隐藏 eframe 就不再跑
+    /// `ui()`，边沿检测等不到下一帧，全局呼出会一直停在注销状态（真等不到还有兜底定时器）。
+    fn sync_keypick_suspend(&mut self) {
+        let picking = self.hotkey_recording || self.typeback_armed;
+        if picking == self.keypick_suspended {
+            return;
+        }
+        self.keypick_suspended = picking;
+        post_hotkey_signal(
+            if picking { WM_APP_SUSPEND_HOTKEY } else { WM_APP_RESUME_HOTKEY },
+            if picking { "取键期注销" } else { "取键后恢复" },
+        );
+    }
+
     /// 录制落定：合法性 → 本程序键表预检 → 投给热键线程试注册。
     /// 三级里前两级是本地判据（不碰系统），最后一级只有 Windows 知道答案，结果走回执；
     /// **只有注册成功才写 settings.json**（用户 2026-10-19 口径「立即生效、失败回滚旧热键」）。
@@ -1574,18 +1960,77 @@ impl LauncherApp {
             eprintln!("设置页：热键 {show} 与本程序键表冲突，未采纳");
             return false;
         }
+        // 批次 R 新增的一格带来的新冲突：同一个 vk+修饰组合在同一个线程上只能注册一次，
+        // 撞进补字符那一格时 `RegisterHotKey` 给的是 1409，不挡的话用户看到的是"被别的程序占用"
+        // ——占用者其实是我们自己。反向那条（补字符撞主热键）由 `check_typeback` 负责。
+        if let Some(tb) = self.typeback_active {
+            if (tb.mods_named(), tb.vk) == (spec.mods_named(), spec.vk) {
+                self.hotkey_note(
+                    &format!("⚠ {show} 正被补字符热键占着，请先改掉或清除它"),
+                    false,
+                );
+                eprintln!("设置页：热键 {show} 与补字符热键同组，未采纳");
+                return false;
+            }
+        }
         if spec == self.hotkey_active {
             self.hotkey_note(&format!("ℹ {show} 就是当前热键，未改动"), true);
             eprintln!("设置页：热键 {show} 与当前一致，未改动");
             return false;
         }
-        if !post_hotkey_request(spec) {
+        if !post_hotkey_request(HotkeySlot::Toggle, spec) {
             self.hotkey_note("⚠ 热键线程还没就绪，请再录一次", false);
             return false;
         }
         self.hotkey_awaiting = Some(spec);
         eprintln!("设置页：热键换键请求已投递 → {show}（等注册结果）");
         true
+    }
+
+    /// 补字符热键的"应用"。判据比主热键多两条（必须带修饰键、不许与主热键同组），
+    /// 少一条（没有出厂值可退，失败就是失败）。与主热键同一口径：**只有注册成功才写盘**。
+    fn request_typeback(&mut self, spec: HotkeySpec) -> bool {
+        let show = spec.display();
+        if let Err(msg) = spec.check_typeback(&self.hotkey_active) {
+            self.hotkey_note(&format!("⚠ 补字符热键 {show}：{msg}"), false);
+            eprintln!("设置页：补字符热键 {show} 未采纳（{msg}）");
+            return false;
+        }
+        if spec.conflicts_local(LOCAL_TAKEN) {
+            self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
+            eprintln!("设置页：补字符热键 {show} 与本程序键表冲突，未采纳");
+            return false;
+        }
+        if self.typeback_active == Some(spec) {
+            self.hotkey_note(&format!("ℹ {show} 就是当前补字符热键，未改动"), true);
+            eprintln!("设置页：补字符热键 {show} 与当前一致，未改动");
+            return false;
+        }
+        if !post_hotkey_request(HotkeySlot::Typeback, spec) {
+            self.hotkey_note("⚠ 热键线程还没就绪，请再点一次应用", false);
+            return false;
+        }
+        self.typeback_awaiting = Some(spec);
+        eprintln!("设置页：补字符热键请求已投递 → {show}（等注册结果）");
+        true
+    }
+
+    /// 「清除」= 不要这个键了。注销动作仍然交给热键线程（hwnd 归属那条老规矩），
+    /// 这里只投一条消息 + 就地把自己这三份状态与 settings.json 清干净。
+    /// 这条路径不产回执：`UnregisterHotKey` 没有"失败要告诉用户"的那种失败（没装着也返回 false），
+    /// 而清掉配置是本地就能做成的事。
+    fn clear_typeback(&mut self) {
+        post_hotkey_signal(WM_APP_CLEAR_TYPEBACK, "清除补字符热键");
+        *hotkey_lock(&TYPEBACK_ACTIVE) = None;
+        self.typeback_active = None;
+        self.typeback_draft = None;
+        self.typeback_awaiting = None;
+        self.typeback_armed = false;
+        if self.prefs.typeback_hotkey.take().is_some() {
+            source::application::save_settings(&self.prefs);
+        }
+        eprintln!("设置页：补字符热键已清除（注销 + settings.json 置空）");
+        self.hotkey_note("✓ 已清除补字符热键", true);
     }
 
     /// 热键相关的一条回执提示：统一走 Toast（沿用各操作的 TTL 与配色）。
@@ -1857,16 +2302,144 @@ impl LauncherApp {
                             });
                             ui.label(
                                 egui::RichText::new(
-                                    "点「录制新热键」后直接按下想要的组合，不需要再点确认：注册成功立刻生效并写进 settings.json；被系统或其它程序占用会照实报错，并自动回到原来那一组（你原来的设置不会被冲掉）。可录的键只有字母、数字、空格、回车和 F1–F24；非 F 键必须带 Ctrl 或 Alt，因为裸 A、Shift+A 都只是打字，挂成全局键等于一路拦你输入。\nWin 组合键在这里录不了：egui 在 Windows 上不把 Win 当作修饰键传上来（你按 Ctrl 时它给的 command 位就是 Ctrl 的副本），所以按下 Win 只会被判成\"还没按到有效键\"。想要 Win+X，只能手改 settings.json 里那两个数值（Win 位是 8），但这类组合大多被系统自己占了，注册多半会失败。\n本程序自己的组合（Ctrl+N/E/D/I/P/J/K、Ctrl+Shift+D、Ctrl+数字、Alt+数字）会先在本地挡一道。全局占用只能靠\"试注册\"发现——Windows 没有枚举别人热键的 API，所以\"没报错\"只代表这一刻系统允许它注册上，不代表全机没人想用这个键。\n还有一点要知道：全局热键是被系统整条吞掉的，设成 Ctrl+A、Ctrl+C 这类常用编辑键，别的程序里那个动作就跟着没了（本程序没绑它们，所以不会在这里拦你，得自己避）。",
+                                    "点「录制新热键」后直接按下想要的组合，不需要再点确认：注册成功立刻生效并写进 settings.json；被系统或其它程序占用会照实报错，并自动回到原来那一组（你原来的设置不会被冲掉）。\n可录的键：字母、数字、空格、回车、反引号 ` 和 F1–F24。非 F 键必须带 Ctrl、Alt 或 Win，因为裸 A、Shift+A 都只是打字，挂成全局键等于一路拦你输入。\n裸键只放开 ` 这一个（批次 R，2026-10-20 按你的要求加的）：代价是设成它以后全系统都打不出 ` 了，所以请照下面「补字符热键」那张卡片配一个出口；Shift+` 打出的 ~ 不受影响（本机实测）。录制期间程序会先把当前全局热键临时注销——不然裸 ` 被系统整条吞掉，本程序一个按键都收不到，永远录不成；退出录制（落定 / Esc / 取消按钮 / 关窗 / 隐藏到托盘）立刻装回去，另有一个 30 秒兜底定时器防止卡在注销状态。\nWin 组合键在这里录不了：egui 在 Windows 上不把 Win 当作修饰键传上来（你按 Ctrl 时它给的 command 位就是 Ctrl 的副本）。想要 Win+X，用它下面那张补字符卡片上的复选框。\n本程序自己的组合（Ctrl+N/E/D/I/P/J/K、Ctrl+Shift+D、Ctrl+数字、Alt+数字）会先在本地挡一道。全局占用只能靠\"试注册\"发现——Windows 没有枚举别人热键的 API，所以\"没报错\"只代表这一刻系统允许它注册上，不代表全机没人想用这个键。\n还有一点要知道：全局热键是被系统整条吞掉的，设成 Ctrl+A、Ctrl+C 这类常用编辑键，别的程序里那个动作就跟着没了（本程序没绑它们，所以不会在这里拦你，得自己避）。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            // 批次 R：补字符热键。控件形态照 Delphi 版 frmConfig 的
+                            // 「[键框] + ☐Windows / ☑Alt / ☐Ctrl / ☐Shift」（用户 2026-10-20 点名并给了
+                            // 截图），分工也一样：左边那个框只管主键，修饰键全走复选框。
+                            // 这一张同时是本机唯一能把 Win 位设进热键的入口——录制路径产不出它。
+                            ui.label(
+                                egui::RichText::new("补字符热键（按下它，打出被呼出键吞掉的那个字符）")
+                                    .strong(),
+                            );
+                            let typed = typeback_char_for(self.hotkey_active.vk);
+                            let bare_toggle = self.hotkey_active.mods_named() == 0;
+                            ui.horizontal(|ui| {
+                                let shown = if self.typeback_armed {
+                                    "按下键…（Esc / Tab 取消）".to_string()
+                                } else if let Some(a) = self.typeback_awaiting {
+                                    format!("{} 注册中…", a.display())
+                                } else if let Some(d) = self.typeback_draft {
+                                    // 只显键名：修饰键由右边四个复选框各显自己的勾选态。
+                                    HotkeySpec { mods: 0, vk: d.vk }.display()
+                                } else {
+                                    "（还没选键）".to_string()
+                                };
+                                if ui.button(shown).clicked() {
+                                    self.typeback_armed = !self.typeback_armed;
+                                    eprintln!(
+                                        "设置页：补字符键选键 {}（当前草稿 {}）",
+                                        if self.typeback_armed { "开始" } else { "取消" },
+                                        self.typeback_draft
+                                            .map(|d| d.display())
+                                            .unwrap_or_else(|| "空".to_string())
+                                    );
+                                }
+                                ui.label(egui::RichText::new("+").weak());
+                                // 复选框读的是草稿、写的也是草稿；`mods` 里只放实义修饰位，
+                                // NOREPEAT 到投递那一刻才补（见 `request_typeback`）。
+                                let stored = self.typeback_draft.map(|d| d.mods).unwrap_or(0);
+                                let mut bits = stored;
+                                for (bit, name) in [
+                                    (HKF_WIN, "Win"),
+                                    (HKF_CONTROL, "Ctrl"),
+                                    (HKF_ALT, "Alt"),
+                                    (HKF_SHIFT, "Shift"),
+                                ] {
+                                    let mut on = bits & bit != 0;
+                                    if ui.checkbox(&mut on, name).changed() {
+                                        if on {
+                                            bits |= bit;
+                                        } else {
+                                            bits &= !bit;
+                                        }
+                                    }
+                                }
+                                if bits != stored {
+                                    // 还没选键时也允许先勾修饰键：先立一个 vk=0 的草稿，「应用」
+                                    // 会被 `check()` 挡下并说明「只收字母、数字…」。
+                                    match &mut self.typeback_draft {
+                                        Some(d) => d.mods = bits,
+                                        None => {
+                                            self.typeback_draft = Some(HotkeySpec { mods: bits, vk: 0 })
+                                        }
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let busy = self.typeback_armed || self.typeback_awaiting.is_some();
+                                let draft = self.typeback_draft;
+                                ui.add_enabled_ui(!busy, |ui| {
+                                    if ui.button("应用").clicked() {
+                                        match draft {
+                                            Some(d) => {
+                                                self.request_typeback(HotkeySpec {
+                                                    mods: d.mods | HKF_NOREPEAT,
+                                                    vk: d.vk,
+                                                });
+                                            }
+                                            None => self.hotkey_note(
+                                                "⚠ 补字符热键：先在左边点一下、再按一个键",
+                                                false,
+                                            ),
+                                        }
+                                    }
+                                    if ui.button("清除").clicked() {
+                                        if self.typeback_active.is_none() && draft.is_none() {
+                                            self.hotkey_note("ℹ 本来就没有补字符热键", true);
+                                        } else {
+                                            self.clear_typeback();
+                                        }
+                                    }
+                                });
+                            });
+                            ui.label(
+                                egui::RichText::new(match self.typeback_active {
+                                    Some(t) => {
+                                        if !bare_toggle {
+                                            format!(
+                                                "○ 现在装着 {}，但呼出键 {} 带着修饰、不吞字符 ⇒ 按它不会有输出（改成裸键才用得上）。",
+                                                t.display(),
+                                                self.hotkey_active.display()
+                                            )
+                                        } else if let Some(c) = typed {
+                                            format!("✓ 现在装着 {}：按它就把 {c} 投给此刻的焦点窗口。", t.display())
+                                        } else {
+                                            format!(
+                                                "⚠ 现在装着 {}，但呼出键那个 VK 在当前键盘布局下反查不到字符（裸 F 键就是这种），按它不会有输出。",
+                                                t.display()
+                                            )
+                                        }
+                                    }
+                                    None => match self.prefs.typeback_hotkey {
+                                        Some(t) => format!("⚠ 设置里是 {}，但这次没能注册上，按了没反应。", t.display()),
+                                        None => "未启用。".to_string(),
+                                    },
+                                })
+                                .weak()
+                                .small(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "为什么需要它：呼出键设成裸 ` 之后，` 这个字符在全系统都打不出来了（Shift+` 的 ~ 不受影响），这一张卡片就是那个出口。呼出键带修饰时（出厂那组 Ctrl+Alt+Space 就是）它本来就不吞字符 ⇒ 这个键按下去什么都不做，避免凭空往你正在打的字里塞一个空格。\n要打的字符不是写死的，是按呼出键的 VK 反查当前键盘布局算出来的（MapVirtualKeyW），所以换布局不会补错键。\n必须带修饰键（Ctrl / Alt / Win 任一）：裸键挂上去只会把「吞字符的」换成它自己。也不能和呼出键是同一组——系统只会把它当成呼出键。推荐 Win+`：Win 位只有这里的复选框能设，而 Win+` 一般没被系统占。\n还没实测的那一条：注入走 SendInput 的 Unicode 通道（不带 VK，因此不会被自家那条裸 ` 再吞一次），记事本 / 浏览器 / VS Code / 终端 / 中文输入法里的实际表现要靠真机验收。"
                                 )
                                 .weak()
                                 .small(),
                             );
                             ui.separator();
                             let toggle_key = self.hotkey_active.display();
+                            let typeback_key = self
+                                .typeback_active
+                                .map(|t| t.display())
+                                .unwrap_or_else(|| "（补字符未启用）".to_string());
                             egui::Grid::new("hotkeys_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                                 for (key, desc) in [
                                     (toggle_key.as_str(), "全局呼出 / 隐藏（上一张卡片可改）"),
+                                    (typeback_key.as_str(), "补字符：把呼出键吞掉的那个字符打回焦点窗口（上一张卡片可改）"),
                                     ("↑ / ↓", "选择条目"),
                                     ("PgUp / PgDn", "结果列表翻页（列表滚动跟随选中项）"),
                                     ("1 … 9 / 0", "执行第 1–9 行 / 第 10 行（列表前 10 行已标号）；裸键仅输入为空时生效，Ctrl+数字 / Alt+数字 不受限制"),
@@ -1932,6 +2505,15 @@ impl LauncherApp {
         // FR-WIN-04：关闭到托盘时清掉待触发的失焦定时器
         self.hide_at = None;
         self.had_focus_since_show = false;
+        // 批次 R：窗口一隐藏，eframe 就不再跑 `ui()` ⇒ `hotkey_frame` 末尾那条边沿检测等不到
+        // 下一帧。取键态若还开着，全局呼出会一直停在"临时注销"状态（按了没反应），所以在这里
+        // 就地退出取键并把键装回。放在这个函数最前面是因为它下面有一条 `return`。
+        if self.hotkey_recording || self.typeback_armed {
+            self.hotkey_recording = false;
+            self.typeback_armed = false;
+            eprintln!("设置页：窗口隐藏 ⇒ 退出取键（录制/选键状态不跨隐藏保留）");
+            self.sync_keypick_suspend();
+        }
         let Some(before) = self.ime_before.take() else { return };
         if let Some(ime_wnd) = foreground_ime_wnd() {
             restore_ime(ime_wnd, before);
@@ -2219,7 +2801,10 @@ impl eframe::App for LauncherApp {
         // 录制态会把本帧的按键事件清空，后面那块整体收不到键；即便如此仍显式加 `!recording` 门，
         // 让"录制时不响应任何快捷键"这件事读得出来，而不是依赖清事件这个隐式效果。
         self.hotkey_frame(ui);
-        let recording = self.hotkey_recording;
+        // 批次 R：补字符键框选键和主热键录制是同一类状态——都在等一次按键，都不该被本程序的
+        // 快捷键抢走（`take_keypick` 里的 `take_record_press` 已把整帧 Key 事件清空，这扇门是
+        // 让"取键时不响应快捷键"这件事读得出来的那道显式保险）。
+        let recording = self.hotkey_recording || self.typeback_armed;
 
         let mut launch: Option<LaunchItem> = None;
         let mut launch_from_list = false;
@@ -3289,9 +3874,9 @@ fn main() -> eframe::Result {
     let (notify_tx, notify_rx) = mpsc::channel();
     // 批次 Q：热键在设置里可改，而注册发生在 `LauncherApp::new` 之前（热键线程自己那条消息循环），
     // 所以这里先读一次 settings.json。多读一次这个几十十字节的文件，换掉一个"配置要穿过
-    // intent 才能到线程"的接线，值得。
-    let configured_hotkey = source::application::load_settings().toggle_hotkey;
-    spawn_hotkey_thread(hotkey_tx, configured_hotkey);
+    // intent 才能到线程"的接线，值得。批次 R 起这一次读还要带出补字符热键。
+    let configured = source::application::load_settings();
+    spawn_hotkey_thread(hotkey_tx, configured.toggle_hotkey, configured.typeback_hotkey);
 
     let mut wgpu_options = eframe::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
@@ -3334,8 +3919,9 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod nav_tests {
     use super::*;
-    // 只有测试需要断言"录制路径不许产出 Win 位"，运行期没有任何地方读它。
-    use crate::source::application::HKF_WIN;
+    // 批次 Q 这里有一句单独的 `use crate::source::application::HKF_WIN;`，理由是"只有测试断言
+    // 录制路径不许产出 Win 位，运行期没人读它"。批次 R 把这个前提推翻了（补字符卡片上的复选框
+    // 就在运行期读它），所以改成靠上面那条 glob 带进来。
 
     #[test]
     fn digit_zero_means_tenth_row_and_one_means_first() {
@@ -3398,6 +3984,8 @@ mod nav_tests {
         assert_eq!(vk_from_egui_key(Num9), Some(0x39));
         assert_eq!(vk_from_egui_key(Space), Some(0x20));
         assert_eq!(vk_from_egui_key(Enter), Some(0x0D), "回车是 Key::Enter");
+        // 批次 R：` 是这套键表里唯一被允许裸按的键，录制端必须认得它（winit 那边叫 Backquote）。
+        assert_eq!(vk_from_egui_key(Backtick), Some(0xC0), "` = VK_OEM_3");
         assert_eq!(vk_from_egui_key(F1), Some(0x70));
         assert_eq!(vk_from_egui_key(F12), Some(0x7B));
         assert_eq!(vk_from_egui_key(F13), Some(0x7C));

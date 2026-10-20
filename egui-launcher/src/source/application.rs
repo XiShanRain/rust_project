@@ -217,6 +217,13 @@ pub struct AppSettings {
     /// `src/main.rs` 的注册调用里）。存的是 Windows 原始数值，见 [`HotkeySpec`]。
     #[serde(default)]
     pub toggle_hotkey: HotkeySpec,
+
+    /// 补字符热键（批次 R，2026-10-20 用户追加需求）：按下它就把 [`AppSettings::toggle_hotkey`]
+    /// 那个键**不带修饰时打出的字符**投递给当前焦点窗口。存在的理由只有一条——把裸 `` ` ``
+    /// 注册成全局键之后，系统会把那次按键整条吞掉，全机器就再也打不出 `` ` `` 了，
+    /// 这个热键就是把字符还回去的出口。`None` = 不启用。
+    #[serde(default)]
+    pub typeback_hotkey: Option<HotkeySpec>,
 }
 
 // ---- FR-WIN-02 全局呼出热键（批次 Q）----
@@ -243,6 +250,9 @@ pub const VK_Z: u32 = 0x5A;
 pub const VK_F1: u32 = 0x70;
 pub const VK_F24: u32 = 0x87;
 pub const VK_DELETE: u32 = 0x2E;
+/// 反引号 `` ` `` 键（美式布局上同时是 `~` 键，`Win32_UI_Input_KeyboardAndMouse` 里叫 `VK_OEM_3`）。
+/// 批次 R（2026-10-20 用户点名「重音号 ` 」）：这是唯一允许不带修饰键注册成全局热键的键。
+pub const VK_OEM_3: u32 = 0xC0;
 
 /// `RegisterHotKey` 失败码：组合已被系统或别的程序占走。这是"全局冲突"唯一的实测途径
 /// （Windows 没有枚举别人热键的 API），所以判据只能是"试注册"。
@@ -297,19 +307,60 @@ impl HotkeySpec {
 
     /// 录制落定前的合法性判据。只管"这个组合能不能当全局键"，冲突另判（本程序键表预检 +
     /// 试注册失败码），因为冲突的一半只有 Windows 知道。
+    ///
+    /// 批次 R（2026-10-20 用户裁定「只放开 `` ` `` 这一个键」）新增一条例外：**裸 `` ` ``**
+    /// 可以不带任何修饰键注册。判据形状是"不带修饰只允许 `` ` ``；单带 Shift 一律不允许"，
+    /// 后者是批次 Q 那条老规则的具体化，对 `` ` `` 尤其要紧——`Shift+` 打出来就是 `~`，
+    /// 挂成全局键等于把波浪号也从全系统抹掉，而 `` ` `` 本身已经被裸 `` ` `` 那条注册吃掉了，
+    /// 换不回任何东西（本机实测：裸 `` ` `` 装着时 `Shift+` `` ` `` 仍能正常打出 `~`）。
     pub fn check(&self) -> Result<(), &'static str> {
+        let m = self.mods_named();
         let function = (VK_F1..=VK_F24).contains(&self.vk);
-        let textable = matches!(
-            self.vk,
-            VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN
-        );
-        if !(function || textable) {
-            return Err("只收字母、数字、空格、回车与 F1–F24");
+        let letterish =
+            matches!(self.vk, VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN | VK_OEM_3);
+        if !(function || letterish) {
+            return Err("只收字母、数字、空格、回车、反引号 ` 与 F1–F24");
         }
-        // 非 F 键必须带 Ctrl / Alt / Win 之一：裸 A、Shift+A 都只是打字，
-        // 挂成全局键等于"敲到就弹窗"。F 键有专职身份，允许单独用。
-        if !function && self.mods_named() & (HKF_CONTROL | HKF_ALT | HKF_WIN) == 0 {
+        if function {
+            return Ok(());
+        }
+        // 单带 Shift（不带 Ctrl/Alt/Win）一律挡：这类组合只是打字，挂成全局键就是拦打字。
+        if m == HKF_SHIFT {
+            return if self.vk == VK_OEM_3 {
+                Err("单带 Shift 的 ` 就是 ~，挂成全局键会连波浪号一起吞掉；要带就带 Ctrl、Alt 或 Win")
+            } else {
+                Err("只带 Shift 的键都只是打字，不能当全局热键")
+            };
+        }
+        if m == 0 {
+            // 无修饰键的唯一例外。裸 `` ` `` 的代价（全系统打不出 `` ` ``）由补字符热键补回来，
+            // 见 [`AppSettings::typeback_hotkey`]。
+            return self
+                .backtick_bare()
+                .then_some(())
+                .ok_or("不带修饰键的全局热键只允许 ` 这一个键");
+        }
+        if m & (HKF_CONTROL | HKF_ALT | HKF_WIN) == 0 {
             return Err("这个键要当全局热键，至少得带 Ctrl、Alt 或 Win");
+        }
+        Ok(())
+    }
+
+    /// 是不是"不带任何修饰键的 `` ` ``"——批次 R 里唯一被允许的裸键。
+    /// 设置页用它提示代价，`src/main.rs` 的录制期注销也只看主热键是不是这一种形态。
+    pub fn backtick_bare(&self) -> bool {
+        self.vk == VK_OEM_3 && self.mods_named() == 0
+    }
+
+    /// 补字符热键（[`AppSettings::typeback_hotkey`]）专用的判据：先过 [`check`](Self::check)，
+    /// 再多两条只有这个槽才有的规矩。放在这里而不是调用点，是因为这两条也能纯函数单测。
+    pub fn check_typeback(&self, toggle: &HotkeySpec) -> Result<(), &'static str> {
+        self.check()?;
+        if self.mods_named() == 0 {
+            return Err("补字符热键必须带修饰键：不带修饰的话，吞掉字符的就换成它自己");
+        }
+        if (self.mods_named(), self.vk) == (toggle.mods_named(), toggle.vk) {
+            return Err("补字符热键不能和呼出热键是同一组：系统只会把它当成呼出键");
         }
         Ok(())
     }
@@ -331,6 +382,8 @@ impl Default for HotkeySpec {
 /// 键名用英文（Space / Enter）：设置页那张快捷键表一直这么写，且启动日志那行
 /// `hotkey: Ctrl+Alt+Space registered` 从批次 A 起就是原文，复测判据直接抄它——
 /// 改成「空格」会让同一份判据对不上号。
+/// 唯一例外是 [`VK_OEM_3`]，直接显示成 `` ` ``：这个键的名字就是它打出的那个字符，
+/// 写成 "Backtick" 反而要用户先去查词，而 `Win+`` ` `` 这种串正是用户提需求时的原话。
 fn vk_name(vk: u32) -> String {
     match vk {
         VK_A..=VK_Z => char::from_u32(vk).unwrap_or('?').to_string(),
@@ -339,6 +392,7 @@ fn vk_name(vk: u32) -> String {
         VK_RETURN => "Enter".to_string(),
         VK_BACK => "Backspace".to_string(),
         VK_DELETE => "Delete".to_string(),
+        VK_OEM_3 => "`".to_string(),
         VK_F1..=VK_F24 => format!("F{}", vk - VK_F1 + 1),
         other => format!("VK#{other:02X}"),
     }
@@ -1572,6 +1626,9 @@ mod hotkey_tests {
         // 范围外的码必须显式露出来，不能显示成空白让人以为"没设键"。
         assert_eq!(show(HKF_CONTROL, VK_BACK), "Ctrl+Backspace");
         assert_eq!(show(HKF_CONTROL, 0x6A), "Ctrl+VK#6A");
+        // 批次 R：`` ` `` 的展示名就是它自己，`Win+` 这个串是用户提需求时的原话。
+        assert_eq!(show(0, VK_OEM_3), "`");
+        assert_eq!(show(HKF_WIN | HKF_NOREPEAT, VK_OEM_3), "Win+`");
     }
 
     #[test]
@@ -1591,6 +1648,54 @@ mod hotkey_tests {
         assert!(!ok(HKF_CONTROL, VK_BACK), "Backspace 不是可录制目标");
         assert!(!ok(HKF_CONTROL, 0x6A), "小键盘键不在本批口径内");
         assert!(!ok(HKF_CONTROL, VK_F24 + 1));
+    }
+
+    /// 批次 R 的例外集：无修饰键**只**允许 `` ` ``，且 `Shift+`` ` ```（也就是 `~`）必须被挡。
+    /// 这两条都是"代价不对称"的判据：放开裸 `` ` `` 的代价是全系统打不出 `` ` ``（有补字符热键兜），
+    /// 而放开 `Shift+`` ` `` 的代价是打不出 `~`，却换不回任何东西——裸 `` ` `` 那条注册已经把
+    /// `` ` `` 吃掉了。真机实测过：裸 `` ` `` 注册着的时候 `Shift+` `` ` `` 仍然打得出来。
+    #[test]
+    fn bare_backtick_is_the_only_modifier_less_key_allowed() {
+        let ok = |mods, code| HotkeySpec { mods, vk: code }.check().is_ok();
+        // 裸 `` ` ``：本批唯一的新例外，必须放行。
+        assert!(ok(0, VK_OEM_3), "裸 ` 是批次 R 用户点名要的单键触发");
+        assert!(ok(HKF_NOREPEAT, VK_OEM_3), "NOREPEAT 是行为位，不该影响判据");
+        assert!(HotkeySpec { mods: HKF_NOREPEAT, vk: VK_OEM_3 }.backtick_bare());
+        // 带 Ctrl / Alt / Win 的 `` ` `` 照旧收（补字符热键就走 Win+`` ` ``这条路）。
+        assert!(ok(HKF_CONTROL, VK_OEM_3));
+        assert!(ok(HKF_ALT, VK_OEM_3));
+        assert!(ok(HKF_WIN, VK_OEM_3));
+        assert!(ok(HKF_CONTROL | HKF_ALT, VK_OEM_3));
+        // 单带 Shift 的 `` ` `` 必须挡，而且挡的是"只有 Shift"这一种。
+        assert!(!ok(HKF_SHIFT, VK_OEM_3), "Shift+` 就是 ~，不能为了换 ` 把 ~ 也吞掉");
+        assert!(!ok(HKF_SHIFT | HKF_NOREPEAT, VK_OEM_3));
+        assert!(ok(HKF_SHIFT | HKF_CONTROL, VK_OEM_3), "Ctrl+Shift+` 不是打字键，照收");
+        // 其它键的裸键照旧全部拒绝：例外只有 `` ` `` 一个。
+        for code in [VK_A, VK_SPACE, VK_RETURN, vk('7'), VK_OEM_3 + 1, 0x2C] {
+            assert!(!ok(0, code), "裸 0x{code:02X} 不在例外里");
+        }
+        assert!(!HotkeySpec { mods: 0, vk: VK_SPACE }.backtick_bare(), "裸 Space 不许被认成例外");
+    }
+
+    /// 补字符热键比呼出热键多两条规矩：必须带修饰键，且不能和呼出热键撞成同一组。
+    #[test]
+    fn typeback_needs_a_modifier_and_must_differ_from_toggle() {
+        let bt = |mods, code| HotkeySpec { mods, vk: code };
+        let toggle = bt(HKF_NOREPEAT, VK_OEM_3); // 裸 `（用户设的那一种）
+        assert!(bt(HKF_WIN | HKF_NOREPEAT, VK_OEM_3).check_typeback(&toggle).is_ok(), "Win+` 是标准答案");
+        assert!(bt(HKF_CONTROL, VK_OEM_3).check_typeback(&toggle).is_ok());
+        assert!(bt(HKF_ALT, vk('L')).check_typeback(&toggle).is_ok());
+        // 裸键当补字符键 = 把"吞字符"这件事换个地方再做一遍。
+        let bare = bt(0, VK_OEM_3).check_typeback(&toggle).unwrap_err();
+        assert!(bare.contains("必须带修饰键"), "实得：{bare}");
+        // 和呼出键同一组：系统只会把它当呼出键，补字符永远不会发生。
+        // 用出厂键当呼出侧，顺带钉住"比对不看 NOREPEAT"（一个带、一个不带，仍算同一组）。
+        let strong = bt(HKF_CONTROL | HKF_ALT | HKF_NOREPEAT, VK_SPACE);
+        let same = bt(HKF_CONTROL | HKF_ALT, VK_SPACE).check_typeback(&strong).unwrap_err();
+        assert!(same.contains("同一组"), "实得：{same}");
+        // 先过通用判据：不在可录集合里的码，理由要来自 check()。
+        let bad = bt(HKF_CONTROL, VK_BACK).check_typeback(&toggle).unwrap_err();
+        assert!(bad.contains("只收"), "实得：{bad}");
     }
 
     #[test]
@@ -1616,16 +1721,28 @@ mod hotkey_tests {
         let old = br#"{"space_to_run":"word","tab_mode":"navigate","learn_rank":"count"}"#;
         let s: AppSettings = serde_json::from_slice(old).expect("旧文件应能解析");
         assert_eq!(s.toggle_hotkey, HotkeySpec::DEFAULT);
+        // 批次 R 新字段：老文件里连 `typeback_hotkey` 这个键都没有 ⇒ 必须是"不启用"，不是崩。
+        assert_eq!(s.typeback_hotkey, None, "没有补字符热键字段的老文件应读成 None");
 
         let custom = AppSettings {
             toggle_hotkey: HotkeySpec { mods: HKF_ALT | HKF_NOREPEAT, vk: vk_f(6) },
+            typeback_hotkey: Some(HotkeySpec { mods: HKF_WIN | HKF_NOREPEAT, vk: VK_OEM_3 }),
             ..AppSettings::default()
         };
         let json = serde_json::to_string(&custom).unwrap();
         // 存的是裸数（十进制），不引入枚举/字符串编码。
         assert!(json.contains("\"toggle_hotkey\":{\"mods\":"), "应为数值对，实得：{json}");
+        assert!(
+            json.contains("\"typeback_hotkey\":{\"mods\":16392,\"vk\":192}"),
+            "补字符热键要写成同样的数值对（Win+` = HKF_WIN 8 | HKF_NOREPEAT 16384 = 16392，vk 192），实得：{json}"
+        );
         let back: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.toggle_hotkey, custom.toggle_hotkey);
+        assert_eq!(back.typeback_hotkey, custom.typeback_hotkey);
+        // `null` 也必须认（用户手改文件时写"不要这个键"最自然的写法）。
+        let nul = br#"{"toggle_hotkey":{"mods":3,"vk":32},"typeback_hotkey":null}"#;
+        let s: AppSettings = serde_json::from_slice(nul).expect("null 应能解析");
+        assert_eq!(s.typeback_hotkey, None);
     }
 
     /// 这个码本批写错过一次（我先填的是 1410），所以它必须由**两条独立来源**钉住，而不是照抄自己的记忆。
