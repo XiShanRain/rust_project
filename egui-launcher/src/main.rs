@@ -17,12 +17,18 @@ use tray_icon::{
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, CloseHandle, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
-    POINT, RECT, WAIT_OBJECT_0, WPARAM,
+    ERROR_ALREADY_EXISTS, CloseHandle, GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM,
+    LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE};
+// FR-SRC-10：计算器结果行 Enter ＝「把纯数字写进剪贴板」。三件套在 DataExchange，
+// GlobalAlloc/GlobalLock 在 Memory（该模块没有 feature 门，已随 Win32_Foundation 白送）。
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Threading::{
     CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
     WaitForSingleObject,
@@ -607,6 +613,49 @@ fn resolve_file_for_select(path: &str, source_path: &str) -> Option<String> {
     locatable(path).or_else(|| locatable(source_path))
 }
 
+/// `CF_UNICODETEXT` 的格式号。常量本身在 `Win32::System::Ole`（`CLIPBOARD_FORMAT(13u16)`，
+/// 已在 windows-0.62.2 源码里核对过），但 `SetClipboardData` 收的是 `u32` ⇒ 写死 13，
+/// 不为一个数字多开一条 feature。
+const CF_UNICODETEXT: u32 = 13;
+
+/// FR-SRC-10：把计算器结果写进剪贴板（需求原文的 `text` 动作＝只复制数字，不启动进程）。
+///
+/// 剪贴板一旦打开就必须关掉——漏关会让别的程序从此再也打不开它，所以失败路径也走同一条
+/// `CloseClipboard`。句柄交给系统之后归系统所有，只有失败路径才自己 `GlobalFree`。
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0u16)).collect();
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return Err("打开剪贴板失败（可能正被别的程序占着）".to_string());
+        }
+        let done = write_text_format(&wide);
+        let _ = CloseClipboard();
+        done
+    }
+}
+
+/// 必须在剪贴板已打开的状态下调用。UTF-16 带末尾 NUL 是 `CF_UNICODETEXT` 规定的形态。
+fn write_text_format(wide: &[u16]) -> Result<(), String> {
+    let len = wide.len() * std::mem::size_of::<u16>();
+    unsafe {
+        EmptyClipboard().map_err(|e| format!("清空剪贴板失败：{e}"))?;
+        let h = GlobalAlloc(GMEM_MOVEABLE, len).map_err(|e| format!("分配剪贴板内存失败：{e}"))?;
+        let p = GlobalLock(h);
+        if p.is_null() {
+            let _ = GlobalFree(Some(h));
+            return Err("锁定剪贴板内存失败".to_string());
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), p.cast::<u8>(), len);
+        // 带着锁的句柄交给系统 ⇒ SetClipboardData 直接失败，必须先解锁。
+        let _ = GlobalUnlock(h);
+        if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_err() {
+            let _ = GlobalFree(Some(h));
+            return Err("写入剪贴板失败".to_string());
+        }
+        Ok(())
+    }
+}
+
 // ---- FR-ACT-10 键盘导航的纯计算部分（不碰 egui 状态，可单测）----
 
 /// 结果行近似高度：32px 图标 + egui 默认行间距。
@@ -651,6 +700,83 @@ fn commit_word(query: &str, via_digit: bool) -> String {
 /// 第 11 行起不显示——那里没有按键，标了号反而误导。
 fn row_num_label(idx: usize) -> Option<&'static str> {
     ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"].get(idx).copied()
+}
+
+/// 行号徽标 + 悬停说明，计算器行与条目行共用这一个画法（两行的左缘才可能对得齐）。
+/// `verb` 只有两种：条目行「执行」、计算器行「复制」——第 0 行按 1 复制数字，不是跑程序。
+fn row_badge(ui: &mut egui::Ui, idx: usize, verb: &str) {
+    match row_num_label(idx) {
+        Some(num) => {
+            ui.add_sized(
+                [14.0, 32.0],
+                egui::Label::new(egui::RichText::new(num).monospace().weak()),
+            )
+            .on_hover_text(format!("按 {num} 直接{verb}本行"));
+        }
+        None => ui.add_space(14.0),
+    }
+}
+
+// ---- FR-SRC-10 / FR-SRC-11 结果行并入列表的行模型（批次 S / T）----
+
+/// 列表头段（应用结果之前的那几行）的一行。头段次序照需求书 4.1.2 的分值偏移：
+/// 计算器 200、`{query}` 网页搜索 150、应用最高 `score+10`=110 ⇒ 两者都压在应用行之前。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadRow {
+    Calc(source::calc::CalcHit),
+    Search(source::websearch::SearchHit),
+    /// 空词独占（`g `）时的补全提示。不可执行：`Enter` / 数字键只给 Toast。
+    Hint(source::websearch::EngineHint),
+}
+
+/// 一帧的列表计划。`head` 是头段，`results` 是应用结果的名次表——两者拼起来就是整张列表。
+/// 独占（`g 词`）那一格把 `results` 清空：那正是「独占」的定义，不是一层过滤细节。
+struct Plan {
+    head: Vec<HeadRow>,
+    results: Vec<usize>,
+}
+
+/// 合并行号 → 行。`Head` 里放的是 `Plan::head` 的下标，`Item` 里放的仍是
+/// [`results`](LauncherApp::results) 的名次，不是 `self.items` 的下标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Head(usize),
+    Item(usize),
+}
+
+/// 合并后的总行数。导航键（↑↓ / PgUp/PgDn / Ctrl+J/K / Tab 的循环那一半）全在这个口径里回绕，
+/// 不必换算名次。
+fn row_count(results_len: usize, head_len: usize) -> usize {
+    results_len + head_len
+}
+
+/// 合并行号 → 行。越界返回 `None`，调用方按「什么都不做」处理（与 `space_executes` 那侧同口径）。
+fn row_at(selected: usize, results_len: usize, head_len: usize) -> Option<Row> {
+    if selected < head_len {
+        return Some(Row::Head(selected));
+    }
+    let rank = selected - head_len;
+    (rank < results_len).then_some(Row::Item(rank))
+}
+
+/// 头段占掉前 `head_len` 行之后，把合并行号换算成 `space_executes` 要的「名次」。
+/// 选中头段（计算器/搜索/提示）时返回 `None`——那些行不是条目，空格不替它们执行任何程序。
+fn item_rank(selected: usize, head_len: usize) -> Option<usize> {
+    (selected >= head_len).then(|| selected - head_len)
+}
+
+/// 首词 → 独占判定（FR-QRY-01 / 08）。**首词后没有空格就不算独占**：`g` 这个单字
+/// 还可能是 `git` 的开头，那一下让应用结果整段消失等于打断用户正在打的词。
+/// 与 `matching::parse` 的 `has_rest` 同一口径。
+fn exclusive_for(
+    engines: &[source::websearch::WebEngine],
+    query: &str,
+) -> source::websearch::Exclusive {
+    let parsed = matching::parse(query);
+    if !parsed.has_rest {
+        return source::websearch::Exclusive::NotOurs;
+    }
+    source::websearch::exclusive_rows(engines, &parsed.keyword, &parsed.rest)
 }
 
 /// 取回被按下的数字键（小键盘也算：winit 把 `Numpad*` 映射到同一批 `Num*`）。
@@ -1507,6 +1633,13 @@ impl LauncherApp {
         let settings_tab =
             intent.settings_page.and_then(SettingsTab::from_page).unwrap_or(SettingsTab::General);
         let prefs = source::application::load_settings();
+        // 批次 T：`AppSettings` 不再是 `Copy`（多了一张引擎表），下面 `prefs` 要按值进结构体，
+        // 所以这三样初值先取出来，不做整串 clone。
+        let hotkey_active = prefs.toggle_hotkey;
+        let typeback_active = prefs.typeback_hotkey;
+        let typeback_draft = prefs
+            .typeback_hotkey
+            .map(|s| HotkeySpec { mods: s.mods_named(), vk: s.vk });
         let mut seed = Self {
             query: String::new(), clear_query_next_frame: false, items,
             index: matching::MatchIndex::default(),
@@ -1530,15 +1663,13 @@ impl LauncherApp {
             toast: None,
             hotkey_recording: false,
             // 先按配置值显示；第一帧再从 HOTKEY_ACTIVE 校正（启动可能退回过出厂值）。
-            hotkey_active: prefs.toggle_hotkey,
+            hotkey_active,
             hotkey_awaiting: None,
             hotkey_synced: false,
             // 批次 R：补字符键。同一套"先按配置显示、第一帧按系统真值校正"的口径。
             // 草稿把 NOREPEAT 剥掉：四个复选框读写的是实义修饰位，注册时才补回 NOREPEAT。
-            typeback_active: prefs.typeback_hotkey,
-            typeback_draft: prefs
-                .typeback_hotkey
-                .map(|s| HotkeySpec { mods: s.mods_named(), vk: s.vk }),
+            typeback_active,
+            typeback_draft,
             typeback_awaiting: None,
             typeback_armed: false,
             keypick_suspended: false,
@@ -2553,6 +2684,47 @@ impl LauncherApp {
         true
     }
 
+    /// 补全提示行不可执行（需求书把空词这一格定为 `valid=false`）：Enter/点击/数字键
+    /// 落到它身上时统一给这一句。
+    fn hint_toast(&mut self, ctx: &egui::Context) {
+        self.toast = Some((
+            "继续输入关键词后再回车".to_string(),
+            Instant::now() + TOAST_TTL,
+            TOAST_OK,
+        ));
+        ctx.request_repaint_after(TOAST_TTL);
+    }
+
+    /// 批次 T：搜索行的「执行」＝用默认浏览器打开 URL，然后关到托盘。
+    /// **刻意不走 `launch_and_hide`**：那条路把 `entry.arguments` 原样写日志，而这里的 URL
+    /// 含用户敲的查询词（`?q=…`）——批次 P 定的口径是「绝不记查询框原文」。所以日志只记引擎 id，
+    /// URL 本身也不记（它同样带着查询词）。
+    fn open_search_hit(&mut self, ctx: &egui::Context, hit: &source::websearch::SearchHit) -> bool {
+        match shell_execute(&hit.url, "", None) {
+            Ok(_) => eprintln!(
+                "websearch: 已用默认浏览器打开（引擎 {}，查询原文不落日志）",
+                hit.engine_id
+            ),
+            Err(e) => {
+                eprintln!("websearch: 打开失败（引擎 {}）：{e}", hit.engine_id);
+                self.toast = Some((
+                    format!("⚠ 打开失败：{e}"),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_ERR,
+                ));
+                ctx.request_repaint_after(TOAST_TTL);
+                return false;
+            }
+        }
+        self.toast = None;
+        self.clear_query_next_frame = true;
+        self.selected = 0;
+        self.visible = false;
+        self.on_hide();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        true
+    }
+
     /// 把当前整张清单写盘（种子播种一次后即普通用户项，不再剔除）。
     fn save_items(&self) {
         source::application::save_user_items(&self.items);
@@ -2614,6 +2786,45 @@ impl LauncherApp {
     /// 时间戳只喂学习位序这一层，不参与打分、也不参与档位闸门。
     fn results(&mut self) -> Vec<usize> {
         self.index.search(&self.query, &self.items, self.prefs.learn_rank, now_ms())
+    }
+
+    /// FR-SRC-10：当前查询能不能求出一个计算器结果行。纯函数、每帧现算（词法+递归下降，
+    /// 输入是搜索框里那几个字符），语法不通返回 `None` ⇒ 列表里根本没有这一行。
+    /// 「今天」由 `today_day()` 现场取本地历日，日期加减那几档才跟着系统日期走。
+    fn calc_row(&self) -> Option<source::calc::CalcHit> {
+        source::calc::evaluate(&self.query, source::calc::today_day())
+    }
+
+    /// 批次 T：本帧列表的完整计划（头段 + 应用结果）。
+    ///
+    /// 独占只在首词后出现过空格时成立（`has_rest`）——`g` 这个单字还可能是 `git` 的开头，
+    /// 那时让应用结果整段消失等于打断用户正在打的词。
+    fn plan(&mut self) -> Plan {
+        match exclusive_for(&self.prefs.web_engines, &self.query) {
+            source::websearch::Exclusive::Rows(hits) => Plan {
+                head: hits.into_iter().map(HeadRow::Search).collect(),
+                results: Vec::new(),
+            },
+            source::websearch::Exclusive::Hints(hints) => Plan {
+                head: hints.into_iter().map(HeadRow::Hint).collect(),
+                results: Vec::new(),
+            },
+            source::websearch::Exclusive::NotOurs => {
+                let mut head: Vec<HeadRow> =
+                    self.calc_row().map(HeadRow::Calc).into_iter().collect();
+                let results = self.results();
+                // FR-QRY-08 兜底：应用一条没中、计算器也没结果 ⇒ 给出网页搜索行，
+                // 免得用户对着「未找到」只能按 Enter 新建条目。空查询不兜底（源里自己判空）。
+                if head.is_empty() && results.is_empty() {
+                    let hits =
+                        source::websearch::fallback_rows(&self.prefs.web_engines, &self.query);
+                    if !hits.is_empty() {
+                        head = hits.into_iter().map(HeadRow::Search).collect();
+                    }
+                }
+                Plan { head, results }
+            }
+        }
     }
 }
 
@@ -2809,6 +3020,10 @@ impl eframe::App for LauncherApp {
         let mut launch: Option<LaunchItem> = None;
         let mut launch_from_list = false;
         let mut launch_via_digit = false; // 提交即学别名要剥掉尾数字，见 learn_alias 调用处
+        // FR-SRC-10：计算器行的「执行」不启动进程，只把结果数字送进剪贴板（与 launch 互斥）。
+        let mut copy_text: Option<String> = None;
+        // FR-SRC-11：搜索行的「执行」＝打开 URL（独立函数，日志口径见 `open_search_hit`）。
+        let mut open_hit: Option<source::websearch::SearchHit> = None;
         let mut row_actions: Vec<String> = Vec::new();
         let mut pin_toggles: Vec<String> = Vec::new();
 
@@ -2823,6 +3038,8 @@ impl eframe::App for LauncherApp {
         // 1-9/0 与 Ctrl+1-9/0=执行第 N 行（FR-ACT-10，2026-10-17）。
         // Space=执行选中项（FR-ACT-01 的 space_to_run，四档 off/word/unique/always，默认 word；
         // 判据与各自代价见设置页「空格执行选中项」）。Shift+空格 恒为插入真空格，不受档位影响。
+        // FR-SRC-10（批次 S）：查询能算出一个数时列表第 0 行是计算器行。它的「执行」＝复制纯数字
+        // 再关到托盘，走 Enter / 点击 / 数字键这三条；空格与 Tab 补全在选中它时整体不接管。
         // 鼠标中键不再执行任何条目（2026-10-18 用户裁定废弃），移动窗口改由「左键拖空白」承担，见下方同名注释块。
         // consume_key 精确匹配修饰键并吃掉事件，防与 TextEdit/其他控件的键位打架。
         if self.visible && !recording && self.dialog.is_none() && self.confirm.is_none() {
@@ -2921,31 +3138,42 @@ impl eframe::App for LauncherApp {
                         self.prefs.space_to_run
                     );
                 }
-                // `results()` 要 `&mut self`（缓存键表），与下面 `&self.query`/`&self.items`
+                // `plan()` 要 `&mut self`（缓存键表），与下面 `&self.query`/`&self.items`
                 // 冲突，所以先落一个局部副本；只在真的按下空格时才算这一次过滤。
-                let space_results = if space_down && !hit_shift_space {
-                    self.results()
-                } else {
-                    Vec::new()
-                };
+                let mut space_head_len = 0usize;
+                let mut space_results: Vec<usize> = Vec::new();
+                if space_down && !hit_shift_space {
+                    let plan = self.plan();
+                    space_head_len = plan.head.len();
+                    space_results = plan.results;
+                }
+                // 批次 S/T：选中行在头段（计算器/搜索/提示）⇒ 空格整体不接管（那些行的执行入口
+                // 是 Enter/点击/数字键）。`item_rank` 同时把「合并行号」换算成 `space_executes`
+                // 要的名次——头段占了前几行时名次得整体后移，否则四档判据会错位。
+                let space_rank = item_rank(self.selected, space_head_len);
                 let space_takes = space_down
                     && !hit_shift_space
-                    && matching::space_executes(
-                        self.prefs.space_to_run,
-                        &self.query,
-                        &self.items,
-                        &space_results,
-                        self.selected,
-                    );
+                    && space_rank.is_some_and(|rank| {
+                        matching::space_executes(
+                            self.prefs.space_to_run,
+                            &self.query,
+                            &self.items,
+                            &space_results,
+                            rank,
+                        )
+                    });
                 let hit_space = space_takes
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
                 if space_down && !hit_shift_space && !hit_space {
                     // 反向判据也要留痕：注入实测要看的就是"这一按空格到底进没进输入框"。
-                    let n = self.results().len();
+                    // 【2026-10-20 批次 S 顺带修掉一处隐私漏词】这行原本把 `self.query` 原样写进
+                    // 日志——与批次 P 定的「绝不记查询框原文」冲突，改成只记档位/条数/选中行号。
                     eprintln!(
-                        "空格未接管（档位 {}，查询 {:?}，结果 {n} 条）：键事件留给输入框当文本",
+                        "空格未接管（档位 {}，结果 {} 条，头段 {} 行，选中第 {} 行）：键事件留给输入框当文本",
                         self.prefs.space_to_run.as_str(),
-                        self.query
+                        space_results.len(),
+                        space_head_len,
+                        self.selected + 1
                     );
                 }
 
@@ -2962,10 +3190,16 @@ impl eframe::App for LauncherApp {
                     ui.ctx().request_repaint_after(TOAST_TTL);
                     eprintln!("快捷键 Ctrl+I：批量导入全部 已触发（后台扫描开始菜单/桌面）");
                 } else if hit_e || hit_cd || hit_del || hit_csd || hit_cp {
-                    let results = self.results();
-                    let idx = self.selected.min(results.len().saturating_sub(1));
+                    // 头段行（计算器/搜索/提示）没有条目身份 ⇒ 编辑/删除/置顶/打开目录这四档
+                    // 整体不适用。判据只落在 `sel` 这一层：选中头段 ⇒ 拿不到条目，下面的动作原样跳过。
+                    let plan = self.plan();
+                    let item_row = item_rank(self.selected, plan.head.len());
+                    if item_row.is_none() {
+                        eprintln!("快捷键 编辑/删除/置顶/开目录：选中的是头段结果行，这四档不适用");
+                    }
+                    let results = plan.results;
                     // search 返回下标而不是引用：调用方接下来要改 self.items。
-                    let sel = results.get(idx).map(|i| self.items[*i].clone());
+                    let sel = item_row.and_then(|r| results.get(r).map(|i| self.items[*i].clone()));
                     // 身份一律用派生 uid（同 path 不同参数是两个条目），path 只作数据用。
                     if let Some(s) = sel {
                         let uid = s.uid();
@@ -3020,7 +3254,9 @@ impl eframe::App for LauncherApp {
                         }
                     }
                 } else if hit_pgup || hit_pgdn {
-                    let len = self.results().len();
+                    // 翻页/循环全按「合并行号」走：头段那几行也是可停的行。
+                    let plan = self.plan();
+                    let len = row_count(plan.results.len(), plan.head.len());
                     if len > 0 {
                         let rows = page_rows(ui.available_height());
                         self.selected = page_target(self.selected, rows, len, hit_pgdn);
@@ -3034,7 +3270,8 @@ impl eframe::App for LauncherApp {
                     // 与 Tab/Shift+Tab 同口径（回绕循环，不是 ↑↓ 的钳位），差别只有一点：
                     // 这对键**永远只导航**，不会被 tab_mode=Complete 的补全抢走 ——
                     // 补全优先模式下想要一条稳定的「下一条/上一条」通道就靠它。
-                    let len = self.results().len();
+                    let plan = self.plan();
+                    let len = row_count(plan.results.len(), plan.head.len());
                     if len > 0 {
                         let cur = self.selected.min(len - 1);
                         self.selected = if hit_ctrl_k {
@@ -3062,8 +3299,10 @@ impl eframe::App for LauncherApp {
                     // Shift+Tab 恒为上一项（两种模式一致）。导航用回绕，与 ↑↓ 的钳位口径不同：
                     // ↑↓ 已复测定型不动，Tab 这一对按 Delphi 的「循环」语义走。
                     self.focus_query = true; // egui 把 Tab/Shift+Tab 判给下一个/上一个控件，焦点会跳一帧
-                    let results = self.results();
-                    let len = results.len();
+                    let plan = self.plan();
+                    let head_len = plan.head.len();
+                    let results = plan.results;
+                    let len = row_count(results.len(), head_len);
                     if len > 0 {
                         let cur = self.selected.min(len - 1);
                         let backward = hit_shift_tab;
@@ -3072,7 +3311,11 @@ impl eframe::App for LauncherApp {
                         } else {
                             (cur + 1) % len
                         };
+                        // 选中头段行时补整也不接管 —— 那一下 Tab 只循环到下一行。头段正是查询串
+                        // 的派生物：从计算器/搜索行补成某个应用名，眼前那一行（或整段独占结果）
+                        // 会当场消失，这个"跳行"比导航更难解释。
                         let complete_to = if backward
+                            || self.selected < head_len
                             || !matches!(self.prefs.tab_mode, TabMode::Complete)
                         {
                             None
@@ -3108,27 +3351,61 @@ impl eframe::App for LauncherApp {
                         eprintln!("快捷键 Tab：当前查询无结果，忽略");
                     }
                 } else if let Some(digit) = hit_digit {
-                    let results = self.results();
-                    match digit_index(digit, results.len()) {
-                        Some(idx) => {
-                            let item = self.items[results[idx]].clone();
-                            eprintln!("快捷键 数字键 {digit}：执行第 {} 行「{}」", idx + 1, item.name);
-                            launch = Some(item);
-                            launch_from_list = true;
-                            launch_via_digit = true;
-                        }
+                    let plan = self.plan();
+                    let head_len = plan.head.len();
+                    let results = plan.results;
+                    let len = row_count(results.len(), head_len);
+                    match digit_index(digit, len) {
+                        Some(idx) => match row_at(idx, results.len(), head_len) {
+                            Some(Row::Head(h)) => match &plan.head[h] {
+                                HeadRow::Calc(hit) => {
+                                    // FR-SRC-10：数字键指到计算器行 ⇒ 与 Enter 同一语义（复制）。
+                                    copy_text = Some(hit.copy.clone());
+                                    eprintln!("快捷键 数字键 {digit}：复制计算器结果（表达式原文不落日志）");
+                                }
+                                HeadRow::Search(hit) => {
+                                    // FR-SRC-11：与 Enter 同一语义（用默认浏览器打开）。
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：网页搜索（引擎 {}，查询原文不落日志）",
+                                        hit.engine_id
+                                    );
+                                    open_hit = Some(hit.clone());
+                                }
+                                HeadRow::Hint(_) => {
+                                    // 需求书把空词这一格定为 valid=false：数字键不执行，只提示。
+                                    eprintln!("快捷键 数字键 {digit}：选中的是补全提示行，不执行");
+                                    self.hint_toast(ui.ctx());
+                                }
+                            },
+                            Some(Row::Item(rank)) => {
+                                let item = self.items[results[rank]].clone();
+                                eprintln!(
+                                    "快捷键 数字键 {digit}：执行第 {} 行「{}」",
+                                    idx + 1,
+                                    item.name
+                                );
+                                launch = Some(item);
+                                launch_from_list = true;
+                                launch_via_digit = true;
+                            }
+                            None => {}
+                        },
                         None => eprintln!(
-                            "快捷键 数字键 {digit}：第 {} 行不存在（共 {} 行），忽略",
-                            if digit == 0 { 10 } else { digit as usize },
-                            results.len()
+                            "快捷键 数字键 {digit}：第 {} 行不存在（共 {len} 行），忽略",
+                            if digit == 0 { 10 } else { digit as usize }
                         ),
                     }
                 } else if hit_space {
-                    let results = self.results();
-                    let idx = self.selected.min(results.len().saturating_sub(1));
-                    if let Some(&h) = results.get(idx) {
-                        let item = self.items[h].clone();
-                        eprintln!("快捷键 空格：执行第 {} 行「{}」", idx + 1, item.name);
+                    let plan = self.plan();
+                    let head_len = plan.head.len();
+                    let results = plan.results;
+                    let len = row_count(results.len(), head_len);
+                    // 选中头段行时 `space_takes` 已为假 ⇒ 这里只可能拿到条目行；None 分支不用管。
+                    if let Some(Row::Item(rank)) =
+                        row_at(self.selected.min(len.saturating_sub(1)), results.len(), head_len)
+                    {
+                        let item = self.items[results[rank]].clone();
+                        eprintln!("快捷键 空格：执行第 {} 行「{}」", rank + 1 + head_len, item.name);
                         launch = Some(item);
                         launch_from_list = true;
                     }
@@ -3272,8 +3549,13 @@ impl eframe::App for LauncherApp {
             ui.separator();
 
             let q = self.query.trim().to_lowercase();
-            let results = self.results();
-            if results.is_empty() {
+            // 批次 S/T：列表 = 头段（计算器/搜索/提示）+ 应用结果，`self.selected` 按「合并行号」计
+            //（换算全走 `row_at`/`item_rank` 这两个纯函数，见它们各自的判据注释）。
+            let plan = self.plan();
+            let head_len = plan.head.len();
+            let results = plan.results;
+            let total = row_count(results.len(), head_len);
+            if total == 0 {
                 if q.is_empty() {
                     ui.label("清单为空——按 Ctrl+N 或点右上「＋」新建，或按 Ctrl+I 批量导入。");
                 } else {
@@ -3291,18 +3573,29 @@ impl eframe::App for LauncherApp {
                     }
                 }
             } else {
-                if self.selected >= results.len() {
+                if self.selected >= total {
                     self.selected = 0;
                 }
                 // 键盘导航：↑↓ 移动选中，Enter 运行选中项。对话框/确认框开着时让位给它们（Enter=确定）。
                 if self.dialog.is_none() && self.confirm.is_none() {
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                        self.selected = (self.selected + 1).min(results.len() - 1);
+                        self.selected = (self.selected + 1).min(total - 1);
                     } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                         self.selected = self.selected.saturating_sub(1);
                     } else if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        launch = Some(self.items[results[self.selected]].clone());
-                        launch_from_list = true;
+                        match row_at(self.selected, results.len(), head_len) {
+                            // FR-SRC-10 的 `text` 动作：Enter 只把纯数字放进剪贴板，然后关到托盘。
+                            Some(Row::Head(h)) => match &plan.head[h] {
+                                HeadRow::Calc(hit) => copy_text = Some(hit.copy.clone()),
+                                HeadRow::Search(hit) => open_hit = Some(hit.clone()),
+                                HeadRow::Hint(_) => self.hint_toast(ui.ctx()),
+                            },
+                            Some(Row::Item(rank)) => {
+                                launch = Some(self.items[results[rank]].clone());
+                                launch_from_list = true;
+                            }
+                            None => {}
+                        }
                     }
                 }
                 // 列表滚动跟随选中项（FR-ACT-10 验收项）：只在选中变化的那一帧把它居中，
@@ -3313,24 +3606,100 @@ impl eframe::App for LauncherApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (idx, &hit) in results.iter().enumerate() {
+                        for (h, row) in plan.head.iter().enumerate() {
+                            let is_sel = self.selected == h;
+                            match row {
+                                HeadRow::Calc(hit) => {
+                                    // 标题只有数字（`= 600`），单位/进制/来源同一行弱色副标题；
+                                    // 复制走 `hit.copy`——不带千分位、不带单位，粘进别的程序就是一串数字。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "复制");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("=")
+                                                    .monospace()
+                                                    .size(20.0)
+                                                    .weak(),
+                                            ),
+                                        )
+                                        .on_hover_text(source::calc::ROW_TAG);
+                                        let sel = ui.selectable_label(is_sel, hit.title.clone());
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            copy_text = Some(hit.copy.clone());
+                                        }
+                                        sel.context_menu(|ui| {
+                                            if ui.button("复制结果").clicked() {
+                                                copy_text = Some(hit.copy.clone());
+                                                ui.close();
+                                            }
+                                        });
+                                    });
+                                }
+                                HeadRow::Search(hit) => {
+                                    // FR-SRC-11：标题是「Google「词」」，副标题给域名与执行提示。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "搜索");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("\u{1F50D}").size(18.0).weak(),
+                                            ),
+                                        )
+                                        .on_hover_text("网页搜索（FR-SRC-11）");
+                                        let sel = ui.selectable_label(is_sel, hit.title.clone());
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            open_hit = Some(hit.clone());
+                                        }
+                                    });
+                                }
+                                HeadRow::Hint(hint) => {
+                                    // 不可执行行：弱色显示，点/按只给一句 Toast（`hint_toast`）。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "查看");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("…").monospace().size(18.0).weak(),
+                                            ),
+                                        );
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            self.hint_toast(ui.ctx());
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        for (rank, &hit) in results.iter().enumerate() {
+                            let idx = rank + head_len;
                             let item = &self.items[hit];
                             let is_sel = idx == self.selected;
                             ui.horizontal(|ui| {
                                 // 行号徽标（2026-10-18 用户要求：数字键没有可见对应物）：
                                 // 前 10 行标 1-9/0，第 11 行起留白——那里没有按键，标了反而误导。
-                                match row_num_label(idx) {
-                                    Some(num) => {
-                                        ui.add_sized(
-                                            [14.0, 32.0],
-                                            egui::Label::new(
-                                                egui::RichText::new(num).monospace().weak(),
-                                            ),
-                                        )
-                                        .on_hover_text(format!("按 {num} 直接执行本行"));
-                                    }
-                                    None => ui.add_space(14.0),
-                                }
+                                row_badge(ui, idx, "执行");
                                 if let Some(texture) = self.icons.get(&item.source_path) {
                                     ui.image(egui::load::SizedTexture::new(texture.id(), egui::vec2(32.0, 32.0)));
                                 } else {
@@ -3639,6 +4008,47 @@ impl eframe::App for LauncherApp {
             if started && launch_from_list {
                 // FR-SRC-19 补全「提交即学别名」（口径与门槛见 learn_alias）。
                 self.mark_used(&entry.uid(), &commit_word(&self.query, launch_via_digit));
+            }
+        }
+
+        // FR-SRC-11：搜索行的「执行」＝用默认浏览器打开 + 关到托盘。与上两段互斥：
+        // 头段一次只会产生其中一个动作（计算器复制 / 搜索打开 / 条目启动）。
+        if let Some(hit) = open_hit {
+            self.open_search_hit(ui.ctx(), &hit);
+        }
+
+        // FR-SRC-10：计算器行的「执行」＝复制纯数字 + 关到托盘（需求原文把它列成 `text` 动作，
+        // 不是 `run`——算式结果不该启动任何进程）。与上面那段互斥：选中计算器行时不会产生 LaunchItem。
+        // 复制失败不隐藏，与 FR-ACT-02 启动失败同一口径：窗口留在原地把原因显示出来。
+        if let Some(text) = copy_text {
+            match copy_to_clipboard(&text) {
+                Ok(()) => {
+                    // 表达式原文不落日志（FR-SYS-03 隐私口径）⇒ 只记长度与成败。
+                    eprintln!(
+                        "计算器：结果已复制（{} 个字符，表达式原文不落日志）→ 关闭到托盘",
+                        text.chars().count()
+                    );
+                    self.toast = Some((
+                        format!("✓ 已复制 {text}"),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_OK,
+                    ));
+                    self.clear_query_next_frame = true;
+                    self.selected = 0;
+                    self.visible = false;
+                    self.on_hide();
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    ui.ctx().request_repaint_after(TOAST_TTL);
+                }
+                Err(e) => {
+                    self.toast = Some((
+                        format!("⚠ 复制失败：{e}"),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_ERR,
+                    ));
+                    ui.ctx().request_repaint_after(TOAST_TTL);
+                    eprintln!("计算器：复制失败（{e}）");
+                }
             }
         }
 
@@ -3953,6 +4363,76 @@ mod nav_tests {
         assert_eq!(page_target(95, 9, 100, true), 99, "向下夹到最后一行，不越过");
         assert_eq!(page_target(3, 9, 100, false), 0, "向上夹到第一行");
         assert_eq!(page_target(0, 9, 0, true), 0, "空结果不塌陷（len-1 的减法不许下溢）");
+    }
+
+    // ---- 头段（计算器/搜索/提示）并入列表后的行模型（批次 S / T）----
+
+    #[test]
+    fn row_count_adds_the_head_rows_only_when_present() {
+        assert_eq!(row_count(0, 0), 0, "空清单空查询：一行都没有");
+        assert_eq!(row_count(3, 0), 3);
+        assert_eq!(row_count(0, 1), 1, "算式没有条目命中时，列表里就只剩计算器那一行");
+        assert_eq!(row_count(3, 1), 4);
+        assert_eq!(row_count(0, 2), 2, "头段可以不止一行（未来多源并列）");
+        assert_eq!(row_count(3, 2), 5);
+    }
+
+    #[test]
+    fn row_at_puts_the_head_rows_first_and_offsets_the_items() {
+        // 下标表照 MatchIndex::search 的真实产出构造（名次 → self.items 下标）。
+        let results = [7, 2, 9];
+        assert_eq!(row_at(0, results.len(), 1), Some(Row::Head(0)));
+        assert_eq!(row_at(1, results.len(), 1), Some(Row::Item(0)), "第 1 行是第 0 名");
+        assert_eq!(row_at(3, results.len(), 1), Some(Row::Item(2)));
+        assert_eq!(row_at(4, results.len(), 1), None, "越界不给行，调用方什么都不做");
+        // 头段不在场时，合并行号就是名次——这条是"批次 S 之前的行为一个字没变"的证据。
+        assert_eq!(row_at(0, results.len(), 0), Some(Row::Item(0)));
+        assert_eq!(row_at(2, results.len(), 0), Some(Row::Item(2)));
+        assert_eq!(row_at(3, results.len(), 0), None);
+        assert_eq!(row_at(0, 0, 1), Some(Row::Head(0)), "只有计算器一行时第 0 行仍在");
+        // 头段两行（假想的多源并列）：第 0/1 行归头段，应用从第 2 行起。
+        assert_eq!(row_at(1, results.len(), 2), Some(Row::Head(1)));
+        assert_eq!(row_at(2, results.len(), 2), Some(Row::Item(0)));
+        assert_eq!(row_at(4, results.len(), 2), Some(Row::Item(2)));
+    }
+
+    #[test]
+    fn item_rank_refuses_head_rows_and_renumbers_the_rest() {
+        // 空格四档与"编辑/删除/置顶/开目录"这四档都要它：选中头段 ⇒ None（不接管）。
+        assert_eq!(item_rank(0, 1), None);
+        assert_eq!(item_rank(0, 0), Some(0), "头段不在场，第 0 行就是第 0 名");
+        assert_eq!(item_rank(1, 1), Some(0));
+        assert_eq!(item_rank(5, 1), Some(4));
+        // 关键一行：头段两行时 selected=1 也算头段，减法不许下溢。
+        assert_eq!(item_rank(1, 2), None);
+        assert_eq!(item_rank(2, 2), Some(0));
+    }
+
+    #[test]
+    fn exclusive_needs_a_space_after_the_first_word() {
+        use source::websearch::Exclusive;
+        let engines = source::websearch::builtin_engines();
+        // 首词后没空格 ⇒ 普通搜索（`g` 可能是 `git` 的开头）。
+        assert_eq!(exclusive_for(&engines, "g"), Exclusive::NotOurs);
+        assert_eq!(exclusive_for(&engines, "G"), Exclusive::NotOurs);
+        // 首词 + 空格 = 独占：没词只剩补全提示，有词就是可执行行。
+        assert!(matches!(exclusive_for(&engines, "g "), Exclusive::Hints(_)));
+        assert!(matches!(exclusive_for(&engines, "G foo"), Exclusive::Rows(_)));
+        // 前缀/别的词不是引擎关键字。
+        assert_eq!(exclusive_for(&engines, "goo x"), Exclusive::NotOurs);
+        assert_eq!(exclusive_for(&engines, "zzz "), Exclusive::NotOurs);
+    }
+
+    #[test]
+    fn digit_rows_land_on_the_head_rows_first() {
+        // 数字键走的是「合并行号」：计算器在场时按 1 复制数字，按 2 才是原来的第一条。
+        let results = [7, 2];
+        let head_len = 1;
+        let len = row_count(results.len(), head_len);
+        assert_eq!(row_at(digit_index(1, len).unwrap(), results.len(), head_len), Some(Row::Head(0)));
+        assert_eq!(row_at(digit_index(2, len).unwrap(), results.len(), head_len), Some(Row::Item(0)));
+        assert_eq!(row_at(digit_index(3, len).unwrap(), results.len(), head_len), Some(Row::Item(1)));
+        assert_eq!(digit_index(4, len), None, "共三行时按 4 不该指到任何行");
     }
 
     #[test]

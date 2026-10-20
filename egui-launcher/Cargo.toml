@@ -33,6 +33,13 @@ features = [
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    # FR-SRC-10 计算器：Enter 把结果写进剪贴板。剪贴板三件套在 DataExchange；
+    # CF_UNICODETEXT 常量在 Win32_System_Ole 但 SetClipboardData 收 u32 ⇒ 传裸 13，不为一个数字多开一条。
+    "Win32_System_DataExchange",
+    # GlobalAlloc/GlobalLock/GlobalUnlock（剪贴板要求的可移动内存块）。
+    # 【2026-10-20 更正】批次 S 动手前我记的是「Memory 模块没有 feature 门、已随 Win32_Foundation 白送」，
+    # 编译直接 E0432 打脸：它就在 `#[cfg(feature = "Win32_System_Memory")]` 后面。本批净新增 2 条 feature。
+    "Win32_System_Memory",
     "Win32_System_Environment",
     "Win32_System_SystemInformation",
     "Win32_System_LibraryLoader",

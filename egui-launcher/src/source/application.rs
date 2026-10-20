@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
+use super::websearch;
 use serde::{Deserialize, Serialize};
 use pinyin::ToPinyin;
 use windows::core::Interface;
@@ -198,7 +199,11 @@ pub fn save_user_items(items: &[LaunchItem]) {
 
 /// 用户偏好（`settings.json`，与清单同目录、同样便携优先）。
 /// 只放真实生效的开关——不设无功能的占位项（设置页立规同口径）。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+///
+/// 批次 T 起不再是 `Copy`：`web_engines` 是一张可变长的表，而这张表要能被用户手改。
+/// 代价实测出来一处：`Self::new` 里原本在把 `prefs` 按值放进结构体**之后**还读它的两个热键字段，
+/// 不再是 `Copy` 就编译不过 ⇒ 那三个初值改成先取出来（`src/main.rs:1608` 起）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
     /// 空格执行选中项（FR-ACT-01 的 `space_to_run`，Delphi 版 ALTRun 同名字段）。
     /// 批次 J（2026-10-18 用户裁定）由 bool 扩成四档，见 [`SpaceRun`]。
@@ -224,6 +229,13 @@ pub struct AppSettings {
     /// 这个热键就是把字符还回去的出口。`None` = 不启用。
     #[serde(default)]
     pub typeback_hotkey: Option<HotkeySpec>,
+
+    /// 网页搜索引擎表（FR-SRC-11，批次 T）。字段缺省＝[`websearch::builtin_engines`] 那九条，
+    /// 所以旧 `settings.json` 照旧解析、不写就不丢内置项。
+    /// 本批**没有编辑入口**：设置页还没有「数据源 / 网页搜索」那一页（与 FR-CFG-04 的偏差已登记），
+    /// 要加自定义引擎目前只能手改这个文件——需求书 TC 11-1 那条 `localhost:{query|8000}` 就是这么验的。
+    #[serde(default = "crate::source::websearch::builtin_engines")]
+    pub web_engines: Vec<websearch::WebEngine>,
 }
 
 // ---- FR-WIN-02 全局呼出热键（批次 Q）----
