@@ -15,7 +15,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::source::application::{LaunchItem, LearnRank, SpaceRun};
+use crate::source::application::{ItemKind, LaunchItem, LearnRank, SpaceRun};
 
 /// FR-QRY-07 结果上限。
 const MAX_RESULTS: usize = 50;
@@ -79,10 +79,25 @@ pub struct MatchKeys {
 
 impl MatchKeys {
     fn build(item: &LaunchItem) -> MatchKeys {
-        MatchKeys {
-            name: Key::new(&item.name),
-            aliases: item.keyword.split_whitespace().filter_map(Key::new).collect(),
+        let mut aliases: Vec<Key> =
+            item.keyword.split_whitespace().filter_map(Key::new).collect();
+        // FR-SRC-05：`file`/`folder` 额外用「目标名」参与匹配——文件去扩展名的文件名、
+        // 文件夹名，以及它的拼音首字母（中文目录名只有一个关键词 `文档` 时，敲 `wd` 也得命中）。
+        // 与别名同放一个列表：别名本就是"刻意设置的触发码"，目标名对这两类条目也是同一个地位。
+        if matches!(item.kind, ItemKind::File | ItemKind::Folder) {
+            if let Some(stem) = crate::source::application::target_stem(item) {
+                if let Some(key) = Key::new(&stem) {
+                    aliases.push(key);
+                }
+                let pinyin = crate::source::application::default_keyword(&stem);
+                if !pinyin.is_empty() {
+                    if let Some(key) = Key::new(&pinyin) {
+                        aliases.push(key);
+                    }
+                }
+            }
         }
+        MatchKeys { name: Key::new(&item.name), aliases }
     }
     fn name_chars(&self) -> usize {
         self.name.as_ref().map_or(0, |k| k.chars)
@@ -126,6 +141,10 @@ impl MatchIndex {
         for it in items {
             it.name.hash(&mut h);
             it.keyword.hash(&mut h);
+            // 批次 U：file/folder 的目标名键由 path 派生、由 kind 决定要不要建 ⇒ 两者都得进指纹，
+            // 否则编辑路径后键表不重算（改 `C:\a.txt` → `C:\b.txt` 仍按旧名匹配）。
+            it.path.hash(&mut h);
+            it.kind.label().hash(&mut h);
         }
         h.finish()
     }

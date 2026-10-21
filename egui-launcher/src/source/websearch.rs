@@ -108,11 +108,17 @@ fn slot_of(inner: &str) -> Slot<'_> {
     }
 }
 
-/// 把 `query` 填进模板的所有 `{query}` / `{query|默认值}`。
+/// 把 `query` 填进模板的所有 `{query}` / `{query|默认值}`（网页搜索口径：百分号编码）。
 /// 返回 `None` = 空词且某个占位符没有默认值 ⇒ 需求书那条 `valid=false`。
 pub fn fill_template(url: &str, query: &str) -> Option<String> {
-    let mut out = String::with_capacity(url.len() + query.len());
-    let mut rest = url;
+    fill_template_with(url, query, true)
+}
+
+/// 同上，但由调用方决定要不要编码。批次 U 的 FR-SRC-05 命令源复用这套 `{query}` 语法：
+/// URL 目标要编码（空格→`%20`），命令行参数必须原样（`ping 10.0.0.1` 不能变成 `%20`）。
+pub fn fill_template_with(template: &str, query: &str, encode: bool) -> Option<String> {
+    let mut out = String::with_capacity(template.len() + query.len());
+    let mut rest = template;
     while let Some(pos) = rest.find('{') {
         out.push_str(&rest[..pos]);
         let after = &rest[pos + 1..];
@@ -121,15 +127,21 @@ pub fn fill_template(url: &str, query: &str) -> Option<String> {
                 if query.is_empty() {
                     return None;
                 }
-                out.push_str(&percent_encode(query));
+                if encode {
+                    out.push_str(&percent_encode(query));
+                } else {
+                    out.push_str(query);
+                }
                 rest = &rest[pos + 1 + end + 1..];
             }
             Some((end, Slot::WithDefault(def))) => {
                 // 默认值属于模板而不是用户输入 ⇒ 原样插入、不编码。
                 if query.is_empty() {
                     out.push_str(def);
-                } else {
+                } else if encode {
                     out.push_str(&percent_encode(query));
+                } else {
+                    out.push_str(query);
                 }
                 rest = &rest[pos + 1 + end + 1..];
             }

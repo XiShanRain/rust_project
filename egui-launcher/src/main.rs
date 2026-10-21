@@ -88,6 +88,9 @@ const TOAST_TTL: Duration = Duration::from_secs(3);
 const TOAST_FADE: Duration = Duration::from_millis(400);
 const TOAST_ERR: egui::Color32 = egui::Color32::from_rgb(255, 156, 146);
 const TOAST_OK: egui::Color32 = egui::Color32::from_rgb(140, 220, 150);
+/// FR-SRC-06：可见期内重算路径四态的最小间隔。拔插 U 盘不需要秒级响应，
+/// 但用户往往"插上就呼出"，3 秒足够避开窗口刚打开那一瞬。
+const PATH_RESCAN_INTERVAL: Duration = Duration::from_secs(3);
 
 // FR-SRC-21 单实例：命名互斥体 + WM_COPYDATA 转发
 const SINGLE_INSTANCE_MUTEX: &str = "Local\\XiShan.EguiLauncher.SingleInstance";
@@ -523,6 +526,13 @@ struct LauncherApp {
     icon_rx: mpsc::Receiver<(String, Vec<u8>, u32, u32)>,
     icon_tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, // 常驻，可 clone 给每批新项再起加载器
     icons: std::collections::HashMap<String, egui::TextureHandle>, // source_path → 纹理
+    // ---- 批次 U：FR-SRC-06 路径四态（后台线程算、主线程按 uid 缓存）----
+    path_tx: mpsc::Sender<Vec<(String, source::pathcheck::PathState)>>,
+    path_rx: mpsc::Receiver<Vec<(String, source::pathcheck::PathState)>>,
+    path_states: std::collections::HashMap<String, source::pathcheck::PathState>,
+    /// 有一轮检查还没回来（UNC 断线可能挂很久）⇒ 不再派新一轮，避免线程堆积。
+    path_in_flight: bool,
+    path_scanned_at: Instant,
     tray_rx: mpsc::Receiver<TrayEvent>,
     hotkey_rx: mpsc::Receiver<()>,
     // FR-SRC-21：主实例收二次进程转发（Activate/AddPath/Ping/Preferences/AddBatch）。
@@ -717,6 +727,15 @@ fn row_badge(ui: &mut egui::Ui, idx: usize, verb: &str) {
     }
 }
 
+/// FR-SRC-06：路径四态在行尾的颜色。Offline 是"介质不在"（提示性），Not found 才像"写错了"。
+fn path_state_color(state: source::pathcheck::PathState) -> egui::Color32 {
+    match state {
+        source::pathcheck::PathState::Offline => egui::Color32::from_rgb(235, 175, 95),
+        source::pathcheck::PathState::NotFound => TOAST_ERR,
+        _ => egui::Color32::GRAY,
+    }
+}
+
 // ---- FR-SRC-10 / FR-SRC-11 结果行并入列表的行模型（批次 S / T）----
 
 /// 列表头段（应用结果之前的那几行）的一行。头段次序照需求书 4.1.2 的分值偏移：
@@ -727,6 +746,22 @@ enum HeadRow {
     Search(source::websearch::SearchHit),
     /// 空词独占（`g `）时的补全提示。不可执行：`Enter` / 数字键只给 Toast。
     Hint(source::websearch::EngineHint),
+    /// 批次 U（FR-SRC-05）：自定义命令的独占行（`kw 参数`，`{query}` 已填好）。
+    Custom(source::custom::CustomHit),
+    /// 自定义命令「还缺一个参数」的提示行：不可执行，Enter 补全成 `"kw "`。
+    CustomHint(source::custom::CustomHint),
+}
+
+impl HeadRow {
+    /// 这一行是否代表清单里真实的一条自定义命令（提示行与独占行都算）⇒ 编辑/删除对它有意义。
+    /// 计算器、网页搜索、引擎提示三类头段没有条目身份，返回 `None`。
+    fn custom_uid(&self) -> Option<&str> {
+        match self {
+            HeadRow::Custom(hit) => Some(&hit.uid),
+            HeadRow::CustomHint(hint) => Some(&hint.uid),
+            _ => None,
+        }
+    }
 }
 
 /// 一帧的列表计划。`head` 是头段，`results` 是应用结果的名次表——两者拼起来就是整张列表。
@@ -763,6 +798,17 @@ fn row_at(selected: usize, results_len: usize, head_len: usize) -> Option<Row> {
 /// 选中头段（计算器/搜索/提示）时返回 `None`——那些行不是条目，空格不替它们执行任何程序。
 fn item_rank(selected: usize, head_len: usize) -> Option<usize> {
     (selected >= head_len).then(|| selected - head_len)
+}
+
+/// 提示行代表的那一条从下方结果里摘掉（按 uid）。留着会让清单看着像有两个 `ping`，
+/// 而且那一行的状态色（`Not found` / `Offline`）会被误读成"这条命令坏了"。
+/// `results` 是清单下标表（[`LauncherApp::results`] 的返回值），不是名次。
+fn drop_hinted(
+    results: &mut Vec<usize>,
+    items: &[source::application::LaunchItem],
+    hint: &source::custom::CustomHint,
+) {
+    results.retain(|&i| items[i].uid() != hint.uid);
 }
 
 /// 首词 → 独占判定（FR-QRY-01 / 08）。**首词后没有空格就不算独占**：`g` 这个单字
@@ -862,9 +908,15 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// `shell:` 文件夹、协议（`ms-settings:`）都能覆盖 —— `std::process::Command` 覆盖不了
 /// 协议/URL/Store，故 FR-ACT-02 要求一律走这里。SEE_MASK_FLAG_NO_UI 抑制系统错误框，失败以 Result 返回。
 fn shell_execute(file: &str, params: &str, dir: Option<&str>) -> windows::core::Result<()> {
-    let wfile = wide_z(file);
-    let wparams = wide_z(params);
-    let wdir = dir.map(|d| wide_z(d));
+    // 清单里的路径可能是 `%VAR%` 形态（出厂「启动器目录」用的是 `%LAUNCHER_DIR%`，
+    // 要跟着 exe 搬家）——ShellExecuteExW 不替我们展开，所以在这里统一走一次。
+    // `expand_env` 对未定义的 `%…%` 原样保留，用户写错的变量不会被悄悄吃掉。
+    let file = source::custom::expand_env(file);
+    let params = source::custom::expand_env(params);
+    let dir = dir.map(source::custom::expand_env);
+    let wfile = wide_z(&file);
+    let wparams = wide_z(&params);
+    let wdir = dir.as_ref().map(|d| wide_z(d));
     let mut sei: SHELLEXECUTEINFOW = unsafe { core::mem::zeroed() };
     sei.cbSize = core::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
     sei.fMask = SEE_MASK_FLAG_NO_UI;
@@ -1619,6 +1671,7 @@ impl LauncherApp {
     ) -> Self {
         let (icon_tx, icon_rx) = mpsc::channel();
         let (apps_tx, apps_rx) = mpsc::channel();
+        let (path_tx, path_rx) = mpsc::channel();
         // 清单文件不存在（首次运行）→ 用内置系统工具播种一次并落盘；此后它就是一张普通用户清单，
         // 全部可编辑/删除（对标 Delphi WriteDefaultShortCutList）。文件已存在（哪怕被清空）不覆盖。
         let mut items = if source::application::user_list_exists() {
@@ -1629,10 +1682,25 @@ impl LauncherApp {
             seeds
         };
         items = dedup_items(items);
+        // §4.2.1 出厂命令集的补齐：老清单（settings 里的轮次落后）启动时补一次缺，补完记账。
+        // 只加不删、已有条目一律不动；记账之后删掉的条目不会自己回来（找回用设置页那个按钮）。
+        let mut prefs = source::application::load_settings();
+        if prefs.seed_round < source::application::SEED_ROUND {
+            let added = source::application::merge_missing_seeds(&mut items);
+            if added > 0 {
+                source::application::save_user_items(&items);
+                eprintln!(
+                    "source: 出厂命令集补齐 {added} 条（第 {} 轮，老清单 {} 条）",
+                    source::application::SEED_ROUND,
+                    items.len() - added
+                );
+            }
+            prefs.seed_round = source::application::SEED_ROUND;
+            source::application::save_settings(&prefs);
+        }
         let settings_open = intent.settings_page.is_some();
         let settings_tab =
             intent.settings_page.and_then(SettingsTab::from_page).unwrap_or(SettingsTab::General);
-        let prefs = source::application::load_settings();
         // 批次 T：`AppSettings` 不再是 `Copy`（多了一张引擎表），下面 `prefs` 要按值进结构体，
         // 所以这三样初值先取出来，不做整串 clone。
         let hotkey_active = prefs.toggle_hotkey;
@@ -1645,6 +1713,10 @@ impl LauncherApp {
             index: matching::MatchIndex::default(),
             apps_tx, apps_rx, icon_tx: icon_tx.clone(),
             icons: std::collections::HashMap::new(),
+            path_tx, path_rx,
+            path_states: std::collections::HashMap::new(),
+            path_in_flight: false,
+            path_scanned_at: Instant::now(),
             selected: 0,
             scroll_followed: 0,
             focus_query: intent.visible && intent.dialog.is_none() && !settings_open,
@@ -1678,6 +1750,9 @@ impl LauncherApp {
         let source_paths: Vec<String> =
             seed.items.iter().map(|i| i.source_path.clone()).filter(|p| !p.is_empty()).collect();
         spawn_icon_loader(icon_tx, source_paths);
+        // FR-SRC-06：启动就先在后台算一轮四态，首屏列表（很快会呼出）拿到的是缓存而不是
+        // 现场 I/O；之后呼出与每 3 秒各刷新一次（`refresh_path_states`）。
+        seed.refresh_path_states(true);
         // 启动即直接可见时永远走不到 `show_now()` 的「从不可见到可见」边沿，`on_show()` 里的输入法
         // 切换与失焦武装一次都不跑 ⇒ 冷启动后第一次打字被中文输入法截走（2026-10-18 用户裁定补一次）。
         // 判据取 focus_query（＝首屏就是搜索页）：弹窗/设置页启动时焦点归它们，不能让 on_show 抢回去。
@@ -1685,6 +1760,54 @@ impl LauncherApp {
             seed.on_show();
         }
         seed
+    }
+
+    /// FR-SRC-06：派一轮后台路径四态检查。`force` = 忽略最小间隔（呼出时总想拿最新结果）。
+    /// 同一时刻只跑一波：断开的网络盘会让检查线程挂很久，攒线程没有意义。
+    fn refresh_path_states(&mut self, force: bool) {
+        if self.path_in_flight || self.items.is_empty() {
+            return;
+        }
+        if !force && self.path_scanned_at.elapsed() < PATH_RESCAN_INTERVAL {
+            return;
+        }
+        self.path_in_flight = true;
+        self.path_scanned_at = Instant::now();
+        source::pathcheck::spawn_scan(self.path_tx.clone(), self.items.clone());
+    }
+
+    /// 把查询框整串换成 `text` 并把光标放到末尾。补全的 `text` 来自清单（关键字 + 空格），
+    /// 不是把用户输入回写——所以这条日志可以记。
+    fn complete_query(&mut self, ctx: &egui::Context, text: &str) {
+        let chars = text.chars().count();
+        self.query = text.to_string();
+        self.selected = 0;
+        self.focus_query = true;
+        // 光标位置存在 TextEditState 里，程序化换掉整个字符串不会带着它走（与 Tab 补全同一个坑）。
+        if let Some(mut st) = egui::widgets::text_edit::TextEditState::load(ctx, search_field_id()) {
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(chars),
+            )));
+            st.store(ctx, search_field_id());
+        }
+        ctx.request_repaint();
+        eprintln!("自定义命令：查询补全为「{text}」");
+    }
+
+    /// 提示行被 Enter / 数字键 / 点击激活。查询已经补好（`"ping "`）就只提示"等参数"，
+    /// 否则把关键字 + 空格写进查询框、光标落末尾（需求书 FR-SRC-05 那条 `Enter` 补全）。
+    fn custom_hint_activate(&mut self, ctx: &egui::Context, hint: &source::custom::CustomHint) {
+        if self.query == hint.completion {
+            self.toast = Some((
+                "继续输入参数后再回车".to_string(),
+                Instant::now() + TOAST_TTL,
+                TOAST_OK,
+            ));
+            ctx.request_repaint_after(TOAST_TTL);
+            eprintln!("自定义命令：查询已在「{}」，等待用户输入参数", hint.completion);
+        } else {
+            self.complete_query(ctx, &hint.completion);
+        }
     }
 
     /// FR-SRC-21：IPC 触发的呼出（已显示则只重抢焦点，不再走 on_show 重复切输入法）。
@@ -2381,6 +2504,62 @@ impl LauncherApp {
                                 .weak()
                                 .small(),
                             );
+                            ui.separator();
+                            // FR-SRC-05 / §4.2.1：关键字唯一性提示。只提示、不阻断
+                            // （需求书明写"不阻断启动，避免影响 S3"）；撞名时按清单先后取第一条。
+                            ui.label(egui::RichText::new("关键字重复检查").strong());
+                            let dups = source::custom::duplicate_keywords(&self.items);
+                            if dups.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("没有重复关键字。")
+                                        .weak()
+                                        .small(),
+                                );
+                            } else {
+                                for (word, names) in dups.iter().take(6) {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "⚠ 「{word}」被 {} 条共用：{}",
+                                            names.len(),
+                                            names.join("、")
+                                        ))
+                                        .small()
+                                        .color(TOAST_ERR),
+                                    );
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "触发独占时只认清单里先出现的那一条；学习别名也会算进这张表（同名不阻断使用）。",
+                                    )
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                            ui.separator();
+                            // §4.2.1 / 2026-10-21 用户追加要求：出厂的系统条目被误删后要能找回。
+                            ui.label(egui::RichText::new("出厂命令集").strong());
+                            if ui.button("补回缺失的出厂命令").clicked() {
+                                let added = source::application::merge_missing_seeds(&mut self.items);
+                                if added > 0 {
+                                    self.save_items();
+                                }
+                                eprintln!("设置页：补回缺失的出厂命令 → {added} 条");
+                                let text = if added > 0 {
+                                    format!("✓ 已补回 {added} 条出厂命令")
+                                } else {
+                                    "出厂命令一条不缺，清单没动".to_string()
+                                };
+                                self.toast = Some((text, Instant::now() + TOAST_TTL, TOAST_OK));
+                                ui.ctx().request_repaint_after(TOAST_TTL);
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "只补清单里缺的（按 uid / 名称认已存在），只加不删，改过的条目不动。删掉的内置条目下次启动不会自己回来，要找回就按这里。",
+                                )
+                                .weak()
+                                .small(),
+                            );
                         }
                         SettingsTab::Features => {
                             ui.label(egui::RichText::new("批量导入").strong());
@@ -2615,6 +2794,9 @@ impl LauncherApp {
         // 呼出后把键盘焦点给搜索框（下一帧渲染 TextEdit 时 request_focus）
         self.focus_query = true;
         self.selected = 0;
+        // FR-SRC-06：每次呼出强制重算一轮（刚插上的 U 盘 / 刚恢复的网络盘要立刻反映），
+        // 放在 hwnd 早退之前——没有窗口句柄时四态也该刷新。
+        self.refresh_path_states(true);
         let Some(hwnd) = self.self_hwnd else { return };
         let ime_wnd = unsafe { ImmGetDefaultIMEWnd(hwnd) };
         if ime_wnd.0.is_null() { return; }
@@ -2661,11 +2843,40 @@ impl LauncherApp {
     /// 启动一律走 ShellExecuteExW（FR-ACT-02）。arguments 目前按整串传 lpParameters。
     /// 返回是否真正启动成功——FR-SRC-19 的学习统计只在成功时累计。
     fn launch_and_hide(&mut self, ctx: &egui::Context, entry: &LaunchItem) -> bool {
+        self.launch_with_log(ctx, entry, None)
+    }
+
+    /// 批次 U（FR-SRC-05）：自定义命令的启动。`{query}` 填好之后 path/arguments 里带着
+    /// 用户敲的参数 ⇒ **绝不入日志**（批次 P 口径），只记清单侧身份（name + uid）与成败。
+    fn launch_and_hide_masked(
+        &mut self,
+        ctx: &egui::Context,
+        entry: &LaunchItem,
+        uid: &str,
+    ) -> bool {
+        self.launch_with_log(ctx, entry, Some(uid))
+    }
+
+    fn launch_with_log(
+        &mut self,
+        ctx: &egui::Context,
+        entry: &LaunchItem,
+        masked_uid: Option<&str>,
+    ) -> bool {
         match shell_execute(&entry.path, &entry.arguments, entry.working_dir.as_deref()) {
-            Ok(_) => eprintln!("launch: {} {}", entry.path, entry.arguments),
+            Ok(_) => match masked_uid {
+                None => eprintln!("launch: {} {}", entry.path, entry.arguments),
+                Some(uid) => eprintln!(
+                    "launch(custom): 已启动「{}」（{uid}，填入的路径/参数含查询词，不落日志）",
+                    entry.name
+                ),
+            },
             Err(e) => {
                 // M1 验收：启动失败不崩溃、不隐藏——窗口留在原地显示 Toast，TOAST_TTL 后自动消失。
-                eprintln!("launch failed: {}: {e}", entry.path);
+                match masked_uid {
+                    None => eprintln!("launch failed: {}: {e}", entry.path),
+                    Some(uid) => eprintln!("launch(custom) failed: 「{}」{uid}: {e}", entry.name),
+                }
                 self.toast = Some((
                     format!("⚠ 启动失败：{}（{e}）", entry.name),
                     Instant::now() + TOAST_TTL,
@@ -2799,7 +3010,23 @@ impl LauncherApp {
     ///
     /// 独占只在首词后出现过空格时成立（`has_rest`）——`g` 这个单字还可能是 `git` 的开头，
     /// 那时让应用结果整段消失等于打断用户正在打的词。
+    ///
+    /// 批次 U 起多两层：用户自定义命令**先于**内置网页引擎判定（用户数据压过出厂数据，
+    /// 两者关键字撞码时以清单为准）；`kw` 精确等于某条需要参数的命令关键字时，
+    /// 在头段加一条补全提示行，并把同一条目从下方结果里摘掉（只剩提示行那一处）。
     fn plan(&mut self) -> Plan {
+        match source::custom::exclusive(&self.items, &self.query) {
+            source::custom::Exclusive::Rows(hits) => {
+                return Plan { head: hits.into_iter().map(HeadRow::Custom).collect(), results: Vec::new() };
+            }
+            source::custom::Exclusive::Hints(hints) => {
+                return Plan {
+                    head: hints.into_iter().map(HeadRow::CustomHint).collect(),
+                    results: Vec::new(),
+                };
+            }
+            source::custom::Exclusive::NotOurs => {}
+        }
         match exclusive_for(&self.prefs.web_engines, &self.query) {
             source::websearch::Exclusive::Rows(hits) => Plan {
                 head: hits.into_iter().map(HeadRow::Search).collect(),
@@ -2810,9 +3037,16 @@ impl LauncherApp {
                 results: Vec::new(),
             },
             source::websearch::Exclusive::NotOurs => {
-                let mut head: Vec<HeadRow> =
-                    self.calc_row().map(HeadRow::Calc).into_iter().collect();
-                let results = self.results();
+                // 头段次序：自定义提示行（用户刚打全一个触发码）→ 计算器 → 应用结果。
+                // 提示行放最前是因为它只在「查询恰好等于某个关键字」时出现，那一刻用户
+                // 要的就是这条命令，不该被 `1` 之类的算式行压住。
+                let mut head: Vec<HeadRow> = Vec::new();
+                let mut results = self.results();
+                if let Some(hint) = source::custom::keyword_hint(&self.items, &self.query) {
+                    drop_hinted(&mut results, &self.items, &hint);
+                    head.push(HeadRow::CustomHint(hint));
+                }
+                head.extend(self.calc_row().map(HeadRow::Calc));
                 // FR-QRY-08 兜底：应用一条没中、计算器也没结果 ⇒ 给出网页搜索行，
                 // 免得用户对着「未找到」只能按 Enter 新建条目。空查询不兜底（源里自己判空）。
                 if head.is_empty() && results.is_empty() {
@@ -2838,6 +3072,15 @@ impl eframe::App for LauncherApp {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
+
+        // FR-SRC-06：收取后台路径检查结果（整体替换缓存：一次扫描覆盖整张清单）。
+        while let Ok(states) = self.path_rx.try_recv() {
+            self.path_in_flight = false;
+            self.path_states = states.into_iter().collect();
+            ui.ctx().request_repaint();
+        }
+        // 窗口可见期间的兜底刷新（最小间隔见 PATH_RESCAN_INTERVAL）：用户可能开着框去插 U 盘。
+        self.refresh_path_states(false);
 
         // E-06 托盘事件
         while let Ok(event) = self.tray_rx.try_recv() {
@@ -3020,6 +3263,11 @@ impl eframe::App for LauncherApp {
         let mut launch: Option<LaunchItem> = None;
         let mut launch_from_list = false;
         let mut launch_via_digit = false; // 提交即学别名要剥掉尾数字，见 learn_alias 调用处
+        // 批次 U：走「脱敏日志」的启动（自定义命令：填好的参数里有查询词）。
+        let mut launch_masked = false;
+        // 学习统计按**原条目** uid 记；自定义命令的 `entry` 是填过 `{query}` 的副本，
+        // 它的派生 uid 与清单里那条不同，不能用。
+        let mut launch_uid: Option<String> = None;
         // FR-SRC-10：计算器行的「执行」不启动进程，只把结果数字送进剪贴板（与 launch 互斥）。
         let mut copy_text: Option<String> = None;
         // FR-SRC-11：搜索行的「执行」＝打开 URL（独立函数，日志口径见 `open_search_hit`）。
@@ -3192,14 +3440,26 @@ impl eframe::App for LauncherApp {
                 } else if hit_e || hit_cd || hit_del || hit_csd || hit_cp {
                     // 头段行（计算器/搜索/提示）没有条目身份 ⇒ 编辑/删除/置顶/打开目录这四档
                     // 整体不适用。判据只落在 `sel` 这一层：选中头段 ⇒ 拿不到条目，下面的动作原样跳过。
+                    // 例外（批次 U）：自定义命令的提示行/独占行背后是清单里真实的一条 ⇒ 编辑与删除
+                    // 按 uid 回查原条目照常可用；置顶与打开目录仍不适用（对命令无意义，旧口径不动）。
                     let plan = self.plan();
                     let item_row = item_rank(self.selected, plan.head.len());
-                    if item_row.is_none() {
-                        eprintln!("快捷键 编辑/删除/置顶/开目录：选中的是头段结果行，这四档不适用");
-                    }
                     let results = plan.results;
                     // search 返回下标而不是引用：调用方接下来要改 self.items。
-                    let sel = item_row.and_then(|r| results.get(r).map(|i| self.items[*i].clone()));
+                    let mut sel =
+                        item_row.and_then(|r| results.get(r).map(|i| self.items[*i].clone()));
+                    if sel.is_none() && (hit_e || hit_del || hit_csd) {
+                        if let Some(Row::Head(h)) =
+                            row_at(self.selected, results.len(), plan.head.len())
+                        {
+                            sel = plan.head[h]
+                                .custom_uid()
+                                .and_then(|u| self.items.iter().find(|i| i.uid() == u).cloned());
+                        }
+                    }
+                    if item_row.is_none() && sel.is_none() {
+                        eprintln!("快捷键 编辑/删除/置顶/开目录：选中的是头段结果行，这四档不适用");
+                    }
                     // 身份一律用派生 uid（同 path 不同参数是两个条目），path 只作数据用。
                     if let Some(s) = sel {
                         let uid = s.uid();
@@ -3375,6 +3635,25 @@ impl eframe::App for LauncherApp {
                                     // 需求书把空词这一格定为 valid=false：数字键不执行，只提示。
                                     eprintln!("快捷键 数字键 {digit}：选中的是补全提示行，不执行");
                                     self.hint_toast(ui.ctx());
+                                }
+                                HeadRow::Custom(hit) => {
+                                    // FR-SRC-05：与 Enter 同一语义，日志走脱敏路径。
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：执行自定义命令「{}」（参数不落日志）",
+                                        hit.name
+                                    );
+                                    launch = Some(hit.entry.clone());
+                                    launch_uid = Some(hit.uid.clone());
+                                    launch_masked = true;
+                                    launch_from_list = true;
+                                    launch_via_digit = true;
+                                }
+                                HeadRow::CustomHint(hint) => {
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：选中「{}」的补全提示行",
+                                        hint.title
+                                    );
+                                    self.custom_hint_activate(ui.ctx(), hint);
                                 }
                             },
                             Some(Row::Item(rank)) => {
@@ -3589,6 +3868,15 @@ impl eframe::App for LauncherApp {
                                 HeadRow::Calc(hit) => copy_text = Some(hit.copy.clone()),
                                 HeadRow::Search(hit) => open_hit = Some(hit.clone()),
                                 HeadRow::Hint(_) => self.hint_toast(ui.ctx()),
+                                HeadRow::Custom(hit) => {
+                                    launch = Some(hit.entry.clone());
+                                    launch_uid = Some(hit.uid.clone());
+                                    launch_masked = true;
+                                    launch_from_list = true;
+                                }
+                                HeadRow::CustomHint(hint) => {
+                                    self.custom_hint_activate(ui.ctx(), hint);
+                                }
                             },
                             Some(Row::Item(rank)) => {
                                 launch = Some(self.items[results[rank]].clone());
@@ -3690,6 +3978,97 @@ impl eframe::App for LauncherApp {
                                         }
                                     });
                                 }
+                                HeadRow::Custom(hit) => {
+                                    // FR-SRC-05：`{query}` 已填好的独占行；路径四态跟条目一起显示。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "运行");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("▸").monospace().size(18.0).weak(),
+                                            ),
+                                        )
+                                        .on_hover_text("自定义命令（FR-SRC-05）");
+                                        let sel = ui.selectable_label(is_sel, hit.name.clone());
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        let state = self
+                                            .path_states
+                                            .get(&hit.uid)
+                                            .copied()
+                                            .unwrap_or_default();
+                                        if state.is_problem() {
+                                            ui.label(
+                                                egui::RichText::new(state.label())
+                                                    .small()
+                                                    .color(path_state_color(state)),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            launch = Some(hit.entry.clone());
+                                            launch_uid = Some(hit.uid.clone());
+                                            launch_masked = true;
+                                            launch_from_list = true;
+                                        }
+                                    });
+                                }
+                                HeadRow::CustomHint(hint) => {
+                                    // 不可执行行（valid=false）：点/按都是"补全成 `kw `"。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "补全");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("…").monospace().size(18.0).weak(),
+                                            ),
+                                        );
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        // 把"我是清单里哪一条"写在脸上：只报「需要参数」会被当成
+                                        // 系统自带的另一条同名命令（2026-10-21 真人反馈）。
+                                        if !hint.command.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(hint.command.as_str())
+                                                    .monospace()
+                                                    .weak()
+                                                    .size(12.0),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            self.custom_hint_activate(ui.ctx(), hint);
+                                        }
+                                        // 头段行没有名次，但这一类有条目身份 ⇒ 右键照样编辑/删除（按 uid 回查）。
+                                        sel.context_menu(|ui| {
+                                            if ui.button("编辑…").clicked() {
+                                                if let Some(it) = self
+                                                    .items
+                                                    .iter()
+                                                    .find(|i| i.uid() == hint.uid)
+                                                    .cloned()
+                                                {
+                                                    self.dialog = Some(DialogState::from_item(&it));
+                                                }
+                                                ui.close();
+                                            }
+                                            if ui.button("删除（不删磁盘文件）").clicked() {
+                                                row_actions.push(hint.uid.clone());
+                                                ui.close();
+                                            }
+                                        });
+                                    });
+                                }
                             }
                         }
                         for (rank, &hit) in results.iter().enumerate() {
@@ -3711,6 +4090,17 @@ impl eframe::App for LauncherApp {
                                 if is_sel && follow_selection {
                                     sel.scroll_to_me(Some(egui::Align::Center));
                                 }
+                                // FR-SRC-06：路径四态只在异常时露出来（OK/- 不占版面）。
+                                let uid = item.uid();
+                                if let Some(state) = self.path_states.get(&uid) {
+                                    if state.is_problem() {
+                                        ui.label(
+                                            egui::RichText::new(state.label())
+                                                .small()
+                                                .color(path_state_color(*state)),
+                                        );
+                                    }
+                                }
                                 if sel.clicked() {
                                     launch = Some(item.clone());
                                     launch_from_list = true;
@@ -3725,12 +4115,12 @@ impl eframe::App for LauncherApp {
                                     // FR-SRC-19：置顶开关入口（右键），与 Ctrl+P 同语义。
                                     let pin_label = if item.pinned { "取消置顶" } else { "置顶" };
                                     if ui.button(pin_label).clicked() {
-                                        pin_toggles.push(item.uid());
+                                        pin_toggles.push(uid.clone());
                                         ui.close();
                                     }
                                     // 与 Delete/Ctrl+Shift+D 同一条确认路径（2026-10-18 用户要求）。
                                     if ui.button("删除（不删磁盘文件）").clicked() {
-                                        row_actions.push(item.uid());
+                                        row_actions.push(uid.clone());
                                         ui.close();
                                     }
                                 });
@@ -4004,10 +4394,16 @@ impl eframe::App for LauncherApp {
         // 运行选中的程序并关闭到托盘（FR-ACT + 用户要求：Enter/点击运行后窗口自动关）。
         // FR-SRC-19：清单项成功启动才累计使用统计（launch_and_hide 失败分支提前 return，走不到这里）。
         if let Some(entry) = launch {
-            let started = self.launch_and_hide(ui.ctx(), &entry);
+            // 自定义命令的 uid 取原条目（`entry` 是填过 `{query}` 的副本，派生 uid 已变）。
+            let uid = launch_uid.clone().unwrap_or_else(|| entry.uid());
+            let started = if launch_masked {
+                self.launch_and_hide_masked(ui.ctx(), &entry, &uid)
+            } else {
+                self.launch_and_hide(ui.ctx(), &entry)
+            };
             if started && launch_from_list {
                 // FR-SRC-19 补全「提交即学别名」（口径与门槛见 learn_alias）。
-                self.mark_used(&entry.uid(), &commit_word(&self.query, launch_via_digit));
+                self.mark_used(&uid, &commit_word(&self.query, launch_via_digit));
             }
         }
 
@@ -4394,6 +4790,67 @@ mod nav_tests {
         assert_eq!(row_at(1, results.len(), 2), Some(Row::Head(1)));
         assert_eq!(row_at(2, results.len(), 2), Some(Row::Item(0)));
         assert_eq!(row_at(4, results.len(), 2), Some(Row::Item(2)));
+    }
+
+    #[test]
+    fn hint_row_absorbs_the_same_item_from_results() {
+        use crate::source::application::{ItemKind, LaunchItem};
+        let ping = LaunchItem {
+            name: "ping".into(),
+            keyword: "ping".into(),
+            kind: ItemKind::Command,
+            path: "cmd.exe".into(),
+            arguments: "/k ping {query}".into(),
+            ..Default::default()
+        };
+        let items = vec![ping, LaunchItem { name: "画图".into(), ..Default::default() }];
+        let hint = crate::source::custom::keyword_hint(&items, "ping").expect("ping 应有提示行");
+        let mut results = vec![0, 1];
+        drop_hinted(&mut results, &items, &hint);
+        assert_eq!(results, vec![1], "提示行已经代表这条命令，下方不再重复出现");
+    }
+
+    #[test]
+    fn only_custom_head_rows_carry_an_item_identity() {
+        use crate::source::application::{ItemKind, LaunchItem};
+        use crate::source::calc::CalcHit;
+        use crate::source::custom::{CustomHint, CustomHit};
+        use crate::source::websearch::EngineHint;
+        let item = LaunchItem {
+            name: "ping".into(),
+            keyword: "ping".into(),
+            kind: ItemKind::Command,
+            path: "cmd.exe".into(),
+            arguments: "/k ping {query}".into(),
+            ..Default::default()
+        };
+        let uid = item.uid();
+        let s = String::new();
+        let hint = CustomHint {
+            uid: uid.clone(),
+            title: s.clone(),
+            subtitle: s.clone(),
+            completion: s.clone(),
+            command: s.clone(),
+        };
+        let hit = CustomHit {
+            uid: uid.clone(),
+            name: item.name.clone(),
+            entry: item.clone(),
+            subtitle: s.clone(),
+        };
+        assert_eq!(HeadRow::CustomHint(hint).custom_uid(), Some(uid.as_str()));
+        assert_eq!(HeadRow::Custom(hit).custom_uid(), Some(uid.as_str()));
+        // 没有条目身份的头段不许被编辑/删除接管——旧口径，漂了就等于给计算器行挂上删除键。
+        let calc = CalcHit { title: s.clone(), subtitle: s.clone(), copy: s.clone() };
+        assert_eq!(HeadRow::Calc(calc).custom_uid(), None);
+        let eng = EngineHint {
+            engine_id: s.clone(),
+            title: s.clone(),
+            subtitle: s.clone(),
+            completion: s,
+        };
+        assert_eq!(HeadRow::Hint(eng).custom_uid(), None);
     }
 
     #[test]

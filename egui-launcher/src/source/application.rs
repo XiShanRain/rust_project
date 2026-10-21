@@ -72,7 +72,8 @@ impl ItemKind {
 }
 
 /// 一条可启动项。字段全部是纯数据，供主线程转成界面条目 / 拼启动命令。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// 批次 U 起补 `PartialEq`：`HeadRow` 要能比较（里面装着已填好 `{query}` 的条目副本）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchItem {
     pub name: String,
     /// 交给 `ShellExecuteExW` 的 `lpFile`：exe 全路径或命令名、`.lnk` 目标、URL、`shell:` 文件夹、协议。
@@ -236,6 +237,12 @@ pub struct AppSettings {
     /// 要加自定义引擎目前只能手改这个文件——需求书 TC 11-1 那条 `localhost:{query|8000}` 就是这么验的。
     #[serde(default = "crate::source::websearch::builtin_engines")]
     pub web_engines: Vec<websearch::WebEngine>,
+
+    /// 出厂命令集已经自动补到第几轮（§4.2.1）。`0` = 这份清单建于 2026-10-21 扩充出厂集之前
+    /// ⇒ 下次启动补一次缺，补完记账。记过账之后就不再自动补 ⇒ 用户删掉的条目不会自己回来；
+    /// 误删想找回走设置页的「补回缺失的出厂命令」（见 [`merge_missing_seeds`]）。
+    #[serde(default)]
+    pub seed_round: u32,
 }
 
 // ---- FR-WIN-02 全局呼出热键（批次 Q）----
@@ -666,8 +673,16 @@ pub fn save_settings(s: &AppSettings) {
     }
 }
 
-/// 内置系统工具底座（对齐 Delphi AltRun 保留的自带程序）。全部走 `ShellExecuteExW`：
-/// 命令名靠 App Paths 解析、`shell:` 已知文件夹与 `ms-settings:` 协议原生支持。
+/// 出厂命令集的轮次（§4.2.1）。每次往 [`builtin_seeds`] 里加条目就 +1：
+/// 老用户的 `settings.json` 里记的是旧号 ⇒ 启动时自动补一次缺，补完即记账。
+/// 记账之后不再自动补 ⇒ **删掉的条目不会因为下次启动又回来**。
+pub const SEED_ROUND: u32 = 1;
+
+/// 出厂内置命令集（§4.2.1，对齐 AHK 版 `AppSettings._DefaultCommands()`）。
+/// 只在清单文件首次新建时整批写入；此后它们就是普通条目——可改名、可改路径、可删除。
+///
+/// 名字用中文（与这批种子原有的风格一致），AHK 的关键字作为别名并用：
+/// 同一条命令另起一个英文名会和现有条目撞 uid，被 [`dedup_items`] 去重掉。
 /// `path` 用简洁命令名（启动），`source_path` 用 exe 全路径（取图标）；无固定 exe 的给空。
 pub fn builtin_seeds() -> Vec<LaunchItem> {
     let windir = std::env::var_os("WINDIR")
@@ -675,48 +690,105 @@ pub fn builtin_seeds() -> Vec<LaunchItem> {
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     let sys32 = |exe: &str| windir.join("System32").join(exe).to_string_lossy().into_owned();
 
-    let command = |name: &str, path: &str, exe: &str| LaunchItem {
+    /// 名称拼音首字母 + 需求书点名要的关键字（空白分词，别名表本来就支持多键）。
+    fn keyword(name: &str, explicit: &str) -> String {
+        let base = default_keyword(name);
+        match (base.is_empty(), explicit.is_empty()) {
+            (true, _) => explicit.to_string(),
+            (false, true) => base,
+            (false, false) => format!("{base} {explicit}"),
+        }
+    }
+
+    let command = |name: &str, path: &str, args: &str, exe: &str, explicit: &str| LaunchItem {
         name: name.to_string(),
         path: path.to_string(),
-        arguments: String::new(),
+        arguments: args.to_string(),
         working_dir: None,
         source_path: sys32(exe),
         kind: ItemKind::Command,
-        keyword: default_keyword(name),
+        keyword: keyword(name, explicit),
         ..Default::default()
     };
-    let folder = |name: &str, path: &str| LaunchItem {
+    let folder = |name: &str, path: &str, explicit: &str| LaunchItem {
         name: name.to_string(),
         path: path.to_string(),
         arguments: String::new(),
         working_dir: None,
         source_path: String::new(),
         kind: ItemKind::Folder,
-        keyword: default_keyword(name),
+        keyword: keyword(name, explicit),
+        ..Default::default()
+    };
+    let url = |name: &str, path: &str, explicit: &str| LaunchItem {
+        name: name.to_string(),
+        path: path.to_string(),
+        arguments: String::new(),
+        working_dir: None,
+        source_path: String::new(),
+        kind: ItemKind::Url,
+        keyword: keyword(name, explicit),
         ..Default::default()
     };
 
     vec![
-        command("计算器", "calc.exe", "calc.exe"),
-        command("记事本", "notepad.exe", "notepad.exe"),
-        command("画图", "mspaint.exe", "mspaint.exe"),
-        command("命令提示符", "cmd.exe", "cmd.exe"),
-        command("PowerShell", "powershell.exe", "WindowsPowerShell/v1.0/powershell.exe"),
-        command("任务管理器", "taskmgr.exe", "Taskmgr.exe"),
-        command("控制面板", "control.exe", "control.exe"),
-        folder("此电脑", "shell:MyComputerFolder"),
-        folder("回收站", "shell:RecycleBinFolder"),
-        LaunchItem {
-            name: "设置".to_string(),
-            path: "ms-settings:".to_string(),
-            arguments: String::new(),
-            working_dir: None,
-            source_path: String::new(),
-            kind: ItemKind::Url,
-            keyword: default_keyword("设置"),
-            ..Default::default()
-        },
+        // ---- Delphi 版底座（一直就在）----
+        command("计算器", "calc.exe", "", "calc.exe", ""),
+        // §4.2.1 的 Notepad 关键字是 `np`：不另起一条「Notepad」，同 path 会撞 uid 被去重。
+        command("记事本", "notepad.exe", "", "notepad.exe", "np"),
+        command("画图", "mspaint.exe", "", "mspaint.exe", ""),
+        command("命令提示符", "cmd.exe", "", "cmd.exe", ""),
+        command("PowerShell", "powershell.exe", "", "WindowsPowerShell/v1.0/powershell.exe", ""),
+        command("任务管理器", "taskmgr.exe", "", "Taskmgr.exe", ""),
+        command("控制面板", "control.exe", "", "control.exe", ""),
+        folder("此电脑", "shell:MyComputerFolder", ""),
+        folder("回收站", "shell:RecycleBinFolder", ""),
+        url("设置", "ms-settings:", ""),
+        // ---- §4.2.1 出厂命令集（2026-10-21 补齐；此前 12 条只落了 Notepad/Paint 两条）----
+        // Desktop 在参考项目里与 Notepad 共用 `np`，按 4.2.1 的去重规则不保留。
+        // hosts 存的是非提权版：能打开、保存会被系统拒绝（提权要 `*runas`，见 FR-ACT-04）。
+        command(
+            "编辑 hosts 文件",
+            "notepad.exe",
+            r"%windir%\System32\drivers\etc\hosts",
+            "notepad.exe",
+            "hosts",
+        ),
+        folder("下载", "shell:Downloads", "dl"),
+        // 空词回车先补成 `docs `，再敲子目录名；`{query}` 由 custom::build_hit 填进路径。
+        folder("文档", r"%USERPROFILE%\Documents\{query}", "docs"),
+        // 占位符而不是绝对路径：程序搬文件夹后这条自己跟着走，不用重新播种。
+        folder("启动器目录", crate::source::custom::LAUNCHER_DIR_PLACEHOLDER, ""),
+        command("IP 配置", "cmd.exe", "/k ipconfig", "cmd.exe", "ipconfig"),
+        command("Ping", "cmd.exe", "/k ping {query}", "cmd.exe", "ping"),
+        // 网址尚未确定 ⇒ 用 RFC 2606 保留的 `.invalid` 当占位，改这一条的路径即可。
+        url("项目主页（待填网址）", "https://example.invalid/altrun", "altrun"),
+        url(
+            "谷歌地图",
+            "https://www.google.com/maps/search/?api=1&query={query}",
+            "maps",
+        ),
+        url("系统更新", "ms-settings:windowsupdate", "wu"),
     ]
+}
+
+/// 把清单里缺的出厂条目**追加到末尾**，返回补了几条。
+///
+/// 「已存在」认两个键：uid（路径+参数没动过）**或**名称（改过路径/参数的那条也算在）。
+/// 这样既不会把用户改过的条目复制一份，删掉之后又能用设置页的动作找回来。
+/// 只加不删、不改已有条目：同关键字撞车时按清单先后取第一条（TC-SRC-05-3），
+/// 所以用户自己手加的那条（排在前面）继续生效。
+pub fn merge_missing_seeds(items: &mut Vec<LaunchItem>) -> usize {
+    let uids: std::collections::HashSet<String> = items.iter().map(|i| i.uid()).collect();
+    let names: std::collections::HashSet<String> =
+        items.iter().map(|i| i.name.trim().to_lowercase()).collect();
+    let missing: Vec<LaunchItem> = builtin_seeds()
+        .into_iter()
+        .filter(|s| !uids.contains(&s.uid()) && !names.contains(&s.name.trim().to_lowercase()))
+        .collect();
+    let added = missing.len();
+    items.extend(missing);
+    added
 }
 
 /// 按派生 [`LaunchItem::uid`] 去重（种子优先在前，批量导入的重复项被剔除）。
@@ -752,6 +824,26 @@ pub fn is_url(s: &str) -> bool {
 /// 把任意输入判成条目类型：URL/协议→`Url`，其余（命令名 / 路径 / .lnk）→`Command`。
 pub fn infer_kind(input: &str) -> ItemKind {
     if is_url(input) { ItemKind::Url } else { ItemKind::Command }
+}
+
+/// FR-SRC-05：`file`/`folder` 类型的「目标名」匹配键——文件取去扩展名的文件名、
+/// 文件夹取路径末段（尾部分隔符先剥掉）。URL、`shell:` 虚拟文件夹、含 `{query}`
+/// 的路径没有稳定目标名，一律返回 `None`（匹配层就不追加这半条键）。
+pub fn target_stem(item: &LaunchItem) -> Option<String> {
+    let path = item.path.trim();
+    if path.is_empty()
+        || is_url(path)
+        || path.to_ascii_lowercase().starts_with("shell:")
+        || path.contains("{query")
+    {
+        return None;
+    }
+    let stem = match item.kind {
+        ItemKind::File => Path::new(path).file_stem(),
+        ItemKind::Folder => Path::new(path.trim_end_matches(['\\', '/'])).file_name(),
+        _ => None,
+    };
+    stem.and_then(|s| s.to_str()).map(str::to_string).filter(|s| !s.is_empty())
 }
 
 /// 由名称生成默认别名（FR-SRC-22「默认拼音首字母」）：每个汉字取其拼音首字母
@@ -1312,6 +1404,50 @@ mod dedup_tests {
     fn same_path_same_arguments_dedups_case_insensitively() {
         let v = dedup_items(vec![with_args("CMD.exe", "/K PING"), with_args("cmd.exe", "/k ping ")]);
         assert_eq!(v.len(), 1, "实际留下 {} 条", v.len());
+    }
+
+    /// §4.2.1 出厂集必须覆盖参考项目那 12 条里我们决定保留的部分。关键字是需求书点名的
+    /// （`np`/`hosts`/`dl`/`docs`/`ipconfig`/`ping`/`altrun`/`maps`）——少一个就又回到
+    /// 「用户得自己手加一条 ping」那天。
+    #[test]
+    fn builtin_seeds_cover_the_factory_set() {
+        let seeds = builtin_seeds();
+        let has = |kw: &str| seeds.iter().any(|s| s.keyword.split_whitespace().any(|w| w == kw));
+        for kw in ["np", "hosts", "dl", "docs", "ipconfig", "ping", "altrun", "maps"] {
+            assert!(has(kw), "出厂集里没有关键字 {kw}");
+        }
+        assert!(
+            seeds.iter().any(|s| s.path == "ms-settings:windowsupdate"),
+            "Windows Update 那条要能启动"
+        );
+        // 这两条是本批两处机制的依赖：`{query}` 模板与「启动器目录」占位符。
+        assert!(seeds.iter().any(|s| s.arguments == "/k ping {query}"));
+        assert!(seeds.iter().any(|s| s.path == crate::source::custom::LAUNCHER_DIR_PLACEHOLDER));
+        // 同 uid 的两条会在 dedup_items 里被悄悄吃掉一条。
+        let mut uids: Vec<String> = seeds.iter().map(|s| s.uid()).collect();
+        let before = uids.len();
+        uids.sort();
+        uids.dedup();
+        assert_eq!(uids.len(), before, "出厂集内部有重复 uid");
+    }
+
+    /// 补种只加缺的：删掉的补回来，改过路径/参数（名称没变）的不能复制第二份。
+    #[test]
+    fn merge_missing_seeds_only_adds_what_is_missing() {
+        let mut items = builtin_seeds();
+        items.retain(|i| i.name != "Ping");
+        if let Some(it) = items.iter_mut().find(|i| i.name == "记事本") {
+            it.path = r"C:\Windows\notepad.exe".to_string();
+        }
+        let before = items.len();
+        assert_eq!(merge_missing_seeds(&mut items), 1, "只该补回被删掉的 Ping");
+        assert_eq!(items.len(), before + 1);
+        assert_eq!(
+            items.iter().filter(|i| i.name == "记事本").count(),
+            1,
+            "改了路径的条目不复制一份"
+        );
+        assert_eq!(merge_missing_seeds(&mut items), 0, "补种必须幂等");
     }
 
     /// FR-SRC-19 新字段全带 `serde(default)`：加字段之前的旧清单必须原样可读。
