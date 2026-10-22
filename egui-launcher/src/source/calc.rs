@@ -289,24 +289,32 @@ fn c_to_temp(c: f64, sym: &str) -> f64 {
 }
 
 /// 独立换算关键字：`in` / `to`。取最后一个整词命中，返回 (左串, 右串)。
+///
+/// 走的是字节游标，所以**切片口的两个下标必须都落在 ASCII 字母段的两侧**：`&s[a..b]` 即使
+/// `a == b` 也要求 `a` 是字符边界（2026-10-22 真机崩溃：中文查询让 `word_start` 停在
+/// `报` 的中间字节上，`&s[2..2]` 直接 panic，搜索框里敲任何非 ASCII 都闪退）。
 fn split_conversion(s: &str) -> Option<(&str, &str)> {
     let bytes = s.as_bytes();
     let mut found: Option<(usize, usize)> = None;
     let mut i = 0;
     while i < bytes.len() {
+        if !bytes[i].is_ascii_alphabetic() {
+            // 非字母字节逐个跳过：多字节字符的中间字节也走到这里，但这一支不切片。
+            i += 1;
+            continue;
+        }
         let word_start = i;
-        while i < bytes.len() && (bytes[i] as char).is_ascii_alphabetic() {
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
             i += 1;
         }
+        // 字母段的两侧必然是字符边界：段首是刚跳过的非字母字节之后，段尾要么是 ASCII
+        // 非字母、要么是一个多字节字符的首字节。
         let word = &s[word_start..i];
         let wl = word.to_ascii_lowercase();
-        let standalone = word_start == 0 || !is_word_byte(bytes[word_start - 1])
+        let standalone = (word_start == 0 || !is_word_byte(bytes[word_start - 1]))
             && (i == bytes.len() || !is_word_byte(bytes[i]));
-        if !word.is_empty() && (wl == "in" || wl == "to") && standalone {
+        if (wl == "in" || wl == "to") && standalone {
             found = Some((word_start, i));
-        }
-        if i == word_start {
-            i += 1;
         }
     }
     let (a, b) = found?;
@@ -1016,5 +1024,21 @@ mod tests {
         // `in` 既是换算关键字又是英寸单位
         assert_eq!(val("10 in in cm").as_deref(), Some("25.4"));
         assert_eq!(val("2 in in mm").as_deref(), Some("50.8"));
+    }
+
+    #[test]
+    fn non_ascii_queries_cannot_panic_the_byte_walker() {
+        // 2026-10-22 真机闪退（用户报的三条 Backspace 崩溃是同一个根因）：搜索框里敲中文，
+        // `split_conversion` 把 `word_start` 停在多字节字符的中间字节上再切片 ⇒ panic。
+        // 计算器对中文查询的正确答案只有"不出行"，绝不许是"整个程序退出"。
+        for q in [
+            "报", "报告", "'报", "'报告", "pic 报", "folder 项", "记事本", "计算器", "你好",
+            "10 公里 in cm", "2 in 你好", "今天 + 7 天", "米", "°C → °F",
+        ] {
+            assert!(
+                evaluate(q, today_day()).is_none(),
+                "{q:?} 不该出计算器行（中文一律走「不出行」，不是闪退）"
+            );
+        }
     }
 }

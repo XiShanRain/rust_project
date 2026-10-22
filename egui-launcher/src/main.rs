@@ -43,11 +43,11 @@ use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, ShellExecuteExW, SHELLEXECU
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
-    GetWindowThreadProcessId, KillTimer, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SendMessageTimeoutW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_APP, WM_COPYDATA, WM_DESTROY,
-    WM_HOTKEY, WM_TIMER, WNDCLASSEXW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    GetWindowThreadProcessId, IsIconic, KillTimer, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SendMessageTimeoutW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_APP, WM_COPYDATA,
+    WM_DESTROY, WM_HOTKEY, WM_TIMER, WNDCLASSEXW, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
 /// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
@@ -60,8 +60,8 @@ mod cli;
 mod matching;
 mod source;
 use source::application::{
-    default_keyword, dedup_items, is_url, learn_alias, make_item_from_input, ItemKind, LaunchItem,
-    LearnRank, SpaceRun, TabMode,
+    default_keyword, dedup_items, is_url, learn_alias, make_item_from_input, Corrupted, ItemKind,
+    LaunchItem, LearnRank, SpaceRun, TabMode,
 };
 // FR-WIN-02（批次 Q）：热键的位值与 VK 码用 application 侧的那套常量，判据与展示名才能
 // 在纯函数里单测；调 RegisterHotKey 时再包成 HOT_KEY_MODIFIERS。
@@ -385,6 +385,21 @@ impl DialogState {
             source_path: it.source_path,
         }
     }
+    /// 批次 X（FR-SRC-14 → FR-SRC-20）：从文件搜索行预填「添加快捷项」。
+    /// 别名留空 ⇒ 提交时 `to_item` 按名称自动生成拼音首字母，与手工新建同一条路。
+    /// `source_path` 直接给文件本体：这一行的图标就是它自己的图标。
+    fn from_file_hit(hit: &source::filesearch::FileHit) -> Self {
+        Self {
+            edit_uid: None,
+            name: hit.title.clone(),
+            keyword: String::new(),
+            path: hit.path.clone(),
+            arguments: String::new(),
+            working_dir: String::new(),
+            kind: if hit.is_dir { ItemKind::Folder } else { ItemKind::File },
+            source_path: hit.path.clone(),
+        }
+    }
     /// 用既有项预填（编辑）。
     fn from_item(it: &LaunchItem) -> Self {
         Self {
@@ -533,6 +548,24 @@ struct LauncherApp {
     /// 有一轮检查还没回来（UNC 断线可能挂很久）⇒ 不再派新一轮，避免线程堆积。
     path_in_flight: bool,
     path_scanned_at: Instant,
+    // ---- 批次 X：FR-SRC-14 文件搜索与目录浏览（索引与列目录都在后台线程，主线程只换快照）----
+    file_tx: mpsc::Sender<source::filesearch::FileUpdate>,
+    file_rx: mpsc::Receiver<source::filesearch::FileUpdate>,
+    /// 整表快照：`FileUpdate::Index` 到达时整体替换，旧快照在那一帧前一直可用。
+    file_index: Vec<source::filesearch::FileEntry>,
+    /// 上一轮索引建成的时刻（`None` = 还没建成过）；同时兼任 30 分钟重扫的计时起点。
+    file_indexed_at: Option<Instant>,
+    file_rebuild_in_flight: bool,
+    /// 一次目录浏览的回报，带 `(dir, filter)` 供查询核对。
+    dir_hits: Option<(String, String, Vec<source::filesearch::FileHit>)>,
+    /// 已派出去、还没被采纳的那次浏览的 `(dir, filter)`。
+    dir_in_flight: Option<(String, String)>,
+    /// 同一查询串一帧里会被 [`plan`](LauncherApp::plan) 算好几遍（空格判据、渲染、Enter…），
+    /// 而文件源要扫三万条 ⇒ 按查询串缓存本轮命中。索引回报到达时清空，别让新索引撞上旧缓存。
+    file_hits_cache: Option<(String, Vec<source::filesearch::FileHit>)>,
+    /// E1（批次 X）：配置文件坏过一次的话，这里存那句说明。静默启动时 `ui()` 根本不跑，
+    /// 所以它是「等窗口第一次真被看见」才转成 Toast 的那句话，不是开机就闪一下没了。
+    startup_notice: Option<String>,
     tray_rx: mpsc::Receiver<TrayEvent>,
     hotkey_rx: mpsc::Receiver<()>,
     // FR-SRC-21：主实例收二次进程转发（Activate/AddPath/Ping/Preferences/AddBatch）。
@@ -750,6 +783,8 @@ enum HeadRow {
     Custom(source::custom::CustomHit),
     /// 自定义命令「还缺一个参数」的提示行：不可执行，Enter 补全成 `"kw "`。
     CustomHint(source::custom::CustomHint),
+    /// 批次 X（FR-SRC-14）：文件搜索 / 目录浏览的一行。「执行」＝用系统关联程序打开它。
+    File(source::filesearch::FileHit),
 }
 
 impl HeadRow {
@@ -761,6 +796,27 @@ impl HeadRow {
             HeadRow::CustomHint(hint) => Some(&hint.uid),
             _ => None,
         }
+    }
+
+    /// 这一行是不是一个文件/目录。文件行也不在清单里 ⇒ 编辑/删除/置顶同样不适用，
+    /// 但 Ctrl+D（资源管理器定位）与 Ctrl+Shift+N（预填新建）对它有意义，靠这个取。
+    fn file_hit(&self) -> Option<&source::filesearch::FileHit> {
+        match self {
+            HeadRow::File(hit) => Some(hit),
+            _ => None,
+        }
+    }
+}
+
+/// `HeadRow::Hint` 那一句"这行不能执行"的文案。批次 X 起这一格住了两种住户：
+/// 引擎的空词补全提示，和「文件索引建立中」。按引擎 id 分流，而不是把提示行的副标题
+/// 原样当 Toast 用——`在 'g ' 后输入，然后回车` 那种话带着触发符，复读一遍只会让人以为
+/// 自己打错了。
+fn hint_message(hint: &source::websearch::EngineHint) -> &'static str {
+    if hint.engine_id == "filesearch" {
+        "文件索引还在后台建立，稍等片刻再回车"
+    } else {
+        "继续输入关键词后再回车"
     }
 }
 
@@ -779,8 +835,8 @@ enum Row {
     Item(usize),
 }
 
-/// 合并后的总行数。导航键（↑↓ / PgUp/PgDn / Ctrl+J/K / Tab 的循环那一半）全在这个口径里回绕，
-/// 不必换算名次。
+/// 合并后的总行数。导航键（↑↓ / PgUp/PgDn / Ctrl+N/P / Ctrl+J/K / Tab 的循环那一半）全在这个
+/// 口径里回绕，不必换算名次。
 fn row_count(results_len: usize, head_len: usize) -> usize {
     results_len + head_len
 }
@@ -1046,8 +1102,9 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// 本程序自己占用的组合（录制端落定前的预检表）。**表里的每一条都对着 `ui()` 里一次真实的
-/// `consume_key`**（Ctrl+N 新建、Ctrl+E 编辑、Ctrl+I 批量导入、Ctrl+D 打开目录、
-/// Ctrl+Shift+D 删除、Ctrl+P 置顶、Ctrl+J/K 循环导航、Ctrl+数字 与 Alt+数字 执行第 N 行），
+/// `consume_key`**（Ctrl+Shift+N 新建、Ctrl+E 编辑、Ctrl+I 批量导入、Ctrl+D 打开目录、
+/// Ctrl+Shift+D 删除、Ctrl+Shift+P 置顶、Ctrl+N/P 与 Ctrl+J/K 循环导航、Ctrl+数字 与
+/// Alt+数字 执行第 N 行），
 /// 不多写一条：表是"避让本程序的功能键"，不是"避开所有看着眼熟的键"，多出来的条目会白白
 /// 挡掉系统里其实空着的组合（Ctrl+A 这种本程序压根没绑）。
 ///
@@ -1065,9 +1122,11 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_CONTROL, 0x49), // Ctrl+I 批量导入全部
     (HKF_CONTROL, 0x4A), // Ctrl+J 循环下一项
     (HKF_CONTROL, 0x4B), // Ctrl+K 循环上一项
-    (HKF_CONTROL, 0x4E), // Ctrl+N 新建快捷项
-    (HKF_CONTROL, 0x50), // Ctrl+P 置顶 / 取消置顶
+    (HKF_CONTROL, 0x4E), // Ctrl+N 循环下一项（2026-10-22 从「新建」改为导航）
+    (HKF_CONTROL, 0x50), // Ctrl+P 循环上一项（2026-10-22 从「置顶」改为导航）
     (HKF_CONTROL | HKF_SHIFT, 0x44), // Ctrl+Shift+D 删除选中项
+    (HKF_CONTROL | HKF_SHIFT, 0x4E), // Ctrl+Shift+N 新建快捷项
+    (HKF_CONTROL | HKF_SHIFT, 0x50), // Ctrl+Shift+P 置顶 / 取消置顶
     // 数字行：Ctrl+1..9/0 与 Alt+1..9/0 执行第 N 行（FR-ACT-10）。
     (HKF_CONTROL, 0x30),
     (HKF_CONTROL, 0x31),
@@ -1672,10 +1731,18 @@ impl LauncherApp {
         let (icon_tx, icon_rx) = mpsc::channel();
         let (apps_tx, apps_rx) = mpsc::channel();
         let (path_tx, path_rx) = mpsc::channel();
+        let (file_tx, file_rx) = mpsc::channel();
         // 清单文件不存在（首次运行）→ 用内置系统工具播种一次并落盘；此后它就是一张普通用户清单，
         // 全部可编辑/删除（对标 Delphi WriteDefaultShortCutList）。文件已存在（哪怕被清空）不覆盖。
+        //
+        // E1（批次 X）：以前"解析失败"和"文件不存在"都落回空清单，而下面那条播种/补齐路径会把
+        // 空清单整张写回去 ⇒ 用户条目被静默销毁，连现场都不留。现在 `load_*` 先把坏文件改名隔离
+        // （`.bad`）再回来，这里只把它当空清单用，并且**只有真的没有文件时才播种**。
+        let mut broken_list: Option<Corrupted> = None;
         let mut items = if source::application::user_list_exists() {
-            source::application::load_user_items()
+            let (list, bad) = source::application::load_user_items();
+            broken_list = bad;
+            list
         } else {
             let seeds = source::application::builtin_seeds();
             source::application::save_user_items(&seeds);
@@ -1684,19 +1751,83 @@ impl LauncherApp {
         items = dedup_items(items);
         // §4.2.1 出厂命令集的补齐：老清单（settings 里的轮次落后）启动时补一次缺，补完记账。
         // 只加不删、已有条目一律不动；记账之后删掉的条目不会自己回来（找回用设置页那个按钮）。
-        let mut prefs = source::application::load_settings();
+        let (mut prefs, broken_settings) = source::application::load_settings();
+        // 两种下场分开说：`Kept` 报得出留证落点，`Lost` 只能请人工处理，并且要立刻把"本轮对它
+        // 只读不写"通知到下面那条补齐路径（2026-10-22 真机⑫：留证没成功时照样播种写盘，
+        // 把唯一那份坏文件覆盖了——那一次日志里就写着「覆盖写会丢掉唯一证据」）。
+        let mut evidence_lost = false;
+        for (label, c, fallback) in [
+            ("settings.json", &broken_settings, "出厂默认"),
+            ("user_items.json", &broken_list, "空清单"),
+        ] {
+            match c {
+                Some(Corrupted::Kept(p)) => eprintln!(
+                    "配置损坏：{label} 解析失败，已隔离为 {}，本次按{fallback}启动（原文件未被覆盖）",
+                    p.display()
+                ),
+                Some(Corrupted::Lost) => {
+                    evidence_lost = true;
+                    eprintln!(
+                        "配置损坏：{label} 解析失败且留证没成功 ⇒ 本轮对它只读不写（写一次就覆盖掉唯一证据），请人工备份后删掉这个文件"
+                    );
+                }
+                None => {}
+            }
+        }
+        // 两句合成一句给用户看（Toast 只有一条，说两遍等于没说）。路径是他自己的文件名，
+        // 出现在窗口里不是日志里 ⇒ 不违 FR-SYS-03 那条"日志不记用户原文"。
+        let kept = |c: &Option<Corrupted>| match c {
+            Some(Corrupted::Kept(p)) => Some(
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| p.display().to_string()),
+            ),
+            Some(Corrupted::Lost) | None => None,
+        };
+        let notice = match (kept(&broken_list), kept(&broken_settings)) {
+            (Some(items_bad), Some(settings_bad)) => Some(format!(
+                "⚠ 两个配置文件坏了，已分别改名留底：{items_bad} ／ {settings_bad}，本次从空清单 + 出厂默认启动"
+            )),
+            (Some(a), None) | (None, Some(a)) => Some(format!(
+                "⚠ 配置文件坏了，已改名留底：{a}，本次从出厂默认启动（你的原文件没有被覆盖）"
+            )),
+            (None, None) => None,
+        };
+        // 留证没成功那句话不许被"已改名留底"盖掉：两种下场说成一件事就是骗用户。
+        let notice = if evidence_lost {
+            Some(match notice {
+                Some(s) => format!("{s}；另有一份留证没成功 ⇒ 本轮对它只读不写，请人工处理"),
+                None => "⚠ 配置文件坏了，但留证没成功（改名与另存副本都失败）⇒ 本轮对它只读不写，请人工备份后删掉"
+                    .to_string(),
+            })
+        } else {
+            notice
+        };
         if prefs.seed_round < source::application::SEED_ROUND {
             let added = source::application::merge_missing_seeds(&mut items);
             if added > 0 {
-                source::application::save_user_items(&items);
-                eprintln!(
-                    "source: 出厂命令集补齐 {added} 条（第 {} 轮，老清单 {} 条）",
-                    source::application::SEED_ROUND,
-                    items.len() - added
-                );
+                if evidence_lost {
+                    eprintln!(
+                        "source: 出厂命令集本可补 {added} 条，但坏文件留证没成功 ⇒ 这次不写清单（补齐只在内存里生效）"
+                    );
+                } else {
+                    source::application::save_user_items(&items);
+                    eprintln!(
+                        "source: 出厂命令集补齐 {added} 条（第 {} 轮，老清单 {} 条）",
+                        source::application::SEED_ROUND,
+                        items.len() - added
+                    );
+                }
             }
             prefs.seed_round = source::application::SEED_ROUND;
-            source::application::save_settings(&prefs);
+            if evidence_lost {
+                // 连记账那一格也不写：settings.json 可能正是没留住证据的那一份。
+                // 代价是下一次启动会再补一轮种子（只加不删，幂等），比覆盖掉现场轻。
+                eprintln!("source: 留证没成功 ⇒ 本轮不写 settings.json（seed_round 只在内存里推进）");
+            } else {
+                source::application::save_settings(&prefs);
+            }
         }
         let settings_open = intent.settings_page.is_some();
         let settings_tab =
@@ -1717,6 +1848,15 @@ impl LauncherApp {
             path_states: std::collections::HashMap::new(),
             path_in_flight: false,
             path_scanned_at: Instant::now(),
+            file_tx,
+            file_rx,
+            file_index: Vec::new(),
+            file_indexed_at: None,
+            file_rebuild_in_flight: false,
+            dir_hits: None,
+            dir_in_flight: None,
+            file_hits_cache: None,
+            startup_notice: notice,
             selected: 0,
             scroll_followed: 0,
             focus_query: intent.visible && intent.dialog.is_none() && !settings_open,
@@ -1753,6 +1893,10 @@ impl LauncherApp {
         // FR-SRC-06：启动就先在后台算一轮四态，首屏列表（很快会呼出）拿到的是缓存而不是
         // 现场 I/O；之后呼出与每 3 秒各刷新一次（`refresh_path_states`）。
         seed.refresh_path_states(true);
+        // 批次 X：文件索引也在冷启动这一趟就派出去。放在 `new` 而不是只靠 `ui()` 里那次兜底，
+        // 是为了让静默启动（开机自启那一类）也在后台建好——否则用户第一次呼出时看到的一定是
+        // 「索引建立中」，而他要的恰恰是那一刻。
+        seed.refresh_file_index(true);
         // 启动即直接可见时永远走不到 `show_now()` 的「从不可见到可见」边沿，`on_show()` 里的输入法
         // 切换与失焦武装一次都不跑 ⇒ 冷启动后第一次打字被中文输入法截走（2026-10-18 用户裁定补一次）。
         // 判据取 focus_query（＝首屏就是搜索页）：弹窗/设置页启动时焦点归它们，不能让 on_show 抢回去。
@@ -1776,11 +1920,95 @@ impl LauncherApp {
         source::pathcheck::spawn_scan(self.path_tx.clone(), self.items.clone());
     }
 
-    /// 把查询框整串换成 `text` 并把光标放到末尾。补全的 `text` 来自清单（关键字 + 空格），
-    /// 不是把用户输入回写——所以这条日志可以记。
-    fn complete_query(&mut self, ctx: &egui::Context, text: &str) {
+    /// 批次 X：派一轮后台文件索引重建。口径与 [`refresh_path_states`](LauncherApp::refresh_path_states)
+    /// 一致——同一时刻只跑一轮，回收据的那帧才允许下一轮；`force` 忽略最小间隔（冷启动那一次）。
+    fn refresh_file_index(&mut self, force: bool) {
+        if self.file_rebuild_in_flight {
+            return;
+        }
+        if let Some(built) = self.file_indexed_at {
+            if !force && built.elapsed() < source::filesearch::REBUILD_INTERVAL {
+                return;
+            }
+        }
+        self.file_rebuild_in_flight = true;
+        source::filesearch::spawn_rebuild(self.file_tx.clone());
+    }
+
+    /// 批次 X：派一次目录浏览（读一层，不递归）。列目录也是磁盘 I/O——一个十万文件的下载夹
+    /// 或一个正在断线的网络盘会把 UI 线程按住几百毫秒，所以它不进主线程。
+    ///
+    /// 去重只看两条：已经有这一对 `(dir, filter)` 的结果、或这一对正飞在路上。
+    /// 别的组合照样派——打字途中旧的在途请求会被 [`file_plan`](LauncherApp::file_plan) 的
+    /// 核对判据丢掉，宁可多开几个短命线程，也不能让「最新那一次」因为限流而永远没结果。
+    fn request_browse(&mut self, dir: &str, filter: &str) {
+        if self.dir_hits.as_ref().is_some_and(|(d, f, _)| d == dir && f == filter)
+            || self.dir_in_flight.as_ref().is_some_and(|(d, f)| d == dir && f == filter)
+        {
+            return;
+        }
+        self.dir_in_flight = Some((dir.to_string(), filter.to_string()));
+        source::filesearch::spawn_browse(self.file_tx.clone(), dir.to_string(), filter.to_string());
+    }
+
+    /// 批次 X（FR-SRC-14）：本查询该不该由文件源独占整张列表。
+    /// 返回 `None` = 没有触发符，普通合并（自定义提示 / 计算器 / 应用结果 / 网页兜底）照常。
+    ///
+    /// 独占的位置排在 [`custom::exclusive`](source::custom::exclusive) 与网页引擎独占**之后**：
+    /// 用户自己配的命令与出厂引擎关键字优先于本源那些 `open`/`pic` 之类的触发词。
+    fn file_plan(&mut self) -> Option<Plan> {
+        use source::filesearch as fs;
+        let route = fs::route(&self.query);
+        match route {
+            fs::Route::NotOurs => None,
+            fs::Route::Browse { dir, filter } => {
+                self.request_browse(&dir, &filter);
+                let hits = match &self.dir_hits {
+                    Some((d, f, hits)) if *d == dir && *f == filter => hits.clone(),
+                    _ => Vec::new(),
+                };
+                Some(Plan { head: hits.into_iter().map(HeadRow::File).collect(), results: Vec::new() })
+            }
+            fs::Route::Search { words, exts, dirs_only } => {
+                self.refresh_file_index(false);
+                // 冷启动那一阵索引还在后台：给一行说明，而不是让用户对着空列表猜是不是搜坏了。
+                if self.file_indexed_at.is_none() {
+                    return Some(Plan {
+                        head: vec![HeadRow::Hint(source::websearch::EngineHint {
+                            engine_id: "filesearch".to_string(),
+                            title: "文件索引建立中".to_string(),
+                            subtitle: "首次扫描正在后台进行，稍后再试一次".to_string(),
+                            completion: String::new(),
+                        })],
+                        results: Vec::new(),
+                    });
+                }
+                let cached = self
+                    .file_hits_cache
+                    .as_ref()
+                    .filter(|(q, _)| *q == self.query)
+                    .map(|(_, hits)| hits.clone());
+                let hits = match cached {
+                    Some(hits) => hits,
+                    None => {
+                        let hits = fs::search(&self.file_index, &words, &exts, dirs_only);
+                        self.file_hits_cache = Some((self.query.clone(), hits.clone()));
+                        hits
+                    }
+                };
+                Some(Plan { head: hits.into_iter().map(HeadRow::File).collect(), results: Vec::new() })
+            }
+        }
+    }
+
+    /// 把查询框整串换成 `text`、光标放到末尾、要焦点、要重绘。
+    /// `log` 由调用方给**且不得带上 `text`**：这一条路的两类来源（自定义命令补全、文件模式前缀）
+    /// 都可能把用户敲进去的原文回写，而 FR-SYS-03 定的口径是日志绝不记查询原文。
+    /// （批次 U 之前只有 `complete_query` 一个函数，日志里直接内插了 `text`——那时 `text`
+    /// 恒来自清单关键字，所以成立；批次 X 加了 Ctrl+F 这条路之后就不成立了。）
+    fn set_query(&mut self, ctx: &egui::Context, text: String, log: &str) {
         let chars = text.chars().count();
-        self.query = text.to_string();
+        self.query = text;
         self.selected = 0;
         self.focus_query = true;
         // 光标位置存在 TextEditState 里，程序化换掉整个字符串不会带着它走（与 Tab 补全同一个坑）。
@@ -1791,7 +2019,12 @@ impl LauncherApp {
             st.store(ctx, search_field_id());
         }
         ctx.request_repaint();
-        eprintln!("自定义命令：查询补全为「{text}」");
+        eprintln!("{log}");
+    }
+
+    /// 补全：查询换成清单里那条命令的关键字 + 空格。
+    fn complete_query(&mut self, ctx: &egui::Context, text: &str) {
+        self.set_query(ctx, text.to_string(), &format!("自定义命令：查询补全为「{text}」"));
     }
 
     /// 提示行被 Enter / 数字键 / 点击激活。查询已经补好（`"ping "`）就只提示"等参数"，
@@ -1810,9 +2043,22 @@ impl LauncherApp {
         }
     }
 
+    /// 窗口在系统那边是不是"最小化"状态。`self.visible` 只是本程序自己记的旗标，
+    /// `Win+D` / 任务栏「显示桌面」那类是直接改 OS 窗口状态、我们一个回调都收不到 ⇒ 旗标还停在
+    /// `true`。2026-10-22 真机③：呼出路径只问旗标，于是托盘「显示」整块被跳过（只发 `Focus`，
+    /// 而 `SetForegroundWindow` 不会把最小化的窗口拉起来），热键那一按更被当成"再隐藏一次"。
+    /// 判据要问 OS，不能问自己的旗标。
+    fn is_iconic(&self) -> bool {
+        self.self_hwnd.map(|h| unsafe { IsIconic(h).as_bool() }).unwrap_or(false)
+    }
+
     /// FR-SRC-21：IPC 触发的呼出（已显示则只重抢焦点，不再走 on_show 重复切输入法）。
     fn show_now(&mut self, ctx: &egui::Context) {
-        if !self.visible {
+        let iconic = self.is_iconic();
+        if !self.visible || iconic {
+            if iconic && self.visible {
+                eprintln!("呼出：旗标说「已显示」不作数（系统在最小化态）⇒ 还原并显示");
+            }
             self.visible = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             // winit 的可见标志会与实际窗口脱节（被系统/全屏程序最小化后，标志仍是「可见」，
@@ -2474,7 +2720,7 @@ impl LauncherApp {
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "补全优先＝只有当「能被这个查询补长的候选恰好一条」时 Tab 才补全整词（如 jsq→计算器）；候选多于一条说明歧义没消，Tab 改为循环下一项，绝不替你猜第一条。\n专职导航＝Tab 下一项、Shift+Tab 上一项（Delphi 版 ALTRun 的做法），代价是没有补全。\n两种口径都保留 ↑↓ 翻页与 PgUp/PgDn；Tab 导航到头回绕，↑↓ 仍是钳位不动。想要一条不被补全抢走的稳定导航，用 Ctrl+J / Ctrl+K。",
+                                    "补全优先＝只有当「能被这个查询补长的候选恰好一条」时 Tab 才补全整词（如 jsq→计算器）；候选多于一条说明歧义没消，Tab 改为循环下一项，绝不替你猜第一条。\n专职导航＝Tab 下一项、Shift+Tab 上一项（Delphi 版 ALTRun 的做法），代价是没有补全。\n两种口径都保留 ↑↓ 翻页与 PgUp/PgDn；Tab 导航到头回绕，↑↓ 仍是钳位不动。想要一条不被补全抢走的稳定导航，用 Ctrl+N / Ctrl+P（或 Ctrl+J / Ctrl+K）。",
                                 )
                                 .weak()
                                 .small(),
@@ -2499,7 +2745,7 @@ impl LauncherApp {
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "这一层只在两条目的匹配档位相同时才决定先后，匹配更准的那条永远在前。\n次数优先（默认）＝执行次数多的在前，次数相同才看最近一次。刚用过一次的东西不会把用了几十次的老项挤下去。\n次数 + 时间衰减＝比 log2(1+次数) × 0.5^(距上次使用天数 / 7)：次数照旧计权重但被 log2 压过量级，一条项整整 7 天没用热度掉一半，所以\"上周用过一次的\"不会长期赖在前面。\n置顶（Ctrl+P）永远压过这一层；想钉住某个条目就用它，不用靠改口径绕。",
+                                    "这一层只在两条目的匹配档位相同时才决定先后，匹配更准的那条永远在前。\n次数优先（默认）＝执行次数多的在前，次数相同才看最近一次。刚用过一次的东西不会把用了几十次的老项挤下去。\n次数 + 时间衰减＝比 log2(1+次数) × 0.5^(距上次使用天数 / 7)：次数照旧计权重但被 log2 压过量级，一条项整整 7 天没用热度掉一半，所以\"上周用过一次的\"不会长期赖在前面。\n置顶（Ctrl+Shift+P）永远压过这一层；想钉住某个条目就用它，不用靠改口径绕。",
                                 )
                                 .weak()
                                 .small(),
@@ -2612,7 +2858,7 @@ impl LauncherApp {
                             });
                             ui.label(
                                 egui::RichText::new(
-                                    "点「录制新热键」后直接按下想要的组合，不需要再点确认：注册成功立刻生效并写进 settings.json；被系统或其它程序占用会照实报错，并自动回到原来那一组（你原来的设置不会被冲掉）。\n可录的键：字母、数字、空格、回车、反引号 ` 和 F1–F24。非 F 键必须带 Ctrl、Alt 或 Win，因为裸 A、Shift+A 都只是打字，挂成全局键等于一路拦你输入。\n裸键只放开 ` 这一个（批次 R，2026-10-20 按你的要求加的）：代价是设成它以后全系统都打不出 ` 了，所以请照下面「补字符热键」那张卡片配一个出口；Shift+` 打出的 ~ 不受影响（本机实测）。录制期间程序会先把当前全局热键临时注销——不然裸 ` 被系统整条吞掉，本程序一个按键都收不到，永远录不成；退出录制（落定 / Esc / 取消按钮 / 关窗 / 隐藏到托盘）立刻装回去，另有一个 30 秒兜底定时器防止卡在注销状态。\nWin 组合键在这里录不了：egui 在 Windows 上不把 Win 当作修饰键传上来（你按 Ctrl 时它给的 command 位就是 Ctrl 的副本）。想要 Win+X，用它下面那张补字符卡片上的复选框。\n本程序自己的组合（Ctrl+N/E/D/I/P/J/K、Ctrl+Shift+D、Ctrl+数字、Alt+数字）会先在本地挡一道。全局占用只能靠\"试注册\"发现——Windows 没有枚举别人热键的 API，所以\"没报错\"只代表这一刻系统允许它注册上，不代表全机没人想用这个键。\n还有一点要知道：全局热键是被系统整条吞掉的，设成 Ctrl+A、Ctrl+C 这类常用编辑键，别的程序里那个动作就跟着没了（本程序没绑它们，所以不会在这里拦你，得自己避）。",
+                                    "点「录制新热键」后直接按下想要的组合，不需要再点确认：注册成功立刻生效并写进 settings.json；被系统或其它程序占用会照实报错，并自动回到原来那一组（你原来的设置不会被冲掉）。\n可录的键：字母、数字、空格、回车、反引号 ` 和 F1–F24。非 F 键必须带 Ctrl、Alt 或 Win，因为裸 A、Shift+A 都只是打字，挂成全局键等于一路拦你输入。\n裸键只放开 ` 这一个（批次 R，2026-10-20 按你的要求加的）：代价是设成它以后全系统都打不出 ` 了，所以请照下面「补字符热键」那张卡片配一个出口；Shift+` 打出的 ~ 不受影响（本机实测）。录制期间程序会先把当前全局热键临时注销——不然裸 ` 被系统整条吞掉，本程序一个按键都收不到，永远录不成；退出录制（落定 / Esc / 取消按钮 / 关窗 / 隐藏到托盘）立刻装回去，另有一个 30 秒兜底定时器防止卡在注销状态。\nWin 组合键在这里录不了：egui 在 Windows 上不把 Win 当作修饰键传上来（你按 Ctrl 时它给的 command 位就是 Ctrl 的副本）。想要 Win+X，用它下面那张补字符卡片上的复选框。\n本程序自己的组合（Ctrl+N/E/D/I/J/K、Ctrl+Shift+N/D/P、Ctrl+数字、Alt+数字）会先在本地挡一道。全局占用只能靠\"试注册\"发现——Windows 没有枚举别人热键的 API，所以\"没报错\"只代表这一刻系统允许它注册上，不代表全机没人想用这个键。\n还有一点要知道：全局热键是被系统整条吞掉的，设成 Ctrl+A、Ctrl+C 这类常用编辑键，别的程序里那个动作就跟着没了（本程序没绑它们，所以不会在这里拦你，得自己避）。",
                                 )
                                 .weak()
                                 .small(),
@@ -2753,21 +2999,30 @@ impl LauncherApp {
                                     ("↑ / ↓", "选择条目"),
                                     ("PgUp / PgDn", "结果列表翻页（列表滚动跟随选中项）"),
                                     ("1 … 9 / 0", "执行第 1–9 行 / 第 10 行（列表前 10 行已标号）；裸键仅输入为空时生效，Ctrl+数字 / Alt+数字 不受限制"),
-                                    ("Tab", "补全 / 循环下一项（按设置页「Tab 键行为」）；补全优先模式下只有「能被这个查询补长的候选恰好一条」才补全，否则导航"),
+                                    ("Tab", "补全 / 循环下一项（按设置页「Tab 键行为」）；补全优先模式下只有「能被这个查询补长的候选恰好一条」才补全，否则导航；选中的是文件夹行时恒为进入该目录（FR-SRC-14）"),
                                     ("Shift+Tab", "循环上一项（两种 Tab 模式一致）"),
-                                    ("Ctrl+J / Ctrl+K", "循环下一项 / 上一项（恒为导航，不会被补全抢走）"),
+                                    ("Ctrl+N / Ctrl+P", "循环下一项 / 上一项（恒为导航，不会被补全抢走）"),
+                                    ("Ctrl+J / Ctrl+K", "同上，另一对（保留给老习惯）"),
                                     ("Space", "执行选中项（默认仅输入为空时；设置页「空格直接执行」可改为始终执行）"),
                                     ("左键拖边缘/角", "改变窗口大小（四边 + 四角各 6px 隐形手柄，最小 360×240）"),
                                     ("Ctrl+= / Ctrl+-", "窗口放大 / 缩小一档（60×40 逻辑像素，键盘路径同上）"),
                                     ("左键拖空白", "移动窗口：顶栏空白（搜索框与「＋ 新建」之间、设置页标题右侧）或列表右侧空白；中键不再执行任何条目"),
                                     ("Enter", "运行选中项；弹窗/确认框确定；无匹配弹新增"),
                                     ("Esc", "关确认框 → 关弹窗 → 设置页返回 → 清空输入 → 关闭到托盘（按序）"),
-                                    ("Ctrl+N", "新建快捷项"),
+                                    ("Ctrl+Shift+N", "新建快捷项（选中的是文件行时预填这一行的路径与类型）"),
                                     ("Ctrl+E", "编辑选中项"),
                                     ("Delete", "删除选中项（仅输入为空时；弹确认框）"),
                                     ("Ctrl+Shift+D", "删除选中项（不受输入限制；弹确认框）"),
-                                    ("Ctrl+D", "打开选中项所在目录"),
-                                    ("Ctrl+P", "置顶 / 取消置顶选中项（📌）"),
+                                    ("Ctrl+D", "打开选中项所在目录（文件行：在资源管理器里定位这个文件）"),
+                                    ("Ctrl+Shift+P", "置顶 / 取消置顶选中项（📌）"),
+                                    ("Ctrl+F", "进入文件模式：在当前输入前补一个 ' 触发符；已在文件模式时只提示，不叠第二个前缀"),
+                                    ("D:\\proj\\ 、 \\\\srv\\share\\", "文件模式第一式：直接打路径浏览那一层（尾部分隔符＝列整个目录；不带则是「目录 + 过滤词」）"),
+                                    ("' 报告", "第二式：在索引范围（桌面 / 下载 / 文档，四级以内，3 万条封顶）里按文件名搜"),
+                                    ("open|find|file 报告", "第三式：动词触发（与 ' 同一结果）"),
+                                    ("pic|doc|video|audio|zip|exe|cad 报告", "第四式：按类型筛扩展名（目录不参与类型筛选）"),
+                                    ("folder 项目", "第五式：只找文件夹"),
+                                    (" 报告（空格开头）", "第六式：空格开头进文件模式（Shift+空格 插入的那个真空格）"),
+                                    ("文件行右键", "复制路径 / 在资源管理器中显示 / 添加为快捷项（文件行不在清单里 ⇒ 编辑、删除、置顶对它不适用）"),
                                     ("Ctrl+I", "批量导入全部"),
                                     ("Ctrl+,", "打开 / 返回设置页"),
                                 ] {
@@ -2896,13 +3151,10 @@ impl LauncherApp {
     }
 
     /// 补全提示行不可执行（需求书把空词这一格定为 `valid=false`）：Enter/点击/数字键
-    /// 落到它身上时统一给这一句。
-    fn hint_toast(&mut self, ctx: &egui::Context) {
-        self.toast = Some((
-            "继续输入关键词后再回车".to_string(),
-            Instant::now() + TOAST_TTL,
-            TOAST_OK,
-        ));
+    /// 落到它身上时统一给一句提示。文案由调用方给——批次 X 起 `HeadRow::Hint` 多了一格
+    /// 「文件索引建立中」，那句"继续输入关键词后再回车"对它没有意义。
+    fn hint_toast(&mut self, ctx: &egui::Context, msg: &str) {
+        self.toast = Some((msg.to_string(), Instant::now() + TOAST_TTL, TOAST_OK));
         ctx.request_repaint_after(TOAST_TTL);
     }
 
@@ -2934,6 +3186,54 @@ impl LauncherApp {
         self.on_hide();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         true
+    }
+
+    /// 批次 X：文件行的「执行」＝用系统关联程序打开这个文件/目录，然后关到托盘。
+    /// 与 [`open_search_hit`](LauncherApp::open_search_hit) 同一条理由**不走 `launch_and_hide`**：
+    /// 那条路把 `path` 原样写日志，而这里的每一条路径都是用户从搜索框里现搜出来的——
+    /// 可能是他从下载夹里翻出来的一个文件名。FR-SYS-03 的口径是「清单内条目才记 name」，
+    /// 文件源不在清单里 ⇒ 只记动作与类型，路径与查询原文都不落日志。
+    fn open_file_hit(&mut self, ctx: &egui::Context, hit: &source::filesearch::FileHit) -> bool {
+        match shell_execute(&hit.path, "", None) {
+            Ok(_) => eprintln!(
+                "文件搜索：已用系统关联程序打开{}（路径由查询现出，不落日志）",
+                if hit.is_dir { "目录" } else { "文件" }
+            ),
+            Err(e) => {
+                eprintln!("文件搜索：打开失败：{e}");
+                self.toast = Some((
+                    format!("⚠ 打开失败：{e}"),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_ERR,
+                ));
+                ctx.request_repaint_after(TOAST_TTL);
+                return false;
+            }
+        }
+        self.toast = None;
+        self.clear_query_next_frame = true;
+        self.selected = 0;
+        self.visible = false;
+        self.on_hide();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        true
+    }
+
+    /// 批次 X：在资源管理器里打开所在目录并选中这个文件/目录，随后关到托盘。
+    /// 临时条目不进清单、不记学习统计（`launch_from_list` 为假），与清单行 Ctrl+D 那一条同形态；
+    /// 日志走脱敏路径：这条路径同样来自查询。
+    fn select_in_explorer(&mut self, ctx: &egui::Context, path: &str) {
+        let entry = LaunchItem {
+            name: "所在目录".to_string(),
+            path: "explorer.exe".to_string(),
+            arguments: format!("/select,\"{path}\""),
+            working_dir: None,
+            source_path: String::new(),
+            kind: ItemKind::Command,
+            keyword: String::new(),
+            ..Default::default()
+        };
+        self.launch_and_hide_masked(ctx, &entry, "FR-SRC-14 文件行");
     }
 
     /// 把当前整张清单写盘（种子播种一次后即普通用户项，不再剔除）。
@@ -3037,6 +3337,12 @@ impl LauncherApp {
                 results: Vec::new(),
             },
             source::websearch::Exclusive::NotOurs => {
+                // 批次 X（FR-SRC-14）：文件模式排在网页引擎之后、普通合并之前——它是"整张列表
+                // 都是文件"的独占，放在合并之后就只能插在应用结果前面，那样类型词会跟清单
+                // 条目混在一起，用户分不清自己是在搜文件还是在搜快捷项。
+                if let Some(plan) = self.file_plan() {
+                    return plan;
+                }
                 // 头段次序：自定义提示行（用户刚打全一个触发码）→ 计算器 → 应用结果。
                 // 提示行放最前是因为它只在「查询恰好等于某个关键字」时出现，那一刻用户
                 // 要的就是这条命令，不该被 `1` 之类的算式行压住。
@@ -3082,6 +3388,44 @@ impl eframe::App for LauncherApp {
         // 窗口可见期间的兜底刷新（最小间隔见 PATH_RESCAN_INTERVAL）：用户可能开着框去插 U 盘。
         self.refresh_path_states(false);
 
+        // 批次 X：收取文件源的后台回报（索引整表替换 / 一次目录浏览）。
+        while let Ok(update) = self.file_rx.try_recv() {
+            use source::filesearch::FileUpdate as U;
+            match update {
+                U::Index(entries) => {
+                    let n = entries.len();
+                    self.file_index = entries;
+                    self.file_indexed_at = Some(Instant::now());
+                    self.file_rebuild_in_flight = false;
+                    // 新索引配旧缓存就是"用上一轮的命中回答这一轮的查询"⇒ 一起清掉。
+                    self.file_hits_cache = None;
+                    eprintln!("文件索引：本轮建成 {n} 条（范围＝桌面/下载/文档，深度 4，上限 3 万）");
+                    ui.ctx().request_repaint();
+                }
+                U::Dir { dir, filter, hits } => {
+                    // 只认"当前还在等的那一份"。打字途中派出去的旧请求回来得晚，采纳它会让列表
+                    // 显示另一个目录的内容——列错目录比空一帧严重得多。
+                    if self.dir_in_flight.as_ref().is_some_and(|(d, f)| *d == dir && *f == filter) {
+                        self.dir_in_flight = None;
+                        let n = hits.len();
+                        self.dir_hits = Some((dir, filter, hits));
+                        eprintln!("文件搜索：目录列表回报（{n} 条，路径不落日志）");
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+        }
+        // 可见期间的 30 分钟重扫兜底（静默启动时上面 `new` 已派过第一轮）。
+        self.refresh_file_index(false);
+        // E1：配置坏过一次的那句说明，等窗口真被看见才说（Toast 会被 `on_show` 清空，
+        // 所以它必须在 `hotkey_frame` 之后、渲染之前入队）。
+        if self.visible {
+            if let Some(msg) = self.startup_notice.take() {
+                self.toast = Some((msg, Instant::now() + TOAST_TTL, TOAST_ERR));
+                ui.ctx().request_repaint_after(TOAST_TTL);
+            }
+        }
+
         // E-06 托盘事件
         while let Ok(event) = self.tray_rx.try_recv() {
             match event {
@@ -3109,7 +3453,9 @@ impl eframe::App for LauncherApp {
 
         // FR-WIN-05 全局热键 toggle（Ctrl+Alt+Space）
         while self.hotkey_rx.try_recv().is_ok() {
-            if self.visible {
+            // 隐藏那一支的条件是「旗标说显示着 **且** 系统那边也显示着」：只问旗标时，`Win+D`
+            // 之后第一按会走成"再隐藏一次"（用户看到的就是按了没反应，2026-10-22 真机③）。
+            if self.visible && !self.is_iconic() {
                 eprintln!("FR-WIN-05: 热键切换 → 隐藏");
                 self.visible = false;
                 self.on_hide();
@@ -3272,6 +3618,11 @@ impl eframe::App for LauncherApp {
         let mut copy_text: Option<String> = None;
         // FR-SRC-11：搜索行的「执行」＝打开 URL（独立函数，日志口径见 `open_search_hit`）。
         let mut open_hit: Option<source::websearch::SearchHit> = None;
+        // 批次 X：文件行的三个动作各自一条道（打开 / 在资源管理器里定位 / 复制路径）。
+        // 都只带路径字符串而不带 LaunchItem：这三件事都不进清单、不记学习统计。
+        let mut open_file: Option<source::filesearch::FileHit> = None;
+        let mut select_path: Option<String> = None;
+        let mut copy_path: Option<String> = None;
         let mut row_actions: Vec<String> = Vec::new();
         let mut pin_toggles: Vec<String> = Vec::new();
 
@@ -3279,10 +3630,10 @@ impl eframe::App for LauncherApp {
         // 键位口径（用户 2026-10-17 指定）：Delete=删除选中项（仅空输入时；有输入时归 TextEdit 前向删除）、
         // Ctrl+Shift+D=删除选中项（不受输入限制）、Ctrl+D=打开选中项所在目录（explorer /select）、
         // Ctrl+,=设置页开/关（2026-10-17 追加；SendTo 已从快捷键撤下改设置页开关）、
-        // Ctrl+P=置顶/取消置顶选中项（FR-SRC-19，2026-10-17）、
+        // Ctrl+Shift+N=新建快捷项、Ctrl+Shift+P=置顶/取消置顶选中项（FR-SRC-19；2026-10-22 从 Ctrl+N/P 挪来）、
         // PgUp/PgDn=翻页、Tab=补全或循环下一项（语义见设置页 tab_mode）、Shift+Tab=循环上一项、
-        // Ctrl+J/Ctrl+K=恒为循环下/上一项（2026-10-18 用户点名 Emacs 的 next/prev line；
-        // 因 Ctrl+N=新建、Ctrl+P=置顶 已占用，用户改选这一对空闲键），
+        // Ctrl+N/Ctrl+P=恒为循环下/上一项（2026-10-22 用户点名 Emacs 的 next/prev line，
+        // 正合需求书 FR-ACT-10 原文；Ctrl+J/Ctrl+K 那对 2026-10-18 加的旧键一并保留），
         // 1-9/0 与 Ctrl+1-9/0=执行第 N 行（FR-ACT-10，2026-10-17）。
         // Space=执行选中项（FR-ACT-01 的 space_to_run，四档 off/word/unique/always，默认 word；
         // 判据与各自代价见设置页「空格执行选中项」）。Shift+空格 恒为插入真空格，不受档位影响。
@@ -3325,15 +3676,30 @@ impl eframe::App for LauncherApp {
                 eprintln!("快捷键 Ctrl+,：设置页 {}", if self.settings_open { "打开" } else { "返回搜索" });
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
-                let (hit_n, hit_i, hit_e, hit_cd, hit_csd, hit_cp) = {
+                // Ctrl+Shift+N 新建、Ctrl+Shift+P 置顶、Ctrl+Shift+D 删除（2026-10-22 用户改键：
+                // Ctrl+N/Ctrl+P 让给"下一项/上一项"，与需求书 FR-ACT-10 原文的 `Ctrl+P/N` 移动对齐；
+                // 置顶挪到 Shift 层，与新建同层对称）。
+                // **带 Shift 的三条必须先消费**：`consume_key` 走 `Modifiers::matches_logically`，
+                // 它只看"模式要的修饰键有没有按"，忽略多出来的 Shift（egui 文档原话：先匹配更具体的
+                // 组合）⇒ 先吃 COMMAND 会把 COMMAND|SHIFT 一起吞掉。原先把 Ctrl+D 排在 Ctrl+Shift+D
+                // 前面，导致删除键永远走不到 —— 本次改键时发现并一并修正。
+                let (hit_csn, hit_csd, hit_csp) = {
+                    let hot = |k: egui::Key| {
+                        ui.input_mut(|i| {
+                            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, k)
+                        })
+                    };
+                    (hot(egui::Key::N), hot(egui::Key::D), hot(egui::Key::P))
+                };
+                let (hit_n, hit_p, hit_i, hit_e, hit_cd, hit_cf) = {
                     let hot = |mods: egui::Modifiers, k: egui::Key| ui.input_mut(|i| i.consume_key(mods, k));
                     (
                         hot(egui::Modifiers::COMMAND, egui::Key::N),
+                        hot(egui::Modifiers::COMMAND, egui::Key::P),
                         hot(egui::Modifiers::COMMAND, egui::Key::I),
                         hot(egui::Modifiers::COMMAND, egui::Key::E),
                         hot(egui::Modifiers::COMMAND, egui::Key::D),
-                        hot(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::D),
-                        hot(egui::Modifiers::COMMAND, egui::Key::P),
+                        hot(egui::Modifiers::COMMAND, egui::Key::F),
                     )
                 };
                 // 裸 Delete 只在搜索框为空时接管：有输入时它是文本编辑键，不能抢。
@@ -3353,7 +3719,8 @@ impl eframe::App for LauncherApp {
                     )
                 };
                 // Ctrl+J / Ctrl+K ＝ 无条件循环导航（2026-10-18 用户点名要 Emacs 的 next/prev line；
-                // Ctrl+N/Ctrl+P 已被「新建」「置顶」占用，用户改选这一对空闲键）。
+                // 当时 Ctrl+N/Ctrl+P 被「新建」「置顶」占着，2026-10-22 那两项挪到 Shift 层后
+                // N/P 也接上了同一个动作，这两键作为老习惯保留）。
                 let (hit_ctrl_j, hit_ctrl_k) = {
                     let hot = |mods: egui::Modifiers, k: egui::Key| ui.input_mut(|i| i.consume_key(mods, k));
                     (
@@ -3425,8 +3792,54 @@ impl eframe::App for LauncherApp {
                     );
                 }
 
-                if hit_n {
-                    self.dialog = Some(DialogState::blank());
+                if hit_cf {
+                    // 批次 X：Ctrl+F 进文件模式 = 在已有输入前补一个 `'` 触发符（打的词留着当过滤词，
+                    // 不要用户重打一遍）。已经在文件模式里就不叠第二个前缀——`''词` 会被当成
+                    // 文件名的一部分去匹配，那一下按键把用户的查询弄脏了，比没反应更糟。
+                    let p = source::filesearch::route(&self.query);
+                    let already = self.query.starts_with('\'')
+                        || self.query.starts_with(' ')
+                        || matches!(p, source::filesearch::Route::Search { .. } | source::filesearch::Route::Browse { .. });
+                    if already {
+                        self.toast = Some((
+                            "已在文件模式（Esc 清空回到清单；直接打路径也能浏览）".to_string(),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                        ui.ctx().request_repaint_after(TOAST_TTL);
+                        eprintln!("快捷键 Ctrl+F：已在文件模式，不叠第二个前缀");
+                    } else {
+                        let text = format!("'{}", self.query.trim());
+                        self.set_query(
+                            ui.ctx(),
+                            text,
+                            "快捷键 Ctrl+F：进入文件模式（补 ' 前缀，原输入保留为过滤词、不写日志）",
+                        );
+                    }
+                } else if hit_csn {
+                    // 批次 X：选中的是文件行时把这一行预填进添加对话框（"从眼前这一行建快捷项"），
+                    // 其余情况仍是空白对话框——新建的语义不动，只是键从 Ctrl+N 挪到 Ctrl+Shift+N
+                    // （2026-10-22 用户改键）。
+                    // 没预填那一条也要留痕（2026-10-22 真机⑧报的就是"弹了框但两格全空"，当时日志
+                    // 里没有任何一行能说明它走的是哪个分支——测量不能只记成功那一半）。
+                    let (hit, head_len) = {
+                        let plan = self.plan();
+                        let head_len = plan.head.len();
+                        (plan.head.get(self.selected).and_then(|r| r.file_hit()).cloned(), head_len)
+                    };
+                    self.dialog = Some(match hit {
+                        Some(hit) => {
+                            eprintln!("快捷键 Ctrl+Shift+N：用选中的文件行预填添加框（路径不落日志）");
+                            DialogState::from_file_hit(&hit)
+                        }
+                        None => {
+                            eprintln!(
+                                "快捷键 Ctrl+Shift+N：选中的不是文件行（第 {} 行，头段 {head_len} 行）⇒ 空白添加框",
+                                self.selected + 1
+                            );
+                            DialogState::blank()
+                        }
+                    });
                     self.dialog_enter_armed = true; // 开框这次 Enter 归"开框"，同帧不误提交
                 } else if hit_i {
                     source::application::spawn_batch_import(self.apps_tx.clone());
@@ -3437,12 +3850,21 @@ impl eframe::App for LauncherApp {
                     ));
                     ui.ctx().request_repaint_after(TOAST_TTL);
                     eprintln!("快捷键 Ctrl+I：批量导入全部 已触发（后台扫描开始菜单/桌面）");
-                } else if hit_e || hit_cd || hit_del || hit_csd || hit_cp {
+                } else if hit_e || hit_cd || hit_del || hit_csd || hit_csp {
                     // 头段行（计算器/搜索/提示）没有条目身份 ⇒ 编辑/删除/置顶/打开目录这四档
                     // 整体不适用。判据只落在 `sel` 这一层：选中头段 ⇒ 拿不到条目，下面的动作原样跳过。
                     // 例外（批次 U）：自定义命令的提示行/独占行背后是清单里真实的一条 ⇒ 编辑与删除
                     // 按 uid 回查原条目照常可用；置顶与打开目录仍不适用（对命令无意义，旧口径不动）。
                     let plan = self.plan();
+                    // 批次 X：文件行不在清单里、没有条目身份 ⇒ 编辑/删除/置顶对它无意义，
+                    // 但 Ctrl+D 有真实含义（在资源管理器里定位这个文件）。下面那套按 uid 回查
+                    // 的逻辑对文件行天然拿不到 `sel`，所以只需在这里单独取走 Ctrl+D 这一档。
+                    let on_file_row = plan.head.get(self.selected).and_then(|r| r.file_hit()).cloned();
+                    let handled_file_cd = hit_cd && on_file_row.is_some();
+                    if let Some(hit) = on_file_row.filter(|_| hit_cd) {
+                        select_path = Some(hit.path.clone());
+                        eprintln!("快捷键 Ctrl+D：在资源管理器中定位文件行（路径由查询现出，不落日志）");
+                    }
                     let item_row = item_rank(self.selected, plan.head.len());
                     let results = plan.results;
                     // search 返回下标而不是引用：调用方接下来要改 self.items。
@@ -3457,7 +3879,7 @@ impl eframe::App for LauncherApp {
                                 .and_then(|u| self.items.iter().find(|i| i.uid() == u).cloned());
                         }
                     }
-                    if item_row.is_none() && sel.is_none() {
+                    if item_row.is_none() && sel.is_none() && !handled_file_cd {
                         eprintln!("快捷键 编辑/删除/置顶/开目录：选中的是头段结果行，这四档不适用");
                     }
                     // 身份一律用派生 uid（同 path 不同参数是两个条目），path 只作数据用。
@@ -3468,8 +3890,9 @@ impl eframe::App for LauncherApp {
                         if hit_e {
                             self.dialog = Some(DialogState::from_item(&s));
                             self.dialog_enter_armed = true;
-                        } else if hit_cp {
-                            // FR-SRC-19 Ctrl+P：切换选中项置顶，立即落盘、Toast 回执。
+                        } else if hit_csp {
+                            // FR-SRC-19 Ctrl+Shift+P：切换选中项置顶，立即落盘、Toast 回执。
+                            // （2026-10-22 从 Ctrl+P 挪来——Ctrl+P 现在是「上一项」。）
                             // 用下标+先取副本，避免 iter_mut 借用未结束就调 &self 的 save_items。
                             if let Some(pos) = self.items.iter().position(|i| i.uid() == uid) {
                                 self.items[pos].pinned = !self.items[pos].pinned;
@@ -3483,7 +3906,7 @@ impl eframe::App for LauncherApp {
                                 };
                                 self.toast = Some((text, Instant::now() + TOAST_TTL, TOAST_OK));
                                 ui.ctx().request_repaint_after(TOAST_TTL);
-                                eprintln!("快捷键 Ctrl+P：置顶切换 {uid} → {on}");
+                                eprintln!("快捷键 Ctrl+Shift+P：置顶切换 {uid} → {on}");
                             }
                         } else if hit_del || hit_csd {
                             // 2026-10-18 用户要求（选中「控制面板」被误删过一次）：删除一律先弹确认，
@@ -3526,26 +3949,37 @@ impl eframe::App for LauncherApp {
                             self.selected + 1
                         );
                     }
-                } else if hit_ctrl_j || hit_ctrl_k {
+                } else if hit_ctrl_j || hit_ctrl_k || hit_n || hit_p {
                     // 与 Tab/Shift+Tab 同口径（回绕循环，不是 ↑↓ 的钳位），差别只有一点：
-                    // 这对键**永远只导航**，不会被 tab_mode=Complete 的补全抢走 ——
-                    // 补全优先模式下想要一条稳定的「下一条/上一条」通道就靠它。
+                    // 这几对键**永远只导航**，不会被 tab_mode=Complete 的补全抢走 ——
+                    // 补全优先模式下想要一条稳定的「下一条/上一条」通道就靠它们。
+                    // Ctrl+N/Ctrl+P 是 2026-10-22 用户点名的一对（Emacs 的 next/prev line，也正合
+                    // 需求书 FR-ACT-10 原文的 `Ctrl+P/N` 移动）；Ctrl+J/Ctrl+K 一并保留，老习惯不断。
+                    let backward = hit_ctrl_k || hit_p;
+                    let key = if hit_p {
+                        "Ctrl+P"
+                    } else if hit_ctrl_k {
+                        "Ctrl+K"
+                    } else if hit_n {
+                        "Ctrl+N"
+                    } else {
+                        "Ctrl+J"
+                    };
                     let plan = self.plan();
                     let len = row_count(plan.results.len(), plan.head.len());
                     if len > 0 {
                         let cur = self.selected.min(len - 1);
-                        self.selected = if hit_ctrl_k {
+                        self.selected = if backward {
                             (cur + len - 1) % len
                         } else {
                             (cur + 1) % len
                         };
                         eprintln!(
-                            "快捷键 {}：循环选中第 {} 行（共 {len} 行）",
-                            if hit_ctrl_k { "Ctrl+K" } else { "Ctrl+J" },
+                            "快捷键 {key}：循环选中第 {} 行（共 {len} 行）",
                             self.selected + 1
                         );
                     } else {
-                        eprintln!("快捷键 Ctrl+J/K：当前查询无结果，忽略");
+                        eprintln!("快捷键 {key}：当前查询无结果，忽略");
                     }
                 } else if hit_tab || hit_shift_tab {
                     // FR-ACT-06 Tab 语义由设置页 `tab_mode` 二选一（2026-10-18 用户裁定两种都做）：
@@ -3583,7 +4017,21 @@ impl eframe::App for LauncherApp {
                             matching::unique_completion(&self.query, &self.items, &results)
                                 .map(|rank| self.items[results[rank]].name.clone())
                         };
-                        if let Some(name) = complete_to {
+                        // 批次 X（结 B4）：选中目录型文件行时 Tab ＝ 进这个目录——把路径写进查询框
+                        // 并以分隔符结尾，浏览模式自己会列它。这一档排在补全之前是有意的：
+                        // 头段行本来就不参与补全（上面 `self.selected < head_len` 那条判据为此存在），
+                        // 现在它有了自己的 Tab 语义，不再是"什么也不做、只跳下一行"。
+                        let into_dir = if backward || self.selected >= head_len {
+                            None
+                        } else {
+                            plan.head[self.selected]
+                                .file_hit()
+                                .filter(|h| h.is_dir)
+                                .map(|h| format!("{}\\", h.path))
+                        };
+                        if let Some(dir) = into_dir {
+                            self.set_query(ui.ctx(), dir, "快捷键 Tab：进入选中的目录（浏览模式，路径不写日志）");
+                        } else if let Some(name) = complete_to {
                             let chars = name.chars().count();
                             self.query = name.clone();
                             self.selected = 0;
@@ -3631,10 +4079,10 @@ impl eframe::App for LauncherApp {
                                     );
                                     open_hit = Some(hit.clone());
                                 }
-                                HeadRow::Hint(_) => {
+                                HeadRow::Hint(hint) => {
                                     // 需求书把空词这一格定为 valid=false：数字键不执行，只提示。
                                     eprintln!("快捷键 数字键 {digit}：选中的是补全提示行，不执行");
-                                    self.hint_toast(ui.ctx());
+                                    self.hint_toast(ui.ctx(), hint_message(hint));
                                 }
                                 HeadRow::Custom(hit) => {
                                     // FR-SRC-05：与 Enter 同一语义，日志走脱敏路径。
@@ -3654,6 +4102,13 @@ impl eframe::App for LauncherApp {
                                         hint.title
                                     );
                                     self.custom_hint_activate(ui.ctx(), hint);
+                                }
+                                HeadRow::File(hit) => {
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：打开文件行的{}（路径由查询现出，不落日志）",
+                                        if hit.is_dir { "目录" } else { "文件" }
+                                    );
+                                    open_file = Some(hit.clone());
                                 }
                             },
                             Some(Row::Item(rank)) => {
@@ -3790,7 +4245,7 @@ impl eframe::App for LauncherApp {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .id(search_id)
-                        .hint_text("搜索…（↑↓/PgUp/PgDn 选择，Enter/空格/1-9 运行，Tab 补全，Ctrl+N 新建，Ctrl+E 编辑，Delete 删除，Ctrl+D 开目录，Ctrl+P 置顶，Ctrl+, 设置，Esc 清空/关闭）"),
+                        .hint_text("搜索…（↑↓/PgUp/PgDn/Ctrl+N/P 选择，Enter/空格/1-9 运行，Tab 补全，Ctrl+Shift+N 新建，Ctrl+E 编辑，Delete 删除，Ctrl+D 开目录，Ctrl+Shift+P 置顶，Ctrl+, 设置，Esc 清空/关闭）"),
                 );
                 pill_right = resp.rect.max.x;
                 if resp.changed() {
@@ -3835,8 +4290,27 @@ impl eframe::App for LauncherApp {
             let results = plan.results;
             let total = row_count(results.len(), head_len);
             if total == 0 {
+                // 批次 X：文件模式下"未找到"这三行字会说错两件事——范围（不是"清单里没有"，
+                // 是"索引范围里没有"或"这个目录空/读不到"）与预填（`'报告`、`pic 报告` 这种带
+                // 触发符的串喂给 `from_input` 会生成一条命令行是乱码的条目）。所以另起一格。
+                let file_route = source::filesearch::route(&self.query);
+                let in_file_mode = !matches!(file_route, source::filesearch::Route::NotOurs);
                 if q.is_empty() {
-                    ui.label("清单为空——按 Ctrl+N 或点右上「＋」新建，或按 Ctrl+I 批量导入。");
+                    ui.label("清单为空——按 Ctrl+Shift+N 或点右上「＋」新建，或按 Ctrl+I 批量导入。");
+                } else if in_file_mode {
+                    ui.label(match &file_route {
+                        source::filesearch::Route::Browse { dir, .. } =>
+                            format!("这个目录为空或读不到：{dir}"),
+                        _ => "文件模式：索引范围（桌面 / 下载 / 文档，四级以内）内没有匹配的文件。"
+                            .to_string(),
+                    });
+                    if ui.button("＋ 新建快捷项").clicked() {
+                        self.dialog = Some(DialogState::blank());
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.dialog = Some(DialogState::blank());
+                        self.dialog_enter_armed = true;
+                    }
                 } else {
                     ui.label(format!("未找到「{}」——按 Enter 或点下方按钮弹出新增窗口", self.query.trim()));
                     // FR-SRC-23（2026-10-17 修订）：无匹配 Enter 不再直接运行，而是弹出预填当前输入的 AddDialog，确定即入库。
@@ -3867,7 +4341,7 @@ impl eframe::App for LauncherApp {
                             Some(Row::Head(h)) => match &plan.head[h] {
                                 HeadRow::Calc(hit) => copy_text = Some(hit.copy.clone()),
                                 HeadRow::Search(hit) => open_hit = Some(hit.clone()),
-                                HeadRow::Hint(_) => self.hint_toast(ui.ctx()),
+                                HeadRow::Hint(hint) => self.hint_toast(ui.ctx(), hint_message(hint)),
                                 HeadRow::Custom(hit) => {
                                     launch = Some(hit.entry.clone());
                                     launch_uid = Some(hit.uid.clone());
@@ -3877,6 +4351,7 @@ impl eframe::App for LauncherApp {
                                 HeadRow::CustomHint(hint) => {
                                     self.custom_hint_activate(ui.ctx(), hint);
                                 }
+                                HeadRow::File(hit) => open_file = Some(hit.clone()),
                             },
                             Some(Row::Item(rank)) => {
                                 launch = Some(self.items[results[rank]].clone());
@@ -3974,7 +4449,7 @@ impl eframe::App for LauncherApp {
                                             egui::RichText::new(hint.subtitle.as_str()).weak().size(12.0),
                                         );
                                         if sel.clicked() {
-                                            self.hint_toast(ui.ctx());
+                                            self.hint_toast(ui.ctx(), hint_message(hint));
                                         }
                                     });
                                 }
@@ -4069,6 +4544,56 @@ impl eframe::App for LauncherApp {
                                         });
                                     });
                                 }
+                                HeadRow::File(hit) => {
+                                    // 批次 X（FR-SRC-14）：标题是文件名，副标题是所在目录——同一屏里
+                                    // 好几个同名文件全靠后半句认出哪一个才是要找的那个。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "打开");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(if hit.is_dir {
+                                                    "\u{1F4C1}"
+                                                } else {
+                                                    "\u{1F4C4}"
+                                                })
+                                                .size(18.0)
+                                                .weak(),
+                                            ),
+                                        )
+                                        .on_hover_text(if hit.is_dir {
+                                            "文件夹（FR-SRC-14，选中按 Tab 进入）"
+                                        } else {
+                                            "文件（FR-SRC-14）"
+                                        });
+                                        let sel = ui.selectable_label(is_sel, hit.title.clone());
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            open_file = Some(hit.clone());
+                                        }
+                                        // 文件行不在清单里 ⇒ 没有"编辑/删除清单条目"可言，右键给三件
+                                        // 对这个文件本身有意义的事（复制 / 定位 / 收进清单）。
+                                        sel.context_menu(|ui| {
+                                            if ui.button("复制路径").clicked() {
+                                                copy_path = Some(hit.path.clone());
+                                                ui.close();
+                                            }
+                                            if ui.button("在资源管理器中显示").clicked() {
+                                                select_path = Some(hit.path.clone());
+                                                ui.close();
+                                            }
+                                            if ui.button("添加为快捷项…").clicked() {
+                                                self.dialog = Some(DialogState::from_file_hit(hit));
+                                                ui.close();
+                                            }
+                                        });
+                                    });
+                                }
                             }
                         }
                         for (rank, &hit) in results.iter().enumerate() {
@@ -4112,7 +4637,7 @@ impl eframe::App for LauncherApp {
                                         self.dialog = Some(dq);
                                         ui.close();
                                     }
-                                    // FR-SRC-19：置顶开关入口（右键），与 Ctrl+P 同语义。
+                                    // FR-SRC-19：置顶开关入口（右键），与 Ctrl+Shift+P 同语义。
                                     let pin_label = if item.pinned { "取消置顶" } else { "置顶" };
                                     if ui.button(pin_label).clicked() {
                                         pin_toggles.push(uid.clone());
@@ -4201,71 +4726,81 @@ impl eframe::App for LauncherApp {
             let modal_resp = egui::Modal::new(egui::Id::new("shortcut_dialog")).show(
                 ui.ctx(),
                 |ui| {
-                    ui.heading(title);
-                    ui.separator();
-                    let mut result = DlgResult::Keep;
-                    // Enter＝确定（FR-SRC-20 快捷键）：开框当帧被 armed 吞掉；类型下拉展开时 Enter 归选项，不抢。
-                    let armed = self.dialog_enter_armed;
-                    self.dialog_enter_armed = false;
-                    if !armed
-                        && !egui::Popup::is_any_open(ui.ctx())
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
-                        result = DlgResult::Confirm;
-                    }
-                    egui::Grid::new("add_dialog_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
+                    // 尺寸（2026-10-22 用户要求）：原来内容只有 ~300 宽、且不可拉伸。
+                    // `Resize` 给一块能拖右下角的区域，egui 按 id 记住用户拉到的尺寸（本次运行内）。
+                    // 上限随主窗口走：主窗口本身最小 360×240，固定 640 宽会溢出到窗外。
+                    let avail = ui.ctx().viewport_rect().size();
+                    let max_w = (avail.x - 48.0).clamp(320.0, 1200.0);
+                    let max_h = (avail.y - 48.0).clamp(260.0, 900.0);
+                    egui::Resize::default()
+                        .id_salt("shortcut_dialog_size")
+                        .default_size([640.0_f32.min(max_w), 420.0_f32.min(max_h)])
+                        .min_size([460.0_f32.min(max_w), 300.0_f32.min(max_h)])
+                        .max_size([max_w, max_h])
                         .show(ui, |ui| {
-                            let dg = self.dialog.as_mut().unwrap();
-                            ui.label("别名");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut dg.keyword)
-                                    .hint_text("触发码，如 calc")
-                                    .desired_width(240.0),
-                            );
-                            ui.end_row();
-                            ui.label("名称");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut dg.name)
-                                    .hint_text("显示名，如 计算器")
-                                    .desired_width(240.0),
-                            );
-                            ui.end_row();
-                            ui.label("命令行");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut dg.path)
-                                    .hint_text("exe / 路径 / URL / shell: 目标")
-                                    .desired_width(240.0),
-                            );
-                            ui.end_row();
-                            ui.label("参数");
-                            ui.add(egui::TextEdit::singleline(&mut dg.arguments).desired_width(240.0));
-                            ui.end_row();
-                            ui.label("工作目录");
-                            ui.add(egui::TextEdit::singleline(&mut dg.working_dir).desired_width(240.0));
-                            ui.end_row();
-                            ui.label("类型");
-                            let mut idx =
-                                ItemKind::ALL.iter().position(|k| *k == dg.kind).unwrap_or(0);
-                            egui::ComboBox::from_id_salt("kind_combo")
-                                .selected_text(dg.kind.label())
-                                .show_index(ui, &mut idx, ItemKind::ALL.len(), |i| {
-                                    ItemKind::ALL[i].label().to_string()
+                            let mut result = DlgResult::Keep;
+                            // Enter＝确定（FR-SRC-20 快捷键）：开框当帧被 armed 吞掉；类型下拉展开时 Enter 归选项，不抢。
+                            let armed = self.dialog_enter_armed;
+                            self.dialog_enter_armed = false;
+                            if !armed
+                                && !egui::Popup::is_any_open(ui.ctx())
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            {
+                                result = DlgResult::Confirm;
+                            }
+                            ui.heading(title);
+                            ui.separator();
+                            // 每行＝「标签 + 占满剩余宽度的输入框」，输入框跟着窗口一起变宽。
+                            let label_w = 72.0;
+                            let row = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([label_w, 20.0], egui::Label::new(label));
+                                    let w = ui.available_width().max(160.0);
+                                    ui.add_sized(
+                                        [w, 22.0],
+                                        egui::TextEdit::singleline(value).hint_text(hint),
+                                    );
                                 });
-                            dg.kind = ItemKind::ALL[idx];
-                            ui.end_row();
-                        });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("确定").clicked() {
-                            result = DlgResult::Confirm;
-                        }
-                        if ui.button("取消").clicked() {
-                            result = DlgResult::Cancel;
-                        }
-                    });
-                    result
+                            };
+                            {
+                                let dg = self.dialog.as_mut().unwrap();
+                                row(ui, "别名", &mut dg.keyword, "触发码，如 calc");
+                                row(ui, "名称", &mut dg.name, "显示名，如 计算器");
+                                row(ui, "命令行", &mut dg.path, "exe / 路径 / URL / shell: 目标");
+                                row(ui, "参数", &mut dg.arguments, "");
+                                row(ui, "工作目录", &mut dg.working_dir, "");
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([label_w, 20.0], egui::Label::new("类型"));
+                                    let mut idx = ItemKind::ALL
+                                        .iter()
+                                        .position(|k| *k == dg.kind)
+                                        .unwrap_or(0);
+                                    egui::ComboBox::from_id_salt("kind_combo")
+                                        .selected_text(dg.kind.label())
+                                        .show_index(ui, &mut idx, ItemKind::ALL.len(), |i| {
+                                            ItemKind::ALL[i].label().to_string()
+                                        });
+                                    dg.kind = ItemKind::ALL[idx];
+                                });
+                            }
+                            // 按钮贴底：窗口被拉高后不会孤零零吊在表单下面。
+                            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("确定").clicked() {
+                                        result = DlgResult::Confirm;
+                                    }
+                                    if ui.button("取消").clicked() {
+                                        result = DlgResult::Cancel;
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new("拖右下角可改大小（本次运行内记住）")
+                                        .weak()
+                                        .small(),
+                                );
+                            });
+                            result
+                        })
                 },
             );
 
@@ -4411,6 +4946,42 @@ impl eframe::App for LauncherApp {
         // 头段一次只会产生其中一个动作（计算器复制 / 搜索打开 / 条目启动）。
         if let Some(hit) = open_hit {
             self.open_search_hit(ui.ctx(), &hit);
+        }
+
+        // 批次 X：文件行的三个动作（打开 / 在资源管理器中定位 / 复制路径）。与上面三段互斥：
+        // 一次按键或点击只会产出其中一个。
+        if let Some(hit) = open_file {
+            self.open_file_hit(ui.ctx(), &hit);
+        }
+        if let Some(path) = select_path {
+            self.select_in_explorer(ui.ctx(), &path);
+        }
+        if let Some(path) = copy_path {
+            // 复制这一档**不关到托盘**（与计算器那格刻意不同）：右键复制路径通常发生在浏览途中，
+            // 用户下一步是去别处粘贴，不是收工。窗口留在原地，只给一句回执。
+            match copy_to_clipboard(&path) {
+                Ok(()) => {
+                    // 路径由查询现出 ⇒ 日志只记长度（FR-SYS-03 隐私口径）。
+                    eprintln!(
+                        "文件搜索：路径已复制（{} 个字符，路径原文不落日志）",
+                        path.chars().count()
+                    );
+                    self.toast = Some((
+                        format!("✓ 已复制路径：{path}"),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_OK,
+                    ));
+                }
+                Err(e) => {
+                    self.toast = Some((
+                        format!("⚠ 复制失败：{e}"),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_ERR,
+                    ));
+                    eprintln!("文件搜索：复制路径失败（{e}）");
+                }
+            }
+            ui.ctx().request_repaint_after(TOAST_TTL);
         }
 
         // FR-SRC-10：计算器行的「执行」＝复制纯数字 + 关到托盘（需求原文把它列成 `text` 动作，
@@ -4681,7 +5252,19 @@ fn main() -> eframe::Result {
     // 批次 Q：热键在设置里可改，而注册发生在 `LauncherApp::new` 之前（热键线程自己那条消息循环），
     // 所以这里先读一次 settings.json。多读一次这个几十十字节的文件，换掉一个"配置要穿过
     // intent 才能到线程"的接线，值得。批次 R 起这一次读还要带出补字符热键。
-    let configured = source::application::load_settings();
+    let (configured, broken) = source::application::load_settings();
+    match &broken {
+        Some(Corrupted::Kept(p)) => eprintln!(
+            "配置损坏：热键线程用的 settings.json 解析失败，已隔离为 {}，本轮按出厂热键注册",
+            p.display()
+        ),
+        // 这一次读只喂热键线程、不写盘，所以 `Lost` 在这里不需要停手；`LauncherApp::new`
+        // 里那次读才挂着"留证没成功就不写"的门禁。
+        Some(Corrupted::Lost) => {
+            eprintln!("配置损坏：settings.json 解析失败且留证没成功 ⇒ 热键线程按出厂热键注册（这一次只读不写）")
+        }
+        None => {}
+    }
     spawn_hotkey_thread(hotkey_tx, configured.toggle_hotkey, configured.typeback_hotkey);
 
     let mut wgpu_options = eframe::WgpuConfiguration::default();
@@ -4851,6 +5434,24 @@ mod nav_tests {
             completion: s,
         };
         assert_eq!(HeadRow::Hint(eng).custom_uid(), None);
+        // 文件行是从磁盘现出来的，没有清单身份 ⇒ 编辑/删除/置顶那几档不许接管它；
+        // 但 `file_hit()` 必须是它唯一的取行途径（Tab 进目录、Ctrl+D 定位靠这个闸门）。
+        let file = source::filesearch::FileHit {
+            title: "报告.docx".into(),
+            path: r"C:\u\报告.docx".into(),
+            is_dir: false,
+            subtitle: r"C:\u".into(),
+        };
+        let file_row = HeadRow::File(file.clone());
+        let custom_row = HeadRow::Custom(CustomHit {
+            uid,
+            name: "ping".into(),
+            entry: item,
+            subtitle: String::new(),
+        });
+        assert_eq!(file_row.custom_uid(), None);
+        assert_eq!(file_row.file_hit(), Some(&file));
+        assert_eq!(custom_row.file_hit(), None, "只有文件行能被 file_hit 取走");
     }
 
     #[test]

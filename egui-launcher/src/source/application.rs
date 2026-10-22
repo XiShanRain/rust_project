@@ -170,16 +170,11 @@ pub fn user_list_exists() -> bool {
     user_list_path().exists()
 }
 
-/// 读取用户清单；文件缺失或解析失败返回空。
-pub fn load_user_items() -> Vec<LaunchItem> {
-    let path = user_list_path();
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<Vec<LaunchItem>>(&bytes).unwrap_or_else(|e| {
-            eprintln!("source: user_items.json 解析失败（忽略）: {e}");
-            Vec::new()
-        }),
-        Err(_) => Vec::new(),
-    }
+/// 读取用户清单（E1，批次 X）。返回值的第二格只在配置真的坏过时有值，且要分两种下场看
+/// （`Corrupted`）：`Kept` 给调用方一句话提示，`Lost` 还要求调用方**这一轮别写盘**。
+/// 文件本来就在 ⇒ 两格都是干净的默认值。
+pub fn load_user_items() -> (Vec<LaunchItem>, Option<Corrupted>) {
+    load_or_quarantine(&user_list_path())
 }
 
 /// 覆盖写用户清单（调用方负责先剔除内置种子、只持久化用户新增项）。
@@ -189,12 +184,123 @@ pub fn save_user_items(items: &[LaunchItem]) {
         let _ = std::fs::create_dir_all(dir);
     }
     match serde_json::to_vec_pretty(items) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                eprintln!("source: 写 user_items.json 失败 {path:?}: {e}");
-            }
-        }
+        Ok(json) => write_atomic(&path, &json, "user_items.json"),
         Err(e) => eprintln!("source: 序列化用户清单失败: {e}"),
+    }
+}
+
+/// 一份 JSON 读盘的结果：`Ok(内容)`，或 `Err(坏文件的下场)`。
+type Loaded<T> = Result<T, Corrupted>;
+
+/// 坏文件的两种下场。**不能折成一格**：折成 `Option<PathBuf>` 之后 `None` 同时表示"没坏"和
+/// "坏了但没留住"，调用方就无法知道该不该停手——2026-10-22 真机⑫就是这么丢的现场（留证返回
+/// `None` 后照常播种，把唯一那份坏文件覆盖掉了）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Corrupted {
+    /// 证据保住了：改名成功（原位置已空）或另存副本成功。里面是留证落点。
+    Kept(PathBuf),
+    /// 改名与另存都不成，坏文件还挡在原位 ⇒ **任何覆盖写都会销毁唯一证据**，调用方要停手。
+    Lost,
+}
+
+/// 读 + 解析，失败即留证。清单与偏好共用这一条判据，两条路不能各写一份。
+fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Loaded<T> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Ok(T::default()), // 文件不在（首次运行）：正常，不算错误
+    };
+    match serde_json::from_slice::<T>(&bytes) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            eprintln!("source: {path:?} 解析失败: {e}");
+            Err(quarantine(path, &bytes))
+        }
+    }
+}
+
+/// `.bad` 那一族的名额。占满后还有毫秒时间戳兜底，所以这个数字不再是"同一文件能坏几次"的上限。
+const BAD_NAME_SLOTS: usize = 10;
+
+/// 读一份 JSON，把「坏文件的下场」折成调用方好用的两格。**这一层必须逐格构造元组**：
+/// 写成 `load_json(&p).unwrap_or_else(|ev| (T::default(), Some(ev)))` 会让类型推断把
+/// `unwrap_or_else` 的**返回格**当成 `load_json` 的 `T`，于是 `T` 变成「(内容, 下场)」整个元组
+/// ⇒ 解析时按"两元素 JSON 数组"去要求那份清单/偏好 ⇒ **任何正常文件都必然解析失败**。
+/// 批次 X 真机⑫看到的「配置文件坏了，已改名留底：user_items.json.bad2」就是这么来的：
+/// 每一次启动都把好好的清单改名一份、再从空清单起，`.bad` 一路排到 `.bad2`；
+/// 同一条坑的另一半证据是当时 settings 那条报文写着 `expected a tuple of size 2`。
+/// 换成 `Corrupted` 之后这条推断不再统一、编译期就报出来了——旧形状能过编译是运气，不是对。
+fn load_or_quarantine<T: serde::de::DeserializeOwned + Default>(
+    path: &Path,
+) -> (T, Option<Corrupted>) {
+    match load_json(path) {
+        Ok(v) => (v, None),
+        Err(ev) => (T::default(), Some(ev)),
+    }
+}
+
+/// 把坏文件改名为 `xxx.bad`（占用则 `.bad1`…，10 格占满再用 `.bad.<毫秒>`）留证。
+/// 改名不动内容 ⇒ 证据保住；改不动（文件被别的进程占着）就退回用内存里的字节另存一份副本，
+/// 两条都不成才报 `Lost`。
+///
+/// 为什么要有时间戳那格：2026-10-22 真机⑫的现场是同一条 `user_items.json` 被反复弄坏，
+/// `.bad`…`.bad9` 全被占 ⇒ 老代码直接返回"没留住"，而调用方把"没留住"读成"目录写不进去，
+/// 播种也不会覆盖证据"（`Loaded` 旧注释里的原话）——**那个前提是错的**，占满名额跟目录只读
+/// 是两回事，于是覆盖写照样发生。名额这一层修不掉判断错误，所以两处一起改。
+fn quarantine(path: &Path, bytes: &[u8]) -> Corrupted {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for n in 0..BAD_NAME_SLOTS {
+        let suffix = if n == 0 { "bad".to_string() } else { format!("bad{n}") };
+        if let Some(p) = keep_at(path, bytes, &format!("{name}.{suffix}")) {
+            return Corrupted::Kept(p);
+        }
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Some(p) = keep_at(path, bytes, &format!("{name}.bad.{ms}")) {
+        return Corrupted::Kept(p);
+    }
+    eprintln!("source: {path:?} 解析失败且留证没成功 ⇒ 覆盖写会丢掉唯一证据，请人工处理");
+    Corrupted::Lost
+}
+
+/// 一个候选留证名：已存在就跳过（名额已被占）；先试改名（不动内容），改不动再另存副本。
+fn keep_at(path: &Path, bytes: &[u8], candidate: &str) -> Option<PathBuf> {
+    let bad = path.with_file_name(candidate);
+    if bad.exists() {
+        return None;
+    }
+    if std::fs::rename(path, &bad).is_ok() {
+        eprintln!("source: 坏文件已改名留证 {bad:?}（默认值启动，不覆盖原内容）");
+        return Some(bad);
+    }
+    if std::fs::write(&bad, bytes).is_ok() {
+        eprintln!("source: 坏文件改名失败，已另存副本留证 {bad:?}");
+        return Some(bad);
+    }
+    None
+}
+
+/// 原子替换：先写同目录临时文件，成功后再改名盖过去。
+///
+/// `std::fs::write` 是"把目标截断再写"——中途断电、进程被杀、磁盘满就留下半份 JSON，
+/// 下次启动读它必然解析失败，而旧内容已经被截掉了。改名是同卷内的原子操作：
+/// 目标要么保持原样，要么完整是新内容，不存在中间态。
+/// 临时名带 pid：单实例（FR-SRC-21）之外还有人工开第二份的场景，两个写者不能抢同一个临时名。
+fn write_atomic(path: &Path, bytes: &[u8], label: &str) {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        eprintln!("source: 写 {label} 临时文件失败 {path:?}: {e}（原文件未改动）");
+        return;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("source: {label} 替换失败 {path:?}: {e}（原文件未改动）");
+        }
     }
 }
 
@@ -650,25 +756,16 @@ fn prune_archives(dir: &Path) {
     }
 }
 
-/// 读取偏好；文件缺失或解析失败一律回默认值（NFR-04：坏配置不得影响启动）。
-pub fn load_settings() -> AppSettings {
-    match std::fs::read(settings_path()) {
-        Ok(bytes) => serde_json::from_slice::<AppSettings>(&bytes).unwrap_or_else(|e| {
-            eprintln!("source: settings.json 解析失败（用默认值）: {e}");
-            AppSettings::default()
-        }),
-        Err(_) => AppSettings::default(),
-    }
+/// 读取偏好（E1，批次 X，与清单同一条判据）；文件缺失回默认值，文件坏了先留证再回默认值。
+/// 第二格是坏文件的下场（`Corrupted`），调用方拿它给用户提示，并且在 `Lost` 时停手不写。
+/// NFR-04：坏配置不得影响启动。
+pub fn load_settings() -> (AppSettings, Option<Corrupted>) {
+    load_or_quarantine(&settings_path())
 }
 
 pub fn save_settings(s: &AppSettings) {
-    let path = settings_path();
     match serde_json::to_vec_pretty(s) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                eprintln!("source: 写 settings.json 失败 {path:?}: {e}");
-            }
-        }
+        Ok(json) => write_atomic(&settings_path(), &json, "settings.json"),
         Err(e) => eprintln!("source: 序列化偏好失败: {e}"),
     }
 }
@@ -1729,6 +1826,128 @@ mod dedup_tests {
         let b = s.as_bytes();
         assert!(b[10] == b' ' && b[13] == b':' && b[11..13].iter().all(|c| c.is_ascii_digit()));
         assert_eq!(s.len(), 16, "完整横幅应为 YYYY-MM-DD HH:MM，实得：{s}");
+    }
+
+    /// 批次 X 的 E1 我自己写坏的那一处，用**落盘的真形状**当场问一遍。
+    /// 旧写法 `load_json(&p).unwrap_or_else(|ev| (Vec::new(), ev))` 会让推断把
+    /// `unwrap_or_else` 的返回格当成 `load_json` 的 `T` ⇒ `T` 变成「(内容, 下场)」整个元组
+    /// ⇒ 解析按"两元素 JSON 数组"要求清单 ⇒ **每一次启动都把好好的文件判成坏的**。
+    /// 真机⑫（2026-10-22）现场：`.bad`…`.bad9` 九份全是我自己写出去的正常清单（第一份 71490
+    /// 字节、181 条，python 独立验证是合法数组），第 10 次名额占满 ⇒ 留证报"没留住" ⇒ 覆盖写。
+    /// 这条测试不碰真实清单目录，只在临时目录里跑，两格都验：正常文件必须 `Ok`、坏文件必须留证。
+    #[test]
+    fn a_real_list_file_is_an_array_not_a_two_tuple() {
+        let dir = temp_log_dir("e1-roundtrip");
+        let p = dir.join("items.json");
+
+        // ① 真形状 ⇒ 必须读回来。这一格就是旧代码当场失败的那一格。
+        let items = builtin_seeds();
+        let json = serde_json::to_vec_pretty(&items).expect("种子序列化不该失败");
+        std::fs::write(&p, &json).expect("临时目录写不了");
+        let got: Vec<LaunchItem> = load_json(&p).expect("真实形状的清单必须解析成功，不许判坏");
+        assert_eq!(got.len(), items.len(), "读回来的条数要与写下去的一致");
+
+        // ② 真坏了 ⇒ 改名留证，原位置腾出来。
+        std::fs::write(&p, "「这不是 JSON」".as_bytes()).expect("写坏文件失败");
+        let fault = load_json::<Vec<LaunchItem>>(&p).err().expect("坏文件必须报 Err");
+        let Corrupted::Kept(kept) = fault else { panic!("第一次留证该成功，实得 {fault:?}") };
+        assert!(kept.exists() && !p.exists(), "证据该在 {kept:?}，原位置要腾出来");
+
+        // ③ `.bad` 那一族的名额被占满 ⇒ 不许就此说"没留住"，要走毫秒时间戳那一格。
+        //    （真机那一次正是在这里翻车：报了"没留住"，调用方照常覆盖写。）
+        for n in 0..BAD_NAME_SLOTS {
+            let suffix = if n == 0 { "bad".to_string() } else { format!("bad{n}") };
+            std::fs::write(dir.join(format!("items.json.{suffix}")), b"x").expect("占名额失败");
+        }
+        std::fs::write(&p, "「还是不是 JSON」".as_bytes()).expect("第二次写坏文件失败");
+        let again = load_json::<Vec<LaunchItem>>(&p).err().expect("第二次坏文件必须报 Err");
+        match again {
+            // 时间戳那份与原文件都留着 ⇒ 这一格是"另存副本"还是"改名"都能接受，
+            // 只要求：证据在、`Lost` 没出现。
+            Corrupted::Kept(q) => {
+                assert!(q.exists(), "时间戳留证该落下文件，实得 {q:?}");
+                assert!(
+                    q.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("items.json.bad")),
+                    "留证名要挂在原名后面，实得 {q:?}"
+                );
+            }
+            Corrupted::Lost => panic!("名额占满不等于留不到证：时间戳那一格该接住这一路"),
+        }
+
+        // ④ 症状本体的证据：同一份**合法数组**按"两元素元组"去读必然失败。旧写法推断出来的 `T`
+        //    正是这个形状，所以真机每一次启动都在 ① 那一格报"解析失败"——判坏的不是文件，是我。
+        //    （`Corrupted` 没有 `Deserialize`，这里用一个能编译的元组当替身。放在最后一格是因为
+        //    这次失败照样会走留证、把 `p` 改名出去，不许它影响上面三格。）
+        std::fs::write(&p, &json).expect("重写真形状失败");
+        let as_tuple = load_json::<(Vec<LaunchItem>, Option<u32>)>(&p);
+        assert!(as_tuple.is_err(), "按元组要求真清单必须失败，实得 Ok ⇒ 这条替身没照住旧形状");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上一条只问到 `load_json`，**出错的其实是包装层**（`load_user_items` 里那次推断），
+    /// 所以这条才是要害：走真函数、真落盘、真读回，断言"一份正常清单不许报坏"。
+    /// 批次 X 那版在这里必然失败——它会报 `Some(Kept)` 且内容空，因为解析按两元素元组要求文件。
+    ///
+    /// 这条测试要往清单的真实落盘位置写文件，所以先自证位置安全：只允许落在**测试二进制自己
+    /// 那一格目录**（便携优先那条判据下的 exe 同级）。位置不对就直接跳过，绝不拿用户的
+    /// `%LOCALAPPDATA%\egui-launcher` 当真清单的耗材。原有的文件先挪开、结束还原。
+    #[test]
+    fn load_user_items_reads_back_a_file_it_just_wrote() {
+        let list = user_list_path();
+        let here = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+        let Some(exe_dir) = here else { return };
+        if list.parent() != Some(exe_dir.as_path()) {
+            eprintln!("跳过：清单落盘位置 {} 不在测试 exe 同级 ⇒ 不往里写", list.display());
+            return;
+        }
+        let settings = settings_path();
+        let backup = |p: &Path| -> Option<PathBuf> {
+            if !p.exists() {
+                return None;
+            }
+            let to = p.with_file_name(format!("{}.test-backup", p.file_name()?.to_str()?));
+            std::fs::rename(p, &to).ok().map(|_| to)
+        };
+        let saved_list = backup(&list);
+        let saved_settings = backup(&settings);
+
+        // ① 写一份真清单再读回来：不许报坏，条数要一致。这一格就是旧代码的照妖镜。
+        let seeds = builtin_seeds();
+        save_user_items(&seeds);
+        let (got, fault) = load_user_items();
+        assert!(fault.is_none(), "正常清单不许判坏，实得 {fault:?}");
+        assert_eq!(got.len(), seeds.len(), "读回来的条数要与写下去的一致");
+
+        // ② 偏好同理（真机那一条 `expected a tuple of size 2` 就是从这份文件上先冒出来的）。
+        save_settings(&AppSettings::default());
+        let (prefs, fault) = load_settings();
+        assert!(fault.is_none(), "正常偏好不许判坏，实得 {fault:?}");
+        assert_eq!(prefs.seed_round, AppSettings::default().seed_round);
+
+        // ③ 真的坏才报坏，且要留证在原位置之外。
+        std::fs::write(&list, "[1,2]".as_bytes()).expect("写坏清单失败");
+        match load_user_items() {
+            (empty, Some(Corrupted::Kept(kept))) => {
+                assert!(empty.is_empty(), "坏文件读回来必须是空");
+                assert!(kept.exists() && !list.exists(), "证据该在 {kept:?}，原位置该腾出来");
+                let _ = std::fs::remove_file(&kept);
+            }
+            (_, other) => panic!("坏清单该走 Kept，实得 {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&list);
+        let _ = std::fs::remove_file(&settings);
+        for back in [saved_list, saved_settings].into_iter().flatten() {
+            let Some(name) = back
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".test-backup"))
+            else { continue };
+            if let Some(dir) = back.parent() {
+                let _ = std::fs::rename(&back, dir.join(name));
+            }
+        }
     }
 }
 
