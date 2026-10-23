@@ -279,6 +279,11 @@ impl DataSource for FileSource {
         self.refresh_index(true);
     }
 
+    /// FR-SRC-17 自身命令「重建文件索引」：与冷启动同口径强制重建（走同一在途闸门）。
+    fn rebuild(&mut self) {
+        self.refresh_index(true);
+    }
+
     fn poll(&mut self) -> bool {
         let mut changed = false;
         while let Ok(update) = self.rx.try_recv() {

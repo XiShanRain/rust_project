@@ -54,6 +54,10 @@ pub enum ItemKind {
     Url,
     Folder,
     File,
+    /// 批次 A2（FR-SRC-17）：启动器自己的动作，`path` 形如 `internal:<id>`。
+    /// `ShellExecuteExW` 起不了它 ⇒ `main.rs` 在启动前分派到内置实现。
+    /// **不进 [`ItemKind::ALL`]**：添加/编辑对话框不给用户手填这种类型。
+    Internal,
 }
 
 impl ItemKind {
@@ -72,6 +76,7 @@ impl ItemKind {
             ItemKind::Url => "网址/协议",
             ItemKind::Folder => "文件夹",
             ItemKind::File => "文件",
+            ItemKind::Internal => "系统命令",
         }
     }
 }
@@ -360,6 +365,21 @@ pub struct AppSettings {
     /// 不会因为多出一个不认识的项就把整份 `settings.json` 判坏（E1 那种事故的形状）。
     #[serde(default)]
     pub sources_off: Vec<String>,
+
+    /// 内置条目里被用户隐藏的那些（FR-SRC-17 的 `hidden[]`）：存派生 uid。
+    /// 「隐藏」与「删除」的差别只有一条：隐藏的条目在下次「补回缺失的出厂命令」之后
+    /// 仍会被剔除，而删掉的条目会回来（再由用户自己再删）。本批没有 UI 入口——手改这个数组。
+    #[serde(default)]
+    pub hidden: Vec<String>,
+
+    /// 危险操作（关机 / 重启 / 注销 / 清空回收站）执行前先弹确认（FR-SRC-17 `confirm_actions`）。
+    /// **默认开**：这四条都不可撤销，误按一次就丢工作；关掉它等于把回车键直接接到关机命令上。
+    #[serde(default = "default_true")]
+    pub confirm_actions: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 为什么手写而不是派生：`web_engines` 的 serde 默认值只在**字段缺失**时生效，
@@ -377,6 +397,8 @@ impl Default for AppSettings {
             web_engines: crate::source::websearch::builtin_engines(),
             seed_round: 0,
             sources_off: Vec::new(),
+            hidden: Vec::new(),
+            confirm_actions: true,
         }
     }
 }
@@ -848,10 +870,77 @@ pub fn save_settings(s: &AppSettings) {
     }
 }
 
-/// 出厂命令集的轮次（§4.2.1）。每次往 [`builtin_seeds`] 里加条目就 +1：
+/// 出厂命令集的轮次（§4.2.1 + 批次 A2）。每次往 [`builtin_seeds`] 里加条目就 +1：
 /// 老用户的 `settings.json` 里记的是旧号 ⇒ 启动时自动补一次缺，补完即记账。
 /// 记账之后不再自动补 ⇒ **删掉的条目不会因为下次启动又回来**。
-pub const SEED_ROUND: u32 = 1;
+///
+/// 2026-10-23：1 → 2。FR-SRC-17 的系统命令五组（自身 / 电源与会话 / Windows 工具 /
+/// ms-settings 页 / 音量与媒体）随这一轮补进老清单。
+pub const SEED_ROUND: u32 = 2;
+
+/// `%WINDIR%\System32\<exe>`：出厂条目的图标源（启动仍用简洁命令名）。
+pub(crate) fn system32(exe: &str) -> String {
+    let windir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    windir.join("System32").join(exe).to_string_lossy().into_owned()
+}
+
+/// 名称拼音首字母 + 需求书点名要的关键字（空白分词，别名表本来就支持多键）。
+pub(crate) fn seed_keyword(name: &str, explicit: &str) -> String {
+    let base = default_keyword(name);
+    match (base.is_empty(), explicit.is_empty()) {
+        (true, _) => explicit.to_string(),
+        (false, true) => base,
+        (false, false) => format!("{base} {explicit}"),
+    }
+}
+
+/// 命令类出厂种子：`path` 是启动用的命令名，`exe` 是 `System32` 下的图标源。
+pub(crate) fn command_seed(
+    name: &str,
+    path: &str,
+    args: &str,
+    exe: &str,
+    explicit: &str,
+) -> LaunchItem {
+    LaunchItem {
+        name: name.to_string(),
+        path: path.to_string(),
+        arguments: args.to_string(),
+        working_dir: None,
+        source_path: system32(exe),
+        kind: ItemKind::Command,
+        keyword: seed_keyword(name, explicit),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn folder_seed(name: &str, path: &str, explicit: &str) -> LaunchItem {
+    LaunchItem {
+        name: name.to_string(),
+        path: path.to_string(),
+        arguments: String::new(),
+        working_dir: None,
+        source_path: String::new(),
+        kind: ItemKind::Folder,
+        keyword: seed_keyword(name, explicit),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn url_seed(name: &str, path: &str, explicit: &str) -> LaunchItem {
+    LaunchItem {
+        name: name.to_string(),
+        path: path.to_string(),
+        arguments: String::new(),
+        working_dir: None,
+        source_path: String::new(),
+        kind: ItemKind::Url,
+        keyword: seed_keyword(name, explicit),
+        ..Default::default()
+    }
+}
 
 /// 出厂内置命令集（§4.2.1，对齐 AHK 版 `AppSettings._DefaultCommands()`）。
 /// 只在清单文件首次新建时整批写入；此后它们就是普通条目——可改名、可改路径、可删除。
@@ -860,91 +949,51 @@ pub const SEED_ROUND: u32 = 1;
 /// 同一条命令另起一个英文名会和现有条目撞 uid，被 [`dedup_items`] 去重掉。
 /// `path` 用简洁命令名（启动），`source_path` 用 exe 全路径（取图标）；无固定 exe 的给空。
 pub fn builtin_seeds() -> Vec<LaunchItem> {
-    let windir = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let sys32 = |exe: &str| windir.join("System32").join(exe).to_string_lossy().into_owned();
-
-    /// 名称拼音首字母 + 需求书点名要的关键字（空白分词，别名表本来就支持多键）。
-    fn keyword(name: &str, explicit: &str) -> String {
-        let base = default_keyword(name);
-        match (base.is_empty(), explicit.is_empty()) {
-            (true, _) => explicit.to_string(),
-            (false, true) => base,
-            (false, false) => format!("{base} {explicit}"),
-        }
-    }
-
-    let command = |name: &str, path: &str, args: &str, exe: &str, explicit: &str| LaunchItem {
-        name: name.to_string(),
-        path: path.to_string(),
-        arguments: args.to_string(),
-        working_dir: None,
-        source_path: sys32(exe),
-        kind: ItemKind::Command,
-        keyword: keyword(name, explicit),
-        ..Default::default()
-    };
-    let folder = |name: &str, path: &str, explicit: &str| LaunchItem {
-        name: name.to_string(),
-        path: path.to_string(),
-        arguments: String::new(),
-        working_dir: None,
-        source_path: String::new(),
-        kind: ItemKind::Folder,
-        keyword: keyword(name, explicit),
-        ..Default::default()
-    };
-    let url = |name: &str, path: &str, explicit: &str| LaunchItem {
-        name: name.to_string(),
-        path: path.to_string(),
-        arguments: String::new(),
-        working_dir: None,
-        source_path: String::new(),
-        kind: ItemKind::Url,
-        keyword: keyword(name, explicit),
-        ..Default::default()
-    };
-
-    vec![
+    let mut seeds = vec![
         // ---- Delphi 版底座（一直就在）----
-        command("计算器", "calc.exe", "", "calc.exe", ""),
+        command_seed("计算器", "calc.exe", "", "calc.exe", ""),
         // §4.2.1 的 Notepad 关键字是 `np`：不另起一条「Notepad」，同 path 会撞 uid 被去重。
-        command("记事本", "notepad.exe", "", "notepad.exe", "np"),
-        command("画图", "mspaint.exe", "", "mspaint.exe", ""),
-        command("命令提示符", "cmd.exe", "", "cmd.exe", ""),
-        command("PowerShell", "powershell.exe", "", "WindowsPowerShell/v1.0/powershell.exe", ""),
-        command("任务管理器", "taskmgr.exe", "", "Taskmgr.exe", ""),
-        command("控制面板", "control.exe", "", "control.exe", ""),
-        folder("此电脑", "shell:MyComputerFolder", ""),
-        folder("回收站", "shell:RecycleBinFolder", ""),
-        url("设置", "ms-settings:", ""),
+        command_seed("记事本", "notepad.exe", "", "notepad.exe", "np"),
+        command_seed("画图", "mspaint.exe", "", "mspaint.exe", ""),
+        command_seed("命令提示符", "cmd.exe", "", "cmd.exe", ""),
+        command_seed("PowerShell", "powershell.exe", "", "WindowsPowerShell/v1.0/powershell.exe", ""),
+        command_seed("任务管理器", "taskmgr.exe", "", "Taskmgr.exe", ""),
+        command_seed("控制面板", "control.exe", "", "control.exe", ""),
+        folder_seed("此电脑", "shell:MyComputerFolder", ""),
+        folder_seed("回收站", "shell:RecycleBinFolder", ""),
+        // 2026-10-23 从「设置」改名：与「启动器设置」成对，敲「设置」时两条入口一眼可分。
+        url_seed("Windows 设置", "ms-settings:", ""),
         // ---- §4.2.1 出厂命令集（2026-10-21 补齐；此前 12 条只落了 Notepad/Paint 两条）----
         // Desktop 在参考项目里与 Notepad 共用 `np`，按 4.2.1 的去重规则不保留。
         // hosts 存的是非提权版：能打开、保存会被系统拒绝（提权要 `*runas`，见 FR-ACT-04）。
-        command(
+        command_seed(
             "编辑 hosts 文件",
             "notepad.exe",
             r"%windir%\System32\drivers\etc\hosts",
             "notepad.exe",
             "hosts",
         ),
-        folder("下载", "shell:Downloads", "dl"),
+        folder_seed("下载", "shell:Downloads", "dl"),
         // 空词回车先补成 `docs `，再敲子目录名；`{query}` 由 custom::build_hit 填进路径。
-        folder("文档", r"%USERPROFILE%\Documents\{query}", "docs"),
+        folder_seed("文档", r"%USERPROFILE%\Documents\{query}", "docs"),
         // 占位符而不是绝对路径：程序搬文件夹后这条自己跟着走，不用重新播种。
-        folder("启动器目录", crate::source::custom::LAUNCHER_DIR_PLACEHOLDER, ""),
-        command("IP 配置", "cmd.exe", "/k ipconfig", "cmd.exe", "ipconfig"),
-        command("Ping", "cmd.exe", "/k ping {query}", "cmd.exe", "ping"),
+        folder_seed("启动器目录", crate::source::custom::LAUNCHER_DIR_PLACEHOLDER, ""),
+        command_seed("IP 配置", "cmd.exe", "/k ipconfig", "cmd.exe", "ipconfig"),
+        command_seed("Ping", "cmd.exe", "/k ping {query}", "cmd.exe", "ping"),
         // 网址尚未确定 ⇒ 用 RFC 2606 保留的 `.invalid` 当占位，改这一条的路径即可。
-        url("项目主页（待填网址）", "https://example.invalid/altrun", "altrun"),
-        url(
+        url_seed("项目主页（待填网址）", "https://example.invalid/altrun", "altrun"),
+        url_seed(
             "谷歌地图",
             "https://www.google.com/maps/search/?api=1&query={query}",
             "maps",
         ),
-        url("系统更新", "ms-settings:windowsupdate", "wu"),
-    ]
+        url_seed("系统更新", "ms-settings:windowsupdate", "wu"),
+    ];
+    // 批次 A2（FR-SRC-17）：系统命令五组并进出厂条目。
+    // 剪贴板文本转换组按用户裁定整批暂缓——它要读写剪贴板，与"一条会启动程序的清单条目"
+    // 语义不同，留给单独一批（发布说明第三十一节登记待办）。
+    seeds.extend(crate::source::system::system_seeds());
+    seeds
 }
 
 /// 把清单里缺的出厂条目**追加到末尾**，返回补了几条。
@@ -974,6 +1023,21 @@ pub fn dedup_items(items: Vec<LaunchItem>) -> Vec<LaunchItem> {
         .into_iter()
         .filter(|it| seen.insert(it.uid()))
         .collect()
+}
+
+/// FR-SRC-17 的 `hidden[]`：按派生 uid 把用户隐藏的条目从清单里剔掉，返回剔了几条。
+/// 只认 uid（`uid()` 本身就小写）——同名但路径不同的两条不会互相牵连。
+/// 调用时机只有两处：启动读完配置之后、以及「补回缺失的出厂命令」之后
+/// （否则补回来的条目会把隐藏项又塞回清单）。
+pub fn drop_hidden(items: &mut Vec<LaunchItem>, hidden: &[String]) -> usize {
+    if hidden.is_empty() {
+        return 0;
+    }
+    let set: std::collections::HashSet<&str> =
+        hidden.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let before = items.len();
+    items.retain(|i| !set.contains(i.uid().as_str()));
+    before - items.len()
 }
 
 /// 判断输入是否像 URL/协议（FR-SRC-23）：含 `://`、以 `www.` 起、或是 ≥2 字母的方案名后跟 `:`。
@@ -1017,7 +1081,8 @@ pub fn target_stem(item: &LaunchItem) -> Option<String> {
     let stem = match item.kind {
         ItemKind::File => Path::new(path).file_stem(),
         ItemKind::Folder => Path::new(path.trim_end_matches(['\\', '/'])).file_name(),
-        ItemKind::Url => None,
+        // `internal:<id>` 不是磁盘路径，按 Windows 路径解析只会得到一个假文件名。
+        ItemKind::Url | ItemKind::Internal => None,
         _ => Path::new(path).file_stem(),
     };
     stem.and_then(|s| s.to_str()).map(str::to_string).filter(|s| !s.is_empty())
@@ -1050,6 +1115,12 @@ pub fn default_keyword(name: &str) -> String {
 pub fn learn_alias(item: &mut LaunchItem, word: &str) -> bool {
     let w = word.trim().to_lowercase();
     if w.chars().count() < 2 || w == item.name.to_lowercase() {
+        return false;
+    }
+    // 这个词本来就在名称里（`设置`→「Windows 设置」、`task`→「Task Scheduler」）⇒ 学下来
+    // 一个字符都不会多认，只会往「关键字重复」表里塞一行共用词（2026-10-23 用户反馈
+    // 「敲设置出来四十行」的第三个根因）。空格执行也早有同一口径：只是前缀时空格当文本。
+    if item.name.to_lowercase().contains(&w) {
         return false;
     }
     if item.keyword.split_whitespace().any(|a| a.to_lowercase() == w) {
@@ -1809,6 +1880,40 @@ mod dedup_tests {
         assert_eq!(merge_missing_seeds(&mut items), 0, "补种必须幂等");
     }
 
+    /// FR-SRC-17 `hidden[]`：按 uid 剔除，别的条目一条不碰；空表/空白项不误伤。
+    #[test]
+    fn hidden_uids_are_dropped_and_nothing_else_is() {
+        let mut items = vec![
+            LaunchItem { name: "关机".into(), path: "internal:shutdown".into(), kind: ItemKind::Internal, ..Default::default() },
+            LaunchItem { name: "记事本".into(), path: "notepad.exe".into(), kind: ItemKind::Command, ..Default::default() },
+        ];
+        let uid = items[0].uid();
+        assert_eq!(drop_hidden(&mut items, &["   ".to_string()]), 0, "空白项不算隐藏");
+        assert_eq!(drop_hidden(&mut items, &[uid.clone(), uid]), 1, "重复 uid 只剔一条");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "记事本");
+        assert_eq!(drop_hidden(&mut items, &[]), 0);
+    }
+
+    /// 出厂种子必须真的包含 A2 的五组（自测一遍，防止 `system_seeds()` 没接上）。
+    #[test]
+    fn factory_seeds_include_the_system_command_groups() {
+        let seeds = builtin_seeds();
+        let count = |pred: fn(&LaunchItem) -> bool| seeds.iter().filter(|s| pred(s)).count();
+        assert_eq!(count(|s| s.kind == ItemKind::Internal && s.path == "internal:shutdown"), 1);
+        assert!(count(|s| s.path.starts_with("ms-settings:")) >= 30, "ms-settings 页没接进来");
+        assert!(count(|s| s.path == "devmgmt.msc") == 1, "Windows 工具没接进来");
+        assert!(count(|s| s.path == "internal:volume-mute") == 1, "音量与媒体没接进来");
+    }
+
+    /// 出厂条目的关键字两两不能撞：撞了设置页一开局就报一串警告，而且触发独占时
+    /// 只认排在前面的那条（A2 新增 78 条最容易踩这条）。
+    #[test]
+    fn factory_seed_keywords_do_not_collide() {
+        let dups = crate::source::custom::duplicate_keywords(&builtin_seeds());
+        assert!(dups.is_empty(), "出厂条目关键字撞车：{dups:?}");
+    }
+
     /// FR-SRC-19 新字段全带 `serde(default)`：加字段之前的旧清单必须原样可读。
     #[test]
     fn legacy_list_without_new_fields_parses() {
@@ -1921,6 +2026,7 @@ mod dedup_tests {
         assert!(!learn_alias(&mut it, "jsq"), "已在别名里 ⇒ 不重复攒");
         assert!(!learn_alias(&mut it, "j"), "单字不攒：会给所有含 j 的查询喂 30 档噪声");
         assert!(!learn_alias(&mut it, "计算器"), "等于名称 ⇒ 没有可学的");
+        assert!(!learn_alias(&mut it, "计算"), "名称里已有的词不学：只会让重复关键字表多一行");
         assert!(!learn_alias(&mut it, "  "), "空白词不攒");
         assert!(learn_alias(&mut it, "CALC"), "新的两字符以上触发词应攒下");
         assert_eq!(it.keyword, "jsq calc", "空格追加，不动默认拼音首字母");

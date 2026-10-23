@@ -62,7 +62,9 @@ pub fn check(path: &str, kind: ItemKind) -> PathState {
     if raw.is_empty() {
         return PathState::NotChecked;
     }
-    if kind == ItemKind::Url
+    // `internal:<id>`（批次 A2 的内置动作）不是文件、也不是真协议 ⇒ 与 URL 同档不检查。
+    if kind == ItemKind::Internal
+        || kind == ItemKind::Url
         || is_url(raw)
         || raw.to_ascii_lowercase().starts_with("shell:")
         || custom::has_query_placeholder(raw)
@@ -234,6 +236,10 @@ mod tests {
             assert_eq!(check(path, ItemKind::Command), PathState::NotChecked, "{path}");
         }
         assert_eq!(check("   ", ItemKind::File), PathState::NotChecked);
+        // 批次 A2：内置动作的 `internal:<id>` 不是磁盘目标，必须免检——
+        // 否则每条系统命令都会挂一个假的 `Not found`。
+        assert_eq!(check("internal:shutdown", ItemKind::Internal), PathState::NotChecked);
+        assert_eq!(check("internal:settings:2", ItemKind::Internal), PathState::NotChecked);
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod custom;
 pub mod filesearch;
 pub mod icon;
 pub mod pathcheck;
+pub mod system;
 pub mod websearch;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -154,6 +155,10 @@ pub trait DataSource {
     fn rows(&mut self, _cx: &mut SearchCtx<'_>) -> Vec<usize> {
         Vec::new()
     }
+    /// 「重建索引」类内置动作（FR-SRC-17 自身命令组）的挂点，默认什么都不做。
+    /// 只有真持有索引的源需要覆盖（目前是文件源）；调用方负责先看开关——
+    /// 关掉的源不该因为一条命令就在后台读盘。
+    fn rebuild(&mut self) {}
 }
 
 /// 注册表。**顺序就是报文次序**：先按此序问独占，再按此序拼头段，最后按此序取结果。

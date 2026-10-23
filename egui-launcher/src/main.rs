@@ -29,25 +29,33 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+// 批次 A2（FR-SRC-17）「锁定屏幕」。走 API 而不是 `rundll32 user32.dll,LockWorkStation`：
+// 少起一个进程，也就没有控制台窗口闪烁那一档事。
+use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
     CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
     WaitForSingleObject,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY,
-    MAPVK_VK_TO_CHAR,
+    HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MapVirtualKeyW, RegisterHotKey, SendInput,
+    UnregisterHotKey, VIRTUAL_KEY, MAPVK_VK_TO_CHAR, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE,
+    VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
-use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, ShellExecuteExW, SHELLEXECUTEINFOW};
+use windows::Win32::UI::Shell::{
+    SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW, SEE_MASK_FLAG_NO_UI,
+    ShellExecuteExW, SHELLEXECUTEINFOW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, KillTimer, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SendMessageTimeoutW, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_APP, WM_COPYDATA,
-    WM_DESTROY, WM_HOTKEY, WM_TIMER, WNDCLASSEXW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    GetWindowThreadProcessId, HWND_BROADCAST, IsIconic, KillTimer, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SC_MONITORPOWER, SendMessageTimeoutW, SetTimer, SetWindowPos, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE, MSG, MSGFLT_ALLOW,
+    SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_APP,
+    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW, WINDOW_EX_STYLE,
+    WINDOW_STYLE,
 };
 
 /// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
@@ -486,6 +494,15 @@ struct ConfirmRequest {
     path: String,
 }
 
+/// 批次 A2（FR-SRC-17）：危险内置动作的执行前确认。与删除确认同一形态——
+/// 只带"要做什么"和身份，真正的动作推迟到用户按「执行」那一帧。
+#[derive(Debug, Clone)]
+struct InternalConfirm {
+    action: source::system::InternalAction,
+    name: String,
+    uid: String,
+}
+
 /// 左键拖空白移动/缩放窗口的锚点。坐标一律用 Win32 权威值（物理像素）：egui 的 `outer_rect`
 /// 要等 winit 把 WM_MOVE 回读进输入状态，按帧用它算位移会滞后，实测两次拖拽分别只走 82% 和反向。
 #[derive(Clone, Copy)]
@@ -539,6 +556,8 @@ struct LauncherApp {
     focus_query: bool,            // 呼出后请求把键盘焦点给搜索框
     dialog: Option<DialogState>,  // FR-SRC-20 添加/编辑对话框（Some=打开）
     confirm: Option<ConfirmRequest>, // 删除确认弹窗（Some=打开；2026-10-18 用户要求，删除不再一键生效）
+    internal_confirm: Option<InternalConfirm>, // 批次 A2：关机/重启/注销/清空回收站的执行确认
+    about_open: bool,             // 批次 A2：「关于本程序」弹窗（Some 的等价物，用 bool 更直白）
     win_drag: Option<DragAnchor>,    // 左键拖空白移动窗口的进行中锚点（None=没在拖）
     dialog_enter_armed: bool,     // 弹窗当帧吞掉 Enter，防"打开框的那次回车"当帧又触发对话框的确定
     settings_open: bool,          // 设置页（整页模式，替代搜索页；2026-10-17 用户要求）
@@ -948,6 +967,52 @@ fn open_log_file() {
     match shell_execute(&file, "", None) {
         Ok(_) => eprintln!("打开日志：{file}"),
         Err(e) => eprintln!("打开日志失败：{}：{e}", path.display()),
+    }
+}
+
+// ---- 批次 A2（FR-SRC-17）内置动作的两条系统调用 ----
+
+/// 起一条控制台工具（`shutdown.exe`）。本程序是 GUI 子系统，不起控制台；
+/// `CREATE_NO_WINDOW` 再挡掉子进程自己新建控制台窗——否则关机前会先闪一个黑框。
+fn run_console_tool(exe: &str, args: &[&str]) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new(exe)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+}
+
+/// 音量/媒体键：按下 + 抬起各一次。与补字符那格同一个 `SendInput`，区别是这里发真 VK。
+fn press_vk(vk: u16) {
+    let key = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: 0,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let sent = unsafe { SendInput(&[key(false), key(true)], std::mem::size_of::<INPUT>() as i32) };
+    if sent != 2 {
+        eprintln!("internal: vk 0x{vk:02X} 只注入 {sent}/2（目标程序可能忽略了它）");
+    }
+}
+
+/// 危险动作确认框里那句"到底会发生什么"。只说事实，不吓人也不轻描淡写。
+fn confirm_warning(action: source::system::InternalAction) -> &'static str {
+    use source::system::InternalAction as A;
+    match action {
+        A::Shutdown => "将立即关闭这台电脑，未保存的工作会丢失。",
+        A::Restart => "将立即重启这台电脑，未保存的工作会丢失。",
+        A::Logoff => "将注销当前用户，所有未保存的工作会丢失。",
+        A::EmptyRecycleBin => "将清空回收站，里面的文件无法再恢复（本程序不再弹系统二次确认）。",
+        _ => "",
     }
 }
 
@@ -1772,6 +1837,50 @@ impl LauncherApp {
                 source::application::save_settings(&prefs);
             }
         }
+        // 2026-10-23 一次性改名：老清单里的「设置·X」→「Win·X」/「启动器·X」，
+        // 总入口「设置」→「Windows 设置」（用户反馈敲「设置」出来四十行）。
+        // 与 seed_round 无关——补种只加不删，改名得单独走一趟；幂等，第二轮起恒为 0。
+        let renamed = source::system::rename_legacy_settings(&mut items);
+        if renamed > 0 {
+            if evidence_lost {
+                eprintln!("source: 设置条目改名 {renamed} 条（坏文件留证没成功 ⇒ 这次不写清单）");
+            } else {
+                source::application::save_user_items(&items);
+                eprintln!("source: 设置条目改名 {renamed} 条（已写清单）");
+            }
+        }
+        // 2026-10-23 同目标去重：A9 从开始菜单导进过一条 Store 版「设置」，与出厂的
+        // `ms-settings:` 打开的是同一个界面 ⇒ 清单一度两条同名同义。用户裁定保留协议那条、
+        // 隐藏 Store 那条；走 hidden[] 而不是删除，想找回改 settings.json 就行。
+        let dup_settings: Vec<String> = items
+            .iter()
+            .filter(|i| {
+                i.kind == ItemKind::App
+                    && i.path.to_ascii_lowercase().contains("windows.immersivecontrolpanel")
+                    && !prefs.hidden.iter().any(|h| h == &i.uid())
+            })
+            .map(|i| i.uid())
+            .collect();
+        if !dup_settings.is_empty() {
+            prefs.hidden.extend(dup_settings.iter().cloned());
+            if evidence_lost {
+                eprintln!("source: 隐藏重复的 Store 版「设置」（坏文件留证没成功 ⇒ 这次不写 settings.json）");
+            } else {
+                source::application::save_settings(&prefs);
+                eprintln!("source: 隐藏重复的 Store 版「设置」（已写 hidden[]）");
+            }
+        }
+        // FR-SRC-17 `hidden[]`：隐藏不是删除——补种会把条目塞回来，所以每一轮启动都再剔一次。
+        // 只有真剔掉东西才写盘（平时 dropped=0，不该因为这条路径多写一次文件）。
+        let dropped = source::application::drop_hidden(&mut items, &prefs.hidden);
+        if dropped > 0 {
+            if evidence_lost {
+                eprintln!("source: hidden[] 隐藏 {dropped} 条（坏文件留证没成功 ⇒ 这次不写清单）");
+            } else {
+                source::application::save_user_items(&items);
+                eprintln!("source: hidden[] 隐藏 {dropped} 条（已写清单）");
+            }
+        }
         let settings_open = intent.settings_page.is_some();
         let settings_tab =
             intent.settings_page.and_then(SettingsTab::from_page).unwrap_or(SettingsTab::General);
@@ -1798,6 +1907,8 @@ impl LauncherApp {
             focus_query: intent.visible && intent.dialog.is_none() && !settings_open,
             dialog: intent.dialog, dialog_enter_armed: false,
             confirm: None,
+            internal_confirm: None,
+            about_open: false,
             win_drag: None,
             settings_open, settings_tab,
             prefs,
@@ -2648,14 +2759,24 @@ impl LauncherApp {
                             ui.label(egui::RichText::new("出厂命令集").strong());
                             if ui.button("补回缺失的出厂命令").clicked() {
                                 let added = source::application::merge_missing_seeds(&mut self.items);
-                                if added > 0 {
+                                // 补回来的条目里可能有用户明确隐藏的 ⇒ 立刻再剔一次，否则
+                                // 「隐藏」会被这个按钮当成「删除后补回」悄悄撤销。
+                                let hidden = source::application::drop_hidden(
+                                    &mut self.items,
+                                    &self.prefs.hidden,
+                                );
+                                if added > 0 || hidden > 0 {
                                     self.save_items();
                                 }
-                                eprintln!("设置页：补回缺失的出厂命令 → {added} 条");
-                                let text = if added > 0 {
-                                    format!("✓ 已补回 {added} 条出厂命令")
-                                } else {
+                                eprintln!(
+                                    "设置页：补回缺失的出厂命令 → 补 {added} 条，按 hidden[] 再剔 {hidden} 条"
+                                );
+                                let text = if added == 0 {
                                     "出厂命令一条不缺，清单没动".to_string()
+                                } else if hidden > 0 {
+                                    format!("✓ 已补回 {added} 条（其中 {hidden} 条按 hidden[] 隐藏）")
+                                } else {
+                                    format!("✓ 已补回 {added} 条出厂命令")
                                 };
                                 self.toast = Some((text, Instant::now() + TOAST_TTL, TOAST_OK));
                                 ui.ctx().request_repaint_after(TOAST_TTL);
@@ -2663,7 +2784,7 @@ impl LauncherApp {
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "只补清单里缺的（按 uid / 名称认已存在），只加不删，改过的条目不动。删掉的内置条目下次启动不会自己回来，要找回就按这里。",
+                                    "只补清单里缺的（按 uid / 名称认已存在），只加不删，改过的条目不动。删掉的内置条目下次启动不会自己回来，要找回就按这里。写在 settings.json 的 hidden 数组里的条目补回来后会再被剔除（隐藏 ≠ 删除）。",
                                 )
                                 .weak()
                                 .small(),
@@ -2685,6 +2806,40 @@ impl LauncherApp {
                                 egui::RichText::new("扫描开始菜单/桌面的快捷方式并入清单（已有项不重复、不删除）。")
                                     .weak()
                                     .small(),
+                            );
+                            ui.separator();
+                            // FR-SRC-17 `confirm_actions`（批次 A2）：四条不可撤销动作的执行确认。
+                            ui.label(egui::RichText::new("危险操作先确认").strong());
+                            let mut confirm_actions = self.prefs.confirm_actions;
+                            if ui
+                                .checkbox(
+                                    &mut confirm_actions,
+                                    "关机 / 重启 / 注销 / 清空回收站 执行前弹确认（默认开）",
+                                )
+                                .changed()
+                            {
+                                self.prefs.confirm_actions = confirm_actions;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：confirm_actions = {confirm_actions}（已写 settings.json）"
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "关掉之后这四条在列表里回车即执行。它们都不可撤销，只在确定自己不会误按时关。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            ui.label(egui::RichText::new("系统命令").strong());
+                            ui.label(
+                                egui::RichText::new(
+                                    "系统命令（关机、设置页直达、Windows 工具、ms-settings 页、音量与媒体）并进出厂条目，与普通条目一样可搜索、可置顶、可编辑、可删除。想「隐藏而不是删除」时，把条目的 uid 写进 settings.json 的 hidden 数组——隐藏项在「补回缺失的出厂命令」之后也不会回来。",
+                                )
+                                .weak()
+                                .small(),
                             );
                         }
                         SettingsTab::Hotkeys => {
@@ -3027,6 +3182,13 @@ impl LauncherApp {
         entry: &LaunchItem,
         masked_uid: Option<&str>,
     ) -> bool {
+        // 批次 A2（FR-SRC-17）：内置动作（`internal:<id>`）不归 ShellExecute 管——
+        // 它既不是协议也不是程序。危险动作的确认也在 `run_internal` 里拦：
+        // 那里返回 false ＝ 这一帧还没执行，调用方据此不记学习统计，
+        // 等确认弹窗按「执行」那一帧才补记。
+        if entry.kind == ItemKind::Internal {
+            return self.run_internal(ctx, entry);
+        }
         match shell_execute(&entry.path, &entry.arguments, entry.working_dir.as_deref()) {
             Ok(_) => match masked_uid {
                 None => eprintln!("launch: {} {}", entry.path, entry.arguments),
@@ -3050,13 +3212,273 @@ impl LauncherApp {
                 return false;
             }
         }
+        self.collapse_after_run(ctx);
+        true
+    }
+
+    /// 执行完把窗口收回托盘（FR-ACT「运行后自动关」）。启动成功与内置动作共用一条路径，
+    /// 免得两处各写一遍、将来只改一处。
+    fn collapse_after_run(&mut self, ctx: &egui::Context) {
         self.toast = None;
         self.clear_query_next_frame = true;
         self.selected = 0;
         self.visible = false;
         self.on_hide();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    /// 批次 A2（FR-SRC-17）内置动作的入口：解析路径 → 危险动作先弹确认 → 交给 [`Self::exec_internal`]。
+    /// 返回 `false` ＝ 这一帧什么都没做（路径不认识 / 正在等确认），调用方据此不记学习统计。
+    fn run_internal(&mut self, ctx: &egui::Context, entry: &LaunchItem) -> bool {
+        let Some(action) = source::system::InternalAction::from_path(&entry.path) else {
+            eprintln!("internal: 不认识的系统命令路径 {}", entry.path);
+            self.internal_toast(ctx, &format!("⚠ 这条系统命令不认识：{}", entry.path), false);
+            return false;
+        };
+        if action.needs_confirm() && self.prefs.confirm_actions {
+            eprintln!("internal: 「{}」执行前确认（{}）", entry.name, action.id());
+            self.internal_confirm = Some(InternalConfirm {
+                action,
+                name: entry.name.clone(),
+                uid: entry.uid(),
+            });
+            ctx.request_repaint();
+            return false;
+        }
+        self.exec_internal(ctx, action)
+    }
+
+    /// 真正执行一个内置动作。返回 `false` ＝ 没做成（窗口留在原地，已给 Toast）。
+    fn exec_internal(
+        &mut self,
+        ctx: &egui::Context,
+        action: source::system::InternalAction,
+    ) -> bool {
+        use source::system::InternalAction as A;
+        match action {
+            A::Settings(page) => {
+                self.settings_open = true;
+                self.settings_tab =
+                    SettingsTab::from_page(u32::from(page)).unwrap_or(SettingsTab::General);
+                self.clear_query_next_frame = true;
+                self.focus_query = false;
+                eprintln!("internal: 打开设置页 {page}");
+                ctx.request_repaint();
+                true
+            }
+            A::Reload => {
+                self.reload_config(ctx);
+                true
+            }
+            A::RebuildAppIndex => {
+                source::application::spawn_batch_import(self.apps_tx.clone());
+                eprintln!("internal: 重建应用索引（后台扫描开始菜单/桌面）");
+                self.internal_toast(ctx, "✓ 应用索引已在后台重建，完成后自动合并", true);
+                true
+            }
+            A::RebuildFileIndex => {
+                if !self.prefs.source_on(source::SourceId::Files) {
+                    eprintln!("internal: 文件搜索源已关闭，拒绝重建索引");
+                    self.internal_toast(ctx, "⚠ 文件搜索源已关闭，没有可重建的索引", false);
+                    return false;
+                }
+                let mut hit = false;
+                for s in self.sources.iter_mut() {
+                    if s.id() == source::SourceId::Files {
+                        s.rebuild();
+                        hit = true;
+                    }
+                }
+                eprintln!("internal: 文件索引重建请求已派发（找到文件源={hit}）");
+                self.internal_toast(ctx, "✓ 文件索引已在后台重建", hit);
+                hit
+            }
+            A::About => {
+                self.about_open = true;
+                eprintln!("internal: 打开「关于本程序」");
+                ctx.request_repaint();
+                true
+            }
+            A::OpenLog => {
+                open_log_file();
+                self.collapse_after_run(ctx);
+                true
+            }
+            A::Quit => {
+                eprintln!("internal: 退出启动器");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                true
+            }
+            A::Lock => match unsafe { LockWorkStation() } {
+                Ok(()) => {
+                    eprintln!("internal: 已锁定屏幕");
+                    self.collapse_after_run(ctx);
+                    true
+                }
+                Err(e) => {
+                    eprintln!("internal: 锁定屏幕失败：{e}");
+                    self.internal_toast(ctx, &format!("⚠ 锁定屏幕失败：{e}"), false);
+                    false
+                }
+            },
+            // 睡眠走 powrprof 的 SetSuspendState（`0,1,0` = 不休眠）——本机开了休眠时
+            // Windows 可能按休眠处理，这是系统行为不是本程序的；休眠用 `shutdown /h`。
+            A::Sleep => self.run_console_action(
+                ctx,
+                "睡眠",
+                "rundll32.exe",
+                &["powrprof.dll,SetSuspendState", "0,1,0"],
+            ),
+            A::Hibernate => self.run_console_action(ctx, "休眠", "shutdown.exe", &["/h"]),
+            A::Shutdown => {
+                self.run_console_action(ctx, "关机", "shutdown.exe", &["/s", "/t", "0"])
+            }
+            A::Restart => {
+                self.run_console_action(ctx, "重启", "shutdown.exe", &["/r", "/t", "0"])
+            }
+            A::Logoff => self.run_console_action(ctx, "注销", "shutdown.exe", &["/l"]),
+            A::EmptyRecycleBin => {
+                let flags = SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND;
+                match unsafe { SHEmptyRecycleBinW(None, PCWSTR::null(), flags) } {
+                    Ok(()) => {
+                        eprintln!("internal: 回收站已清空");
+                        self.collapse_after_run(ctx);
+                        true
+                    }
+                    Err(e) => {
+                        // 回收站本来就空时也可能回一个失败码；照实说，不谎报成功。
+                        eprintln!("internal: 清空回收站失败：{e}");
+                        self.internal_toast(ctx, &format!("⚠ 清空回收站失败：{e}"), false);
+                        false
+                    }
+                }
+            }
+            A::MonitorOff => {
+                let r = unsafe {
+                    SendMessageTimeoutW(
+                        HWND_BROADCAST,
+                        WM_SYSCOMMAND,
+                        WPARAM(SC_MONITORPOWER as usize),
+                        LPARAM(2),
+                        SMTO_ABORTIFHUNG,
+                        1000,
+                        None,
+                    )
+                };
+                eprintln!("internal: 已请求关闭显示器（SendMessageTimeout 返回 {}）", r.0);
+                self.collapse_after_run(ctx);
+                true
+            }
+            A::VolumeMute => self.send_media_key(ctx, VK_VOLUME_MUTE, "静音"),
+            A::VolumeUp => self.send_media_key(ctx, VK_VOLUME_UP, "音量加"),
+            A::VolumeDown => self.send_media_key(ctx, VK_VOLUME_DOWN, "音量减"),
+            A::MediaPlayPause => self.send_media_key(ctx, VK_MEDIA_PLAY_PAUSE, "播放/暂停"),
+            A::MediaNext => self.send_media_key(ctx, VK_MEDIA_NEXT_TRACK, "下一曲"),
+            A::MediaPrev => self.send_media_key(ctx, VK_MEDIA_PREV_TRACK, "上一曲"),
+            A::MediaStop => self.send_media_key(ctx, VK_MEDIA_STOP, "停止播放"),
+        }
+    }
+
+    /// 音量/媒体键：走 `SendInput` 的虚拟键注入（与补字符那格同一个 API，但这里是真 VK）。
+    fn send_media_key(&mut self, ctx: &egui::Context, vk: VIRTUAL_KEY, what: &str) -> bool {
+        press_vk(vk.0);
+        eprintln!("internal: 已发送「{what}」键（vk 0x{:02X}）", vk.0);
+        self.collapse_after_run(ctx);
         true
+    }
+
+    /// 派发一条控制台动作（`shutdown.exe`）。`CREATE_NO_WINDOW` 保证不闪黑窗。
+    fn run_console_action(
+        &mut self,
+        ctx: &egui::Context,
+        what: &str,
+        exe: &str,
+        args: &[&str],
+    ) -> bool {
+        match run_console_tool(exe, args) {
+            Ok(()) => {
+                eprintln!("internal: {what} 已派发（{exe}）");
+                self.collapse_after_run(ctx);
+                true
+            }
+            Err(e) => {
+                eprintln!("internal: {what} 失败：{e}");
+                self.internal_toast(ctx, &format!("⚠ {what}失败：{e}"), false);
+                false
+            }
+        }
+    }
+
+    fn internal_toast(&mut self, ctx: &egui::Context, text: &str, ok: bool) {
+        self.toast = Some((
+            text.to_string(),
+            Instant::now() + TOAST_TTL,
+            if ok { TOAST_OK } else { TOAST_ERR },
+        ));
+        ctx.request_repaint_after(TOAST_TTL);
+    }
+
+    /// FR-SRC-17「重新加载配置」：把 `settings.json` 与 `user_items.json` 重新读一遍。
+    /// 这是手改配置文件后的正规入口——解析失败时**沿用当前状态**，绝不拿默认值覆盖
+    /// （那会把用户手写坏一个逗号的清单变成空清单，形状与 E1 事故相同）。
+    fn reload_config(&mut self, ctx: &egui::Context) {
+        let off_before: Vec<source::SourceId> = self
+            .sources
+            .iter()
+            .filter(|s| !self.prefs.source_on(s.id()))
+            .map(|s| s.id())
+            .collect();
+        let hotkey_before = self.hotkey_active;
+        let (prefs, bad_prefs) = source::application::load_settings();
+        let (items, bad_items) = source::application::load_user_items();
+
+        let mut note: Vec<String> = Vec::new();
+        if bad_prefs.is_some() {
+            note.push("settings.json 解析失败，沿用当前设置".to_string());
+        } else {
+            self.prefs = prefs;
+            if self.prefs.toggle_hotkey != hotkey_before {
+                self.request_hotkey(self.prefs.toggle_hotkey);
+                note.push("呼出热键已按配置重装".to_string());
+            }
+            // 之前关着、现在打开的源要补一次初始化（文件源要重建索引，参照设置页开关）。
+            for id in off_before.iter().copied().filter(|id| self.prefs.source_on(*id)) {
+                if let Some(s) = self.sources.iter_mut().find(|s| s.id() == id) {
+                    s.init();
+                    note.push(format!("数据源 {} 已重新初始化", id.as_str()));
+                }
+            }
+        }
+
+        if bad_items.is_some() {
+            note.push("user_items.json 解析失败，沿用当前清单".to_string());
+        } else {
+            self.items = dedup_items(items);
+            let dropped = source::application::drop_hidden(&mut self.items, &self.prefs.hidden);
+            self.selected = 0;
+            let need: Vec<String> = self
+                .items
+                .iter()
+                .filter(|i| {
+                    !i.source_path.is_empty() && !self.icons.contains_key(i.source_path.as_str())
+                })
+                .map(|i| i.source_path.clone())
+                .collect();
+            if !need.is_empty() {
+                spawn_icon_loader(self.icon_tx.clone(), need);
+            }
+            eprintln!(
+                "internal: 重新加载配置 → 清单 {} 条（hidden 剔掉 {dropped} 条）",
+                self.items.len()
+            );
+        }
+
+        let text = if note.is_empty() {
+            format!("✓ 已重新加载配置（清单 {} 条）", self.items.len())
+        } else {
+            format!("⚠ 重新加载：{}", note.join("；"))
+        };
+        self.internal_toast(ctx, &text, note.is_empty());
     }
 
     /// 补全提示行不可执行（需求书把空词这一格定为 `valid=false`）：Enter/点击/数字键
@@ -3363,7 +3785,12 @@ impl eframe::App for LauncherApp {
         if self.visible {
             // keep_open 豁免（bf07e45 登记的待办，对话框上线后补上）：
             // Modal（添加/编辑框、删除确认框）或设置页开着时失焦不关到托盘，否则半成品表单/正在看的设置随窗口一起消失；已武装的定时器一并撤销。
-            if self.dialog.is_some() || self.confirm.is_some() || self.settings_open {
+            if self.dialog.is_some()
+                || self.confirm.is_some()
+                || self.internal_confirm.is_some()
+                || self.about_open
+                || self.settings_open
+            {
                 self.hide_at = None;
             } else if ui.input(|i| i.focused) {
                 self.had_focus_since_show = true;
@@ -3479,7 +3906,13 @@ impl eframe::App for LauncherApp {
         // 再关到托盘，走 Enter / 点击 / 数字键这三条；空格与 Tab 补全在选中它时整体不接管。
         // 鼠标中键不再执行任何条目（2026-10-18 用户裁定废弃），移动窗口改由「左键拖空白」承担，见下方同名注释块。
         // consume_key 精确匹配修饰键并吃掉事件，防与 TextEdit/其他控件的键位打架。
-        if self.visible && !recording && self.dialog.is_none() && self.confirm.is_none() {
+        if self.visible
+            && !recording
+            && self.dialog.is_none()
+            && self.confirm.is_none()
+            && self.internal_confirm.is_none()
+            && !self.about_open
+        {
             // 键盘缩放（2026-10-18 立规「每个功能都要配快捷键」：拖边缘是鼠标路径，这里补键盘路径）：
             // Ctrl+= 放大一档、Ctrl+- 缩小一档，搜索页与设置页都可用。走 ViewportCommand::InnerSize
             // （逻辑像素），下限与鼠标缩放同一口径，上限 1200×900 免得连按飞出屏幕。
@@ -3998,7 +4431,11 @@ impl eframe::App for LauncherApp {
         // 顶部栏那段空白在 CentralPanel 里量到真实坐标后再铺（见 drag_handle 的两处调用）。
         // 添加框/确认框打开时整块撤掉：背景层只会在「该点没有任何控件认领拖拽」时赢，
         // 缩小矩形 + 让开弹窗，就不可能抢走搜索框、新建按钮与行标签的点击。
-        if !(self.dialog.is_some() || self.confirm.is_some()) {
+        if !(self.dialog.is_some()
+            || self.confirm.is_some()
+            || self.internal_confirm.is_some()
+            || self.about_open)
+        {
             let root = ui.max_rect();
             let plate = egui::Rect::from_min_max(
                 egui::pos2(root.min.x + 260.0, root.min.y + 40.0),
@@ -4100,7 +4537,11 @@ impl eframe::App for LauncherApp {
                     }
                 });
             });
-            if self.dialog.is_none() && self.confirm.is_none() {
+            if self.dialog.is_none()
+                && self.confirm.is_none()
+                && self.internal_confirm.is_none()
+                && !self.about_open
+            {
                 let r = head_row.response.rect;
                 self.drag_handle(
                     ui,
@@ -4178,7 +4619,11 @@ impl eframe::App for LauncherApp {
                     self.selected = 0;
                 }
                 // 键盘导航：↑↓ 移动选中，Enter 运行选中项。对话框/确认框开着时让位给它们（Enter=确定）。
-                if self.dialog.is_none() && self.confirm.is_none() {
+                if self.dialog.is_none()
+                    && self.confirm.is_none()
+                    && self.internal_confirm.is_none()
+                    && !self.about_open
+                {
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         self.selected = (self.selected + 1).min(total - 1);
                     } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
@@ -4614,21 +5059,36 @@ impl eframe::App for LauncherApp {
                                 let dg = self.dialog.as_mut().unwrap();
                                 row(ui, "别名", &mut dg.keyword, "触发码，如 calc");
                                 row(ui, "名称", &mut dg.name, "显示名，如 计算器");
-                                row(ui, "命令行", &mut dg.path, "exe / 路径 / URL / shell: 目标");
+                                let path_hint = if dg.kind == ItemKind::Internal {
+                                    "内置动作标记 internal:<id>，改了这条就执行不了"
+                                } else {
+                                    "exe / 路径 / URL / shell: 目标"
+                                };
+                                row(ui, "命令行", &mut dg.path, path_hint);
                                 row(ui, "参数", &mut dg.arguments, "");
                                 row(ui, "工作目录", &mut dg.working_dir, "");
                                 ui.horizontal(|ui| {
                                     ui.add_sized([label_w, 20.0], egui::Label::new("类型"));
-                                    let mut idx = ItemKind::ALL
-                                        .iter()
-                                        .position(|k| *k == dg.kind)
-                                        .unwrap_or(0);
-                                    egui::ComboBox::from_id_salt("kind_combo")
-                                        .selected_text(dg.kind.label())
-                                        .show_index(ui, &mut idx, ItemKind::ALL.len(), |i| {
-                                            ItemKind::ALL[i].label().to_string()
-                                        });
-                                    dg.kind = ItemKind::ALL[idx];
+                                    if dg.kind == ItemKind::Internal {
+                                        // 内置动作（批次 A2）不在下拉里：`ALL` 不含 Internal，
+                                        // 硬套下拉会 `unwrap_or(0)` 把类型静默改成「应用」，
+                                        // 存盘后这条系统命令就再也执行不了。这里只读展示。
+                                        ui.label(
+                                            egui::RichText::new("系统命令（内置动作，类型不可改）")
+                                                .weak(),
+                                        );
+                                    } else {
+                                        let mut idx = ItemKind::ALL
+                                            .iter()
+                                            .position(|k| *k == dg.kind)
+                                            .unwrap_or(0);
+                                        egui::ComboBox::from_id_salt("kind_combo")
+                                            .selected_text(dg.kind.label())
+                                            .show_index(ui, &mut idx, ItemKind::ALL.len(), |i| {
+                                                ItemKind::ALL[i].label().to_string()
+                                            });
+                                        dg.kind = ItemKind::ALL[idx];
+                                    }
                                 });
                             }
                             // 按钮贴底：窗口被拉高后不会孤零零吊在表单下面。
@@ -4774,6 +5234,106 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        // ---- 批次 A2：危险内置动作的执行确认（关机 / 重启 / 注销 / 清空回收站）----
+        // 与删除确认同形态：这一帧只问，按「执行」那一帧才真的做；Esc 由下方全局分段链处理。
+        // 别在这里再调 `should_close()`：它不消费按键，Esc 会同一帧被处理两遍——
+        // 取消完确认框还会顺着链再清一次查询框（空查询时直接收窗）。
+        if self.internal_confirm.is_some() {
+            enum InternalResult {
+                Keep,
+                Yes,
+                No,
+            }
+            let modal = egui::Modal::new(egui::Id::new("internal_confirm")).show(
+                ui.ctx(),
+                |ui| {
+                    let c = self.internal_confirm.as_ref().unwrap();
+                    ui.heading(format!("执行「{}」？", c.name));
+                    ui.separator();
+                    ui.label(egui::RichText::new(confirm_warning(c.action)).strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "这条操作不可撤销。确认前请先保存手头的工作；关掉「危险操作先确认」可跳过这一步。",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    let mut result = InternalResult::Keep;
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        result = InternalResult::Yes;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("执行 (Enter)").clicked() {
+                            result = InternalResult::Yes;
+                        }
+                        if ui.button("取消 (Esc)").clicked() {
+                            result = InternalResult::No;
+                        }
+                    });
+                    result
+                },
+            );
+            match modal.inner {
+                InternalResult::Yes => {
+                    if let Some(c) = self.internal_confirm.take() {
+                        let ok = self.exec_internal(ui.ctx(), c.action);
+                        if ok {
+                            // 与「启动成功才累计」同一口径：确认后真的执行了才记一次。
+                            self.mark_used(&c.uid, "");
+                        }
+                        eprintln!(
+                            "内部确认：按「执行」→ {}（{}）",
+                            c.action.id(),
+                            if ok { "成功" } else { "失败" }
+                        );
+                        self.focus_query = true;
+                    }
+                }
+                InternalResult::No => {
+                    eprintln!("内部确认：按「取消」，未执行");
+                    self.internal_confirm = None;
+                    self.focus_query = true;
+                    ui.ctx().request_repaint();
+                }
+                InternalResult::Keep => {}
+            }
+        }
+
+        // ---- 批次 A2：「关于本程序」----
+        if self.about_open {
+            let modal = egui::Modal::new(egui::Id::new("about_program")).show(ui.ctx(), |ui| {
+                ui.heading("关于本程序");
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("egui-launcher v{}", env!("CARGO_PKG_VERSION")))
+                        .strong(),
+                );
+                ui.label("Rust + egui/eframe 重写的 ALTRun 启动器。");
+                ui.add_space(6.0);
+                let exe = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "（取不到程序路径）".to_string());
+                ui.label(egui::RichText::new(format!("程序位置：{exe}")).small());
+                ui.label(egui::RichText::new(format!("清单条目：{} 条", self.items.len())).small());
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "日志只记动作和清单内条目的名称 / uid，不记查询框原文，也不记窗口标题。",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(8.0);
+                ui.button("关闭 (Esc)").clicked()
+            });
+            // Esc 同样交给下方全局分段链，不在模态里重复处理。
+            if modal.inner {
+                self.about_open = false;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
+            }
+        }
+
         // 运行选中的程序并关闭到托盘（FR-ACT + 用户要求：Enter/点击运行后窗口自动关）。
         // FR-SRC-19：清单项成功启动才累计使用统计（launch_and_hide 失败分支提前 return，走不到这里）。
         if let Some(entry) = launch {
@@ -4870,7 +5430,16 @@ impl eframe::App for LauncherApp {
         // Esc 分段（FR-ACT-10「清空后隐藏」+2026-10-17 设置页一档 +2026-10-18 删除确认一档）：
         // 确认框→关框；对话框→关框；设置页→回搜索；有字→清空；全空→关闭到托盘。
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.confirm.is_some() {
+            if self.internal_confirm.is_some() {
+                eprintln!("内部确认：按 Esc 取消，未执行");
+                self.internal_confirm = None;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
+            } else if self.about_open {
+                self.about_open = false;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
+            } else if self.confirm.is_some() {
                 eprintln!("删除确认：按 Esc 取消，未删除");
                 self.confirm = None;
                 self.focus_query = true;
