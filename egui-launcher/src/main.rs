@@ -558,6 +558,7 @@ struct LauncherApp {
     confirm: Option<ConfirmRequest>, // 删除确认弹窗（Some=打开；2026-10-18 用户要求，删除不再一键生效）
     internal_confirm: Option<InternalConfirm>, // 批次 A2：关机/重启/注销/清空回收站的执行确认
     about_open: bool,             // 批次 A2：「关于本程序」弹窗（Some 的等价物，用 bool 更直白）
+    help_entry: Option<source::cheatsheet::CheatHit>, // 批次 A8：速查表条目的帮助页（Some=打开）
     win_drag: Option<DragAnchor>,    // 左键拖空白移动窗口的进行中锚点（None=没在拖）
     dialog_enter_armed: bool,     // 弹窗当帧吞掉 Enter，防"打开框的那次回车"当帧又触发对话框的确定
     settings_open: bool,          // 设置页（整页模式，替代搜索页；2026-10-17 用户要求）
@@ -1909,6 +1910,7 @@ impl LauncherApp {
             confirm: None,
             internal_confirm: None,
             about_open: false,
+            help_entry: None,
             win_drag: None,
             settings_open, settings_tab,
             prefs,
@@ -3059,6 +3061,7 @@ impl LauncherApp {
                                     ("Ctrl+D", "打开选中项所在目录（文件行：在资源管理器里定位这个文件）"),
                                     ("Ctrl+Shift+P", "置顶 / 取消置顶选中项（📌）"),
                                     ("Ctrl+F", "进入文件模式：在当前输入前补一个 ' 触发符；已在文件模式时只提示，不叠第二个前缀"),
+                                    ("?", "打开速查表：全部语法与快捷键都在那一页（`? 词` 过滤，Enter 看某一条的帮助页）"),
                                     ("D:\\proj\\ 、 \\\\srv\\share\\", "文件模式第一式：直接打路径浏览那一层（尾部分隔符＝列整个目录；不带则是「目录 + 过滤词」）"),
                                     ("' 报告", "第二式：在索引范围（桌面 / 下载 / 文档，四级以内，3 万条封顶）里按文件名搜"),
                                     ("open|find|file 报告", "第三式：动词触发（与 ' 同一结果）"),
@@ -3693,6 +3696,8 @@ impl LauncherApp {
         let now = now_ms();
         // 先取值再借 `prefs.engines`：配置里存的是稳定名，认识的才留下，不认识回落 cmd。
         let term_shell = self.prefs.term_shell();
+        // 速查表要按「哪些源开着」过滤条目，dispatch 也要同一份判断 ⇒ 只算一个闭包，两处共用。
+        let on = |id: source::SourceId| self.prefs.source_on(id);
         let mut cx = source::SearchCtx {
             query: &self.query,
             items: &self.items,
@@ -3701,8 +3706,9 @@ impl LauncherApp {
             index: &mut self.index,
             now_ms: now,
             term_shell,
+            source_on: &on,
         };
-        source::dispatch(&mut self.sources, &mut cx, |id| self.prefs.source_on(id))
+        source::dispatch(&mut self.sources, &mut cx, &on)
     }
 }
 
@@ -3847,6 +3853,7 @@ impl eframe::App for LauncherApp {
                 || self.confirm.is_some()
                 || self.internal_confirm.is_some()
                 || self.about_open
+                || self.help_entry.is_some()
                 || self.settings_open
             {
                 self.hide_at = None;
@@ -3972,6 +3979,7 @@ impl eframe::App for LauncherApp {
             && self.confirm.is_none()
             && self.internal_confirm.is_none()
             && !self.about_open
+            && self.help_entry.is_none()
         {
             // 键盘缩放（2026-10-18 立规「每个功能都要配快捷键」：拖边缘是鼠标路径，这里补键盘路径）：
             // Ctrl+= 放大一档、Ctrl+- 缩小一档，搜索页与设置页都可用。走 ViewportCommand::InnerSize
@@ -4454,6 +4462,21 @@ impl eframe::App for LauncherApp {
                                     eprintln!("快捷键 数字键 {digit}：选中的是终端用法行，不执行");
                                     self.hint_toast(ui.ctx(), source::terminal::USAGE_TOAST);
                                 }
+                                HeadRow::Cheat(hit) => {
+                                    // FR-SRC-18：与 Enter 同一语义——打开帮助页，不关窗口。
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：打开速查表条目「{}」",
+                                        hit.entry.title
+                                    );
+                                    self.help_entry = Some(*hit);
+                                }
+                                HeadRow::CheatHint(_) => {
+                                    eprintln!("快捷键 数字键 {digit}：选中速查表的无匹配提示行，不执行");
+                                    self.hint_toast(
+                                        ui.ctx(),
+                                        source::cheatsheet::NO_MATCH_TOAST,
+                                    );
+                                }
                             },
                             Some(Row::Item(rank)) => {
                                 let item = self.items[results[rank]].clone();
@@ -4505,7 +4528,8 @@ impl eframe::App for LauncherApp {
         if !(self.dialog.is_some()
             || self.confirm.is_some()
             || self.internal_confirm.is_some()
-            || self.about_open)
+            || self.about_open
+            || self.help_entry.is_some())
         {
             let root = ui.max_rect();
             let plate = egui::Rect::from_min_max(
@@ -4593,7 +4617,7 @@ impl eframe::App for LauncherApp {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .id(search_id)
-                        .hint_text("搜索…（↑↓/PgUp/PgDn/Ctrl+N/P 选择，Enter/空格/1-9 运行，Tab 补全，Ctrl+Shift+N 新建，Ctrl+E 编辑，Delete 删除，Ctrl+D 开目录，Ctrl+Shift+P 置顶，Ctrl+, 设置，Esc 清空/关闭）"),
+                        .hint_text("搜索…（↑↓/PgUp/PgDn/Ctrl+N/P 选择，Enter/空格/1-9 运行，Tab 补全，Ctrl+Shift+N 新建，Ctrl+E 编辑，Delete 删除，Ctrl+D 开目录，Ctrl+Shift+P 置顶，Ctrl+, 设置，? 帮助，Esc 清空/关闭）"),
                 );
                 pill_right = resp.rect.max.x;
                 if resp.changed() {
@@ -4612,6 +4636,7 @@ impl eframe::App for LauncherApp {
                 && self.confirm.is_none()
                 && self.internal_confirm.is_none()
                 && !self.about_open
+                && self.help_entry.is_none()
             {
                 let r = head_row.response.rect;
                 self.drag_handle(
@@ -4694,6 +4719,7 @@ impl eframe::App for LauncherApp {
                     && self.confirm.is_none()
                     && self.internal_confirm.is_none()
                     && !self.about_open
+                    && self.help_entry.is_none()
                 {
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         self.selected = (self.selected + 1).min(total - 1);
@@ -4719,6 +4745,10 @@ impl eframe::App for LauncherApp {
                                 HeadRow::Terminal(hit) => open_term = Some(hit.clone()),
                                 HeadRow::TermHint(_) => {
                                     self.hint_toast(ui.ctx(), source::terminal::USAGE_TOAST)
+                                }
+                                HeadRow::Cheat(hit) => self.help_entry = Some(*hit),
+                                HeadRow::CheatHint(_) => {
+                                    self.hint_toast(ui.ctx(), source::cheatsheet::NO_MATCH_TOAST)
                                 }
                             },
                             Some(Row::Item(rank)) => {
@@ -5011,6 +5041,68 @@ impl eframe::App for LauncherApp {
                                         );
                                         if sel.clicked() {
                                             self.hint_toast(ui.ctx(), source::terminal::USAGE_TOAST);
+                                        }
+                                    });
+                                }
+                                HeadRow::Cheat(hit) => {
+                                    // FR-SRC-18：一行一条语法/快捷键；点击＝打开帮助页（窗口不关）。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "查看");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("?").monospace().size(20.0).weak(),
+                                            ),
+                                        )
+                                        .on_hover_text(format!(
+                                            "速查表 · {}",
+                                            hit.entry.group.label()
+                                        ));
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hit.entry.key).monospace(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.entry.group.label())
+                                                .weak()
+                                                .size(11.0),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(hit.entry.summary).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            self.help_entry = Some(*hit);
+                                        }
+                                    });
+                                }
+                                HeadRow::CheatHint(hint) => {
+                                    // 过滤词一条也没命中的提示行：点/按只给一句换词建议。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "查看");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("?").monospace().size(20.0).weak(),
+                                            ),
+                                        );
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hint.subtitle).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            self.hint_toast(
+                                                ui.ctx(),
+                                                source::cheatsheet::NO_MATCH_TOAST,
+                                            );
                                         }
                                     });
                                 }
@@ -5426,6 +5518,58 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        // ---- 批次 A8：速查表条目的帮助页（「对应帮助页」在本程序内，不依赖 docs/）----
+        if let Some(hit) = self.help_entry {
+            let entry = hit.entry;
+            let modal = egui::Modal::new(egui::Id::new("cheatsheet_help")).show(ui.ctx(), |ui| {
+                // 模态是居中的胶囊，宽度由内容决定；窗口只有 640 宽时必须主动收窄，
+                // 否则 520 的定宽会顶出窗口左右两边（2026-10-23 真机截图裁边）。
+                ui.set_max_width((ui.ctx().content_rect().width() - 64.0).clamp(240.0, 520.0));
+                ui.heading(entry.title);
+                ui.label(
+                    egui::RichText::new(format!("速查表 · {}", entry.group.label()))
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(entry.key).monospace().strong());
+                ui.separator();
+                ui.label(entry.detail);
+                ui.add_space(10.0);
+                let mut go_page = None;
+                let mut close = false;
+                ui.horizontal(|ui| {
+                    if let Some(page) = entry.settings_page {
+                        let name = match page {
+                            1 => "通用",
+                            2 => "功能",
+                            3 => "热键",
+                            4 => "数据源",
+                            _ => "设置",
+                        };
+                        if ui.button(format!("打开设置页（{name}）")).clicked() {
+                            go_page = Some(page);
+                        }
+                    }
+                    if ui.button("关闭 (Esc)").clicked() {
+                        close = true;
+                    }
+                });
+                (go_page, close)
+            });
+            // Esc 由下方全局分段链处理，模态里不重复。
+            let (go_page, close) = modal.inner;
+            if let Some(page) = go_page {
+                self.help_entry = None;
+                self.open_settings_page(page);
+                ui.ctx().request_repaint();
+            } else if close {
+                self.help_entry = None;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
+            }
+        }
+
         // ---- 批次 A2：「关于本程序」----
         if self.about_open {
             let modal = egui::Modal::new(egui::Id::new("about_program")).show(ui.ctx(), |ui| {
@@ -5563,6 +5707,10 @@ impl eframe::App for LauncherApp {
             if self.internal_confirm.is_some() {
                 eprintln!("内部确认：按 Esc 取消，未执行");
                 self.internal_confirm = None;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
+            } else if self.help_entry.is_some() {
+                self.help_entry = None;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
             } else if self.about_open {

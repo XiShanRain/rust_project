@@ -1,8 +1,9 @@
 //! FR-SRC 数据源模块。每个 provider 一个子模块，统一产出「可搜索的条目快照」。
 //!
-//! 现已落地七个：FR-SRC-02（应用程序源）、FR-SRC-05（自定义命令源）、
+//! 现已落地八个：FR-SRC-02（应用程序源）、FR-SRC-05（自定义命令源）、
 //! FR-SRC-06（路径四态校验）、FR-SRC-10（计算器）、FR-SRC-11（网页搜索）、
-//! FR-SRC-14（文件搜索与目录浏览）、FR-SRC-16（终端命令 `>`）。
+//! FR-SRC-14（文件搜索与目录浏览）、FR-SRC-16（终端命令 `>`）、
+//! FR-SRC-18（速查表 `?`，表里每条语法也按所属源的开关过滤）。
 //!
 //! **批次 A10（2026-10-22）起**这几个源不再硬编在 `main.rs::plan()` 的匹配链里，而是实现
 //! [`DataSource`]、由 [`default_sources`] 按固定顺序注册；`plan()` 只按注册表走一圈。
@@ -17,6 +18,7 @@
 
 pub mod application;
 pub mod calc;
+pub mod cheatsheet;
 pub mod custom;
 pub mod filesearch;
 pub mod icon;
@@ -47,14 +49,23 @@ pub enum SourceId {
     Calc,
     /// 终端命令（`>命令`）。
     Terminal,
+    /// 速查表（`?`、`? 词`）。
+    Cheatsheet,
 }
 
 impl SourceId {
     /// 注册表的实际顺序（只在单测里用：`default_sources` 的顺序不许漂）。
-    /// 与 [`default_sources`] 一致——显式语法（`>`）最前，其后用户数据压过出厂数据，应用清单殿后。
+    /// 与 [`default_sources`] 一致——显式语法（`?` / `>`）最前，其后用户数据压过出厂数据，应用清单殿后。
     #[cfg(test)]
-    pub const ALL: [Self; 6] =
-        [Self::Terminal, Self::Custom, Self::Web, Self::Files, Self::Calc, Self::Apps];
+    pub const ALL: [Self; 7] = [
+        Self::Cheatsheet,
+        Self::Terminal,
+        Self::Custom,
+        Self::Web,
+        Self::Files,
+        Self::Calc,
+        Self::Apps,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -64,6 +75,7 @@ impl SourceId {
             Self::Files => "files",
             Self::Calc => "calc",
             Self::Terminal => "terminal",
+            Self::Cheatsheet => "cheatsheet",
         }
     }
 }
@@ -90,6 +102,10 @@ pub enum SourceRow {
     Terminal(terminal::TermHit),
     /// 裸 `>` 的用法行：不可执行，`Enter` / 数字键只给一句 Toast。
     TermHint(terminal::TermHint),
+    /// 速查表的一行。「执行」＝打开这一条的帮助页（不关窗口）。
+    Cheat(cheatsheet::CheatHit),
+    /// `? 词` 一条也没命中时的提示行：不可执行，只给一句 Toast。
+    CheatHint(cheatsheet::CheatHint),
 }
 
 impl SourceRow {
@@ -125,6 +141,9 @@ pub struct SearchCtx<'a> {
     /// 终端源用哪个 shell（设置页「功能」页那四选一）。放在上下文里而不是源自己身上：
     /// 源是启动时注册的，配置却随时会变，源每次都读同一份上下文就不会落后一帧。
     pub term_shell: terminal::TermShell,
+    /// 此刻哪些数据源是开着的。速查表据此整条过滤掉「已关掉的源」的语法
+    /// （FR-SRC-18「按功能启用状态过滤」）；与 `dispatch` 的 `on` 是同一个判断。
+    pub source_on: &'a dyn Fn(SourceId) -> bool,
 }
 
 /// 本帧列表的完整计划。原先叫 `Plan`、定义在 `main.rs`；批次 A10 搬到数据源层。
@@ -180,7 +199,8 @@ pub trait DataSource {
 /// - 想抢在它们之前 ⇒ 往前放（目前 `Custom` 在最前，是因为"用户数据压过出厂数据"）。
 pub fn default_sources() -> Vec<Box<dyn DataSource>> {
     vec![
-        // 显式语法排最前：`>` 是用户明说"这条给终端"，不该被同名关键字抢走。
+        // 两个显式语法排最前：`?` / `>` 是用户明说"这条给速查表 / 终端"，不该被同名关键字抢走。
+        Box::new(cheatsheet::CheatSource),
         Box::new(terminal::TerminalSource),
         Box::new(custom::CustomSource),
         Box::new(websearch::WebSource),
@@ -304,6 +324,11 @@ mod registry_tests {
         }
     }
 
+    /// 测试里所有源都当开着（速查表要的开关判断）。
+    fn all_on(_: SourceId) -> bool {
+        true
+    }
+
     fn ctx_with<'a>(query: &'a str, items: &'a [LaunchItem], index: &'a mut MatchIndex) -> SearchCtx<'a> {
         SearchCtx {
             query,
@@ -313,6 +338,7 @@ mod registry_tests {
             index,
             now_ms: 0,
             term_shell: terminal::TermShell::default(),
+            source_on: &all_on,
         }
     }
 
