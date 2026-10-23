@@ -75,6 +75,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// 批次 A10：行模型与列表计划搬进了数据源层；这里保留旧名，五千行 UI 代码一个字不用改。
+use source::{SearchPlan as Plan, SourceRow as HeadRow};
+
 // FR-WIN-04 失焦关闭到托盘：焦点丢失后延迟这么久再复查关闭（AHK 参考 _OnActivate 用 50ms 复查；
 // 不用 0ms 是为避开右键菜单/瞬态焦点抖动导致的误关闭）。
 // 术语：本程序「关闭到托盘」= ViewportCommand::Visible(false)，窗口消失、进程仍常驻托盘，
@@ -306,21 +309,24 @@ enum TrayEvent {
     Exit,
 }
 
-/// 设置页分类（对标 AHK 版设置窗口的左侧分类栏，先立当下有真实选项的三类）。
+/// 设置页分类（对标 AHK 版设置窗口的左侧分类栏，先立当下有真实选项的四类）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
     Features,
     Hotkeys,
+    /// 批次 A10：每个数据源一行开关。这一页的条目由注册表渲染，不在这里硬编。
+    Sources,
 }
 
 impl SettingsTab {
-    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键）；越界返回 None，由调用方落回通用。
+    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源）；越界返回 None，由调用方落回通用。
     fn from_page(page: u32) -> Option<Self> {
         match page {
             1 => Some(Self::General),
             2 => Some(Self::Features),
             3 => Some(Self::Hotkeys),
+            4 => Some(Self::Sources),
             _ => None,
         }
     }
@@ -548,21 +554,10 @@ struct LauncherApp {
     /// 有一轮检查还没回来（UNC 断线可能挂很久）⇒ 不再派新一轮，避免线程堆积。
     path_in_flight: bool,
     path_scanned_at: Instant,
-    // ---- 批次 X：FR-SRC-14 文件搜索与目录浏览（索引与列目录都在后台线程，主线程只换快照）----
-    file_tx: mpsc::Sender<source::filesearch::FileUpdate>,
-    file_rx: mpsc::Receiver<source::filesearch::FileUpdate>,
-    /// 整表快照：`FileUpdate::Index` 到达时整体替换，旧快照在那一帧前一直可用。
-    file_index: Vec<source::filesearch::FileEntry>,
-    /// 上一轮索引建成的时刻（`None` = 还没建成过）；同时兼任 30 分钟重扫的计时起点。
-    file_indexed_at: Option<Instant>,
-    file_rebuild_in_flight: bool,
-    /// 一次目录浏览的回报，带 `(dir, filter)` 供查询核对。
-    dir_hits: Option<(String, String, Vec<source::filesearch::FileHit>)>,
-    /// 已派出去、还没被采纳的那次浏览的 `(dir, filter)`。
-    dir_in_flight: Option<(String, String)>,
-    /// 同一查询串一帧里会被 [`plan`](LauncherApp::plan) 算好几遍（空格判据、渲染、Enter…），
-    /// 而文件源要扫三万条 ⇒ 按查询串缓存本轮命中。索引回报到达时清空，别让新索引撞上旧缓存。
-    file_hits_cache: Option<(String, Vec<source::filesearch::FileHit>)>,
+    // ---- 批次 A10：数据源注册表（插件插槽）----
+    /// 本帧列表由这几家拼出来，顺序即报文次序。文件源的索引/列目录状态在 `FileSource` 自己
+    /// 肚子里，`LauncherApp` 不再持有它那八个字段；开关读 [`AppSettings::sources_off`]。
+    sources: Vec<Box<dyn source::DataSource>>,
     /// E1（批次 X）：配置文件坏过一次的话，这里存那句说明。静默启动时 `ui()` 根本不跑，
     /// 所以它是「等窗口第一次真被看见」才转成 Toast 的那句话，不是开机就闪一下没了。
     startup_notice: Option<String>,
@@ -770,43 +765,12 @@ fn path_state_color(state: source::pathcheck::PathState) -> egui::Color32 {
 }
 
 // ---- FR-SRC-10 / FR-SRC-11 结果行并入列表的行模型（批次 S / T）----
-
-/// 列表头段（应用结果之前的那几行）的一行。头段次序照需求书 4.1.2 的分值偏移：
-/// 计算器 200、`{query}` 网页搜索 150、应用最高 `score+10`=110 ⇒ 两者都压在应用行之前。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HeadRow {
-    Calc(source::calc::CalcHit),
-    Search(source::websearch::SearchHit),
-    /// 空词独占（`g `）时的补全提示。不可执行：`Enter` / 数字键只给 Toast。
-    Hint(source::websearch::EngineHint),
-    /// 批次 U（FR-SRC-05）：自定义命令的独占行（`kw 参数`，`{query}` 已填好）。
-    Custom(source::custom::CustomHit),
-    /// 自定义命令「还缺一个参数」的提示行：不可执行，Enter 补全成 `"kw "`。
-    CustomHint(source::custom::CustomHint),
-    /// 批次 X（FR-SRC-14）：文件搜索 / 目录浏览的一行。「执行」＝用系统关联程序打开它。
-    File(source::filesearch::FileHit),
-}
-
-impl HeadRow {
-    /// 这一行是否代表清单里真实的一条自定义命令（提示行与独占行都算）⇒ 编辑/删除对它有意义。
-    /// 计算器、网页搜索、引擎提示三类头段没有条目身份，返回 `None`。
-    fn custom_uid(&self) -> Option<&str> {
-        match self {
-            HeadRow::Custom(hit) => Some(&hit.uid),
-            HeadRow::CustomHint(hint) => Some(&hint.uid),
-            _ => None,
-        }
-    }
-
-    /// 这一行是不是一个文件/目录。文件行也不在清单里 ⇒ 编辑/删除/置顶同样不适用，
-    /// 但 Ctrl+D（资源管理器定位）与 Ctrl+Shift+N（预填新建）对它有意义，靠这个取。
-    fn file_hit(&self) -> Option<&source::filesearch::FileHit> {
-        match self {
-            HeadRow::File(hit) => Some(hit),
-            _ => None,
-        }
-    }
-}
+//
+// 行模型（`HeadRow`）与列表计划（`Plan`）批次 A10 起定义在 `src/source/mod.rs`，
+// 分别叫 `SourceRow` / `SearchPlan`；本文件顶部用别名保留旧名。
+// 头段次序照需求书 4.1.2 的分值偏移：计算器 200、`{query}` 网页搜索 150、
+// 应用最高 `score+10`=110 ⇒ 两者都压在应用行之前。实际次序由 `source::default_sources()`
+// 的注册顺序决定。
 
 /// `HeadRow::Hint` 那一句"这行不能执行"的文案。批次 X 起这一格住了两种住户：
 /// 引擎的空词补全提示，和「文件索引建立中」。按引擎 id 分流，而不是把提示行的副标题
@@ -818,13 +782,6 @@ fn hint_message(hint: &source::websearch::EngineHint) -> &'static str {
     } else {
         "继续输入关键词后再回车"
     }
-}
-
-/// 一帧的列表计划。`head` 是头段，`results` 是应用结果的名次表——两者拼起来就是整张列表。
-/// 独占（`g 词`）那一格把 `results` 清空：那正是「独占」的定义，不是一层过滤细节。
-struct Plan {
-    head: Vec<HeadRow>,
-    results: Vec<usize>,
 }
 
 /// 合并行号 → 行。`Head` 里放的是 `Plan::head` 的下标，`Item` 里放的仍是
@@ -856,31 +813,6 @@ fn item_rank(selected: usize, head_len: usize) -> Option<usize> {
     (selected >= head_len).then(|| selected - head_len)
 }
 
-/// 提示行代表的那一条从下方结果里摘掉（按 uid）。留着会让清单看着像有两个 `ping`，
-/// 而且那一行的状态色（`Not found` / `Offline`）会被误读成"这条命令坏了"。
-/// `results` 是清单下标表（[`LauncherApp::results`] 的返回值），不是名次。
-fn drop_hinted(
-    results: &mut Vec<usize>,
-    items: &[source::application::LaunchItem],
-    hint: &source::custom::CustomHint,
-) {
-    results.retain(|&i| items[i].uid() != hint.uid);
-}
-
-/// 首词 → 独占判定（FR-QRY-01 / 08）。**首词后没有空格就不算独占**：`g` 这个单字
-/// 还可能是 `git` 的开头，那一下让应用结果整段消失等于打断用户正在打的词。
-/// 与 `matching::parse` 的 `has_rest` 同一口径。
-fn exclusive_for(
-    engines: &[source::websearch::WebEngine],
-    query: &str,
-) -> source::websearch::Exclusive {
-    let parsed = matching::parse(query);
-    if !parsed.has_rest {
-        return source::websearch::Exclusive::NotOurs;
-    }
-    source::websearch::exclusive_rows(engines, &parsed.keyword, &parsed.rest)
-}
-
 /// 取回被按下的数字键（小键盘也算：winit 把 `Numpad*` 映射到同一批 `Num*`）。
 /// 用 `consume_key` 精确匹配修饰键并吃掉事件；裸数字那一带由调用方在输入框为空时才请求。
 fn pressed_digit(ui: &egui::Ui, mods: egui::Modifiers) -> Option<u8> {
@@ -898,6 +830,13 @@ fn pressed_digit(ui: &egui::Ui, mods: egui::Modifiers) -> Option<u8> {
     ];
     KEYS.iter()
         .find_map(|(key, digit)| ui.input_mut(|i| i.consume_key(mods, *key)).then_some(*digit))
+}
+
+/// 裸数字（不带修饰）在空输入时能否快捷执行第 N 行。
+/// 2026-10-23 用户裁定：计算器源开着时让位给表达式——`1+2` 的第一个 `1`
+/// 不该先启动第 1 行；`Ctrl+数字` / `Alt+数字` 不受这条影响。
+fn bare_digit_allowed(query: &str, calc_on: bool) -> bool {
+    query.trim().is_empty() && !calc_on
 }
 
 // ---- E-05 IME 操作（与 AHK 参考项目 Win.ImeState / Win.SetImeState 同构）----
@@ -963,11 +902,16 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// 统一用 `ShellExecuteExW` 启动：`.lnk` 目标、命令名（PATH / App Paths 解析）、URL、
 /// `shell:` 文件夹、协议（`ms-settings:`）都能覆盖 —— `std::process::Command` 覆盖不了
 /// 协议/URL/Store，故 FR-ACT-02 要求一律走这里。SEE_MASK_FLAG_NO_UI 抑制系统错误框，失败以 Result 返回。
+/// 批次 A9：Store/MSIX 条目（路径形如 `shell:AppsFolder\<AUMID>`）是唯一的例外——
+/// 它改走 `IApplicationActivationManager`，理由见 `application::activate_uwp`。
 fn shell_execute(file: &str, params: &str, dir: Option<&str>) -> windows::core::Result<()> {
     // 清单里的路径可能是 `%VAR%` 形态（出厂「启动器目录」用的是 `%LAUNCHER_DIR%`，
     // 要跟着 exe 搬家）——ShellExecuteExW 不替我们展开，所以在这里统一走一次。
     // `expand_env` 对未定义的 `%…%` 原样保留，用户写错的变量不会被悄悄吃掉。
     let file = source::custom::expand_env(file);
+    if let Some(aumid) = source::application::uwp_aumid(&file) {
+        return source::application::activate_uwp(aumid);
+    }
     let params = source::custom::expand_env(params);
     let dir = dir.map(source::custom::expand_env);
     let wfile = wide_z(&file);
@@ -1731,7 +1675,6 @@ impl LauncherApp {
         let (icon_tx, icon_rx) = mpsc::channel();
         let (apps_tx, apps_rx) = mpsc::channel();
         let (path_tx, path_rx) = mpsc::channel();
-        let (file_tx, file_rx) = mpsc::channel();
         // 清单文件不存在（首次运行）→ 用内置系统工具播种一次并落盘；此后它就是一张普通用户清单，
         // 全部可编辑/删除（对标 Delphi WriteDefaultShortCutList）。文件已存在（哪怕被清空）不覆盖。
         //
@@ -1848,14 +1791,7 @@ impl LauncherApp {
             path_states: std::collections::HashMap::new(),
             path_in_flight: false,
             path_scanned_at: Instant::now(),
-            file_tx,
-            file_rx,
-            file_index: Vec::new(),
-            file_indexed_at: None,
-            file_rebuild_in_flight: false,
-            dir_hits: None,
-            dir_in_flight: None,
-            file_hits_cache: None,
+            sources: source::default_sources(),
             startup_notice: notice,
             selected: 0,
             scroll_followed: 0,
@@ -1893,10 +1829,16 @@ impl LauncherApp {
         // FR-SRC-06：启动就先在后台算一轮四态，首屏列表（很快会呼出）拿到的是缓存而不是
         // 现场 I/O；之后呼出与每 3 秒各刷新一次（`refresh_path_states`）。
         seed.refresh_path_states(true);
-        // 批次 X：文件索引也在冷启动这一趟就派出去。放在 `new` 而不是只靠 `ui()` 里那次兜底，
-        // 是为了让静默启动（开机自启那一类）也在后台建好——否则用户第一次呼出时看到的一定是
-        // 「索引建立中」，而他要的恰恰是那一刻。
-        seed.refresh_file_index(true);
+        // 批次 A10：按注册表初始化各源。关掉的源**不初始化**——不建索引、不开后台线程。
+        // 放在 `new` 而不是只靠 `ui()` 里那次兜底，是为了让静默启动（开机自启那一类）也在后台
+        // 把文件索引建好；否则用户第一次呼出时看到的一定是「索引建立中」，而他要的恰恰是那一刻。
+        for s in seed.sources.iter_mut() {
+            if seed.prefs.source_on(s.id()) {
+                s.init();
+            } else {
+                eprintln!("数据源 {}：已在设置里关闭，本次不初始化", s.id().as_str());
+            }
+        }
         // 启动即直接可见时永远走不到 `show_now()` 的「从不可见到可见」边沿，`on_show()` 里的输入法
         // 切换与失焦武装一次都不跑 ⇒ 冷启动后第一次打字被中文输入法截走（2026-10-18 用户裁定补一次）。
         // 判据取 focus_query（＝首屏就是搜索页）：弹窗/设置页启动时焦点归它们，不能让 on_show 抢回去。
@@ -1918,87 +1860,6 @@ impl LauncherApp {
         self.path_in_flight = true;
         self.path_scanned_at = Instant::now();
         source::pathcheck::spawn_scan(self.path_tx.clone(), self.items.clone());
-    }
-
-    /// 批次 X：派一轮后台文件索引重建。口径与 [`refresh_path_states`](LauncherApp::refresh_path_states)
-    /// 一致——同一时刻只跑一轮，回收据的那帧才允许下一轮；`force` 忽略最小间隔（冷启动那一次）。
-    fn refresh_file_index(&mut self, force: bool) {
-        if self.file_rebuild_in_flight {
-            return;
-        }
-        if let Some(built) = self.file_indexed_at {
-            if !force && built.elapsed() < source::filesearch::REBUILD_INTERVAL {
-                return;
-            }
-        }
-        self.file_rebuild_in_flight = true;
-        source::filesearch::spawn_rebuild(self.file_tx.clone());
-    }
-
-    /// 批次 X：派一次目录浏览（读一层，不递归）。列目录也是磁盘 I/O——一个十万文件的下载夹
-    /// 或一个正在断线的网络盘会把 UI 线程按住几百毫秒，所以它不进主线程。
-    ///
-    /// 去重只看两条：已经有这一对 `(dir, filter)` 的结果、或这一对正飞在路上。
-    /// 别的组合照样派——打字途中旧的在途请求会被 [`file_plan`](LauncherApp::file_plan) 的
-    /// 核对判据丢掉，宁可多开几个短命线程，也不能让「最新那一次」因为限流而永远没结果。
-    fn request_browse(&mut self, dir: &str, filter: &str) {
-        if self.dir_hits.as_ref().is_some_and(|(d, f, _)| d == dir && f == filter)
-            || self.dir_in_flight.as_ref().is_some_and(|(d, f)| d == dir && f == filter)
-        {
-            return;
-        }
-        self.dir_in_flight = Some((dir.to_string(), filter.to_string()));
-        source::filesearch::spawn_browse(self.file_tx.clone(), dir.to_string(), filter.to_string());
-    }
-
-    /// 批次 X（FR-SRC-14）：本查询该不该由文件源独占整张列表。
-    /// 返回 `None` = 没有触发符，普通合并（自定义提示 / 计算器 / 应用结果 / 网页兜底）照常。
-    ///
-    /// 独占的位置排在 [`custom::exclusive`](source::custom::exclusive) 与网页引擎独占**之后**：
-    /// 用户自己配的命令与出厂引擎关键字优先于本源那些 `open`/`pic` 之类的触发词。
-    fn file_plan(&mut self) -> Option<Plan> {
-        use source::filesearch as fs;
-        let route = fs::route(&self.query);
-        match route {
-            fs::Route::NotOurs => None,
-            fs::Route::Browse { dir, filter } => {
-                self.request_browse(&dir, &filter);
-                let hits = match &self.dir_hits {
-                    Some((d, f, hits)) if *d == dir && *f == filter => hits.clone(),
-                    _ => Vec::new(),
-                };
-                Some(Plan { head: hits.into_iter().map(HeadRow::File).collect(), results: Vec::new() })
-            }
-            fs::Route::Search { words, exts, dirs_only } => {
-                self.refresh_file_index(false);
-                // 冷启动那一阵索引还在后台：给一行说明，而不是让用户对着空列表猜是不是搜坏了。
-                if self.file_indexed_at.is_none() {
-                    return Some(Plan {
-                        head: vec![HeadRow::Hint(source::websearch::EngineHint {
-                            engine_id: "filesearch".to_string(),
-                            title: "文件索引建立中".to_string(),
-                            subtitle: "首次扫描正在后台进行，稍后再试一次".to_string(),
-                            completion: String::new(),
-                        })],
-                        results: Vec::new(),
-                    });
-                }
-                let cached = self
-                    .file_hits_cache
-                    .as_ref()
-                    .filter(|(q, _)| *q == self.query)
-                    .map(|(_, hits)| hits.clone());
-                let hits = match cached {
-                    Some(hits) => hits,
-                    None => {
-                        let hits = fs::search(&self.file_index, &words, &exts, dirs_only);
-                        self.file_hits_cache = Some((self.query.clone(), hits.clone()));
-                        hits
-                    }
-                };
-                Some(Plan { head: hits.into_iter().map(HeadRow::File).collect(), results: Vec::new() })
-            }
-        }
     }
 
     /// 把查询框整串换成 `text`、光标放到末尾、要焦点、要重绘。
@@ -2071,14 +1932,14 @@ impl LauncherApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键）。
+    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源）。
     fn open_settings_page(&mut self, page: u32) {
         self.settings_open = true;
         self.settings_tab = match SettingsTab::from_page(page) {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键），落回通用"
+                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源），落回通用"
                 );
                 SettingsTab::General
             }
@@ -2588,6 +2449,7 @@ impl LauncherApp {
                     ("通用", SettingsTab::General),
                     ("功能", SettingsTab::Features),
                     ("热键", SettingsTab::Hotkeys),
+                    ("数据源", SettingsTab::Sources),
                 ] {
                     if ui.selectable_label(self.settings_tab == tab, label).clicked() {
                         self.settings_tab = tab;
@@ -3032,6 +2894,53 @@ impl LauncherApp {
                                 }
                             });
                         }
+                        SettingsTab::Sources => {
+                            // 批次 A10 的验收判据就长在这一页上：这里没有硬编任何源的名字，
+                            // 列表直接取自 `self.sources`；`default_sources()` 里加一行，
+                            // 这一页就自己多出一行。
+                            ui.label(egui::RichText::new("启用哪些数据源").strong());
+                            ui.label(
+                                egui::RichText::new(
+                                    "关掉的源既不搜索也不出提示行，下一次启动照样保持关闭（开关写在 settings.json 的 sources_off）。改动即时生效，不用重启。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            // 先把要画的行取成纯数据：`self.sources` 要可变借给 init()，
+                            // 而 prefs 只读，两处借用不能在同一个迭代器里混着用。
+                            let rows: Vec<(source::SourceId, &'static str, &'static str, bool)> = self
+                                .sources
+                                .iter()
+                                .map(|s| (s.id(), s.label(), s.note(), self.prefs.source_on(s.id())))
+                                .collect();
+                            for (id, label, note, mut on) in rows {
+                                if ui.checkbox(&mut on, label).changed()
+                                    && self.prefs.set_source(id, on)
+                                {
+                                    source::application::save_settings(&self.prefs);
+                                    eprintln!(
+                                        "设置页：数据源 {} → {}（已写 settings.json）",
+                                        id.as_str(),
+                                        if on { "开" } else { "关" }
+                                    );
+                                    if on {
+                                        // 重新打开时补一次初始化：文件源要重建索引，
+                                        // 否则要等下一个 30 分钟周期才搜得到。
+                                        if let Some(s) =
+                                            self.sources.iter_mut().find(|s| s.id() == id)
+                                        {
+                                            s.init();
+                                        }
+                                    }
+                                    ui.ctx().request_repaint();
+                                }
+                                if !note.is_empty() {
+                                    ui.label(egui::RichText::new(note).weak().small());
+                                    ui.add_space(6.0);
+                                }
+                            }
+                        }
                     });
                 }
             );
@@ -3292,79 +3201,28 @@ impl Default for LauncherApp {
 }
 
 impl LauncherApp {
-    /// 当前查询的结果次序：匹配档位是第一主键，同档位内按设置页 `learn_rank` 选的口径比
-    /// （甲＝累计次数→最近一次，乙＝热度 log2(1+次数)×半衰期衰减）。
-    /// 时间戳只喂学习位序这一层，不参与打分、也不参与档位闸门。
-    fn results(&mut self) -> Vec<usize> {
-        self.index.search(&self.query, &self.items, self.prefs.learn_rank, now_ms())
-    }
-
-    /// FR-SRC-10：当前查询能不能求出一个计算器结果行。纯函数、每帧现算（词法+递归下降，
-    /// 输入是搜索框里那几个字符），语法不通返回 `None` ⇒ 列表里根本没有这一行。
-    /// 「今天」由 `today_day()` 现场取本地历日，日期加减那几档才跟着系统日期走。
-    fn calc_row(&self) -> Option<source::calc::CalcHit> {
-        source::calc::evaluate(&self.query, source::calc::today_day())
-    }
-
-    /// 批次 T：本帧列表的完整计划（头段 + 应用结果）。
+    /// 本帧列表的完整计划（头段 + 应用结果）。批次 A10 起只剩"组上下文 → 交给注册表"。
     ///
-    /// 独占只在首词后出现过空格时成立（`has_rest`）——`g` 这个单字还可能是 `git` 的开头，
-    /// 那时让应用结果整段消失等于打断用户正在打的词。
+    /// 次序全部由 [`source::default_sources`] 的注册顺序决定：自定义命令 → 网页引擎 → 文件 →
+    /// 计算器 → 应用清单。几个判据原样保留在各自的源里：
+    /// - 独占只在首词后出现过空格时成立（`has_rest`）——`g` 这个单字还可能是 `git` 的开头；
+    /// - 用户自定义命令**先于**内置网页引擎（用户数据压过出厂数据）；
+    /// - 文件模式排在网页引擎之后、普通合并之前（整张列表都是文件的独占）；
+    /// - `kw` 精确等于某条需要参数的命令关键字时，头段给提示行并把同一条目从结果里摘掉；
+    /// - 一条结果都没有时才问兜底（FR-QRY-08）。
     ///
-    /// 批次 U 起多两层：用户自定义命令**先于**内置网页引擎判定（用户数据压过出厂数据，
-    /// 两者关键字撞码时以清单为准）；`kw` 精确等于某条需要参数的命令关键字时，
-    /// 在头段加一条补全提示行，并把同一条目从下方结果里摘掉（只剩提示行那一处）。
+    /// 关掉的源在 [`source::dispatch`] 里**连被问到的机会都没有**，不会出结果、也不会出提示行。
     fn plan(&mut self) -> Plan {
-        match source::custom::exclusive(&self.items, &self.query) {
-            source::custom::Exclusive::Rows(hits) => {
-                return Plan { head: hits.into_iter().map(HeadRow::Custom).collect(), results: Vec::new() };
-            }
-            source::custom::Exclusive::Hints(hints) => {
-                return Plan {
-                    head: hints.into_iter().map(HeadRow::CustomHint).collect(),
-                    results: Vec::new(),
-                };
-            }
-            source::custom::Exclusive::NotOurs => {}
-        }
-        match exclusive_for(&self.prefs.web_engines, &self.query) {
-            source::websearch::Exclusive::Rows(hits) => Plan {
-                head: hits.into_iter().map(HeadRow::Search).collect(),
-                results: Vec::new(),
-            },
-            source::websearch::Exclusive::Hints(hints) => Plan {
-                head: hints.into_iter().map(HeadRow::Hint).collect(),
-                results: Vec::new(),
-            },
-            source::websearch::Exclusive::NotOurs => {
-                // 批次 X（FR-SRC-14）：文件模式排在网页引擎之后、普通合并之前——它是"整张列表
-                // 都是文件"的独占，放在合并之后就只能插在应用结果前面，那样类型词会跟清单
-                // 条目混在一起，用户分不清自己是在搜文件还是在搜快捷项。
-                if let Some(plan) = self.file_plan() {
-                    return plan;
-                }
-                // 头段次序：自定义提示行（用户刚打全一个触发码）→ 计算器 → 应用结果。
-                // 提示行放最前是因为它只在「查询恰好等于某个关键字」时出现，那一刻用户
-                // 要的就是这条命令，不该被 `1` 之类的算式行压住。
-                let mut head: Vec<HeadRow> = Vec::new();
-                let mut results = self.results();
-                if let Some(hint) = source::custom::keyword_hint(&self.items, &self.query) {
-                    drop_hinted(&mut results, &self.items, &hint);
-                    head.push(HeadRow::CustomHint(hint));
-                }
-                head.extend(self.calc_row().map(HeadRow::Calc));
-                // FR-QRY-08 兜底：应用一条没中、计算器也没结果 ⇒ 给出网页搜索行，
-                // 免得用户对着「未找到」只能按 Enter 新建条目。空查询不兜底（源里自己判空）。
-                if head.is_empty() && results.is_empty() {
-                    let hits =
-                        source::websearch::fallback_rows(&self.prefs.web_engines, &self.query);
-                    if !hits.is_empty() {
-                        head = hits.into_iter().map(HeadRow::Search).collect();
-                    }
-                }
-                Plan { head, results }
-            }
-        }
+        let now = now_ms();
+        let mut cx = source::SearchCtx {
+            query: &self.query,
+            items: &self.items,
+            engines: &self.prefs.web_engines,
+            learn_rank: self.prefs.learn_rank,
+            index: &mut self.index,
+            now_ms: now,
+        };
+        source::dispatch(&mut self.sources, &mut cx, |id| self.prefs.source_on(id))
     }
 }
 
@@ -3388,35 +3246,15 @@ impl eframe::App for LauncherApp {
         // 窗口可见期间的兜底刷新（最小间隔见 PATH_RESCAN_INTERVAL）：用户可能开着框去插 U 盘。
         self.refresh_path_states(false);
 
-        // 批次 X：收取文件源的后台回报（索引整表替换 / 一次目录浏览）。
-        while let Ok(update) = self.file_rx.try_recv() {
-            use source::filesearch::FileUpdate as U;
-            match update {
-                U::Index(entries) => {
-                    let n = entries.len();
-                    self.file_index = entries;
-                    self.file_indexed_at = Some(Instant::now());
-                    self.file_rebuild_in_flight = false;
-                    // 新索引配旧缓存就是"用上一轮的命中回答这一轮的查询"⇒ 一起清掉。
-                    self.file_hits_cache = None;
-                    eprintln!("文件索引：本轮建成 {n} 条（范围＝桌面/下载/文档，深度 4，上限 3 万）");
-                    ui.ctx().request_repaint();
-                }
-                U::Dir { dir, filter, hits } => {
-                    // 只认"当前还在等的那一份"。打字途中派出去的旧请求回来得晚，采纳它会让列表
-                    // 显示另一个目录的内容——列错目录比空一帧严重得多。
-                    if self.dir_in_flight.as_ref().is_some_and(|(d, f)| *d == dir && *f == filter) {
-                        self.dir_in_flight = None;
-                        let n = hits.len();
-                        self.dir_hits = Some((dir, filter, hits));
-                        eprintln!("文件搜索：目录列表回报（{n} 条，路径不落日志）");
-                        ui.ctx().request_repaint();
-                    }
-                }
+        // 批次 A10：各数据源收自己的后台回报（文件源的索引整表替换 / 一次目录浏览，以及
+        // 30 分钟重扫的兜底都在 `FileSource::poll` 里）。有变化才重绘，没变化不打扰。
+        // 关掉的源连 poll 都不调：`FileSource::poll` 顺手会派下一轮索引，放进来等于开关只关了
+        // 搜索、后台仍在读盘（2026-10-22 真机：`files` 关着启动，日志仍出现「本轮建成 604 条」）。
+        for s in self.sources.iter_mut() {
+            if self.prefs.source_on(s.id()) && s.poll() {
+                ui.ctx().request_repaint();
             }
         }
-        // 可见期间的 30 分钟重扫兜底（静默启动时上面 `new` 已派过第一轮）。
-        self.refresh_file_index(false);
         // E1：配置坏过一次的那句说明，等窗口真被看见才说（Toast 会被 `on_show` 清空，
         // 所以它必须在 `hotkey_frame` 之后、渲染之前入队）。
         if self.visible {
@@ -3729,11 +3567,13 @@ impl eframe::App for LauncherApp {
                     )
                 };
                 // FR-ACT-01 把数字键列为执行手段：Ctrl+ / Alt+1..9/0 不受输入限制，
-                // 裸数字沿用裸 Delete 的口径——只在输入框为空时接管（有输入时数字是查询文本）。
+                // 裸数字只在输入框为空时接管；2026-10-23 起计算器源开着时再让一步
+                //（表达式第一个字符必是数字），判据见 `bare_digit_allowed`。
+                let calc_on = self.prefs.source_on(source::SourceId::Calc);
                 let hit_digit = pressed_digit(ui, egui::Modifiers::COMMAND)
                     .or_else(|| pressed_digit(ui, egui::Modifiers::ALT))
                     .or_else(|| {
-                        if self.query.trim().is_empty() {
+                        if bare_digit_allowed(&self.query, calc_on) {
                             pressed_digit(ui, egui::Modifiers::NONE)
                         } else {
                             None
@@ -4298,12 +4138,20 @@ impl eframe::App for LauncherApp {
                 if q.is_empty() {
                     ui.label("清单为空——按 Ctrl+Shift+N 或点右上「＋」新建，或按 Ctrl+I 批量导入。");
                 } else if in_file_mode {
-                    ui.label(match &file_route {
-                        source::filesearch::Route::Browse { dir, .. } =>
-                            format!("这个目录为空或读不到：{dir}"),
-                        _ => "文件模式：索引范围（桌面 / 下载 / 文档，四级以内）内没有匹配的文件。"
-                            .to_string(),
-                    });
+                    if self.prefs.source_on(source::SourceId::Files) {
+                        ui.label(match &file_route {
+                            source::filesearch::Route::Browse { dir, .. } =>
+                                format!("这个目录为空或读不到：{dir}"),
+                            _ => "文件模式：索引范围（桌面 / 下载 / 文档，四级以内）内没有匹配的文件。"
+                                .to_string(),
+                        });
+                    } else {
+                        // 2026-10-23 A2：源关着的时候说「索引范围内没有匹配」会把用户
+                        // 引向错的地方——此刻根本没有索引，开关就在设置页第 4 页。
+                        ui.label(
+                            "文件搜索已关闭——按 Ctrl+, 进设置，在「数据源」页把「文件搜索」打开后再试。",
+                        );
+                    }
                     if ui.button("＋ 新建快捷项").clicked() {
                         self.dialog = Some(DialogState::blank());
                     }
@@ -5313,6 +5161,14 @@ mod nav_tests {
     // 就在运行期读它），所以改成靠上面那条 glob 带进来。
 
     #[test]
+    fn bare_digit_yields_to_calculator_when_calc_source_is_on() {
+        assert!(bare_digit_allowed("", false));
+        assert!(!bare_digit_allowed("", true), "计算器开着时第一个数字要进表达式");
+        assert!(!bare_digit_allowed("1+2", false), "有输入时数字本来就是查询文本");
+        assert!(!bare_digit_allowed("   ", true));
+    }
+
+    #[test]
     fn digit_zero_means_tenth_row_and_one_means_first() {
         assert_eq!(digit_index(1, 20), Some(0));
         assert_eq!(digit_index(9, 20), Some(8));
@@ -5375,23 +5231,8 @@ mod nav_tests {
         assert_eq!(row_at(4, results.len(), 2), Some(Row::Item(2)));
     }
 
-    #[test]
-    fn hint_row_absorbs_the_same_item_from_results() {
-        use crate::source::application::{ItemKind, LaunchItem};
-        let ping = LaunchItem {
-            name: "ping".into(),
-            keyword: "ping".into(),
-            kind: ItemKind::Command,
-            path: "cmd.exe".into(),
-            arguments: "/k ping {query}".into(),
-            ..Default::default()
-        };
-        let items = vec![ping, LaunchItem { name: "画图".into(), ..Default::default() }];
-        let hint = crate::source::custom::keyword_hint(&items, "ping").expect("ping 应有提示行");
-        let mut results = vec![0, 1];
-        drop_hinted(&mut results, &items, &hint);
-        assert_eq!(results, vec![1], "提示行已经代表这条命令，下方不再重复出现");
-    }
+    // 批次 A10：`drop_hinted` 的判据已并入 `source::dispatch` 第 4 段，
+    // 对应单测 `a_custom_hint_absorbs_the_same_item_from_results` 跟着搬到 `src/source/mod.rs`。
 
     #[test]
     fn only_custom_head_rows_carry_an_item_identity() {
@@ -5469,6 +5310,7 @@ mod nav_tests {
     #[test]
     fn exclusive_needs_a_space_after_the_first_word() {
         use source::websearch::Exclusive;
+        use source::websearch::exclusive_for;
         let engines = source::websearch::builtin_engines();
         // 首词后没空格 ⇒ 普通搜索（`g` 可能是 `git` 的开头）。
         assert_eq!(exclusive_for(&engines, "g"), Exclusive::NotOurs);

@@ -12,6 +12,8 @@
 
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
+use crate::source::{DataSource, SearchCtx, SourceId, SourceRow};
+
 /// 一行计算器结果。`title` 与 `subtitle` 只进界面；`copy` 是 `Enter` 写进剪贴板的内容，
 /// 恒为不带千分位、不带单位的纯数字（日期除外——日期复制 ISO 串）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -857,6 +859,30 @@ pub fn today_day() -> i64 {
 
 /// 结果行标题右侧的固定标识（界面上一眼看出这行不是快捷项）。
 pub const ROW_TAG: &str = "计算器";
+
+/// 批次 A10：把本模块接进数据源注册表。只贡献头段一行（不出结果集）。
+#[derive(Debug, Default)]
+pub struct CalcSource;
+
+impl DataSource for CalcSource {
+    fn id(&self) -> SourceId {
+        SourceId::Calc
+    }
+
+    fn label(&self) -> &'static str {
+        "计算器"
+    }
+
+    fn note(&self) -> &'static str {
+        "查询能求成一个数时在列表头段加一行（`1+2`、`100 usd`、`today+3`），`Enter` 复制结果。关掉之后这些查询回到普通搜索。"
+    }
+
+    fn head(&mut self, cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {
+        // "今天"在 `SearchCtx` 里只有毫秒时间戳，日期加减要的是本地日序 ⇒ 这里现取一次。
+        // 它与 `cx.now_ms` 取自同一帧，不会跨日抖动。
+        evaluate(cx.query, today_day()).map(SourceRow::Calc).into_iter().collect()
+    }
+}
 
 #[cfg(test)]
 mod tests {

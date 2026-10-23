@@ -15,7 +15,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::source::application::{ItemKind, LaunchItem, LearnRank, SpaceRun};
+use crate::source::application::{LaunchItem, LearnRank, SpaceRun};
 
 /// FR-QRY-07 结果上限。
 const MAX_RESULTS: usize = 50;
@@ -81,19 +81,18 @@ impl MatchKeys {
     fn build(item: &LaunchItem) -> MatchKeys {
         let mut aliases: Vec<Key> =
             item.keyword.split_whitespace().filter_map(Key::new).collect();
-        // FR-SRC-05：`file`/`folder` 额外用「目标名」参与匹配——文件去扩展名的文件名、
-        // 文件夹名，以及它的拼音首字母（中文目录名只有一个关键词 `文档` 时，敲 `wd` 也得命中）。
-        // 与别名同放一个列表：别名本就是"刻意设置的触发码"，目标名对这两类条目也是同一个地位。
-        if matches!(item.kind, ItemKind::File | ItemKind::Folder) {
-            if let Some(stem) = crate::source::application::target_stem(item) {
-                if let Some(key) = Key::new(&stem) {
+        // FR-SRC-05：目标名也参与匹配——文件去扩展名的文件名、文件夹名，以及 App / Command
+        // 指向的 exe 名（2026-10-23 A7：`notepad.exe` 敲 `notepad` 要能命中）。
+        // 目标名的拼音首字母一起放进来：中文目录名只有一个关键词 `文档` 时，敲 `wd` 也得命中。
+        // 与别名同放一个列表：别名本就是"刻意设置的触发码"，目标名是同一个地位。
+        if let Some(stem) = crate::source::application::target_stem(item) {
+            if let Some(key) = Key::new(&stem) {
+                aliases.push(key);
+            }
+            let pinyin = crate::source::application::default_keyword(&stem);
+            if !pinyin.is_empty() {
+                if let Some(key) = Key::new(&pinyin) {
                     aliases.push(key);
-                }
-                let pinyin = crate::source::application::default_keyword(&stem);
-                if !pinyin.is_empty() {
-                    if let Some(key) = Key::new(&pinyin) {
-                        aliases.push(key);
-                    }
                 }
             }
         }
@@ -434,6 +433,26 @@ mod tests {
         let p = parse(q);
         let k = MatchKeys::build(&items[0]);
         score_item(&p, &k).unwrap_or((0, 0.0))
+    }
+
+    #[test]
+    fn command_target_name_matches_without_an_alias() {
+        // 2026-10-23 A7：清单里「记事本」只有别名 jsb / np，敲 notepad 曾完全搜不到。
+        let cmd = vec![LaunchItem {
+            name: "记事本".to_string(),
+            path: "notepad.exe".to_string(),
+            kind: crate::source::application::ItemKind::Command,
+            ..Default::default()
+        }];
+        assert_eq!(order(&cmd, "notepad"), vec!["记事本".to_string()]);
+        // UWP 条目（shell: 路径）不加目标名，仍只认名称与别名。
+        let uwp = vec![LaunchItem {
+            name: "记事本".to_string(),
+            path: r"shell:AppsFolder\Microsoft.WindowsNotepad_8wekyb3d8bbwe!App".to_string(),
+            kind: crate::source::application::ItemKind::App,
+            ..Default::default()
+        }];
+        assert!(order(&uwp, "notepad").is_empty(), "AUMID 不该被当成 exe 名");
     }
 
     // ---- FR-QRY-03 逐档覆盖（TC-QRY-03）----

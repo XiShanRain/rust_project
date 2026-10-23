@@ -12,7 +12,8 @@
 //! E-03 实测导出的 4 条约束已在批量扫描里落地：
 //! 1. `%VAR%` 形态：`ExpandEnvironmentStringsW` 展开 target / working_dir；
 //! 2. 图标空/负索引：本模块不取图标（`source::icon`），仅保证不因图标缺失而丢条目；
-//! 3. Store/MSIX target 为空串：`resolve_lnk` 直接丢弃（留给 Get-StartApps 源）；
+//! 3. Store/MSIX target 为空串：`resolve_lnk` 直接丢弃；2026-10-22 批次 A9 起改由
+//!    `scan_store_apps` 从 `shell:AppsFolder` 命名空间补齐（这些应用在文件系统里没有 `.lnk`）；
 //! 4. 扫描先按扩展名过滤，单文件解析失败只跳过、不中断整体（NFR-04）。
 
 use std::path::{Path, PathBuf};
@@ -20,18 +21,22 @@ use std::sync::mpsc;
 use std::thread;
 
 use super::websearch;
+use crate::source::{DataSource, SearchCtx, SourceId};
 use serde::{Deserialize, Serialize};
 use pinyin::ToPinyin;
 use windows::core::Interface;
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED, IPersistFile, STGM_READ,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx,
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, IPersistFile, STGM_READ,
 };
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::UI::Shell::{
-    IShellLinkW, SHChangeNotify, SLGP_UNCPRIORITY, SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_PATHW,
+    ApplicationActivationManager, IApplicationActivationManager, IEnumShellItems, IShellItem,
+    IShellLinkW, SHChangeNotify, SHCreateItemFromParsingName, AO_NONE, BHID_EnumItems,
+    SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_PATHW, SIGDN_DESKTOPABSOLUTEPARSING,
+    SIGDN_NORMALDISPLAY, SLGP_UNCPRIORITY,
 };
 
 /// `{00021401-0000-0000-C000-000000000046}`，coclass ShellLink（见 E-03 记录）。
@@ -310,7 +315,7 @@ fn write_atomic(path: &Path, bytes: &[u8], label: &str) {
 /// 批次 T 起不再是 `Copy`：`web_engines` 是一张可变长的表，而这张表要能被用户手改。
 /// 代价实测出来一处：`Self::new` 里原本在把 `prefs` 按值放进结构体**之后**还读它的两个热键字段，
 /// 不再是 `Copy` 就编译不过 ⇒ 那三个初值改成先取出来（`src/main.rs:1608` 起）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// 空格执行选中项（FR-ACT-01 的 `space_to_run`，Delphi 版 ALTRun 同名字段）。
     /// 批次 J（2026-10-18 用户裁定）由 bool 扩成四档，见 [`SpaceRun`]。
@@ -349,6 +354,54 @@ pub struct AppSettings {
     /// 误删想找回走设置页的「补回缺失的出厂命令」（见 [`merge_missing_seeds`]）。
     #[serde(default)]
     pub seed_round: u32,
+
+    /// 关掉的数据源（批次 A10「数据源」设置页）。存 [`SourceId::as_str`] 的稳定名而不是枚举值：
+    /// 将来插件源的 id 写进老配置、或某个源被删掉，读配置这一侧只认自己认识的名字，
+    /// 不会因为多出一个不认识的项就把整份 `settings.json` 判坏（E1 那种事故的形状）。
+    #[serde(default)]
+    pub sources_off: Vec<String>,
+}
+
+/// 为什么手写而不是派生：`web_engines` 的 serde 默认值只在**字段缺失**时生效，
+/// 而整份 `settings.json` 缺失或坏掉时 `load_json` 走的是 `T::default()`——
+/// 派生实现给的是空表，于是首次运行与 E1 重建后的网页搜索一条引擎都没有
+///（2026-10-23 真机 A6 的根因）。
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            space_to_run: SpaceRun::default(),
+            tab_mode: TabMode::default(),
+            learn_rank: LearnRank::default(),
+            toggle_hotkey: HotkeySpec::default(),
+            typeback_hotkey: None,
+            web_engines: crate::source::websearch::builtin_engines(),
+            seed_round: 0,
+            sources_off: Vec::new(),
+        }
+    }
+}
+
+impl AppSettings {
+    /// 这个源此刻是否启用。名字不认识的一律当"没关"——只影响本程序认识的五个源。
+    pub fn source_on(&self, id: SourceId) -> bool {
+        !self.sources_off.iter().any(|s| s == id.as_str())
+    }
+
+    /// 开 / 关一个源；返回 `true` ＝ 状态真的有变化（调用方据此写盘）。
+    pub fn set_source(&mut self, id: SourceId, on: bool) -> bool {
+        let listed = self.sources_off.iter().any(|s| s == id.as_str());
+        match (on, listed) {
+            (true, true) => {
+                self.sources_off.retain(|s| s != id.as_str());
+                true
+            }
+            (false, false) => {
+                self.sources_off.push(id.as_str().to_string());
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 // ---- FR-WIN-02 全局呼出热键（批次 Q）----
@@ -625,6 +678,31 @@ impl LearnRank {
             Self::Count => "count",
             Self::Decay => "decay",
         }
+    }
+}
+
+/// 批次 A10：整张清单（应用 + 自定义命令）的模糊匹配源。
+///
+/// 它只贡献普通结果，从不独占、也不出提示行——那些是其余几个源的事。
+/// 关掉它最直接的后果是列表只剩头段（计算器 / 文件 / 网页），清单一条都搜不到。
+#[derive(Debug, Default)]
+pub struct AppsSource;
+
+impl DataSource for AppsSource {
+    fn id(&self) -> SourceId {
+        SourceId::Apps
+    }
+
+    fn label(&self) -> &'static str {
+        "应用程序清单"
+    }
+
+    fn note(&self) -> &'static str {
+        "主清单的模糊匹配（名称 / 关键字 / 学习别名）。关掉之后清单里一条都搜不出来，只剩计算器、文件、网页这些头段。"
+    }
+
+    fn rows(&mut self, cx: &mut SearchCtx<'_>) -> Vec<usize> {
+        cx.index.search(cx.query, cx.items, cx.learn_rank, cx.now_ms)
     }
 }
 
@@ -923,9 +1001,10 @@ pub fn infer_kind(input: &str) -> ItemKind {
     if is_url(input) { ItemKind::Url } else { ItemKind::Command }
 }
 
-/// FR-SRC-05：`file`/`folder` 类型的「目标名」匹配键——文件取去扩展名的文件名、
-/// 文件夹取路径末段（尾部分隔符先剥掉）。URL、`shell:` 虚拟文件夹、含 `{query}`
-/// 的路径没有稳定目标名，一律返回 `None`（匹配层就不追加这半条键）。
+/// FR-SRC-05：条目的「目标名」匹配键——文件取去扩展名的文件名、文件夹取路径末段
+/// （尾部分隔符先剥掉）；App / Command 取目标的 exe 名（`notepad.exe` ⇒ `notepad`，
+/// 2026-10-23 真机 A7）。URL、`shell:` 虚拟文件夹、含 `{query}` 的路径没有稳定目标名，
+/// 一律返回 `None`（匹配层就不追加这半条键）。
 pub fn target_stem(item: &LaunchItem) -> Option<String> {
     let path = item.path.trim();
     if path.is_empty()
@@ -938,7 +1017,8 @@ pub fn target_stem(item: &LaunchItem) -> Option<String> {
     let stem = match item.kind {
         ItemKind::File => Path::new(path).file_stem(),
         ItemKind::Folder => Path::new(path.trim_end_matches(['\\', '/'])).file_name(),
-        _ => None,
+        ItemKind::Url => None,
+        _ => Path::new(path).file_stem(),
     };
     stem.and_then(|s| s.to_str()).map(str::to_string).filter(|s| !s.is_empty())
 }
@@ -1014,6 +1094,7 @@ pub fn spawn_batch_import(tx: mpsc::Sender<Vec<LaunchItem>>) {    thread::spawn(
         let mut apps = Vec::new();
         let exe_key = self_exe_key();
         let mut skipped_self = 0usize;
+        let mut skipped_unresolved = 0usize;
         for file in &files {
             if let Some(app) = unsafe { resolve_lnk(file) } {
                 // 自排除：target 规范化后就是本 exe（含我们自己写的启动夹快捷方式）。
@@ -1023,13 +1104,26 @@ pub fn spawn_batch_import(tx: mpsc::Sender<Vec<LaunchItem>>) {    thread::spawn(
                     continue;
                 }
                 apps.push(app);
-            } // 解析失败 / 空 target：跳过不中断（约束 4）
+            } else {
+                // 解析失败 / 空 target：跳过不中断（约束 4）。空 target 的典型是
+                // File Explorer / 控制面板 / 输入法这类 shell 快捷方式与损坏件——
+                // Store 应用不在这里，它们走下面的 AppsFolder 枚举。
+                skipped_unresolved += 1;
+            }
         }
+        let lnk_count = apps.len();
+        // 批次 A9：UWP/MSIX 应用在文件系统里没有 .lnk，只能从 shell 命名空间枚举。
+        let store = unsafe { scan_store_apps() };
+        let store_count = store.len();
+        apps.extend(store);
         eprintln!(
-            "source: 批量扫描 {} 个 .lnk，解析出 {} 条，自排除 {} 条（线程 {:?}，CoInit={hr:?}）",
+            "source: 批量扫描 {} 个 .lnk，解析出 {} 条、未解析 {} 条（空 target／损坏），自排除 {} 条；\
+             另从 shell:AppsFolder 收 UWP/MSIX {} 条（线程 {:?}，CoInit={hr:?}）",
             total,
-            apps.len(),
+            lnk_count,
+            skipped_unresolved,
             skipped_self,
+            store_count,
             thread::current().id()
         );
         unsafe { CoUninitialize() };
@@ -1137,7 +1231,9 @@ pub unsafe fn resolve_lnk(path: &Path) -> Option<LaunchItem> {
             .map(|_| from_wide(&buf))
             .unwrap_or_default();
         if target.trim().is_empty() {
-            return None; // Store/MSIX 或损坏快捷方式：丢弃（约束 3）
+            // Store/MSIX 或损坏的快捷方式：本函数丢弃（约束 3）；Store 应用由
+            // `scan_store_apps` 从 shell 命名空间补齐（批次 A9）。
+            return None;
         }
         let arguments = link.GetArguments(&mut buf).map(|_| from_wide(&buf)).unwrap_or_default();
         let working_dir_raw =
@@ -1168,6 +1264,132 @@ pub unsafe fn resolve_lnk(path: &Path) -> Option<LaunchItem> {
             ..Default::default()
         })
     }
+}
+
+// ---- 批次 A9：MSIX/UWP（Store）应用 ----
+//
+// 这些应用在文件系统里**没有** `.lnk`：开始菜单项由 AppX 包注册生成，`resolve_lnk`
+// 对它们只能拿到空 target（约束 3）。唯一稳定的枚举入口是 `shell:AppsFolder` 命名空间，
+// 启动入口是 `IApplicationActivationManager`（AUMID 是它的官方入参）。
+// 条目路径存 `shell:AppsFolder\<AUMID>`，由 `main.rs::shell_execute` 认前缀分派。
+
+/// 从条目路径里取出 AUMID：`shell:AppsFolder\Microsoft.WindowsCalculator_…!App`
+/// ⇒ `Microsoft.WindowsCalculator_…!App`。前缀大小写不敏感（手填可能写成小写）。
+pub fn uwp_aumid(path: &str) -> Option<&str> {
+    const PREFIX: &str = "shell:AppsFolder\\";
+    let p = path.trim();
+    if !p.get(..PREFIX.len())?.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let aumid = p[PREFIX.len()..].trim();
+    is_uwp_aumid(aumid).then_some(aumid)
+}
+
+/// AUMID 形态：`包族名!应用ID`。只认"含 `!`、不含路径分隔符与冒号"——
+/// 同一个枚举里 Win32 项返回的是 exe 绝对路径，两者不会重叠。
+fn is_uwp_aumid(s: &str) -> bool {
+    !s.is_empty() && s.contains('!') && !s.contains(['\\', '/', ':'])
+}
+
+/// 把 `GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING)` 的结果归一成 AUMID；非 UWP 项返回 None。
+/// 实测/文档两种形态都收：裸 AUMID，或带 `shell:AppsFolder\` 前缀的同串。
+fn aumid_from_parsing_name(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let s = uwp_aumid(s).unwrap_or(s);
+    is_uwp_aumid(s).then(|| s.to_string())
+}
+
+/// 启动 MSIX/UWP 应用。`ShellExecuteExW` 对裸 AUMID 没有解析保证，故走官方入口。
+///
+/// COM 公寓：调用点在 UI 线程，而本项目此前**从未在主线程常驻 `CoInitializeEx`**
+/// （只有后台扫描线程与 SendTo 预填那一下）。这里补一次 STA；已初始化时返回 S_FALSE、
+/// 被别的组件设成其他公寓时返回 RPC_E_CHANGED_MODE，两种情况都不影响 in-proc 的
+/// `CoCreateInstance`。**因此不配对 `CoUninitialize`**——计数里可能有别人的那一份。
+pub fn activate_uwp(aumid: &str) -> windows::core::Result<()> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let manager: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_INPROC_SERVER)?;
+        let id = wide_null(aumid);
+        let args = wide_null("");
+        manager.ActivateApplication(PCWSTR(id.as_ptr()), PCWSTR(args.as_ptr()), AO_NONE)?;
+    }
+    Ok(())
+}
+
+/// 枚举 `shell:AppsFolder`，只收 MSIX/UWP 条目（Win32 项仍归 `.lnk` 扫描，不在这里重复收）。
+/// 必须在已 `CoInitializeEx` 的线程调用（`spawn_batch_import` 的扫描线程满足）。
+unsafe fn scan_store_apps() -> Vec<LaunchItem> {
+    unsafe {
+        let spec = wide_null("shell:AppsFolder");
+        let pbc: Option<&IBindCtx> = None;
+        let folder: IShellItem = match SHCreateItemFromParsingName(PCWSTR(spec.as_ptr()), pbc) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("source: shell:AppsFolder 打不开（{e}），本次不收 Store 应用");
+                return Vec::new();
+            }
+        };
+        let list: IEnumShellItems = match folder.BindToHandler(pbc, &BHID_EnumItems) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("source: 枚举 shell:AppsFolder 失败（{e}）");
+                return Vec::new();
+            }
+        };
+        let mut out: Vec<LaunchItem> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut win32 = 0usize;
+        loop {
+            let mut one = [None::<IShellItem>];
+            let mut fetched = 0u32;
+            if list.Next(&mut one, Some(&mut fetched)).is_err() || fetched == 0 {
+                break;
+            }
+            let Some(item) = one[0].take() else { break };
+            let aumid = match item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) {
+                Ok(p) => aumid_from_parsing_name(&pwstr_take(p)),
+                Err(_) => None,
+            };
+            let Some(aumid) = aumid else {
+                win32 += 1;
+                continue;
+            };
+            if !seen.insert(aumid.to_lowercase()) {
+                continue;
+            }
+            let display = match item.GetDisplayName(SIGDN_NORMALDISPLAY) {
+                Ok(p) => pwstr_take(p),
+                Err(_) => String::new(),
+            };
+            let name = if display.trim().is_empty() { aumid.clone() } else { display };
+            let path = format!("shell:AppsFolder\\{aumid}");
+            out.push(LaunchItem {
+                name: name.clone(),
+                path: path.clone(),
+                // 图标源留空：`SHGetFileInfoW` 对 `shell:` 路径返回失败（本批实测
+                // Settings / Store 两条均为 None）⇒ 列表里退化成首字母图标，
+                // 不因图标缺失丢条目（约束 2）。真图标要走 IShellItemImageFactory，留待后续。
+                source_path: String::new(),
+                kind: ItemKind::App,
+                keyword: default_keyword(&name),
+                ..Default::default()
+            });
+        }
+        eprintln!(
+            "source: shell:AppsFolder 枚举到 UWP/MSIX {} 条（跳过 Win32 项 {} 条）",
+            out.len(),
+            win32
+        );
+        out
+    }
+}
+
+/// 读走 COM 分配的宽字符串并释放——`IShellItem::GetDisplayName` 的内存归调用方。
+unsafe fn pwstr_take(p: PWSTR) -> String {
+    let s = unsafe { p.to_string().unwrap_or_default() };
+    unsafe { CoTaskMemFree(Some(p.as_ptr() as *const core::ffi::c_void)) };
+    s
 }
 
 // ---- FR-SRC-20 ① SendTo 入口安装/卸载（设置页开关的底层动作）----
@@ -1477,6 +1699,46 @@ unsafe fn write_startup_link(exe: &str, link_path: &Path) -> Result<String, Stri
 }
 
 #[cfg(test)]
+mod uwp_tests {
+    use super::*;
+
+    #[test]
+    fn uwp_aumid_reads_own_path_prefix() {
+        assert_eq!(
+            uwp_aumid(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
+            Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")
+        );
+        // 前缀大小写不敏感，尾部空白剥掉（手填/编辑器可能留空格）。
+        assert_eq!(
+            uwp_aumid(r"Shell:Appsfolder\Vendor.App_pfn!App  "),
+            Some("Vendor.App_pfn!App")
+        );
+    }
+
+    #[test]
+    fn uwp_aumid_rejects_paths_that_are_not_aumid() {
+        assert_eq!(uwp_aumid(r"C:\Windows\System32\notepad.exe"), None);
+        assert_eq!(uwp_aumid("shell:AppsFolder"), None);
+        assert_eq!(uwp_aumid(r"shell:AppsFolder\"), None);
+        assert_eq!(uwp_aumid(""), None);
+    }
+
+    /// 枚举返回值有两种形态（裸 AUMID / 带前缀），且同一枚举里的 Win32 项是绝对路径——
+    /// 后者必须落进"跳过"那一档，否则会与 `.lnk` 扫描重复收条目。
+    #[test]
+    fn aumid_from_parsing_name_accepts_both_shapes() {
+        let want = Some("Microsoft.WindowsStore_8wekyb3d8bbwe!App");
+        assert_eq!(aumid_from_parsing_name("Microsoft.WindowsStore_8wekyb3d8bbwe!App").as_deref(), want);
+        assert_eq!(
+            aumid_from_parsing_name(r"shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App").as_deref(),
+            want
+        );
+        assert_eq!(aumid_from_parsing_name(r"C:\Anki\anki.exe"), None);
+        assert_eq!(aumid_from_parsing_name(""), None);
+    }
+}
+
+#[cfg(test)]
 mod dedup_tests {
     use super::*;
 
@@ -1601,6 +1863,52 @@ mod dedup_tests {
         assert!(json.contains(r#""learn_rank":"count""#), "实际写盘：{json}");
         assert!(serde_json::from_str::<AppSettings>(r#"{"space_to_run":"wod"}"#).is_err());
         assert!(serde_json::from_str::<AppSettings>(r#"{"learn_rank":"decayy"}"#).is_err());
+    }
+
+    #[test]
+    fn default_settings_carry_the_builtin_web_engines() {
+        // 2026-10-23 A6：整份配置缺失/判坏时走的是 `Default`，派生实现给的是空表 ⇒
+        // 首次运行与 E1 重建后的网页搜索一条引擎都没有。手写 Default 修的就是这一刻。
+        let d = AppSettings::default();
+        assert_eq!(d.web_engines.len(), crate::source::websearch::builtin_engines().len());
+        assert!(d.web_engines.iter().any(|e| e.keyword == "g"));
+        assert!(d.sources_off.is_empty());
+    }
+
+    #[test]
+    fn target_stem_covers_commands_and_apps_only() {
+        let cmd = LaunchItem {
+            name: "记事本".to_string(),
+            path: "notepad.exe".to_string(),
+            kind: ItemKind::Command,
+            ..Default::default()
+        };
+        assert_eq!(target_stem(&cmd).as_deref(), Some("notepad"));
+        let app = LaunchItem {
+            name: "微信".to_string(),
+            path: r"C:\Program Files\Tencent\WeChat.exe".to_string(),
+            kind: ItemKind::App,
+            ..Default::default()
+        };
+        assert_eq!(target_stem(&app).as_deref(), Some("WeChat"));
+        let url = LaunchItem {
+            path: "https://example.com/a.html".to_string(),
+            kind: ItemKind::Url,
+            ..Default::default()
+        };
+        assert_eq!(target_stem(&url), None, "URL 没有稳定目标名");
+        let uwp = LaunchItem {
+            path: r"shell:AppsFolder\Microsoft.WindowsNotepad_8wekyb3d8bbwe!App".to_string(),
+            kind: ItemKind::App,
+            ..Default::default()
+        };
+        assert_eq!(target_stem(&uwp), None, "AUMID 不是文件路径");
+        let tmpl = LaunchItem {
+            path: r"C:\tools\{query}.exe".to_string(),
+            kind: ItemKind::Command,
+            ..Default::default()
+        };
+        assert_eq!(target_stem(&tmpl), None, "带 {{query}} 的路径由用户参数决定");
     }
 
     #[test]
@@ -2110,6 +2418,33 @@ mod hotkey_tests {
         let nul = br#"{"toggle_hotkey":{"mods":3,"vk":32},"typeback_hotkey":null}"#;
         let s: AppSettings = serde_json::from_slice(nul).expect("null 应能解析");
         assert_eq!(s.typeback_hotkey, None);
+    }
+
+    /// 批次 A10：每源开关的落盘口径。`sources_off` 存名字不存枚举值 ⇒ 将来插件源的名字
+    /// 写进老配置、或某个源被删掉，都不会把整份 `settings.json` 判坏（E1 那种事故的形状）。
+    #[test]
+    fn source_switches_round_trip_and_ignore_unknown_ids() {
+        let s: AppSettings = serde_json::from_slice(br#"{"space_to_run":"word"}"#)
+            .expect("没有 sources_off 字段的老文件应能解析");
+        assert!(SourceId::ALL.iter().all(|id| s.source_on(*id)), "字段缺省 ⇒ 全部启用");
+
+        let mut s = s;
+        assert!(s.set_source(SourceId::Files, false), "第一次关应有变化");
+        assert!(!s.set_source(SourceId::Files, false), "重复关同一个源不算变化（调用方据此决定写不写盘）");
+        assert!(!s.source_on(SourceId::Files));
+        assert!(s.source_on(SourceId::Apps), "只关一个源，别的不受影响");
+        let json = serde_json::to_string(&s).expect("应能序列化");
+        assert!(json.contains(r#""sources_off":["files"]"#), "实际写盘：{json}");
+
+        let mut back: AppSettings = serde_json::from_str(&json).expect("应能读回");
+        assert!(!back.source_on(SourceId::Files), "关掉的源跨启动保持关闭");
+        assert!(back.set_source(SourceId::Files, true), "重新打开应有变化");
+        assert!(back.sources_off.is_empty());
+
+        // 不认识的名字（将来的插件源 / 已经删掉的源）忽略，不参与任何判据。
+        let unknown: AppSettings =
+            serde_json::from_str(r#"{"sources_off":["plugin-x"]}"#).expect("未知 id 不许判坏配置");
+        assert!(SourceId::ALL.iter().all(|id| unknown.source_on(*id)));
     }
 
     /// 这个码本批写错过一次（我先填的是 1410），所以它必须由**两条独立来源**钉住，而不是照抄自己的记忆。

@@ -13,6 +13,7 @@
 
 use crate::source::application::{is_url, ItemKind, LaunchItem};
 use crate::source::websearch;
+use crate::source::{DataSource, SearchCtx, SourceId, SourceRow};
 
 /// 模板里是否含 `{query}` 或 `{query|默认值}`。路径四态校验要靠它决定「跳过检查」
 /// （含占位符的路径在填充前不是一个真实存在的路径，不能判 Not found）。
@@ -228,6 +229,37 @@ pub fn duplicate_keywords(items: &[LaunchItem]) -> Vec<(String, Vec<String>)> {
         }
     }
     map.into_iter().filter(|(_, names)| names.len() > 1).collect()
+}
+
+/// 批次 A10：把本模块接进数据源注册表。独占与头段各走各的判据，正是
+/// [`exclusive`] 与 [`keyword_hint`] 各自已有的那两个入口。
+#[derive(Debug, Default)]
+pub struct CustomSource;
+
+impl DataSource for CustomSource {
+    fn id(&self) -> SourceId {
+        SourceId::Custom
+    }
+
+    fn label(&self) -> &'static str {
+        "自定义命令"
+    }
+
+    fn note(&self) -> &'static str {
+        "`关键字 参数` 独占整张列表；`关键字` 打全但还缺参数时在头部给补全提示。关掉之后这些命令只剩普通搜索结果。"
+    }
+
+    fn take_over(&mut self, cx: &mut SearchCtx<'_>) -> Option<Vec<SourceRow>> {
+        match exclusive(cx.items, cx.query) {
+            Exclusive::Rows(hits) => Some(hits.into_iter().map(SourceRow::Custom).collect()),
+            Exclusive::Hints(hints) => Some(hints.into_iter().map(SourceRow::CustomHint).collect()),
+            Exclusive::NotOurs => None,
+        }
+    }
+
+    fn head(&mut self, cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {
+        keyword_hint(cx.items, cx.query).map(SourceRow::CustomHint).into_iter().collect()
+    }
 }
 
 #[cfg(test)]

@@ -12,6 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::source::{DataSource, SearchCtx, SourceId, SourceRow};
+
 /// 一条引擎。字段与需求书 FR-SRC-11 一一对应；`icon` 本批只存不显示（「下载站点图标」待定）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebEngine {
@@ -204,6 +206,19 @@ pub fn exclusive_rows(engines: &[WebEngine], keyword: &str, rest: &str) -> Exclu
     }])
 }
 
+/// 首词 → 独占判定（FR-QRY-01 / 08）。**首词后没有空格就不算独占**：`g` 这个单字
+/// 还可能是 `git` 的开头，那一下让应用结果整段消失等于打断用户正在打的词。
+/// 与 `matching::parse` 的 `has_rest` 同一口径。
+///
+/// 批次 A10 从 `src/main.rs` 搬来（原处是私有函数，单测直接调它）；判据一个字没改。
+pub fn exclusive_for(engines: &[WebEngine], query: &str) -> Exclusive {
+    let parsed = crate::matching::parse(query);
+    if !parsed.has_rest {
+        return Exclusive::NotOurs;
+    }
+    exclusive_rows(engines, &parsed.keyword, &parsed.rest)
+}
+
 /// 结果为空时的兜底行（FR-QRY-08）。查询词就是用户敲的整串；`FALLBACK_IDS` 里
 /// 没有对应引擎的 id（现阶段只有 `files`）静默跳过。
 pub fn fallback_rows(engines: &[WebEngine], query: &str) -> Vec<SearchHit> {
@@ -233,6 +248,36 @@ pub fn find<'a>(engines: &'a [WebEngine], keyword: &str) -> Option<&'a WebEngine
         return None;
     }
     engines.iter().find(|e| e.keyword.to_lowercase() == key)
+}
+
+/// 批次 A10：把本模块接进数据源注册表。两个入口分别是独占（`g 词`）与一条都没有时的兜底。
+#[derive(Debug, Default)]
+pub struct WebSource;
+
+impl DataSource for WebSource {
+    fn id(&self) -> SourceId {
+        SourceId::Web
+    }
+
+    fn label(&self) -> &'static str {
+        "网页搜索"
+    }
+
+    fn note(&self) -> &'static str {
+        "`引擎关键字 词` 独占整张列表；一条结果都没有时按 `google → bing` 兜底。关掉之后这两条都停。"
+    }
+
+    fn take_over(&mut self, cx: &mut SearchCtx<'_>) -> Option<Vec<SourceRow>> {
+        match exclusive_for(cx.engines, cx.query) {
+            Exclusive::Rows(hits) => Some(hits.into_iter().map(SourceRow::Search).collect()),
+            Exclusive::Hints(hints) => Some(hints.into_iter().map(SourceRow::Hint).collect()),
+            Exclusive::NotOurs => None,
+        }
+    }
+
+    fn fallback(&mut self, cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {
+        fallback_rows(cx.engines, cx.query).into_iter().map(SourceRow::Search).collect()
+    }
 }
 
 #[cfg(test)]

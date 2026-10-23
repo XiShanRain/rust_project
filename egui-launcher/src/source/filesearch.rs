@@ -2,7 +2,10 @@
 //!
 //! 索引在后台线程构建（[`spawn_rebuild`]），主线程只整体换快照；目录浏览也走后台
 //! （[`spawn_browse`]），因为一个网络盘或十万文件的目录会把 UI 线程按住几百毫秒。
-//! 本模块自己不开线程以外的副作用：不落日志、不碰窗口、不读设置——`src/main.rs` 拿产物去画行。
+//! 不碰窗口、不读设置——`src/main.rs` 拿产物去画行。
+//!
+//! 批次 A10 起索引/浏览的全部状态收在 [`FileSource`] 里（原先散在 `LauncherApp` 的八个字段），
+//! 后台回报的收取与那两条进度日志也跟着搬进来——「谁的状态谁记，谁记谁说得清」。
 //!
 //! 五条口径是本批定的，需求原文没钉，逐条登记进发布说明第二十二节：
 //! - **文件模式独占整张列表**：六式都带显式触发符（一路径形态 / 二 `'` / 三 `open|find|file` /
@@ -18,9 +21,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::source::custom::expand_env;
+use crate::source::{DataSource, SearchCtx, SourceId, SourceRow};
 
 /// 需求书的 `scope_folders`。`Desktop` 在实机上常被重定向到 OneDrive，所以两个位置都试，
 /// 存在才算进范围（[`scope_folders`] 会滤掉不存在的）。
@@ -145,7 +149,183 @@ pub fn spawn_browse(tx: mpsc::Sender<FileUpdate>, dir: String, filter: String) {
     });
 }
 
+// ---- 数据源实现（批次 A10：状态从 `LauncherApp` 搬到这里）----
+
+/// FR-SRC-14 的数据源。索引/浏览的后台状态全部收在这里，`main.rs` 不再持有它们：
+/// 原先那八个字段（通道、索引快照、建成时刻、在途旗标、目录回报、查询缓存）只有本源在用。
+#[derive(Debug)]
+pub struct FileSource {
+    tx: mpsc::Sender<FileUpdate>,
+    rx: mpsc::Receiver<FileUpdate>,
+    /// 整表快照：`FileUpdate::Index` 到达时整体替换，旧快照在那一帧前一直可用。
+    index: Vec<FileEntry>,
+    /// 上一轮索引建成的时刻（`None` = 还没建成过）；同时兼任 30 分钟重扫的计时起点。
+    indexed_at: Option<Instant>,
+    rebuild_in_flight: bool,
+    /// 一次目录浏览的回报，带 `(dir, filter)` 供查询核对。
+    dir_hits: Option<(String, String, Vec<FileHit>)>,
+    /// 已派出去、还没被采纳的那次浏览的 `(dir, filter)`。
+    dir_in_flight: Option<(String, String)>,
+    /// 同一查询串一帧里会被 `plan()` 算好几遍（空格判据、渲染、Enter…），而文件源要扫三万条
+    /// ⇒ 按查询串缓存本轮命中。索引回报到达时清空，别让新索引撞上旧缓存。
+    hits_cache: Option<(String, Vec<FileHit>)>,
+}
+
+impl Default for FileSource {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            tx,
+            rx,
+            index: Vec::new(),
+            indexed_at: None,
+            rebuild_in_flight: false,
+            dir_hits: None,
+            dir_in_flight: None,
+            hits_cache: None,
+        }
+    }
+}
+
+impl FileSource {
+    /// 派一轮后台索引重建。同一时刻只跑一轮，回收据的那帧才允许下一轮；
+    /// `force` 忽略最小间隔（冷启动那一次）。
+    fn refresh_index(&mut self, force: bool) {
+        if self.rebuild_in_flight {
+            return;
+        }
+        if let Some(built) = self.indexed_at {
+            if !force && built.elapsed() < REBUILD_INTERVAL {
+                return;
+            }
+        }
+        self.rebuild_in_flight = true;
+        spawn_rebuild(self.tx.clone());
+    }
+
+    /// 派一次目录浏览（读一层，不递归）。列目录也是磁盘 I/O——一个十万文件的下载夹
+    /// 或一个正在断线的网络盘会把 UI 线程按住几百毫秒，所以它不进主线程。
+    ///
+    /// 去重只看两条：已经有这一对 `(dir, filter)` 的结果、或这一对正飞在路上。
+    /// 别的组合照样派——打字途中旧的在途请求会被 [`Self::plan`] 的核对判据丢掉，
+    /// 宁可多开几个短命线程，也不能让「最新那一次」因为限流而永远没结果。
+    fn request_browse(&mut self, dir: &str, filter: &str) {
+        if self.dir_hits.as_ref().is_some_and(|(d, f, _)| d == dir && f == filter)
+            || self.dir_in_flight.as_ref().is_some_and(|(d, f)| d == dir && f == filter)
+        {
+            return;
+        }
+        self.dir_in_flight = Some((dir.to_string(), filter.to_string()));
+        spawn_browse(self.tx.clone(), dir.to_string(), filter.to_string());
+    }
+
+    /// 本查询该不该由文件源独占整张列表。返回 `None` = 没有触发符，普通合并照常。
+    fn plan(&mut self, query: &str) -> Option<Vec<SourceRow>> {
+        let route = route(query);
+        match route {
+            Route::NotOurs => None,
+            Route::Browse { dir, filter } => {
+                self.request_browse(&dir, &filter);
+                let hits = match &self.dir_hits {
+                    Some((d, f, hits)) if *d == dir && *f == filter => hits.clone(),
+                    _ => Vec::new(),
+                };
+                Some(hits.into_iter().map(SourceRow::File).collect())
+            }
+            Route::Search { words, exts, dirs_only } => {
+                self.refresh_index(false);
+                // 冷启动那一阵索引还在后台：给一行说明，而不是让用户对着空列表猜是不是搜坏了。
+                if self.indexed_at.is_none() {
+                    return Some(vec![SourceRow::Hint(crate::source::websearch::EngineHint {
+                        engine_id: "filesearch".to_string(),
+                        title: "文件索引建立中".to_string(),
+                        subtitle: "首次扫描正在后台进行，稍后再试一次".to_string(),
+                        completion: String::new(),
+                    })]);
+                }
+                let cached = self
+                    .hits_cache
+                    .as_ref()
+                    .filter(|(q, _)| q == query)
+                    .map(|(_, hits)| hits.clone());
+                let hits = match cached {
+                    Some(hits) => hits,
+                    None => {
+                        let hits = search(&self.index, &words, &exts, dirs_only);
+                        self.hits_cache = Some((query.to_string(), hits.clone()));
+                        hits
+                    }
+                };
+                Some(hits.into_iter().map(SourceRow::File).collect())
+            }
+        }
+    }
+}
+
+impl DataSource for FileSource {
+    fn id(&self) -> SourceId {
+        SourceId::Files
+    }
+
+    fn label(&self) -> &'static str {
+        "文件搜索"
+    }
+
+    fn note(&self) -> &'static str {
+        "`'词`、空格开头、`open|find|file|folder|doc|pic…` 与路径形态会独占列表。关掉之后这些输入回到普通搜索（不起索引、不读磁盘）。"
+    }
+
+    fn init(&mut self) {
+        self.refresh_index(true);
+    }
+
+    fn poll(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(update) = self.rx.try_recv() {
+            match update {
+                FileUpdate::Index(entries) => {
+                    let n = entries.len();
+                    self.index = entries;
+                    self.indexed_at = Some(Instant::now());
+                    self.rebuild_in_flight = false;
+                    // 新索引配旧缓存就是"用上一轮的命中回答这一轮的查询"⇒ 一起清掉。
+                    self.hits_cache = None;
+                    eprintln!("文件索引：本轮建成 {n} 条（范围＝桌面/下载/文档，深度 4，上限 3 万）");
+                    changed = true;
+                }
+                FileUpdate::Dir { dir, filter, hits } => {
+                    // 只认"当前还在等的那一份"。打字途中派出去的旧请求回来得晚，采纳它会让列表
+                    // 显示另一个目录的内容——列错目录比空一帧严重得多。
+                    if self.dir_in_flight.as_ref().is_some_and(|(d, f)| *d == dir && *f == filter) {
+                        self.dir_in_flight = None;
+                        let n = hits.len();
+                        self.dir_hits = Some((dir, filter, hits));
+                        eprintln!("文件搜索：目录列表回报（{n} 条，路径不落日志）");
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // 可见期间的 30 分钟重扫兜底（静默启动时 `init` 已派过第一轮）。
+        self.refresh_index(false);
+        changed
+    }
+
+    fn take_over(&mut self, cx: &mut SearchCtx<'_>) -> Option<Vec<SourceRow>> {
+        self.plan(cx.query)
+    }
+}
+
 // ---- 触发路由 ----
+
+/// 撇号触发符的等价集合：半角 `'`、中文输入法打出的弯引号 `‘`/`’`、全角 `＇`。
+/// 2026-10-23 真机：中文输入法下按撇号键打出的是 `’`，旧判据只认半角 ⇒
+/// `’报告` 掉进普通搜索、界面显示「未找到」而不是文件模式。
+const APOSTROPHES: [char; 4] = ['\'', '‘', '’', '＇'];
+
+fn is_apostrophe(c: char) -> bool {
+    APOSTROPHES.contains(&c)
+}
 
 /// 五式触发 → [`Route`]。判据只看查询串本身（当帧可观测状态），不看索引、不看磁盘。
 pub fn route(raw: &str) -> Route {
@@ -165,9 +345,9 @@ pub fn route(raw: &str) -> Route {
     let mut words: Vec<String> = Vec::new();
     let mut apostrophe = false;
     for (i, w) in trimmed.split_whitespace().enumerate() {
-        if i == 0 && w.starts_with('\'') {
+        if i == 0 && w.starts_with(is_apostrophe) {
             apostrophe = true;
-            let body = w.trim_start_matches('\'');
+            let body = w.trim_start_matches(is_apostrophe);
             if !body.is_empty() {
                 words.push(body.to_lowercase());
             }
@@ -471,6 +651,21 @@ mod tests {
         assert_eq!(route("file 报告"), Route::Search { words: words("报告"), exts: vec![], dirs_only: false });
         assert_eq!(route("'报告"), Route::Search { words: words("报告"), exts: vec![], dirs_only: false });
         assert_eq!(route(" 报告"), Route::Search { words: words("报告"), exts: vec![], dirs_only: false });
+    }
+
+    #[test]
+    fn full_width_apostrophes_also_enter_file_mode() {
+        // 2026-10-23 真机 A2：中文输入法打出的 `’` 曾被当普通文本，同一个查询
+        // 变成「未找到」而不是文件模式。四种撇号形态必须走同一条路由。
+        for q in ["'报告", "‘报告", "’报告", "＇报告"] {
+            assert_eq!(
+                route(q),
+                Route::Search { words: words("报告"), exts: vec![], dirs_only: false },
+                "触发符 {q:?} 应进文件模式"
+            );
+        }
+        // 只有首词开头才算触发符；后面的弯引号仍是普通查询文本。
+        assert_eq!(route("报告 ’最终"), Route::NotOurs);
     }
 
     fn extension_list(word: &str) -> Vec<String> {
