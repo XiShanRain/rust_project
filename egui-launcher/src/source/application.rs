@@ -376,6 +376,15 @@ pub struct AppSettings {
     /// **默认开**：这四条都不可撤销，误按一次就丢工作；关掉它等于把回车键直接接到关机命令上。
     #[serde(default = "default_true")]
     pub confirm_actions: bool,
+
+    /// `>` 终端用哪个 shell（FR-SRC-16）。存 [`terminal::TermShell::as_str`] 的稳定名，
+    /// 与 `sources_off` 同一口径：本程序不认识的名字回落 `cmd`，不让整份配置判坏。
+    #[serde(default = "default_terminal_shell")]
+    pub terminal_shell: String,
+}
+
+fn default_terminal_shell() -> String {
+    crate::source::terminal::TermShell::default().as_str().to_string()
 }
 
 fn default_true() -> bool {
@@ -399,14 +408,20 @@ impl Default for AppSettings {
             sources_off: Vec::new(),
             hidden: Vec::new(),
             confirm_actions: true,
+            terminal_shell: default_terminal_shell(),
         }
     }
 }
 
 impl AppSettings {
-    /// 这个源此刻是否启用。名字不认识的一律当"没关"——只影响本程序认识的五个源。
+    /// 这个源此刻是否启用。名字不认识的一律当"没关"——只影响本程序认识的几个源。
     pub fn source_on(&self, id: SourceId) -> bool {
         !self.sources_off.iter().any(|s| s == id.as_str())
+    }
+
+    /// 终端源实际用的 shell：配置里那一格是稳定名，不认识就回落 `cmd`。
+    pub fn term_shell(&self) -> crate::source::terminal::TermShell {
+        crate::source::terminal::TermShell::from_name(&self.terminal_shell).unwrap_or_default()
     }
 
     /// 开 / 关一个源；返回 `true` ＝ 状态真的有变化（调用方据此写盘）。
@@ -1968,6 +1983,22 @@ mod dedup_tests {
         assert!(json.contains(r#""learn_rank":"count""#), "实际写盘：{json}");
         assert!(serde_json::from_str::<AppSettings>(r#"{"space_to_run":"wod"}"#).is_err());
         assert!(serde_json::from_str::<AppSettings>(r#"{"learn_rank":"decayy"}"#).is_err());
+    }
+
+    /// FR-SRC-16 的 `terminal_shell`：字段缺失＝`cmd`（旧 `settings.json` 照旧能读），
+    /// 名字不认识也回落 `cmd` —— 与 `sources_off` 同一口径，绝不让一个陌生词把整份配置判坏。
+    #[test]
+    fn terminal_shell_defaults_to_cmd_and_unknown_names_do_not_break_the_file() {
+        use crate::source::terminal::TermShell;
+        let missing: AppSettings = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(missing.terminal_shell, "cmd");
+        assert_eq!(missing.term_shell(), TermShell::Cmd);
+        let known: AppSettings = serde_json::from_str(r#"{"terminal_shell":"pwsh"}"#).unwrap();
+        assert_eq!(known.term_shell(), TermShell::Pwsh);
+        let unknown: AppSettings = serde_json::from_str(r#"{"terminal_shell":"bash"}"#).unwrap();
+        assert_eq!(unknown.term_shell(), TermShell::Cmd, "陌生名字回落默认，不判坏配置");
+        let d = AppSettings::default();
+        assert_eq!(d.terminal_shell, "cmd");
     }
 
     #[test]

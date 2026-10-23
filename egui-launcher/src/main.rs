@@ -2841,6 +2841,32 @@ impl LauncherApp {
                                 .weak()
                                 .small(),
                             );
+                            ui.separator();
+                            // FR-SRC-16（批次 A3）：`>` 终端用哪个 shell。
+                            ui.label(egui::RichText::new("终端 shell").strong());
+                            let mut shell = self.prefs.term_shell();
+                            let before = shell;
+                            ui.horizontal(|ui| {
+                                for s in source::terminal::TermShell::ALL {
+                                    ui.selectable_value(&mut shell, s, s.label());
+                                }
+                            });
+                            if shell != before {
+                                self.prefs.terminal_shell = shell.as_str().to_string();
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：terminal_shell = {}（已写 settings.json）",
+                                    shell.as_str()
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "查询框里敲 `>命令`（例：`>ipconfig /all`）会在新窗口里执行，执行完停在窗口里让你看输出；只敲 `>` 时列表给用法行。\ncmd / powershell / pwsh 各开一个新控制台窗口；Windows Terminal 那一档把同样的命令交给它的新标签（走 cmd）。选择立刻生效，不用重启。命令原文不进日志。",
+                                )
+                                .weak()
+                                .small(),
+                            );
                         }
                         SettingsTab::Hotkeys => {
                             // FR-WIN-02（批次 Q）：全局呼出热键可改。这是设置页里唯一的"输入型"控件，
@@ -3550,6 +3576,35 @@ impl LauncherApp {
         true
     }
 
+    /// 批次 A3（FR-SRC-16）：终端行的「执行」＝开一个新控制台窗口跑这条命令，随后关到托盘。
+    /// **命令原文不进日志**：它就是用户敲进查询框的内容（FR-SYS-03 隐私口径），
+    /// 日志只记 shell 名；失败时 Toast 也只报系统错误码，不回显命令。
+    fn run_terminal_hit(&mut self, ctx: &egui::Context, hit: &source::terminal::TermHit) -> bool {
+        // 命令原文不落日志，但**成败都要落一行**：这是唯一能事后看出「敲了 > 没反应」的线索。
+        // 成功那句在 `spawn` 之后打，免得"已启动"和"启动失败"前后脚同时出现。
+        if let Err(e) = hit.shell.spawn(&hit.command) {
+            eprintln!("terminal: 启动失败（shell {}）：{e}", hit.shell.as_str());
+            self.toast = Some((
+                format!("⚠ 启动失败：{e}"),
+                Instant::now() + TOAST_TTL,
+                TOAST_ERR,
+            ));
+            ctx.request_repaint_after(TOAST_TTL);
+            return false;
+        }
+        eprintln!(
+            "terminal: 已启动（shell {}，命令原文不落日志）",
+            hit.shell.as_str()
+        );
+        self.toast = None;
+        self.clear_query_next_frame = true;
+        self.selected = 0;
+        self.visible = false;
+        self.on_hide();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        true
+    }
+
     /// 批次 X：在资源管理器里打开所在目录并选中这个文件/目录，随后关到托盘。
     /// 临时条目不进清单、不记学习统计（`launch_from_list` 为假），与清单行 Ctrl+D 那一条同形态；
     /// 日志走脱敏路径：这条路径同样来自查询。
@@ -3636,6 +3691,8 @@ impl LauncherApp {
     /// 关掉的源在 [`source::dispatch`] 里**连被问到的机会都没有**，不会出结果、也不会出提示行。
     fn plan(&mut self) -> Plan {
         let now = now_ms();
+        // 先取值再借 `prefs.engines`：配置里存的是稳定名，认识的才留下，不认识回落 cmd。
+        let term_shell = self.prefs.term_shell();
         let mut cx = source::SearchCtx {
             query: &self.query,
             items: &self.items,
@@ -3643,6 +3700,7 @@ impl LauncherApp {
             learn_rank: self.prefs.learn_rank,
             index: &mut self.index,
             now_ms: now,
+            term_shell,
         };
         source::dispatch(&mut self.sources, &mut cx, |id| self.prefs.source_on(id))
     }
@@ -3886,6 +3944,8 @@ impl eframe::App for LauncherApp {
         // 批次 X：文件行的三个动作各自一条道（打开 / 在资源管理器里定位 / 复制路径）。
         // 都只带路径字符串而不带 LaunchItem：这三件事都不进清单、不记学习统计。
         let mut open_file: Option<source::filesearch::FileHit> = None;
+        // 批次 A3：终端行的「执行」＝在新窗口跑命令（日志不记命令原文）。
+        let mut open_term: Option<source::terminal::TermHit> = None;
         let mut select_path: Option<String> = None;
         let mut copy_path: Option<String> = None;
         let mut row_actions: Vec<String> = Vec::new();
@@ -4383,6 +4443,17 @@ impl eframe::App for LauncherApp {
                                     );
                                     open_file = Some(hit.clone());
                                 }
+                                HeadRow::Terminal(hit) => {
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：在终端执行（shell {}，命令原文不落日志）",
+                                        hit.shell.as_str()
+                                    );
+                                    open_term = Some(hit.clone());
+                                }
+                                HeadRow::TermHint(_) => {
+                                    eprintln!("快捷键 数字键 {digit}：选中的是终端用法行，不执行");
+                                    self.hint_toast(ui.ctx(), source::terminal::USAGE_TOAST);
+                                }
                             },
                             Some(Row::Item(rank)) => {
                                 let item = self.items[results[rank]].clone();
@@ -4645,6 +4716,10 @@ impl eframe::App for LauncherApp {
                                     self.custom_hint_activate(ui.ctx(), hint);
                                 }
                                 HeadRow::File(hit) => open_file = Some(hit.clone()),
+                                HeadRow::Terminal(hit) => open_term = Some(hit.clone()),
+                                HeadRow::TermHint(_) => {
+                                    self.hint_toast(ui.ctx(), source::terminal::USAGE_TOAST)
+                                }
                             },
                             Some(Row::Item(rank)) => {
                                 launch = Some(self.items[results[rank]].clone());
@@ -4885,6 +4960,58 @@ impl eframe::App for LauncherApp {
                                                 ui.close();
                                             }
                                         });
+                                    });
+                                }
+                                HeadRow::Terminal(hit) => {
+                                    // FR-SRC-16：整张列表就这一行，标题原样是命令（等宽字体，
+                                    // 让 `|`、`>` 这类符号对得齐）。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "执行");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(">").monospace().size(20.0).weak(),
+                                            ),
+                                        )
+                                        .on_hover_text("终端命令（FR-SRC-16）");
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hit.title.as_str()).monospace(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            open_term = Some(hit.clone());
+                                        }
+                                    });
+                                }
+                                HeadRow::TermHint(hint) => {
+                                    // 不可执行行：点/按只给一句「继续输入命令」。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "查看");
+                                        ui.add_sized(
+                                            [32.0, 32.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(">").monospace().size(20.0).weak(),
+                                            ),
+                                        );
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(12.0),
+                                        );
+                                        if sel.clicked() {
+                                            self.hint_toast(ui.ctx(), source::terminal::USAGE_TOAST);
+                                        }
                                     });
                                 }
                             }
@@ -5360,6 +5487,9 @@ impl eframe::App for LauncherApp {
         // 一次按键或点击只会产出其中一个。
         if let Some(hit) = open_file {
             self.open_file_hit(ui.ctx(), &hit);
+        }
+        if let Some(hit) = open_term {
+            self.run_terminal_hit(ui.ctx(), &hit);
         }
         if let Some(path) = select_path {
             self.select_in_explorer(ui.ctx(), &path);

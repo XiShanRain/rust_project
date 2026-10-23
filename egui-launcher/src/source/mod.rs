@@ -1,8 +1,8 @@
 //! FR-SRC 数据源模块。每个 provider 一个子模块，统一产出「可搜索的条目快照」。
 //!
-//! 现已落地六个：FR-SRC-02（应用程序源）、FR-SRC-05（自定义命令源）、
+//! 现已落地七个：FR-SRC-02（应用程序源）、FR-SRC-05（自定义命令源）、
 //! FR-SRC-06（路径四态校验）、FR-SRC-10（计算器）、FR-SRC-11（网页搜索）、
-//! FR-SRC-14（文件搜索与目录浏览）。
+//! FR-SRC-14（文件搜索与目录浏览）、FR-SRC-16（终端命令 `>`）。
 //!
 //! **批次 A10（2026-10-22）起**这几个源不再硬编在 `main.rs::plan()` 的匹配链里，而是实现
 //! [`DataSource`]、由 [`default_sources`] 按固定顺序注册；`plan()` 只按注册表走一圈。
@@ -22,6 +22,7 @@ pub mod filesearch;
 pub mod icon;
 pub mod pathcheck;
 pub mod system;
+pub mod terminal;
 pub mod websearch;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -44,13 +45,16 @@ pub enum SourceId {
     Files,
     /// 计算器结果行。
     Calc,
+    /// 终端命令（`>命令`）。
+    Terminal,
 }
 
 impl SourceId {
     /// 注册表的实际顺序（只在单测里用：`default_sources` 的顺序不许漂）。
-    /// 与 [`default_sources`] 一致——用户数据（自定义命令）压过出厂数据，应用清单殿后。
+    /// 与 [`default_sources`] 一致——显式语法（`>`）最前，其后用户数据压过出厂数据，应用清单殿后。
     #[cfg(test)]
-    pub const ALL: [Self; 5] = [Self::Custom, Self::Web, Self::Files, Self::Calc, Self::Apps];
+    pub const ALL: [Self; 6] =
+        [Self::Terminal, Self::Custom, Self::Web, Self::Files, Self::Calc, Self::Apps];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -59,6 +63,7 @@ impl SourceId {
             Self::Web => "web",
             Self::Files => "files",
             Self::Calc => "calc",
+            Self::Terminal => "terminal",
         }
     }
 }
@@ -81,6 +86,10 @@ pub enum SourceRow {
     CustomHint(custom::CustomHint),
     /// 文件搜索 / 目录浏览的一行。「执行」＝用系统关联程序打开它。
     File(filesearch::FileHit),
+    /// 终端命令的独占行（`>命令`）。「执行」＝在新终端窗口里跑。
+    Terminal(terminal::TermHit),
+    /// 裸 `>` 的用法行：不可执行，`Enter` / 数字键只给一句 Toast。
+    TermHint(terminal::TermHint),
 }
 
 impl SourceRow {
@@ -113,6 +122,9 @@ pub struct SearchCtx<'a> {
     pub index: &'a mut MatchIndex,
     /// 取一次、全帧共用：同一帧里几个源看到的时间戳必须一致，否则学习位序会抖。
     pub now_ms: i64,
+    /// 终端源用哪个 shell（设置页「功能」页那四选一）。放在上下文里而不是源自己身上：
+    /// 源是启动时注册的，配置却随时会变，源每次都读同一份上下文就不会落后一帧。
+    pub term_shell: terminal::TermShell,
 }
 
 /// 本帧列表的完整计划。原先叫 `Plan`、定义在 `main.rs`；批次 A10 搬到数据源层。
@@ -168,6 +180,8 @@ pub trait DataSource {
 /// - 想抢在它们之前 ⇒ 往前放（目前 `Custom` 在最前，是因为"用户数据压过出厂数据"）。
 pub fn default_sources() -> Vec<Box<dyn DataSource>> {
     vec![
+        // 显式语法排最前：`>` 是用户明说"这条给终端"，不该被同名关键字抢走。
+        Box::new(terminal::TerminalSource),
         Box::new(custom::CustomSource),
         Box::new(websearch::WebSource),
         Box::new(filesearch::FileSource::default()),
@@ -298,6 +312,7 @@ mod registry_tests {
             learn_rank: LearnRank::Count,
             index,
             now_ms: 0,
+            term_shell: terminal::TermShell::default(),
         }
     }
 
@@ -358,6 +373,40 @@ mod registry_tests {
         let plan = dispatch(&mut sources, &mut cx, |_| true);
         assert_eq!(plan.head.len(), 1, "提示行留在头段");
         assert_eq!(plan.results, vec![1], "同一 uid 从下方结果里摘掉，别的条目不误伤");
+    }
+
+    /// FR-SRC-16：`>` 是显式语法 ⇒ 独占整张列表；裸 `>` 只给用法行；源关掉后同一条查询
+    /// 回到普通搜索（设置页那行开关的判据）。
+    #[test]
+    fn a_terminal_prefix_takes_over_and_bare_prefix_gives_usage() {
+        let items = vec![LaunchItem { name: "计算器".into(), path: "calc.exe".into(), ..Default::default() }];
+        let mut index = MatchIndex::default();
+        {
+            let mut sources = default_sources();
+            let mut cx = ctx_with(">ipconfig /all", &items, &mut index);
+            let plan = dispatch(&mut sources, &mut cx, |_| true);
+            assert!(plan.results.is_empty(), "`>` 独占：下面的清单一条都不许露出");
+            match plan.head.as_slice() {
+                [SourceRow::Terminal(h)] => {
+                    assert_eq!(h.command, "ipconfig /all");
+                    assert_eq!(h.shell, terminal::TermShell::Cmd, "默认 shell 是 cmd");
+                }
+                other => panic!("`>命令` 应独占成一行终端行，实际 {other:?}"),
+            }
+        }
+        {
+            let mut sources = default_sources();
+            let mut cx = ctx_with(">", &items, &mut index);
+            let plan = dispatch(&mut sources, &mut cx, |_| true);
+            assert!(plan.results.is_empty());
+            assert!(matches!(plan.head.as_slice(), [SourceRow::TermHint(_)]), "裸 `>` 只给用法行");
+        }
+        {
+            let mut sources = default_sources();
+            let mut cx = ctx_with(">", &items, &mut index);
+            let plan = dispatch(&mut sources, &mut cx, |id| id != SourceId::Terminal);
+            assert!(plan.head.is_empty(), "终端源关着时 `>` 不产生任何行");
+        }
     }
 
     #[test]
