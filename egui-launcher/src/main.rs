@@ -69,7 +69,7 @@ mod matching;
 mod source;
 mod theme;
 use source::application::{
-    Corrupted, ItemKind, LaunchItem, LearnRank, ListRows, RowDensity, SpaceRun, TabMode,
+    Corrupted, ItemKind, LaunchItem, LearnRank, ListRows, RowDensity, Scope, SpaceRun, TabMode,
     dedup_items, default_keyword, is_url, learn_alias, make_item_from_input,
 };
 // FR-WIN-02（批次 Q）：热键的位值与 VK 码用 application 侧的那套常量，判据与展示名才能
@@ -381,10 +381,13 @@ enum SettingsTab {
     Sources,
     /// 批次 F1（FR-UIX-01）：主题选择 + 主题目录入口。第 5 页。
     Appearance,
+    /// 批次 F7（D3 + D6）：重置学习排序 / 恢复默认 / 隐藏的条目。第 6 页。
+    /// 这一页只有破坏性动作与低频维护项，所以排在最后。
+    Advanced,
 }
 
 impl SettingsTab {
-    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=外观）；
+    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=外观 6=高级）；
     /// 越界返回 None，由调用方落回通用。
     fn from_page(page: u32) -> Option<Self> {
         match page {
@@ -393,9 +396,20 @@ impl SettingsTab {
             3 => Some(Self::Hotkeys),
             4 => Some(Self::Sources),
             5 => Some(Self::Appearance),
+            6 => Some(Self::Advanced),
             _ => None,
         }
     }
+}
+
+/// 批次 F7：设置页「高级」页的两个破坏性动作。
+/// 与删除确认分开：`ConfirmRequest` 已被真机验过，不动它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Destructive {
+    /// FR-CFG-07：清空学习排序数据（置顶保留）。
+    ResetLearning,
+    /// FR-CFG-08：先写 `.bak` 再把偏好恢复默认（用户资产保留）。
+    RestoreDefaults,
 }
 
 // FR-SRC-23【2026-10-17 修订】：无匹配 Enter 已从「直接运行兜底」改为弹 AddDialog 预填入库，
@@ -415,6 +429,8 @@ struct DialogState {
     /// 图标源（不显示在表单里）：SendTo 的 .lnk 解析后=lnk 本体（可能带自定义图标）；
     /// 空=提交时回落取命令行。编辑既有项时带入原 source_path 保真。
     source_path: String,
+    /// 批次 G1 分类标签的自由文本（逗号/空白分隔），提交时由 [`source::application::parse_tags_text`] 拆表。
+    tags_text: String,
 }
 
 impl DialogState {
@@ -428,6 +444,7 @@ impl DialogState {
             working_dir: String::new(),
             kind: ItemKind::Command,
             source_path: String::new(),
+            tags_text: String::new(),
         }
     }
     /// 用无匹配输入预填（路径/类型/名称由 make_item_from_input 推断）。
@@ -442,6 +459,7 @@ impl DialogState {
             working_dir: String::new(),
             kind: it.kind,
             source_path: String::new(),
+            tags_text: String::new(),
         }
     }
     /// 用「发送到」转发的 .lnk 解析结果预填：命令行=真实目标，图标源=lnk 本体。
@@ -455,6 +473,7 @@ impl DialogState {
             working_dir: it.working_dir.unwrap_or_default(),
             kind: it.kind,
             source_path: it.source_path,
+            tags_text: String::new(),
         }
     }
     /// 批次 X（FR-SRC-14 → FR-SRC-20）：从文件搜索行预填「添加快捷项」。
@@ -474,6 +493,7 @@ impl DialogState {
                 ItemKind::File
             },
             source_path: hit.path.clone(),
+            tags_text: String::new(),
         }
     }
     /// 用既有项预填（编辑）。
@@ -487,6 +507,7 @@ impl DialogState {
             working_dir: it.working_dir.clone().unwrap_or_default(),
             kind: it.kind,
             source_path: it.source_path.clone(),
+            tags_text: it.tags.join(" "),
         }
     }
     /// 提交时生成条目；`source_path` 默认取 `path`（图标源，URL/无文件时 extract 自然失败退化无图标）。
@@ -535,6 +556,7 @@ impl DialogState {
             },
             kind,
             keyword: kw,
+            tags: source::application::parse_tags_text(&self.tags_text),
             // 新建默认未置顶、零统计；编辑既有项的置顶/使用统计在 DlgResult::Confirm 提交时旧值携带回填。
             ..Default::default()
         }
@@ -633,6 +655,9 @@ struct LauncherApp {
     internal_confirm: Option<InternalConfirm>, // 批次 A2：关机/重启/注销/清空回收站的执行确认
     about_open: bool,                // 批次 A2：「关于本程序」弹窗（Some 的等价物，用 bool 更直白）
     help_entry: Option<source::cheatsheet::CheatHit>, // 批次 A8：速查表条目的帮助页（Some=打开）
+    /// 批次 F7：设置页「高级」页的破坏性动作确认（Some=确认框开着）。
+    /// 按键分支与 Esc 链都要先看它，否则开着确认框还能触发别的快捷键。
+    pending_destructive: Option<Destructive>,
     /// 批次 F6：顶栏 ☰ 主菜单是否开着（2026-10-24 用户点名「换成一个三条杠的菜单，点击显示
     /// 新建按钮和其他设置按钮」）。用裸 bool 而不是 egui 的 memory：快捷键 Ctrl+M 也要能开它，
     /// `egui::Popup::open_bool` 正好吃这一个所有权，关闭（点击/Esc）由 Popup 写回 `false`。
@@ -1342,10 +1367,13 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// 用户点名放开的唯一例外。表里仍然不加条目，因为本程序压根没绑过 `` ` ``：
 /// `grep -rn "Backtick\|VK_OEM_3\|0xC0" src/` 的 27 处命中全在映射、判据、展示名和测试里，
 /// 没有一处是 `consume_key`。】
+/// 【2026-10-24 批次 F7 补一条：`Ctrl+Del`（主界面隐藏出厂条目）同样不进表——`Delete`
+/// 不在可录集合里，录制端永远产不出这个组合，也就撞不上；表只收改得出来的组合。】
 /// 表里的修饰键一律不带 `HKF_NOREPEAT`（比对时两边都剥）。
 const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_CONTROL, 0x44),             // Ctrl+D 打开所在目录
     (HKF_CONTROL, 0x45),             // Ctrl+E 编辑选中项
+    (HKF_CONTROL, 0x47),             // Ctrl+G 缺省分类范围 all ⇄ basic（批次 G1）
     (HKF_CONTROL, 0x49),             // Ctrl+I 批量导入全部
     (HKF_CONTROL, 0x4A),             // Ctrl+J 循环下一项
     (HKF_CONTROL, 0x4B),             // Ctrl+K 循环上一项
@@ -2125,6 +2153,19 @@ impl LauncherApp {
             } else {
                 source::application::save_settings(&prefs);
             }
+            // 批次 G1：同一轮把出厂分类回填到老条目（uid 对得上且标签为空才补）。
+            // 补标签只发生在 seed_round 进位这一次——之后用户清掉标签不会再被补回。
+            let tagged = source::application::apply_factory_tags(&mut items);
+            if tagged > 0 {
+                if evidence_lost {
+                    eprintln!(
+                        "source: 出厂分类回填 {tagged} 条（坏文件留证没成功 ⇒ 这次不写清单）"
+                    );
+                } else {
+                    source::application::save_user_items(&items);
+                    eprintln!("source: 出厂分类回填 {tagged} 条（已写清单）");
+                }
+            }
         }
         // 2026-10-23 一次性改名：老清单里的「设置·X」→「Win·X」/「启动器·X」，
         // 总入口「设置」→「Windows 设置」（用户反馈敲「设置」出来四十行）。
@@ -2215,6 +2256,7 @@ impl LauncherApp {
             internal_confirm: None,
             about_open: false,
             help_entry: None,
+            pending_destructive: None,
             menu_open: false,
             win_drag: None,
             settings_open,
@@ -3038,6 +3080,7 @@ impl LauncherApp {
                     ("热键", SettingsTab::Hotkeys),
                     ("数据源", SettingsTab::Sources),
                     ("外观", SettingsTab::Appearance),
+                    ("高级", SettingsTab::Advanced),
                 ] {
                     if ui.selectable_label(self.settings_tab == tab, label).clicked() {
                         self.settings_tab = tab;
@@ -3252,6 +3295,30 @@ impl LauncherApp {
                                 .small(),
                             );
                             ui.separator();
+                            // 批次 G1：缺省分类范围（主界面 Ctrl+G 一键轮换的就是这一格）。
+                            ui.label(egui::RichText::new("缺省分类范围").strong());
+                            let mut scope = self.prefs.default_scope;
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut scope, Scope::All, "全部（默认）");
+                                ui.selectable_value(&mut scope, Scope::Basic, "基本");
+                            });
+                            if scope != self.prefs.default_scope {
+                                self.prefs.default_scope = scope;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：default_scope = {}（已写 settings.json）",
+                                    scope.as_str()
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "全部（默认）＝清单里所有条目照常显示（本批之前的行为）。\n基本＝只显示出厂白名单（计算器、记事本、关机这些常用命令）＋你自己添加的条目；系统维护那一大批工具（设备管理器、注册表编辑器、36 个设置页……）平时不占列表。\n随时可以用 @分类 临时并进来：敲 @维护 把维护类整个列出，@维护 磁盘＝在维护类里搜「磁盘」，@基本 只看白名单；显式 @ 不受这一格影响。\nCtrl+G 在主界面一键轮换这一格。\n条目自己的分类在添加/编辑弹窗的「分类」格里改（逗号或空格分隔，可填多个）。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
                             // FR-SRC-05 / §4.2.1：关键字唯一性提示。只提示、不阻断
                             // （需求书明写"不阻断启动，避免影响 S3"）；撞名时按清单先后取第一条。
                             ui.label(egui::RichText::new("关键字重复检查").strong());
@@ -3364,7 +3431,7 @@ impl LauncherApp {
                             ui.label(egui::RichText::new("系统命令").strong());
                             ui.label(
                                 egui::RichText::new(
-                                    "系统命令（关机、设置页直达、Windows 工具、ms-settings 页、音量与媒体）并进出厂条目，与普通条目一样可搜索、可置顶、可编辑、可删除。想「隐藏而不是删除」时，把条目的 uid 写进 settings.json 的 hidden 数组——隐藏项在「补回缺失的出厂命令」之后也不会回来。",
+                                    "系统命令（关机、设置页直达、Windows 工具、ms-settings 页、音量与媒体）并进出厂条目，与普通条目一样可搜索、可置顶、可编辑、可删除。想「隐藏而不是删除」时，在主界面把查询框清空、选中一条后按 Ctrl+Del（隐藏项在「补回缺失的出厂命令」之后也不会回来），恢复入口在「高级」页。",
                                 )
                                 .weak()
                                 .small(),
@@ -3757,6 +3824,124 @@ impl LauncherApp {
                                     .weak()
                                     .small(),
                             );
+                        }
+                        SettingsTab::Advanced => {
+                            // 批次 F7（FR-CFG-07）：重置学习排序。
+                            ui.label(egui::RichText::new("重置学习排序").strong());
+                            ui.label(
+                                egui::RichText::new(
+                                    "清空所有条目的「使用次数 / 最近使用时间」，排序回到无 Boost 状态；置顶（Ctrl+Shift+P）不受影响。落盘前会先备份 user_items.json。\n提交即学到的别名清不掉——它和你在「别名」里手填的词存在同一格，事后无法区分（需求书 FR-ACT-10 的已知偏差）。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            if ui.button("重置学习排序…").clicked() {
+                                self.pending_destructive = Some(Destructive::ResetLearning);
+                                eprintln!("设置页：点了「重置学习排序」，等确认");
+                                ui.ctx().request_repaint();
+                            }
+                            ui.separator();
+                            // 批次 F7（FR-CFG-08）：恢复默认。
+                            ui.label(egui::RichText::new("恢复默认").strong());
+                            ui.label(
+                                egui::RichText::new(
+                                    "把「空格执行 / Tab 语义 / 学习排序 / 数据源开关 / 危险操作确认 / 终端 shell / 主题 / 显示条数 / 行密度 / 缺省分类范围」恢复出厂值，并先写一份 settings.json 备份。\n保留：全局热键、补字符热键、网页引擎、隐藏的条目、出厂命令补种轮次，以及 user_items.json 里的自定义命令、置顶、学习统计与分类标签。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            if ui.button("恢复默认…").clicked() {
+                                self.pending_destructive = Some(Destructive::RestoreDefaults);
+                                eprintln!("设置页：点了「恢复默认」，等确认");
+                                ui.ctx().request_repaint();
+                            }
+                            ui.separator();
+                            // 批次 F7（D6 / FR-SRC-17）：隐藏的条目。
+                            ui.label(egui::RichText::new("隐藏的条目").strong());
+                            let rows = source::application::hidden_rows(&self.prefs.hidden);
+                            if rows.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "没有隐藏的条目。在主界面把查询框清空、选中一条出厂命令后按 Ctrl+Del 即可隐藏（自定义条目请用 Ctrl+Shift+D 删除）。",
+                                    )
+                                    .weak()
+                                    .small(),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "隐藏不是删除：条目不进列表，但「补回缺失的出厂命令」也不会把它塞回来。恢复后置顶与学习计数不保留（隐藏时条目已从清单落盘移除）。",
+                                    )
+                                    .weak()
+                                    .small(),
+                                );
+                                let mut restore_uid: Option<String> = None;
+                                let mut restore_all = false;
+                                for row in &rows {
+                                    ui.horizontal(|ui| match &row.name {
+                                        Some(name) => {
+                                            ui.label(name.as_str());
+                                            if ui.small_button("恢复").clicked() {
+                                                restore_uid = Some(row.uid.clone());
+                                            }
+                                        }
+                                        None => {
+                                            // 对不上出厂种子：目前只有启动时自动去重的 Store 版「设置」。
+                                            ui.label(
+                                                egui::RichText::new("（程序自动隐藏，不需要恢复）")
+                                                    .weak()
+                                                    .small(),
+                                            )
+                                            .on_hover_text(row.uid.as_str());
+                                        }
+                                    });
+                                }
+                                let restorable =
+                                    rows.iter().filter(|r| r.name.is_some()).count();
+                                if restorable > 1 && ui.button("全部恢复").clicked() {
+                                    restore_all = true;
+                                }
+                                if let Some(uid) = restore_uid {
+                                    let name = rows
+                                        .iter()
+                                        .find(|r| r.uid == uid)
+                                        .and_then(|r| r.name.clone())
+                                        .unwrap_or_default();
+                                    if source::application::restore_hidden(
+                                        &mut self.items,
+                                        &mut self.prefs.hidden,
+                                        &uid,
+                                    ) {
+                                        self.after_unhide(ui.ctx(), &uid);
+                                        self.toast = Some((
+                                            format!("✓ 已恢复「{name}」"),
+                                            Instant::now() + TOAST_TTL,
+                                            TOAST_OK,
+                                        ));
+                                        ui.ctx().request_repaint_after(TOAST_TTL);
+                                    }
+                                }
+                                if restore_all {
+                                    let n = source::application::restore_all_hidden(
+                                        &mut self.items,
+                                        &mut self.prefs.hidden,
+                                    );
+                                    if n > 0 {
+                                        self.save_items();
+                                        source::application::save_settings(&self.prefs);
+                                        self.refresh_path_states(true);
+                                        self.toast = Some((
+                                            format!("✓ 已恢复 {n} 条隐藏条目"),
+                                            Instant::now() + TOAST_TTL,
+                                            TOAST_OK,
+                                        ));
+                                        eprintln!(
+                                            "设置页：全部恢复隐藏条目 → {n} 条（孤儿 uid 保留）"
+                                        );
+                                        ui.ctx().request_repaint_after(TOAST_TTL);
+                                    }
+                                }
+                            }
                         }
                     });
                 }
@@ -4315,6 +4500,25 @@ impl LauncherApp {
             }
         }
     }
+
+    /// 批次 F7：从「高级」页恢复一条隐藏条目之后的收尾——两份落盘、补取图标、刷新路径态。
+    /// 恢复出来的条目是从出厂种子现补的，图标纹理与路径四态都还没有缓存。
+    fn after_unhide(&mut self, ctx: &egui::Context, uid: &str) {
+        self.save_items();
+        source::application::save_settings(&self.prefs);
+        let icon_src = self
+            .items
+            .iter()
+            .find(|i| i.uid() == uid)
+            .map(|i| i.source_path.clone())
+            .filter(|p| !p.is_empty())
+            .filter(|p| !self.icons.contains_key(p.as_str()));
+        if let Some(p) = icon_src {
+            spawn_icon_loader(self.icon_tx.clone(), vec![p]);
+        }
+        self.refresh_path_states(true);
+        ctx.request_repaint();
+    }
 }
 
 impl Default for LauncherApp {
@@ -4361,8 +4565,14 @@ impl LauncherApp {
         let term_shell = self.prefs.term_shell();
         // 速查表要按「哪些源开着」过滤条目，dispatch 也要同一份判断 ⇒ 只算一个闭包，两处共用。
         let on = |id: source::SourceId| self.prefs.source_on(id);
+        // 批次 G1：`@分类` 前缀在进查询引擎前剥掉——匹配、Tab 补全、学习别名看到的都是
+        // 剥剩的真查询，标签本身不会被 learn_alias 学走（它吃的是 cx.query）。
+        let scope_q = source::application::parse_scope_query(&self.query);
+        let bare_at = self.query.starts_with('@')
+            && scope_q.tags.is_empty()
+            && scope_q.query.trim().is_empty();
         let mut cx = source::SearchCtx {
-            query: &self.query,
+            query: scope_q.query,
             items: &self.items,
             engines: &self.prefs.web_engines,
             learn_rank: self.prefs.learn_rank,
@@ -4372,6 +4582,17 @@ impl LauncherApp {
             source_on: &on,
         };
         let mut plan = source::dispatch(&mut self.sources, &mut cx, &on);
+        // 批次 G1 候选池：只筛清单行（results），头段（计算器/文件/网页/…）与 `>`/`?` 不受影响。
+        // 显式 @ = 严格成员并集；没有显式 @ 时按缺省范围（basic = 无标签 ∪ 基本）。
+        let scope = self.prefs.default_scope;
+        plan.results
+            .retain(|&i| source::application::item_in_scope(&self.items[i], &scope_q.tags, scope));
+        if bare_at {
+            let hint = source::application::ScopeTagHint::from_counts(
+                &source::application::all_tags(&self.items),
+            );
+            plan.head.insert(0, source::SourceRow::ScopeTags(hint));
+        }
         // 2026-10-24：「10 条」档在这里截断，而不是在渲染时截——显示、↑↓、PgUp/PgDn、
         // Ctrl+J/K、Tab、数字键、空格与 Enter 都读同一份 `plan()`，截在这里它们的落点才不会打架。
         if self.prefs.list_rows == ListRows::Ten {
@@ -4644,6 +4865,7 @@ impl eframe::App for LauncherApp {
         // 键位口径（用户 2026-10-17 指定）：Delete=删除选中项（仅空输入时；有输入时归 TextEdit 前向删除）、
         // Ctrl+Shift+D=删除选中项（不受输入限制）、Ctrl+D=打开选中项所在目录（explorer /select）、
         // Ctrl+,=设置页开/关（2026-10-17 追加；SendTo 已从快捷键撤下改设置页开关）、
+        // Ctrl+Del=隐藏选中的出厂条目（批次 F7，仅空查询时；有字时留给 TextEdit 删词）、
         // Ctrl+Shift+N=新建快捷项、Ctrl+Shift+P=置顶/取消置顶选中项（FR-SRC-19；2026-10-22 从 Ctrl+N/P 挪来）、
         // PgUp/PgDn=翻页、Tab=补全或循环下一项（语义见设置页 tab_mode）、Shift+Tab=循环上一项、
         // Ctrl+N/Ctrl+P=恒为循环下/上一项（2026-10-22 用户点名 Emacs 的 next/prev line，
@@ -4660,6 +4882,7 @@ impl eframe::App for LauncherApp {
             && self.dialog.is_none()
             && self.confirm.is_none()
             && self.internal_confirm.is_none()
+            && self.pending_destructive.is_none()
             && !self.about_open
             && self.help_entry.is_none()
         {
@@ -4745,6 +4968,10 @@ impl eframe::App for LauncherApp {
                 // 裸 Delete 只在搜索框为空时接管：有输入时它是文本编辑键，不能抢。
                 let hit_del = self.query.trim().is_empty()
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
+                // 批次 F7（D6 / FR-SRC-17）：Ctrl+Del 隐藏选中的出厂条目。
+                // 同样只在查询框为空时接管——有字时 Ctrl+Del 是 TextEdit 的「删除后一个词」。
+                let hit_cdel = self.query.trim().is_empty()
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Delete));
 
                 // FR-ACT-10 补键：PgUp/PgDn 翻页；FR-ACT-06 Tab / Shift+Tab（语义见 tab_mode）。
                 // Shift+Tab 必须先 consume：egui 的 consume_key 走 Modifiers::matches_logically，
@@ -4763,13 +4990,15 @@ impl eframe::App for LauncherApp {
                 // Ctrl+J / Ctrl+K ＝ 无条件循环导航（2026-10-18 用户点名要 Emacs 的 next/prev line；
                 // 当时 Ctrl+N/Ctrl+P 被「新建」「置顶」占着，2026-10-22 那两项挪到 Shift 层后
                 // N/P 也接上了同一个动作，这两键作为老习惯保留）。
-                let (hit_ctrl_j, hit_ctrl_k) = {
+                let (hit_ctrl_j, hit_ctrl_k, hit_ctrl_g) = {
                     let hot = |mods: egui::Modifiers, k: egui::Key| {
                         ui.input_mut(|i| i.consume_key(mods, k))
                     };
                     (
                         hot(egui::Modifiers::COMMAND, egui::Key::J),
                         hot(egui::Modifiers::COMMAND, egui::Key::K),
+                        // 批次 G1：缺省分类范围轮换键（设置页「通用」页同一格的快捷键）。
+                        hot(egui::Modifiers::COMMAND, egui::Key::G),
                     )
                 };
                 // FR-ACT-01 把数字键列为执行手段：Ctrl+ / Alt+1..9/0 不受输入限制，
@@ -4779,6 +5008,12 @@ impl eframe::App for LauncherApp {
                 let hit_digit = pressed_digit(ui, egui::Modifiers::COMMAND)
                     .or_else(|| pressed_digit(ui, egui::Modifiers::ALT))
                     .or_else(|| {
+                        // 2026-10-24 用户报障：空输入框按 Shift+2 想打 @，却被当成裸数字执行了第 2 行。
+                        // 根因＝`consume_key` 走 `matches_logically`，**多余的 Shift/Alt 会被忽略**
+                        //（egui-0.36.2 input_state/mod.rs:722 文档原文）⇒ 模式 NONE 也命中 Shift+数字。
+                        // 先按 SHIFT 层吃掉这一下（与 Shift+空格同一手法）；键事件被吃不挡字符事件，
+                        // @ / # 照进 TextEdit。只在裸数字这一档做：Ctrl+ / Alt+数字 的原行为不动。
+                        let _ = pressed_digit(ui, egui::Modifiers::SHIFT);
                         if bare_digit_allowed(&self.query, calc_on) {
                             pressed_digit(ui, egui::Modifiers::NONE)
                         } else {
@@ -4917,7 +5152,7 @@ impl eframe::App for LauncherApp {
                     ));
                     ui.ctx().request_repaint_after(TOAST_TTL);
                     eprintln!("快捷键 Ctrl+I：批量导入全部 已触发（后台扫描开始菜单/桌面）");
-                } else if hit_e || hit_cd || hit_del || hit_csd || hit_csp {
+                } else if hit_e || hit_cd || hit_del || hit_csd || hit_csp || hit_cdel {
                     // 头段行（计算器/搜索/提示）没有条目身份 ⇒ 编辑/删除/置顶/打开目录这四档
                     // 整体不适用。判据只落在 `sel` 这一层：选中头段 ⇒ 拿不到条目，下面的动作原样跳过。
                     // 例外（批次 U）：自定义命令的提示行/独占行背后是清单里真实的一条 ⇒ 编辑与删除
@@ -4943,7 +5178,7 @@ impl eframe::App for LauncherApp {
                     // search 返回下标而不是引用：调用方接下来要改 self.items。
                     let mut sel =
                         item_row.and_then(|r| results.get(r).map(|i| self.items[*i].clone()));
-                    if sel.is_none() && (hit_e || hit_del || hit_csd) {
+                    if sel.is_none() && (hit_e || hit_del || hit_csd || hit_cdel) {
                         if let Some(Row::Head(h)) =
                             row_at(self.selected, results.len(), plan.head.len())
                         {
@@ -4953,7 +5188,7 @@ impl eframe::App for LauncherApp {
                         }
                     }
                     if item_row.is_none() && sel.is_none() && !handled_file_cd {
-                        eprintln!("快捷键 编辑/删除/置顶/开目录：选中的是头段结果行，这四档不适用");
+                        eprintln!("快捷键 编辑/删除/隐藏/置顶/开目录：选中的是头段结果行，这几档不适用");
                     }
                     // 身份一律用派生 uid（同 path 不同参数是两个条目），path 只作数据用。
                     if let Some(s) = sel {
@@ -4980,6 +5215,38 @@ impl eframe::App for LauncherApp {
                                 self.toast = Some((text, Instant::now() + TOAST_TTL, TOAST_OK));
                                 ui.ctx().request_repaint_after(TOAST_TTL);
                                 eprintln!("快捷键 Ctrl+Shift+P：置顶切换 {uid} → {on}");
+                            }
+                        } else if hit_cdel {
+                            // 批次 F7（D6）：隐藏只对出厂条目开放——它们的 uid 能反查回名称，
+                            // 也能在设置页「高级」页里一条条恢复；用户条目没有名称可回显，
+                            // 而且不会自己回来，删掉更干脆。
+                            if !source::application::is_factory_uid(&uid) {
+                                self.toast = Some((
+                                    "⚠ 隐藏只用于出厂条目；自定义条目请用 Ctrl+Shift+D 删除"
+                                        .to_string(),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_ERR,
+                                ));
+                                ui.ctx().request_repaint_after(TOAST_TTL);
+                                eprintln!("快捷键 Ctrl+Del：{uid} 不是出厂条目，未隐藏");
+                            } else {
+                                if !self.prefs.hidden.iter().any(|h| h == &uid) {
+                                    self.prefs.hidden.push(uid.clone());
+                                }
+                                self.items.retain(|i| i.uid() != uid);
+                                self.selected = 0;
+                                self.save_items();
+                                source::application::save_settings(&self.prefs);
+                                self.refresh_path_states(true);
+                                self.toast = Some((
+                                    format!("✓ 已隐藏「{name}」（设置 → 高级 可恢复）"),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_OK,
+                                ));
+                                ui.ctx().request_repaint_after(TOAST_TTL);
+                                eprintln!(
+                                    "快捷键 Ctrl+Del：隐藏出厂条目 {uid}（已写 hidden[]，不删磁盘文件）"
+                                );
                             }
                         } else if hit_del || hit_csd {
                             // 2026-10-18 用户要求（选中「控制面板」被误删过一次）：删除一律先弹确认，
@@ -5061,6 +5328,16 @@ impl eframe::App for LauncherApp {
                     } else {
                         eprintln!("快捷键 {key}：当前查询无结果，忽略");
                     }
+                } else if hit_ctrl_g {
+                    // 批次 G1：缺省分类范围一键轮换（all ⇄ basic），设置页「通用」页同一格的快捷键。
+                    self.prefs.default_scope = match self.prefs.default_scope {
+                        Scope::All => Scope::Basic,
+                        Scope::Basic => Scope::All,
+                    };
+                    source::application::save_settings(&self.prefs);
+                    let msg = format!("缺省分类范围：{}", self.prefs.default_scope.label());
+                    self.hint_toast(ui.ctx(), &msg);
+                    eprintln!("快捷键 Ctrl+G：缺省分类范围 ⇄ {}（已写 settings.json）", msg);
                 } else if hit_tab || hit_shift_tab {
                     // FR-ACT-06 Tab 语义由设置页 `tab_mode` 二选一（2026-10-18 用户裁定两种都做）：
                     //   Complete（默认）＝查询能把结果集消歧到只剩一条可补长的候选 ⇒ 补全成它的名称；
@@ -5220,6 +5497,10 @@ impl eframe::App for LauncherApp {
                                         "快捷键 数字键 {digit}：选中速查表的无匹配提示行，不执行"
                                     );
                                     self.hint_toast(ui.ctx(), source::cheatsheet::NO_MATCH_TOAST);
+                                }
+                                HeadRow::ScopeTags(hint) => {
+                                    eprintln!("快捷键 数字键 {digit}：选中的是分类提示行，不执行");
+                                    self.hint_toast(ui.ctx(), hint.subtitle.as_str());
                                 }
                             },
                             Some(Row::Item(rank)) => {
@@ -5566,6 +5847,9 @@ impl eframe::App for LauncherApp {
                                 HeadRow::Cheat(hit) => self.help_entry = Some(*hit),
                                 HeadRow::CheatHint(_) => {
                                     self.hint_toast(ui.ctx(), source::cheatsheet::NO_MATCH_TOAST)
+                                }
+                                HeadRow::ScopeTags(hint) => {
+                                    self.hint_toast(ui.ctx(), hint.subtitle.as_str())
                                 }
                             },
                             Some(Row::Item(rank)) => {
@@ -5932,6 +6216,33 @@ impl eframe::App for LauncherApp {
                                         }
                                     });
                                 }
+                                HeadRow::ScopeTags(hint) => {
+                                    // 批次 G1：裸 `@` 的分类提示行，不可执行；点/按只给用法 Toast。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, "查看");
+                                        ui.add_sized(
+                                            [icon, icon],
+                                            egui::Label::new(
+                                                egui::RichText::new("@").monospace().size(glyph).weak(),
+                                            ),
+                                        );
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hint.subtitle.as_str())
+                                                .weak()
+                                                .size(sub_size),
+                                        );
+                                        if sel.clicked() {
+                                            self.hint_toast(ui.ctx(), hint.subtitle.as_str());
+                                        }
+                                    });
+                                }
                             }
                         }
                         for (rank, &hit) in results.iter().enumerate() {
@@ -6117,6 +6428,12 @@ impl eframe::App for LauncherApp {
                                 row(ui, "命令行", &mut dg.path, path_hint);
                                 row(ui, "参数", &mut dg.arguments, "");
                                 row(ui, "工作目录", &mut dg.working_dir, "");
+                                row(
+                                    ui,
+                                    "分类",
+                                    &mut dg.tags_text,
+                                    "逗号/空格分隔，可多个，如：开发, 工具",
+                                );
                                 ui.horizontal(|ui| {
                                     ui.add_sized([label_w, 20.0], egui::Label::new("类型"));
                                     if dg.kind == ItemKind::Internal {
@@ -6192,6 +6509,23 @@ impl eframe::App for LauncherApp {
                                 None => self.items.push(item.clone()),
                             }
                             self.items = dedup_items(std::mem::take(&mut self.items));
+                            // uid = 类型+命令行+参数（不含名称，见 application.rs `uid()`）⇒ 与既有条目
+                            // 命令行与参数完全相同的新条目会被 dedup 留旧剔新、静默丢掉。批量导入路径
+                            // 有「N 条重复已跳过」回执，弹窗这条路原来没有 ⇒ 2026-10-24 G1 真机抓到后补 Toast。
+                            let survived = self
+                                .items
+                                .iter()
+                                .any(|i| i.uid() == item.uid() && i.name == item.name);
+                            if !survived {
+                                self.toast = Some((
+                                    format!(
+                                        "未添加「{}」：命令行与参数和既有条目重复（同类型才算重复）",
+                                        item.name
+                                    ),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_ERR,
+                                ));
+                            }
                             self.carry_stats(&old);
                             if !item.source_path.is_empty()
                                 && !self.icons.contains_key(item.source_path.as_str())
@@ -6283,6 +6617,106 @@ impl eframe::App for LauncherApp {
                     ui.ctx().request_repaint();
                 }
                 ConfirmResult::Keep => {}
+            }
+        }
+
+        // ---- 批次 F7：「高级」页两个破坏性动作的确认 ----
+        // 与删除确认同形态：这一帧只问，按「确定」那一帧才真的做；Esc 由下方全局分段链处理。
+        if let Some(action) = self.pending_destructive {
+            enum DestructiveResult {
+                Keep,
+                Yes,
+                No,
+            }
+            let modal = egui::Modal::new(egui::Id::new("destructive_confirm")).show(
+                ui.ctx(),
+                |ui| {
+                    let (title, confirm_label, warning) = match action {
+                        Destructive::ResetLearning => (
+                            "重置学习排序？",
+                            "重置 (Enter)",
+                            "清空所有条目的使用次数与最近使用时间：排序回到无 Boost 状态，置顶保留。已学到的别名会留下（与手填别名不可区分）。落盘前先备份 user_items.json。",
+                        ),
+                        Destructive::RestoreDefaults => (
+                            "恢复默认？",
+                            "恢复 (Enter)",
+                            "重置空格执行 / Tab 语义 / 学习排序 / 数据源开关 / 危险操作确认 / 终端 shell / 主题 / 显示条数 / 行密度 / 缺省分类范围。热键、网页引擎、隐藏条目、自定义命令与置顶都会保留。落盘前先备份 settings.json。",
+                        ),
+                    };
+                    ui.heading(title);
+                    ui.separator();
+                    ui.label(egui::RichText::new(warning).weak().small());
+                    let mut result = DestructiveResult::Keep;
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        result = DestructiveResult::Yes;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(confirm_label).clicked() {
+                            result = DestructiveResult::Yes;
+                        }
+                        if ui.button("取消 (Esc)").clicked() {
+                            result = DestructiveResult::No;
+                        }
+                    });
+                    result
+                },
+            );
+            match modal.inner {
+                DestructiveResult::Yes => {
+                    self.pending_destructive = None;
+                    match action {
+                        Destructive::ResetLearning => {
+                            let bak = source::application::backup_file(
+                                &source::application::data_dir().join("user_items.json"),
+                            );
+                            let n = source::application::reset_learning(&mut self.items);
+                            self.save_items();
+                            let bak_note = match &bak {
+                                Some(p) => format!("已备份到 {}", p.display()),
+                                None => "清单文件不存在，未写备份".to_string(),
+                            };
+                            self.toast = Some((
+                                format!("✓ 已重置学习排序（{n} 条有统计，置顶保留）"),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_OK,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                            eprintln!("高级页：重置学习排序 → {n} 条统计清零（{bak_note}）");
+                        }
+                        Destructive::RestoreDefaults => {
+                            let bak = source::application::backup_file(
+                                &source::application::data_dir().join("settings.json"),
+                            );
+                            source::application::restore_defaults(&mut self.prefs);
+                            source::application::save_settings(&self.prefs);
+                            // 立即生效：数据源全开 ⇒ 每一家都补一次初始化（文件源要重建索引）；
+                            // 主题走 sync_theme，随后无条件按新行密度重算窗口高度。
+                            for s in self.sources.iter_mut() {
+                                s.init();
+                            }
+                            self.sync_theme(ui.ctx());
+                            let h = default_window_height(&self.theme, self.prefs.row_density);
+                            self.resize_to_list(ui.ctx(), h, "恢复默认");
+                            let bak_note = match &bak {
+                                Some(p) => format!("已备份到 {}", p.display()),
+                                None => "settings.json 不存在，未写备份".to_string(),
+                            };
+                            self.toast = Some((
+                                "✓ 已恢复默认（热键 / 引擎 / 隐藏项 / 自定义命令保留）".to_string(),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_OK,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                            eprintln!("高级页：恢复默认 → 偏好已重置（{bak_note}）");
+                        }
+                    }
+                }
+                DestructiveResult::No => {
+                    eprintln!("高级页：破坏性动作按「取消」，未执行");
+                    self.pending_destructive = None;
+                    ui.ctx().request_repaint();
+                }
+                DestructiveResult::Keep => {}
             }
         }
 
@@ -6544,6 +6978,11 @@ impl eframe::App for LauncherApp {
                 // 不接住的话这一次 Esc 会顺路把查询清空、甚至把窗口收进托盘。
                 self.menu_open = false;
                 eprintln!("☰ 菜单：按 Esc 收起（窗口与查询都不动）");
+            } else if self.pending_destructive.is_some() {
+                eprintln!("高级页确认：按 Esc 取消，未执行");
+                self.pending_destructive = None;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
             } else if self.internal_confirm.is_some() {
                 eprintln!("内部确认：按 Esc 取消，未执行");
                 self.internal_confirm = None;
@@ -6879,6 +7318,56 @@ mod nav_tests {
             "有输入时数字本来就是查询文本"
         );
         assert!(!bare_digit_allowed("   ", true));
+    }
+
+    /// 2026-10-24 用户报障：空输入框按 Shift+2 想打 @，被裸数字那档当成 `2` 执行了。
+    /// 根因是 egui 的 `consume_key` 走 `matches_logically`，**多余的 Shift 会被忽略**
+    ///（egui-0.36.2 input_state/mod.rs:722）⇒ 裸数字分支必须先吃掉 SHIFT 层。
+    /// 这条同时钉两件事：① egui 确实有这个语义（将来升级变了，闸口是否还有必要就该重估）；
+    /// ② 「先吃 SHIFT 层、再判裸数字」的次序确实把 Shift+2 漏给输入框。
+    #[test]
+    fn shift_digit_is_left_for_text_instead_of_bare_digit() {
+        use egui::{Event, Modifiers};
+        fn key(key: egui::Key, modifiers: Modifiers) -> Event {
+            Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }
+        }
+        let run = |events: Vec<Event>| {
+            let ctx = egui::Context::default();
+            let mut seen: (Option<u8>, Option<u8>) = (None, None);
+            let mut out =
+                ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                    let shift_layer = pressed_digit(ui, Modifiers::SHIFT);
+                    let bare = if bare_digit_allowed("", false) {
+                        pressed_digit(ui, Modifiers::NONE)
+                    } else {
+                        None
+                    };
+                    seen = (shift_layer, bare);
+                });
+            // FullOutput 的纹理增量不落地就会在 drop 时 panic（epaint textures.rs:337），单测里清掉。
+            out.textures_delta.clear();
+            seen
+        };
+        assert_eq!(
+            run(vec![key(egui::Key::Num2, Modifiers::SHIFT)]),
+            (Some(2), None),
+            "Shift+2（@）必须被 SHIFT 层吃掉，裸数字档不许再取走"
+        );
+        assert_eq!(
+            run(vec![key(egui::Key::Num2, Modifiers::NONE)]),
+            (None, Some(2)),
+            "对照：裸 2 仍归裸数字档（原行为不变）"
+        );
+        assert!(
+            Modifiers::SHIFT.matches_logically(Modifiers::NONE),
+            "egui 语义：模式 NONE 忽略多余 Shift —— 这就是必须显式闸的原因"
+        );
     }
 
     #[test]

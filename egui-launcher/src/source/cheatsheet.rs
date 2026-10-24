@@ -161,6 +161,20 @@ pub const ENTRIES: &[CheatEntry] = &[
         source: None,
         settings_page: None,
     },
+    CheatEntry {
+        key: "@维护 磁盘",
+        title: "分类筛选",
+        summary: "`@分类 词` 只列这一类；多个分类取并集",
+        detail: "条目的「分类」标签在新增/编辑弹窗的「分类」一栏改，逗号/空格分隔，可多个。\n\
+                 敲 `@维护` 只列带这个标签的条目，后面还能接词（`@维护 磁盘` 在维护类里再筛）。\n\
+                 `@维护 @开发 磁盘` 是并集：两个分类的条目都进列表。\n\
+                 裸 `@` 给一行分类总览（各类名 + 条数），Enter / 数字键只给一句用法提示。\n\
+                 缺省分类范围设成「基本」时，无标签与标「基本」的条目恒显；显式 `@分类` 不受范围限制。",
+        tags: "@ 分类 标签 筛选 维护 基本 category tag",
+        group: Group::Syntax,
+        source: None,
+        settings_page: Some(1),
+    },
     // ---------- 文件模式（FR-SRC-14，六式） ----------
     CheatEntry {
         key: "D:\\proj\\",
@@ -427,9 +441,34 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: None,
     },
     CheatEntry {
+        key: "Ctrl+G",
+        title: "切换缺省分类范围",
+        summary: "全部 ⇄ 基本，列表立刻跟着变",
+        detail: "在「全部」（所有条目都进候选池）与「基本」（无标签 ∪ 标「基本」）两档之间切换，\n\
+                 与设置页「通用 → 缺省分类范围」是同一处配置，切完立即写盘并给一句 Toast。\n\
+                 显式 `@分类` 筛选不受这一档影响。",
+        tags: "key scope 分类 范围 全部 基本 切换",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(1),
+    },
+    CheatEntry {
+        key: "Ctrl+Del",
+        title: "隐藏选中项",
+        summary: "只对出厂条目；设置 → 高级 可恢复",
+        detail: "把选中的出厂条目写进 `hidden[]` 并从列表剔除；不删磁盘文件，也不删清单里的其它字段。\n\
+                 只在搜索框为空时生效——有字时 Ctrl+Del 是输入框的「删除后一个词」。\n\
+                 自定义条目不给隐藏：它们在设置页里没有名称可回显，也不需要「补回」这一层，直接用 Ctrl+Shift+D 删除。\n\
+                 恢复入口：设置 → 高级 →「隐藏的条目」。",
+        tags: "key 隐藏 hide hidden 出厂 条目",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(6),
+    },
+    CheatEntry {
         key: "Ctrl+,",
         title: "打开 / 返回设置页",
-        summary: "五页：通用 / 功能 / 热键 / 数据源 / 外观",
+        summary: "六页：通用 / 功能 / 热键 / 数据源 / 外观 / 高级",
         detail: "打开设置页；已开着时按它返回搜索页（与 Esc 的「设置页返回搜索」同一档）。",
         tags: "key 设置 settings preferences",
         group: Group::Keys,
@@ -625,8 +664,9 @@ mod tests {
             );
             if let Some(page) = e.settings_page {
                 // 批次 F1 加了第 5 页「外观」，上界跟着走（现量：SettingsTab::from_page 认 1..=5）。
+                // 【2026-10-24 批次 F7：加了第 6 页「高级」，上界改为 1..=6。】
                 assert!(
-                    (1..=5).contains(&page),
+                    (1..=6).contains(&page),
                     "「{}」指向不存在的设置页 {page}",
                     e.title
                 );

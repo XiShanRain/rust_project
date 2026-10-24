@@ -106,6 +106,8 @@ pub enum SourceRow {
     Cheat(cheatsheet::CheatHit),
     /// `? 词` 一条也没命中时的提示行：不可执行，只给一句 Toast。
     CheatHint(cheatsheet::CheatHint),
+    /// 裸 `@` 的分类提示行（批次 G1）：不可执行，点/按只给一句用法 Toast。
+    ScopeTags(application::ScopeTagHint),
 }
 
 impl SourceRow {

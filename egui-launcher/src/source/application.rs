@@ -105,6 +105,10 @@ pub struct LaunchItem {
     /// FR-SRC-19 学习排序：最近一次成功启动的 UNIX 毫秒；0=从未启动过。
     #[serde(default)]
     pub last_used_ms: i64,
+    /// 批次 G1 分类标签：`@分类` 前缀筛选与「缺省分类范围」共用；空＝恒显。
+    /// `#[serde(default)]` 让旧清单缺字段仍可解析（不写就是空标签，任何档都显示）。
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl LaunchItem {
@@ -389,6 +393,8 @@ pub struct AppSettings {
     /// 内置条目里被用户隐藏的那些（FR-SRC-17 的 `hidden[]`）：存派生 uid。
     /// 「隐藏」与「删除」的差别只有一条：隐藏的条目在下次「补回缺失的出厂命令」之后
     /// 仍会被剔除，而删掉的条目会回来（再由用户自己再删）。本批没有 UI 入口——手改这个数组。
+    /// 【2026-10-24 批次 F7：有了 UI 入口——主界面空查询下 Ctrl+Del 隐藏出厂条目，
+    /// 设置页「高级」页列出并恢复。上一句"没有 UI 入口"保留为当时的记录。】
     #[serde(default)]
     pub hidden: Vec<String>,
 
@@ -421,6 +427,12 @@ pub struct AppSettings {
     /// 不换这一档时主题里的这两个键不生效——明写在设置页文案里。
     #[serde(default)]
     pub row_density: RowDensity,
+
+    /// 缺省分类范围（批次 G1）。「全部」＝保持 G1 之前的行为（默认）；
+    /// 「基本」＝出厂白名单 + 用户无标签条目，维护类出厂条目只在 `@维护` 时出现。
+    /// 显式 `@分类` 临时并进来，不经过这一格。
+    #[serde(default)]
+    pub default_scope: Scope,
 }
 
 fn default_terminal_shell() -> String {
@@ -458,6 +470,7 @@ impl Default for AppSettings {
             theme: default_theme(),
             list_rows: ListRows::default(),
             row_density: RowDensity::default(),
+            default_scope: Scope::default(),
         }
     }
 }
@@ -835,6 +848,39 @@ impl RowDensity {
     }
 }
 
+/// 批次 G1：缺省分类范围（`default_scope`，设置页「通用」页二选一）。
+///
+/// 「全部」＝所有条目都进候选池（G1 之前的行为，默认）；
+/// 「基本」＝出厂白名单（[`FACTORY_TAG_BASIC`]）∪ 用户自己的无标签条目——维护类出厂条目
+/// 平时不占列表，显式敲 `@维护` 才临时并进来。显式 `@分类` 不经过这一格（见 [`item_in_scope`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// 默认：所有条目都进候选池。
+    #[default]
+    All,
+    /// 基本档：无标签 ∪ 标了「基本」的条目。
+    Basic,
+}
+
+impl Scope {
+    /// 落盘与设置页用的档位名（与 [`ListRows::as_str`] 同口径）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Basic => "basic",
+        }
+    }
+
+    /// 设置页单选用的显示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部",
+            Self::Basic => "基本",
+        }
+    }
+}
+
 /// 批次 A10：整张清单（应用 + 自定义命令）的模糊匹配源。
 ///
 /// 它只贡献普通结果，从不独占、也不出提示行——那些是其余几个源的事。
@@ -891,6 +937,16 @@ pub fn local_now_stamp() -> String {
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute
+    )
+}
+
+/// 备份文件名用的紧凑本地时间 `YYYYMMDD-HHMMSS`（批次 F7）。
+/// 与 [`local_now_stamp`] 同一个来源：不引日期库，也不拿 UTC 冒充本地时间。
+fn local_now_compact() -> String {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
     )
 }
 
@@ -1025,7 +1081,8 @@ pub fn save_settings(s: &AppSettings) {
 ///
 /// 2026-10-23：1 → 2。FR-SRC-17 的系统命令五组（自身 / 电源与会话 / Windows 工具 /
 /// ms-settings 页 / 音量与媒体）随这一轮补进老清单。
-pub const SEED_ROUND: u32 = 2;
+/// 2026-10-24：2 → 3。批次 G1 的分类标签随这一轮回填到老条目（[`apply_factory_tags`]）。
+pub const SEED_ROUND: u32 = 3;
 
 /// `%WINDIR%\System32\<exe>`：出厂条目的图标源（启动仍用简洁命令名）。
 pub(crate) fn system32(exe: &str) -> String {
@@ -1095,6 +1152,45 @@ pub(crate) fn url_seed(name: &str, path: &str, explicit: &str) -> LaunchItem {
     }
 }
 
+/// 批次 G1 出厂分类的白名单：「基本」档保留的名字，其余出厂条目全部归「维护」。
+///
+/// 白名单按**名称**挑（103 条出厂种子名称互不重复，`builtin_seeds_tags_exact` 单测锁）。
+/// 出厂条目不挂标签会掉进「恒显」池，「缺省分类范围 = 基本」就筛不掉它们；
+/// 用户自己加的条目（批量导入的 .lnk 等）不带标签 ⇒ 任何档都显示。
+/// 名单只是数据：增删一条不用动任何逻辑，改完对照 [`builtin_seeds`] 更新即可。
+pub const FACTORY_TAG_BASIC: &[&str] = &[
+    // 底座 7：Delphi 版一直就在的那组里最常用的
+    "计算器",
+    "记事本",
+    "命令提示符",
+    "任务管理器",
+    "控制面板",
+    "此电脑",
+    "Windows 设置",
+    // 自身 2
+    "启动器设置",
+    "退出启动器",
+    // 电源与会话 5
+    "锁定屏幕",
+    "睡眠",
+    "关机",
+    "重启",
+    "关闭显示器",
+    // 带参项 1
+    "资源管理器",
+    // 设置页 5
+    "Win·显示",
+    "Win·声音",
+    "Win·蓝牙",
+    "Win·WLAN",
+    "Win·默认应用",
+    // 音量与媒体 4
+    "静音",
+    "增加音量",
+    "降低音量",
+    "播放/暂停",
+];
+
 /// 出厂内置命令集（§4.2.1，对齐 AHK 版 `AppSettings._DefaultCommands()`）。
 /// 只在清单文件首次新建时整批写入；此后它们就是普通条目——可改名、可改路径、可删除。
 ///
@@ -1160,7 +1256,166 @@ pub fn builtin_seeds() -> Vec<LaunchItem> {
     // 剪贴板文本转换组按用户裁定整批暂缓——它要读写剪贴板，与"一条会启动程序的清单条目"
     // 语义不同，留给单独一批（发布说明第三十一节登记待办）。
     seeds.extend(crate::source::system::system_seeds());
+    // 批次 G1：出厂条目全部挂分类——白名单「基本」，其余「维护」。
+    let basic: std::collections::HashSet<&str> = FACTORY_TAG_BASIC.iter().copied().collect();
+    for s in &mut seeds {
+        s.tags = vec![if basic.contains(s.name.as_str()) {
+            "基本"
+        } else {
+            "维护"
+        }
+        .to_string()];
+    }
     seeds
+}
+
+/// 批次 G1 一次性回填：老清单里按 uid 认得出厂条目的，把出厂标签补上（**标签为空才补**）。
+///
+/// 只在 seed_round 进位那一轮调用（main.rs 与 [`merge_missing_seeds`] 同一个 if 里）——
+/// 之后用户清掉标签不会被下一次启动补回来。用户条目（批量导入的 .lnk 等）uid 对不上
+/// 任何出厂种子 ⇒ 不受影响、不带标签、任何档都显示。返回补了几条，幂等（第二轮恒 0）。
+pub fn apply_factory_tags(items: &mut [LaunchItem]) -> usize {
+    let tags_by_uid: std::collections::HashMap<String, Vec<String>> = builtin_seeds()
+        .into_iter()
+        .filter(|s| !s.tags.is_empty())
+        .map(|s| (s.uid(), s.tags))
+        .collect();
+    let mut changed = 0;
+    for it in items.iter_mut() {
+        if it.tags.is_empty() {
+            if let Some(tags) = tags_by_uid.get(&it.uid()) {
+                it.tags = tags.clone();
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+/// 批次 G1：清单里所有分类名 → 条数（按名排序）。不带标签的条目不出现。
+/// 供 `@` 空查询的提示行用；将来条目管理界面按组陈列也用它。
+pub fn all_tags(items: &[LaunchItem]) -> std::collections::BTreeMap<String, usize> {
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for it in items {
+        for t in &it.tags {
+            let t = t.trim();
+            if !t.is_empty() {
+                *counts.entry(t.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// 批次 G1：把弹窗「分类」框的自由文本拆成标签表。逗号（含中文逗号）或空白分隔，
+/// 去空白、去空项、保序去重。`开发, 维护 工具` ⇒ [开发, 维护, 工具]。
+pub fn parse_tags_text(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in s.split(|c: char| c == ',' || c == '，' || c.is_whitespace()) {
+        let t = part.trim();
+        if !t.is_empty() && !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// 批次 G1：`@分类` 前缀的解析结果。`query` 是剥掉标签后剩下的真实查询串
+/// （没有 `@` 前缀时就是原串本身），`tags` 是显式点名的分类（去重、保序）。
+pub struct ScopeQuery<'a> {
+    pub query: &'a str,
+    pub tags: Vec<String>,
+}
+
+/// 批次 G1：解析 `@分类` 前缀（`@` 在 char 0 才激活，与 `?`/`>` 的判定同格）。
+///
+/// - `@维护 磁盘` ⇒ tags=[维护]、query=`磁盘`；
+/// - `@维护 @开发 磁盘` ⇒ 两个分类**并集**，query=`磁盘`；
+/// - 裸 `@` ⇒ tags 空、query 空（调用方据此放分类提示行）；
+/// - 只吃**开头的连续 `@词`**：一旦遇到普通词，后面的 `@词` 全是查询文本
+///   （`邮件 我@例子.com` 这类输入不受影响）。
+///
+/// 分类名是精确比对（含大小写）：名字来自同一条添加/编辑通道，所见即所敲。
+/// `@维护` 只写字根、不加空格与全写 `@ 维护` 等价。
+pub fn parse_scope_query(q: &str) -> ScopeQuery<'_> {
+    if !q.starts_with('@') {
+        return ScopeQuery {
+            query: q,
+            tags: Vec::new(),
+        };
+    }
+    let bytes = q.as_bytes();
+    let mut i = 0usize;
+    let mut tags: Vec<String> = Vec::new();
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let word = &q[start..i];
+        match word.strip_prefix('@') {
+            Some(name) if !name.is_empty() => {
+                if !tags.iter().any(|t| t == name) {
+                    tags.push(name.to_string());
+                }
+            }
+            // 单独的 `@`（名字为空）照吃不记：`@ 磁盘` ≡ `磁盘`，`@` 本身 ⇒ 空查询 + 提示行。
+            Some(_) => {}
+            _ => {
+                i = start;
+                break;
+            }
+        }
+    }
+    ScopeQuery {
+        query: &q[i..],
+        tags,
+    }
+}
+
+/// 批次 G1：这条目落不落进本轮候选池（只筛清单行，头段行不受影响）。
+///
+/// - 显式 `@分类`：**严格成员**——条目要带着点名分类里的至少一个（并集）；
+///   无标签的条目不入选（它不属于任何分类）；
+/// - 没有显式分类：按缺省范围——`All` 全放行；`Basic` 放行无标签 ∪ 「基本」。
+pub fn item_in_scope(it: &LaunchItem, explicit: &[String], scope: Scope) -> bool {
+    if !explicit.is_empty() {
+        return it.tags.iter().any(|t| explicit.iter().any(|e| e == t));
+    }
+    match scope {
+        Scope::All => true,
+        Scope::Basic => it.tags.is_empty() || it.tags.iter().any(|t| t == "基本"),
+    }
+}
+
+/// 裸 `@` 提示行的载荷（批次 G1）：列出清单里的全部分类与条数，教人怎么用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeTagHint {
+    /// 「分类：基本 24 · 维护 79」。
+    pub title: String,
+    /// 用法一句话（副标题与点击 Toast 共用）。
+    pub subtitle: String,
+}
+
+impl ScopeTagHint {
+    pub fn from_counts(counts: &std::collections::BTreeMap<String, usize>) -> Self {
+        let title = if counts.is_empty() {
+            "还没有分类".to_string()
+        } else {
+            let list: Vec<String> = counts.iter().map(|(k, v)| format!("{k} {v}")).collect();
+            format!("分类：{}", list.join(" · "))
+        };
+        Self {
+            title,
+            subtitle: "敲 @分类 只看这一类（@维护 @开发 并集），@ 是分类总览".to_string(),
+        }
+    }
 }
 
 /// 把清单里缺的出厂条目**追加到末尾**，返回补了几条。
@@ -1208,6 +1463,140 @@ pub fn drop_hidden(items: &mut Vec<LaunchItem>, hidden: &[String]) -> usize {
     let before = items.len();
     items.retain(|i| !set.contains(i.uid().as_str()));
     before - items.len()
+}
+
+/// 批次 F7（FR-CFG-07）：清空学习排序数据——只动 `use_count` / `last_used_ms`，
+/// 置顶（`pinned`）与其余字段原样保留。返回统计真的变过的条目数。
+///
+/// 已学到的别名**清不掉**：`learn_alias` 是往 `keyword` 里追加，与用户手填的别名
+/// 事后不可区分（FR-ACT-10）。这是需求书 FR-CFG-07 的已知偏差，不是漏做。
+pub fn reset_learning(items: &mut [LaunchItem]) -> usize {
+    let mut touched = 0;
+    for it in items.iter_mut() {
+        if it.use_count != 0 || it.last_used_ms != 0 {
+            touched += 1;
+        }
+        it.use_count = 0;
+        it.last_used_ms = 0;
+    }
+    touched
+}
+
+/// 批次 F7（FR-CFG-08）：恢复默认**只重置偏好里的口径类字段**，用户资产一概不动。
+///
+/// 保留：`toggle_hotkey` / `typeback_hotkey`（热键）、`web_engines`（自定义引擎）、
+/// `hidden`（被隐藏的条目）、`seed_round`（已补种到第几轮——重置它会让下一轮启动
+/// 把用户删掉的出厂条目整批复活）。`user_items.json` 里的自定义命令、置顶、学习统计、
+/// 分类标签也不经过这里。
+pub fn restore_defaults(s: &mut AppSettings) {
+    s.space_to_run = SpaceRun::default();
+    s.tab_mode = TabMode::default();
+    s.learn_rank = LearnRank::default();
+    s.sources_off.clear();
+    s.confirm_actions = true;
+    s.terminal_shell = default_terminal_shell();
+    s.theme = default_theme();
+    s.list_rows = ListRows::default();
+    s.row_density = RowDensity::default();
+    s.default_scope = Scope::default();
+}
+
+/// 破坏性操作前的编号备份（FR-CFG-08「Restore Defaults 前写 `.bak`」）。
+/// 名字形如 `settings.json.bak-20261024-153012`；同一秒内再备份就追加 `-1`、`-2`，
+/// **绝不覆盖已有备份**。源文件不在 ⇒ 返回 `None`（不凭空造一份空备份）。
+pub fn backup_file(path: &Path) -> Option<PathBuf> {
+    let bytes = std::fs::read(path).ok()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let stamp = local_now_compact();
+    for n in 0..100 {
+        let candidate = if n == 0 {
+            format!("{name}.bak-{stamp}")
+        } else {
+            format!("{name}.bak-{stamp}-{n}")
+        };
+        let target = path.with_file_name(candidate);
+        if target.exists() {
+            continue;
+        }
+        write_atomic(&target, &bytes, "备份");
+        if target.exists() {
+            return Some(target);
+        }
+    }
+    eprintln!("source: 备份名额用尽，未写成 {path:?}");
+    None
+}
+
+/// 这个 uid 是否属于出厂命令集。隐藏只对出厂条目开放：它们的 uid 能反查回名称，
+/// 也能在「高级」页里原样恢复；用户条目与扫描项没有名称可回显，走删除。
+pub fn is_factory_uid(uid: &str) -> bool {
+    builtin_seeds().iter().any(|s| s.uid() == uid)
+}
+
+/// 设置页「高级 → 隐藏的条目」一行。`name` 为 `None` ＝ 对不上任何出厂种子
+/// （目前唯一来源是启动时自动去重写进去的 Store 版「设置」），只显示原文、不给恢复按钮。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenRow {
+    pub uid: String,
+    pub name: Option<String>,
+}
+
+/// 把 `hidden[]` 里的 uid 逐条翻译成可展示的行（顺序照配置原样）。
+pub fn hidden_rows(hidden: &[String]) -> Vec<HiddenRow> {
+    let by_uid: std::collections::HashMap<String, String> = builtin_seeds()
+        .into_iter()
+        .map(|s| (s.uid(), s.name))
+        .collect();
+    hidden
+        .iter()
+        .map(|u| u.trim())
+        .filter(|u| !u.is_empty())
+        .map(|u| HiddenRow {
+            uid: u.to_string(),
+            name: by_uid.get(u).cloned(),
+        })
+        .collect()
+}
+
+/// 逐条恢复：从 `hidden[]` 撤掉这个 uid，并把对应的出厂条目补回清单末尾。
+/// 只补这一条，不碰其它缺项（与设置页「补回缺失的出厂命令」的整批语义区分开）。
+/// 对不上种子的孤儿 uid 不在这里动，返回 `false`。
+pub fn restore_hidden(items: &mut Vec<LaunchItem>, hidden: &mut Vec<String>, uid: &str) -> bool {
+    let Some(pos) = hidden.iter().position(|h| h == uid) else {
+        return false;
+    };
+    let Some(seed) = builtin_seeds().into_iter().find(|s| s.uid() == uid) else {
+        return false;
+    };
+    hidden.remove(pos);
+    if !items.iter().any(|i| i.uid() == uid) {
+        items.push(seed);
+    }
+    true
+}
+
+/// 全部恢复：能对上出厂种子的一律撤掉并补回；孤儿 uid 原样留在 `hidden[]`。
+/// 返回恢复了多少条。
+pub fn restore_all_hidden(items: &mut Vec<LaunchItem>, hidden: &mut Vec<String>) -> usize {
+    let seeds: std::collections::HashMap<String, LaunchItem> = builtin_seeds()
+        .into_iter()
+        .map(|s| (s.uid(), s))
+        .collect();
+    let mut restored = 0;
+    let mut keep: Vec<String> = Vec::with_capacity(hidden.len());
+    for uid in hidden.drain(..) {
+        match seeds.get(&uid) {
+            Some(seed) => {
+                if !items.iter().any(|i| i.uid() == uid) {
+                    items.push(seed.clone());
+                }
+                restored += 1;
+            }
+            None => keep.push(uid),
+        }
+    }
+    *hidden = keep;
+    restored
 }
 
 /// 判断输入是否像 URL/协议（FR-SRC-23）：含 `://`、以 `www.` 起、或是 ≥2 字母的方案名后跟 `:`。
@@ -2198,6 +2587,235 @@ mod dedup_tests {
         assert_eq!(merge_missing_seeds(&mut items), 0, "补种必须幂等");
     }
 
+    /// 批次 G1：出厂 103 条必须**条条挂标签**（不挂就掉进「恒显」池，基本档筛不掉），
+    /// 标签只有「基本 / 维护」两值；白名单按名称挑 ⇒ 名称必须互不重复，
+    /// 且白名单里每个名字都得真的挂在对应条目上（漏字=该条目静默掉进维护档）。
+    #[test]
+    fn builtin_seeds_tags_cover_every_factory_item() {
+        let seeds = builtin_seeds();
+        let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for s in &seeds {
+            assert!(
+                names.insert(s.name.as_str()),
+                "出厂名称重复：{}（白名单按名挑，重名会整条串位）",
+                s.name
+            );
+            assert_eq!(
+                s.tags.len(),
+                1,
+                "出厂条目「{}」该恰好一个标签，实得 {:?}",
+                s.name,
+                s.tags
+            );
+            assert!(
+                s.tags[0] == "基本" || s.tags[0] == "维护",
+                "出厂条目「{}」标签必须是 基本/维护，实得 {:?}",
+                s.name,
+                s.tags
+            );
+        }
+        let basic: std::collections::HashSet<&str> = FACTORY_TAG_BASIC.iter().copied().collect();
+        assert_eq!(
+            basic.len(),
+            FACTORY_TAG_BASIC.len(),
+            "白名单本身有重名"
+        );
+        let tagged_basic: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.tags[0] == "基本")
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            tagged_basic.len(),
+            FACTORY_TAG_BASIC.len(),
+            "「基本」实际 {} 条 ≠ 白名单 {} 条：{:?}",
+            tagged_basic.len(),
+            FACTORY_TAG_BASIC.len(),
+            tagged_basic
+        );
+        for name in FACTORY_TAG_BASIC {
+            assert!(
+                tagged_basic.contains(name),
+                "白名单里的「{name}」没挂上基本标签（可能名字改了）"
+            );
+        }
+    }
+
+    /// 批次 G1 回填三态：标签为空的出厂条目补上；已填（含用户改过）的不动；
+    /// 对不上出厂 uid 的用户条目不动。幂等：补完再跑恒为 0。
+    #[test]
+    fn apply_factory_tags_fills_only_empty_tags_and_is_idempotent() {
+        let mut items = builtin_seeds();
+        for it in items.iter_mut() {
+            it.tags.clear();
+        }
+        let total = items.len();
+        assert_eq!(apply_factory_tags(&mut items), total, "空标签的出厂条目要整批补回");
+        assert!(items.iter().all(|i| !i.tags.is_empty()), "补完不许再有空标签");
+
+        // 用户改过的标签不受影响。
+        let mut custom = builtin_seeds();
+        for it in custom.iter_mut() {
+            it.tags = vec!["开发".to_string()];
+        }
+        assert_eq!(apply_factory_tags(&mut custom), 0, "已填标签的一条都不许动");
+        assert!(custom.iter().all(|i| i.tags == ["开发"]));
+
+        // 用户条目（uid 对不上出厂种子）不补标签 ⇒ 恒显。
+        let user = LaunchItem {
+            name: "我的脚本".into(),
+            path: r"D:\tools\go.bat".into(),
+            kind: ItemKind::Command,
+            ..Default::default()
+        };
+        let mut mixed = vec![user];
+        mixed.extend(builtin_seeds().into_iter().map(|mut s| {
+            s.tags.clear();
+            s
+        }));
+        let changed = apply_factory_tags(&mut mixed);
+        assert_eq!(changed, total, "只有出厂条目被补，用户条目不算");
+        assert!(mixed[0].tags.is_empty(), "用户条目必须保持无标签");
+        assert_eq!(apply_factory_tags(&mut mixed), 0, "回填必须幂等");
+    }
+
+    /// 批次 G1 分类计数：只数带标签的条目，按名排序；空标签/空白串不进表。
+    #[test]
+    fn all_tags_counts_tagged_items_only() {
+        let mk = |tags: &[&str]| LaunchItem {
+            name: "x".into(),
+            path: "x".into(),
+            kind: ItemKind::Command,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        };
+        let items = vec![mk(&["维护"]), mk(&["基本", "维护"]), mk(&["基本"]), mk(&[])];
+        let counts = all_tags(&items);
+        assert_eq!(counts.len(), 2, "无标签条目不进表：{counts:?}");
+        assert_eq!(counts.get("基本"), Some(&2));
+        assert_eq!(counts.get("维护"), Some(&2));
+        let keys: Vec<&String> = counts.keys().collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "输出按名排序");
+    }
+
+    /// 批次 G1 旧清单兼容：`tags` 是 `#[serde(default)]` 新增字段，
+    /// G1 之前落盘的 user_items.json（没有 tags 键）必须照常解析成空标签。
+    #[test]
+    fn legacy_item_json_without_tags_parses_empty() {
+        let json = r#"{
+            "name": "记事本",
+            "path": "notepad.exe",
+            "arguments": "",
+            "working_dir": null,
+            "source_path": "notepad.exe",
+            "kind": "command",
+            "keyword": "jsb np"
+        }"#;
+        let it: LaunchItem = serde_json::from_str(json).expect("旧形状必须解析成功");
+        assert!(it.tags.is_empty(), "旧清单无 tags 字段 ⇒ 空标签");
+        assert_eq!(it.name, "记事本");
+    }
+
+    /// 批次 G1 前缀解析的三态与边界：单分类、多分类并集、裸 `@`、去重、
+    /// 「@ 后接普通词」不算分类、标签词之后还有 `@词` 只是查询文本。
+    #[test]
+    fn scope_query_parses_tags_union_and_bare_at() {
+        let got = parse_scope_query("@维护 磁盘");
+        assert_eq!(got.tags, ["维护"], "单分类");
+        assert_eq!(got.query, "磁盘", "余串是查询");
+
+        let got = parse_scope_query("@维护 @开发 磁盘");
+        assert_eq!(got.tags, ["维护", "开发"], "多分类保序");
+        assert_eq!(got.query, "磁盘");
+
+        let got = parse_scope_query("@维护 @维护 磁盘");
+        assert_eq!(got.tags, ["维护"], "同分类去重");
+
+        let got = parse_scope_query("@");
+        assert!(got.tags.is_empty() && got.query.is_empty(), "裸 @ = 空查询空标签");
+
+        let got = parse_scope_query("@ 磁盘");
+        assert!(got.tags.is_empty(), "空名 @ 不算分类");
+        assert_eq!(got.query, "磁盘", "空名 @ 照吃不记");
+
+        let got = parse_scope_query("磁盘");
+        assert!(got.tags.is_empty() && got.query == "磁盘", "无前缀原样通过");
+
+        let got = parse_scope_query("邮件 我@例子.com");
+        assert!(
+            got.tags.is_empty() && got.query == "邮件 我@例子.com",
+            "不以 @ 开头整串是查询"
+        );
+
+        let got = parse_scope_query("@维护 磁盘 @开发");
+        assert_eq!(got.tags, ["维护"], "只吃开头的连续 @词");
+        assert_eq!(got.query, "磁盘 @开发", "普通词之后的 @词是查询文本");
+
+        let got = parse_scope_query("@维护@开发 磁盘");
+        assert_eq!(got.tags, ["维护@开发"], "无空白的 @维护@开发 是一个分类名");
+    }
+
+    /// 批次 G1 候选池判据：显式分类 = 严格成员并集（无标签不入选）；
+    /// 无显式分类时 All 全放行、Basic = 无标签 ∪ 基本。
+    #[test]
+    fn scope_filter_is_strict_union_or_basic_pool() {
+        let mk = |tags: &[&str]| LaunchItem {
+            name: "x".into(),
+            path: "x".into(),
+            kind: ItemKind::Command,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        };
+        let basic = mk(&["基本"]);
+        let maint = mk(&["维护"]);
+        let both = mk(&["基本", "维护"]);
+        let untagged = mk(&[]);
+
+        let on = |explicit: &[&str]| {
+            let e: Vec<String> = explicit.iter().map(|t| t.to_string()).collect();
+            move |it: &LaunchItem| item_in_scope(it, &e, Scope::All)
+        };
+        assert!(on(&["维护"])(&maint), "显式 @维护 命中维护条目");
+        assert!(on(&["维护"])(&both), "多标签条目任一命中即入选");
+        assert!(!on(&["维护"])(&basic), "基本条目不冒充维护");
+        assert!(!on(&["维护"])(&untagged), "无标签不属于任何分类");
+        assert!(on(&["维护", "开发"])(&basic) == false, "并集不含基本");
+        assert!(on(&["维护", "基本"])(&maint), "并集左支");
+        assert!(on(&["维护", "基本"])(&basic), "并集右支");
+
+        let in_scope = |it: &LaunchItem, scope: Scope| item_in_scope(it, &[], scope);
+        assert!(in_scope(&maint, Scope::All) && in_scope(&untagged, Scope::All));
+        assert!(in_scope(&basic, Scope::Basic), "基本档放行基本条目");
+        assert!(in_scope(&untagged, Scope::Basic), "基本档放行无标签条目");
+        assert!(!in_scope(&maint, Scope::Basic), "基本档拦下维护条目");
+    }
+
+    /// 批次 G1 提示行载荷：空清单给「还没有分类」，非空按名排序拼「名 数」。
+    #[test]
+    fn scope_tag_hint_lists_counts_sorted() {
+        let empty: std::collections::BTreeMap<String, usize> = Default::default();
+        assert_eq!(ScopeTagHint::from_counts(&empty).title, "还没有分类");
+
+        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+        counts.insert("维护".into(), 79);
+        counts.insert("基本".into(), 24);
+        let hint = ScopeTagHint::from_counts(&counts);
+        assert_eq!(hint.title, "分类：基本 24 · 维护 79", "按名排序");
+        assert!(!hint.subtitle.is_empty(), "副标题要教用法");
+    }
+
+    /// 批次 G1 落盘名：`Scope` 与 `ListRows` 同口径的 snake_case，序列化再读回不丢档。
+    #[test]
+    fn scope_serde_round_trips_both_variants() {
+        for s in [Scope::All, Scope::Basic] {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: Scope = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, s, "{} 往返后变档", s.as_str());
+            assert_eq!(json, format!("\"{}\"", s.as_str()));
+        }
+        assert!(serde_json::from_str::<Scope>("\"nope\"").is_err(), "陌生名要报错");
+    }
+
     /// FR-SRC-17 `hidden[]`：按 uid 剔除，别的条目一条不碰；空表/空白项不误伤。
     #[test]
     fn hidden_uids_are_dropped_and_nothing_else_is() {
@@ -2229,6 +2847,127 @@ mod dedup_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "记事本");
         assert_eq!(drop_hidden(&mut items, &[]), 0);
+    }
+
+    /// 批次 F7（FR-CFG-07）：只清统计，置顶与别的字段原样；返回真变过的条数。
+    #[test]
+    fn reset_learning_clears_counts_and_keeps_pinned() {
+        let mut items = vec![
+            LaunchItem {
+                name: "A".into(),
+                path: "a.exe".into(),
+                pinned: true,
+                use_count: 9,
+                last_used_ms: 123,
+                keyword: "kuai".into(),
+                ..Default::default()
+            },
+            LaunchItem {
+                name: "B".into(),
+                path: "b.exe".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(reset_learning(&mut items), 1, "只有第一条真有统计");
+        assert_eq!((items[0].use_count, items[0].last_used_ms), (0, 0));
+        assert!(items[0].pinned, "置顶不受重置学习影响");
+        assert_eq!(items[0].keyword, "kuai", "已学别名清不掉（FR-ACT-10 偏差）");
+        assert_eq!(reset_learning(&mut items), 0, "再清一次没有变动");
+    }
+
+    /// 批次 F7（FR-CFG-08）：恢复默认重置口径类字段，保留用户资产。
+    #[test]
+    fn restore_defaults_resets_policy_and_keeps_user_assets() {
+        let mut s = AppSettings::default();
+        let hot = s.toggle_hotkey;
+        let typeback = s.typeback_hotkey;
+        let engines = s.web_engines.len();
+        s.space_to_run = SpaceRun::Always;
+        s.tab_mode = TabMode::Navigate;
+        s.learn_rank = LearnRank::Decay;
+        s.sources_off = vec!["calc".into()];
+        s.confirm_actions = false;
+        s.terminal_shell = "pwsh".into();
+        s.theme = "Modern".into();
+        s.list_rows = ListRows::Ten;
+        s.row_density = RowDensity::Dense;
+        s.default_scope = Scope::Basic;
+        s.hidden = vec!["custom:app|c:\\x.exe|".into()];
+        s.seed_round = 99;
+
+        restore_defaults(&mut s);
+
+        assert_eq!(s.space_to_run, SpaceRun::default());
+        assert_eq!(s.tab_mode, TabMode::default());
+        assert_eq!(s.learn_rank, LearnRank::default());
+        assert!(s.sources_off.is_empty(), "数据源恢复全开");
+        assert!(s.confirm_actions, "危险操作确认恢复默认开");
+        assert_eq!(s.terminal_shell, default_terminal_shell());
+        assert_eq!(s.theme, default_theme());
+        assert_eq!(s.list_rows, ListRows::default());
+        assert_eq!(s.row_density, RowDensity::default());
+        assert_eq!(s.default_scope, Scope::default());
+        assert_eq!(s.toggle_hotkey, hot, "热键保留");
+        assert_eq!(s.typeback_hotkey, typeback, "补字符热键保留");
+        assert_eq!(s.web_engines.len(), engines, "网页引擎保留");
+        assert_eq!(s.hidden.len(), 1, "隐藏项保留（否则删掉的条目会复活）");
+        assert_eq!(s.seed_round, 99, "补种轮次保留");
+    }
+
+    /// 批次 F7（FR-CFG-08）：备份名带编号，同一秒内第二份也不覆盖；源文件不在就不造。
+    #[test]
+    fn backup_file_is_numbered_and_never_overwrites() {
+        let dir = temp_log_dir("backup");
+        let src = dir.join("settings.json");
+        std::fs::write(&src, b"{\"theme\":\"Modern\"}").unwrap();
+        let a = backup_file(&src).expect("第一份备份");
+        let b = backup_file(&src).expect("第二份备份");
+        assert_ne!(a, b, "同一秒内第二份要换编号，不能覆盖");
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        assert!(
+            backup_file(&dir.join("missing.json")).is_none(),
+            "源文件不在就不造空备份"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 批次 F7（D6）：隐藏列表能翻译出出厂名称，孤儿 uid 只显示原文。
+    #[test]
+    fn hidden_rows_resolve_factory_names_and_keep_orphans() {
+        let seed = builtin_seeds().into_iter().next().unwrap();
+        let orphan = "custom:app|z:\\none|".to_string();
+        let rows = hidden_rows(&[seed.uid(), orphan.clone(), "   ".to_string()]);
+        assert_eq!(rows.len(), 2, "空白项不占一行");
+        assert_eq!(rows[0].name.as_deref(), Some(seed.name.as_str()));
+        assert_eq!(rows[1].name, None);
+        assert!(is_factory_uid(&seed.uid()));
+        assert!(!is_factory_uid(&orphan));
+    }
+
+    /// 批次 F7（D6）：逐条恢复只补点名那一条；孤儿留在 `hidden[]` 里；全部恢复跳过孤儿。
+    #[test]
+    fn restoring_hidden_puts_only_that_seed_back() {
+        let seeds = builtin_seeds();
+        let (seed, other) = (seeds[0].clone(), seeds[1].clone());
+        let orphan = "custom:app|z:\\gone|".to_string();
+        let mut items: Vec<LaunchItem> = Vec::new();
+        let mut hidden = vec![seed.uid(), other.uid(), orphan.clone()];
+
+        assert!(restore_hidden(&mut items, &mut hidden, &seed.uid()));
+        assert_eq!(items.len(), 1, "只补点名的这一条");
+        assert_eq!(items[0].uid(), seed.uid());
+        assert!(!hidden.contains(&seed.uid()));
+        assert!(hidden.contains(&other.uid()), "别的隐藏项不动");
+
+        assert!(
+            !restore_hidden(&mut items, &mut hidden, &orphan),
+            "孤儿 uid 不给恢复"
+        );
+        assert!(hidden.contains(&orphan));
+
+        assert_eq!(restore_all_hidden(&mut items, &mut hidden), 1);
+        assert_eq!(items.len(), 2);
+        assert_eq!(hidden, vec![orphan], "孤儿原样留在表里");
     }
 
     /// 出厂种子必须真的包含 A2 的五组（自测一遍，防止 `system_seeds()` 没接上）。
