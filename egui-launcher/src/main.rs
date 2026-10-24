@@ -67,9 +67,10 @@ const HOTKEY_TYPEBACK: i32 = 2;
 mod cli;
 mod matching;
 mod source;
+mod theme;
 use source::application::{
     default_keyword, dedup_items, is_url, learn_alias, make_item_from_input, Corrupted, ItemKind,
-    LaunchItem, LearnRank, SpaceRun, TabMode,
+    LaunchItem, LearnRank, ListRows, RowDensity, SpaceRun, TabMode,
 };
 // FR-WIN-02（批次 Q）：热键的位值与 VK 码用 application 侧的那套常量，判据与展示名才能
 // 在纯函数里单测；调 RegisterHotKey 时再包成 HOT_KEY_MODIFIERS。
@@ -317,7 +318,48 @@ enum TrayEvent {
     Exit,
 }
 
-/// 设置页分类（对标 AHK 版设置窗口的左侧分类栏，先立当下有真实选项的四类）。
+/// 批次 F6：顶栏 ☰ 主菜单里的六个动作。
+///
+/// 为什么是一个"返回枚举"而不是在 Popup 的闭包里直接改 `LauncherApp`：
+/// `egui::Popup::open_bool(&mut self.menu_open)` 把 `self` 可变借到了整个 `show()` 期间，
+/// 闭包里再写 `self.dialog = …` 就是二次可变借用（编译不过）。所以内容闭包只读 `ui`、
+/// 返回本枚举，动作在 `show()` 返回、借用结束之后再落。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    None,
+    NewItem,
+    BatchImport,
+    Settings,
+    Cheatsheet,
+    OpenLog,
+    Exit,
+}
+
+/// ☰ 菜单的内容（批次 F6）。文案里的快捷键与 `LOCAL_TAKEN`、`ui()` 里的 `consume_key` 同源，
+/// 改键要三处一起改——所以这里刻意只写"键名"，不复述语义。
+fn main_menu_content(ui: &mut egui::Ui) -> MenuAction {
+    let item = |ui: &mut egui::Ui, text: &str| ui.button(text).clicked();
+    if item(ui, "＋  新建快捷项        Ctrl+Shift+N") {
+        MenuAction::NewItem
+    } else if item(ui, "⟳  批量导入全部    Ctrl+I") {
+        MenuAction::BatchImport
+    } else if item(ui, "⚙  启动器设置      Ctrl+,") {
+        MenuAction::Settings
+    } else if item(ui, "❓  速查表          输入 ? 后点行") {
+        MenuAction::Cheatsheet
+    } else if item(ui, "📄  打开日志") {
+        MenuAction::OpenLog
+    } else {
+        ui.separator();
+        if item(ui, "✕  退出") {
+            MenuAction::Exit
+        } else {
+            MenuAction::None
+        }
+    }
+}
+
+/// 设置页分类（对标 AHK 版设置窗口的左侧分类栏，先立当下有真实选项的分类）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
@@ -325,16 +367,20 @@ enum SettingsTab {
     Hotkeys,
     /// 批次 A10：每个数据源一行开关。这一页的条目由注册表渲染，不在这里硬编。
     Sources,
+    /// 批次 F1（FR-UIX-01）：主题选择 + 主题目录入口。第 5 页。
+    Appearance,
 }
 
 impl SettingsTab {
-    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源）；越界返回 None，由调用方落回通用。
+    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=外观）；
+    /// 越界返回 None，由调用方落回通用。
     fn from_page(page: u32) -> Option<Self> {
         match page {
             1 => Some(Self::General),
             2 => Some(Self::Features),
             3 => Some(Self::Hotkeys),
             4 => Some(Self::Sources),
+            5 => Some(Self::Appearance),
             _ => None,
         }
     }
@@ -559,11 +605,25 @@ struct LauncherApp {
     internal_confirm: Option<InternalConfirm>, // 批次 A2：关机/重启/注销/清空回收站的执行确认
     about_open: bool,             // 批次 A2：「关于本程序」弹窗（Some 的等价物，用 bool 更直白）
     help_entry: Option<source::cheatsheet::CheatHit>, // 批次 A8：速查表条目的帮助页（Some=打开）
+    /// 批次 F6：顶栏 ☰ 主菜单是否开着（2026-10-24 用户点名「换成一个三条杠的菜单，点击显示
+    /// 新建按钮和其他设置按钮」）。用裸 bool 而不是 egui 的 memory：快捷键 Ctrl+M 也要能开它，
+    /// `egui::Popup::open_bool` 正好吃这一个所有权，关闭（点击/Esc）由 Popup 写回 `false`。
+    menu_open: bool,
     win_drag: Option<DragAnchor>,    // 左键拖空白移动窗口的进行中锚点（None=没在拖）
     dialog_enter_armed: bool,     // 弹窗当帧吞掉 Enter，防"打开框的那次回车"当帧又触发对话框的确定
     settings_open: bool,          // 设置页（整页模式，替代搜索页；2026-10-17 用户要求）
     settings_tab: SettingsTab,    // 设置页当前分类
     prefs: source::application::AppSettings, // 用户偏好（settings.json，目前只有 space_to_run）
+    // ---- 批次 F1：FR-UIX-01 主题（`prefs.theme` 是入口名，这里是解析后的生效形态）----
+    /// 本帧渲染读的那一套尺寸 / 颜色。换主题时由 [`LauncherApp::sync_theme`] 一次性替换。
+    theme: theme::Theme,
+    /// 上一次真正装进 egui 的解析结果；与本次相同就不再碰 `ctx`（避免每帧重设样式）。
+    theme_applied: Option<theme::Theme>,
+    /// 上一次装进 egui 的字体名。字体没变就只换样式，不重建字形缓存。
+    theme_font: Option<String>,
+    /// 设置页下拉的选项（`System` + 内置 + 用户主题）。只在启动 / 呼出 / 换主题时重读，
+    /// 避免「外观」页每帧都去扫一遍 `Themes\` 目录。
+    theme_choices: Vec<String>,
     icon_rx: mpsc::Receiver<(String, Vec<u8>, u32, u32)>,
     icon_tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, // 常驻，可 clone 给每批新项再起加载器
     icons: std::collections::HashMap<String, egui::TextureHandle>, // source_path → 纹理
@@ -716,14 +776,105 @@ fn write_text_format(wide: &[u16]) -> Result<(), String> {
 
 // ---- FR-ACT-10 键盘导航的纯计算部分（不碰 egui 状态，可单测）----
 
-/// 结果行近似高度：32px 图标 + egui 默认行间距。
-const ROW_H: f32 = 36.0;
-/// 搜索行与分隔线占掉的高度，用于把窗口高换算成「一页可见几行」。
-const LIST_CHROME_H: f32 = 44.0;
+/// 列表可视区之外被顶栏 + 内边距 + 外框吃掉的高度，用于把窗口高换算成「一页可见几行」。
+///
+/// 批次 F6 起它不再是一个写死的常量：上＝`list_top_h`（含主题内边距与 [`INPUT_MIN_H`]）、
+/// 下＝`list_bottom_h`（主题内边距 + 外框），两套值都由主题给，翻页这条取的是**整窗**可用高
+/// （`ui.available_height()` 在 CentralPanel 之前），所以必须由调用方现量现传，
+/// 否则 Compact（内边距 10）会算出比窗口实际能装的少一行。
+fn list_chrome_h(theme: &theme::Theme) -> f32 {
+    list_top_h(theme) + list_bottom_h(theme)
+}
+
+/// 主界面一屏的行数（2026-10-24 用户需求：「默认显示 10 条」）。
+/// 两处共用：窗口默认高度按它算；[`ListRows::Ten`] 档按它截断列表（头段行算在内）。
+const LIST_ROWS: usize = 10;
+
+/// 「10 条」档下普通结果还能占几个名额：头段行（计算器 / 搜索 / 提示）算在前 10 行里。
+fn result_room(head_len: usize, rows: usize) -> usize {
+    rows.saturating_sub(head_len)
+}
+
+/// 「10 条」档的截断。**只裁显示与导航用到的 `results`**，`self.items` 一个字不动——
+/// 换回「全部」档立刻就能看到被裁掉的那些。
+fn cap_plan_rows(plan: &mut Plan, rows: usize) {
+    plan.results.truncate(result_room(plan.head.len(), rows));
+}
+
+/// 主窗口默认高度：正好装下 [`LIST_ROWS`] 行。
+///
+/// 三段（Light 主题、150% DPI，2026-10-24 真机截图量的）：
+/// 上＝外框 1 + 内边距 + 输入框 + 4（行距与分隔线）；下＝内边距 + 外框 1；
+/// 中间一行＝[`row_geometry`] 给的行高 + 行距。
+/// 批次 F6 起，行高不再只由主题决定（用户嫌 54+4 在 500 宽里太松），输入框也不再是
+/// "字体多高就多高"（20pt 只撑出 ~29px，用户嫌小），而是钳到 [`INPUT_MIN_H`]。
+fn default_window_height(theme: &theme::Theme, density: RowDensity) -> f32 {
+    let (row_h, _, spacing) = row_geometry(density, theme);
+    (list_top_h(theme) + LIST_ROWS as f32 * (row_h + spacing) + list_bottom_h(theme))
+        .clamp(MIN_H as f32, 900.0)
+}
+
+/// 输入框的最小高度（2026-10-24 用户正文：「输入框大一点，像 ahk 版的输入框一样，大气一点」）。
+/// AHK 版是 `InputHeight := Max(editH, Win.Scale(40))`（`SearchWindow.ahk:92-96`），取 44 再高一档。
+const INPUT_MIN_H: f32 = 44.0;
+
+/// ☰ 按钮的本体宽度（不含它与输入框之间的那个列间距）。批次 F6 换掉「＋ 新建」而来，
+/// 与 [`INPUT_MIN_H`] 同高 ≈ 正方形：AHK 版给它的命中宽也是"内边距 + Scale(28)"这一档。
+const MENU_BTN_W: f32 = 40.0;
+
+/// 输入框与 ☰ 之间**额外预留**的间隙。批次 F6 真机抓出来的缺陷：输入框改成定宽铺满之后，
+/// 这一行里只剩 `item_spacing.x`（8px）的缝，而顶栏拖动手柄两侧各要内缩，缝被吃到 0 宽 ⇒
+/// 「拖顶栏空白移动窗口」整条路静默失效（真机日志里 `搜索页顶栏空白` 零命中）。
+/// 2026-10-18 用户就报过一次"顶部输入框右侧点击空白不能拖动"，这条不能又死一次。
+const TOP_DRAG_GAP: f32 = 12.0;
+
+/// 手柄从缝的两侧各让出多少：保证按下不会误判成点输入框或点 ☰。
+const TOP_DRAG_INSET: f32 = 2.0;
+
+/// 顶栏拖动手柄的实际可命中宽度 = 预留间隙 + 行间距 − 两侧内缩。
+/// 它**与窗口宽度无关**（输入框是"扣掉 ☰ 与这条缝之后铺满"），所以只要 [`TOP_DRAG_GAP`]
+/// 归零就会立刻退化成本次修的那个形状。渲染路径用的是量到的真边界，这里只给单测当判据。
+#[cfg(test)]
+fn top_drag_strip_w(item_spacing_x: f32) -> f32 {
+    TOP_DRAG_GAP + item_spacing_x - 2.0 * TOP_DRAG_INSET
+}
+
+/// 搜索框的占位提示。**批次 F6 起改短**：输入框放大到 22pt 之后，原先那串十来个键名的长提示
+/// 会被输入框右缘裁掉（留半句话比没有更糟）。完整键表有两处入口——☰ 菜单本身（Ctrl+M）
+/// 和查询框打 `?` 的速查表（批次 A8，2026-10-24 批次 F6 起 **37 条**）。
+const SEARCH_HINT: &str = "搜索…（Enter 运行 · Ctrl+M 菜单 · ? 帮助 · Esc 关闭）";
+
+/// 列表可视区之上的占用：外框 1 + 主题内边距 + 输入框 + 4（行距与分隔线，Light 实测值）。
+fn list_top_h(theme: &theme::Theme) -> f32 {
+    1.0 + theme.padding + INPUT_MIN_H + 4.0
+}
+
+/// 列表可视区之下的占用：主题内边距 + 外框 1。
+fn list_bottom_h(theme: &theme::Theme) -> f32 {
+    theme.padding + 1.0
+}
+
+/// 一行的实际几何：（行高、图标边长、行与行的间距）。
+///
+/// 三档数字的来由见 [`RowDensity`] 的文档（Delphi `ItemHeight=16` 是无图标的下限参照，
+/// AHK 的 54 是"行距 0 + 宽 700"才成立的上限参照）。[`RowDensity::Theme`] 把两个尺寸交还给
+/// 主题，行距仍用 [`ROW_STEP_EXTRA`]——主题里没有"行距"这个键（需求书 6.2 的 24 键没有）。
+pub fn row_geometry(density: RowDensity, theme: &theme::Theme) -> (f32, f32, f32) {
+    match density {
+        RowDensity::Snug => (34.0, 24.0, 2.0),
+        RowDensity::Roomy => (40.0, 28.0, 2.0),
+        RowDensity::Dense => (24.0, 16.0, 0.0),
+        RowDensity::Theme => (theme.row_height, theme.icon_size, ROW_STEP_EXTRA),
+    }
+}
+
+/// 一行除主题行高之外的实际增量：`item_spacing.y` 3 + 取整 1。只在 [`RowDensity::Theme`] 下用到。
+const ROW_STEP_EXTRA: f32 = 4.0;
 
 /// 一页可见行数，至少 1（窗口拉到只装得下一行时翻页仍要能动）。
-fn page_rows(available_height: f32) -> usize {
-    ((available_height - LIST_CHROME_H) / ROW_H).floor().max(1.0) as usize
+/// `row_height` 是 [`row_geometry`] 给的实际步进（行高 + 行距）；`chrome` 见 [`list_chrome_h`]。
+fn page_rows(available_height: f32, row_height: f32, chrome: f32) -> usize {
+    ((available_height - chrome) / row_height.max(1.0)).floor().max(1.0) as usize
 }
 
 /// 翻页落点：向下夹到最后一行，向上夹到第一行。
@@ -762,11 +913,13 @@ fn row_num_label(idx: usize) -> Option<&'static str> {
 
 /// 行号徽标 + 悬停说明，计算器行与条目行共用这一个画法（两行的左缘才可能对得齐）。
 /// `verb` 只有两种：条目行「执行」、计算器行「复制」——第 0 行按 1 复制数字，不是跑程序。
+/// 高度跟随主题行高（`interact_size.y`，列表画之前由 `theme.row_height` 赋值）。
 fn row_badge(ui: &mut egui::Ui, idx: usize, verb: &str) {
     match row_num_label(idx) {
         Some(num) => {
+            let h = ui.spacing().interact_size.y.max(14.0);
             ui.add_sized(
-                [14.0, 32.0],
+                [14.0, h],
                 egui::Label::new(egui::RichText::new(num).monospace().weak()),
             )
             .on_hover_text(format!("按 {num} 直接{verb}本行"));
@@ -1113,8 +1266,8 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// 本程序自己占用的组合（录制端落定前的预检表）。**表里的每一条都对着 `ui()` 里一次真实的
 /// `consume_key`**（Ctrl+Shift+N 新建、Ctrl+E 编辑、Ctrl+I 批量导入、Ctrl+D 打开目录、
-/// Ctrl+Shift+D 删除、Ctrl+Shift+P 置顶、Ctrl+N/P 与 Ctrl+J/K 循环导航、Ctrl+数字 与
-/// Alt+数字 执行第 N 行），
+/// Ctrl+Shift+D 删除、Ctrl+Shift+P 置顶、Ctrl+N/P 与 Ctrl+J/K 循环导航、Ctrl+M 开 ☰ 主菜单、
+/// Ctrl+数字 与 Alt+数字 执行第 N 行），
 /// 不多写一条：表是"避让本程序的功能键"，不是"避开所有看着眼熟的键"，多出来的条目会白白
 /// 挡掉系统里其实空着的组合（Ctrl+A 这种本程序压根没绑）。
 ///
@@ -1132,6 +1285,7 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_CONTROL, 0x49), // Ctrl+I 批量导入全部
     (HKF_CONTROL, 0x4A), // Ctrl+J 循环下一项
     (HKF_CONTROL, 0x4B), // Ctrl+K 循环上一项
+    (HKF_CONTROL, 0x4D), // Ctrl+M ☰ 主菜单（批次 F6：新建按钮换成菜单后给它配的键）
     (HKF_CONTROL, 0x4E), // Ctrl+N 循环下一项（2026-10-22 从「新建」改为导航）
     (HKF_CONTROL, 0x50), // Ctrl+P 循环上一项（2026-10-22 从「置顶」改为导航）
     (HKF_CONTROL | HKF_SHIFT, 0x44), // Ctrl+Shift+D 删除选中项
@@ -1737,6 +1891,10 @@ impl LauncherApp {
         notify_rx: mpsc::Receiver<Result<String, String>>,
         self_hwnd: Option<HWND>,
         intent: StartupIntent,
+        // 批次 F1 的主题由 `main` 解析一次后传进来：窗口初始高度要按主题行高算，
+        // 而 `Themes\` 只该读一遍（坏文件在日志里只出现一次）。
+        theme: theme::Theme,
+        theme_choices: Vec<String>,
     ) -> Self {
         let (icon_tx, icon_rx) = mpsc::channel();
         let (apps_tx, apps_rx) = mpsc::channel();
@@ -1892,6 +2050,9 @@ impl LauncherApp {
         let typeback_draft = prefs
             .typeback_hotkey
             .map(|s| HotkeySpec { mods: s.mods_named(), vk: s.vk });
+        // 批次 F1：主题在 `main` 里就解析好了（窗口初始高度要按主题行高算），
+        // 首帧的窗口底色 / 字号 / 行高直接读它，不留一帧"默认外观"。
+        // 真正装进 `ctx` 在 `new` 末尾（那时 `CTX` 已 set）。
         let mut seed = Self {
             query: String::new(), clear_query_next_frame: false, items,
             index: matching::MatchIndex::default(),
@@ -1911,9 +2072,11 @@ impl LauncherApp {
             internal_confirm: None,
             about_open: false,
             help_entry: None,
+            menu_open: false,
             win_drag: None,
             settings_open, settings_tab,
             prefs,
+            theme, theme_applied: None, theme_font: None, theme_choices,
             icon_rx, tray_rx, hotkey_rx,
             ipc_rx, ipc_pending: Vec::new(),
             pending_batch: intent.batch,
@@ -1958,7 +2121,82 @@ impl LauncherApp {
         if seed.focus_query {
             seed.on_show();
         }
+        // 首帧前把主题装进 egui：字体、尺寸表、控件配色一次到位。
+        // 用构造时已解析好的那份，不再读一遍 `Themes\`（坏文件只该在日志里出现一次）。
+        if let Some(ctx) = CTX.get() {
+            let (theme, choices) = (seed.theme.clone(), seed.theme_choices.clone());
+            seed.use_theme(ctx, theme, choices);
+        }
         seed
+    }
+
+    /// 批次 F1（FR-UIX-01）：把 `prefs.theme` 解析成生效主题并装进 egui。
+    ///
+    /// 只在「启动 / 每次呼出 / 设置页换主题」这三处调用，不在 `ui()` 里逐帧解析——
+    /// `load` 会读 `Themes\` 目录，而 `System` 还要读注册表；呼出时重解析是为了让
+    /// 隐藏期间切换的系统明暗在下次出现时生效。
+    fn sync_theme(&mut self, ctx: &egui::Context) {
+        let (theme, choices) = theme::load(&self.prefs.theme);
+        self.use_theme(ctx, theme, choices);
+    }
+
+    /// 装一套已解析好的主题。[`Self::sync_theme`] 与启动路径共用，避免
+    /// `new()` 里为了首帧和末尾各读一遍 `Themes\`。
+    fn use_theme(&mut self, ctx: &egui::Context, theme: theme::Theme, choices: Vec<String>) {
+        self.theme_choices = choices;
+        if self.theme_applied.as_ref() == Some(&theme) {
+            self.theme = theme;
+            return;
+        }
+        if self.theme_font.as_deref() != Some(theme.font_name.as_str()) {
+            theme::install_fonts(ctx, &theme.font_name);
+            self.theme_font = Some(theme.font_name.clone());
+        }
+        eprintln!(
+            "主题：{}（字体 {}，底色 {:02X}{:02X}{:02X}，不透明度 {}）",
+            theme.name,
+            theme.font_name,
+            theme.background.r(),
+            theme.background.g(),
+            theme.background.b(),
+            theme.opacity
+        );
+        theme.apply(ctx);
+        // 2026-10-24 用户裁定：换主题后窗口高度要按新几何重算，保持一屏正好 10 行。
+        // 批次 F6 起行高由「行密度」决定，主题只在「跟随主题」档下供行数——但主题仍供
+        // `padding`（外框内边距）与输入框字号，所以重算这件事照旧要做，只是理由换了。
+        // 只在"真的换了一套主题"时动手：启动首帧由 `with_inner_size` 给同一个值；手动拖过
+        // 的尺寸在呼出/隐藏之间也不动——`sync_theme` 每次呼出都会跑，但主题没变时上面那个
+        // 相等判断已经先返回了。
+        let first_apply = self.theme_applied.is_none();
+        let height = default_window_height(&theme, self.prefs.row_density);
+        self.theme = theme.clone();
+        self.theme_applied = Some(theme);
+        if !first_apply {
+            self.resize_to_list(ctx, height, "换主题");
+        }
+        ctx.request_repaint();
+    }
+
+    /// 把窗口高度设成"正好一屏 [`LIST_ROWS`] 行"（宽度保持现状，不小于 [`MIN_W`]）。
+    /// 换主题与换行密度两条路共用，`why` 只进日志。
+    fn resize_to_list(&self, ctx: &egui::Context, height: f32, why: &str) {
+        let size = ctx.viewport_rect().size();
+        let next = egui::vec2(size.x.max(MIN_W as f32), height);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next));
+        let (row_h, _, spacing) = row_geometry(self.prefs.row_density, &self.theme);
+        eprintln!(
+            "{why}：行密度 {}（行高 {row_h} + 行距 {spacing}）⇒ 窗口高度重算为 {}（原 {}）",
+            self.prefs.row_density.as_str(),
+            height,
+            size.y.round()
+        );
+    }
+
+    /// 列表此刻的行几何（行高、图标边长、行距）。渲染侧每帧调一次，来源是设置项
+    /// `row_density`（[`crate::row_geometry`]）；「跟随主题」档才回落到主题的 `row_height`。
+    fn row_geom(&self) -> (f32, f32, f32) {
+        row_geometry(self.prefs.row_density, &self.theme)
     }
 
     /// FR-SRC-06：派一轮后台路径四态检查。`force` = 忽略最小间隔（呼出时总想拿最新结果）。
@@ -2028,6 +2266,9 @@ impl LauncherApp {
 
     /// FR-SRC-21：IPC 触发的呼出（已显示则只重抢焦点，不再走 on_show 重复切输入法）。
     fn show_now(&mut self, ctx: &egui::Context) {
+        // 批次 F1：隐藏期间系统明暗可能已经切了（选择 `System` 时要用新的），
+        // 用户也可能刚改过 `Themes\*.json`。呼出是"重新读盘"的自然时机。
+        self.sync_theme(ctx);
         let iconic = self.is_iconic();
         if !self.visible || iconic {
             if iconic && self.visible {
@@ -2045,14 +2286,14 @@ impl LauncherApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源）。
+    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=外观）。
     fn open_settings_page(&mut self, page: u32) {
         self.settings_open = true;
         self.settings_tab = match SettingsTab::from_page(page) {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源），落回通用"
+                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=外观），落回通用"
                 );
                 SettingsTab::General
             }
@@ -2128,6 +2369,26 @@ impl LauncherApp {
                     self.begin_win_drag(ui, edge, tag);
                 }
             });
+    }
+
+    /// 同层版的拖窗手柄（2026-10-24）：只给「盖在滚动列表上」的这块用。
+    ///
+    /// [`Self::drag_handle`] 铺在独立的 `Order::Background` 层上，而 `ScrollArea` 收滚轮的条件是
+    /// 「指针所在层就是自己这层」（`is_hovering_outer_rect` → `Context::rect_contains_pointer`）。
+    /// 于是指针一进列表右侧这块矩形，滚轮就被背景层吃掉、列表纹丝不动——这就是主界面滚不动的根因。
+    /// 改成在中央面板同一个 `Ui` 里注册：滚轮看层不看控件，层对上了就能滚。
+    ///
+    /// `Sense::drag()` 不含 click ⇒ 结果行照旧优先吃点击：命中测试里点击控件在上、拖拽控件在下时
+    /// 两者各归各的；而拖拽控件里我们又是**先注册**的那一个（排在滚动区域之前），
+    /// 后注册的控件在上只影响点击，不影响这块空白认领拖拽。
+    fn inline_drag_handle(&mut self, ui: &egui::Ui, id: &'static str, rect: egui::Rect) {
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return; // 窗口太窄/太矮，这段空白不存在
+        }
+        let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::drag());
+        if resp.drag_started() {
+            self.begin_win_drag(ui, EDGE_MOVE, "列表右侧空白");
+        }
     }
 
     /// 四边 + 四角的隐形缩放手柄（2026-10-18 用户：「程序窗口应该允许拖动窗口边缘时可以改变大小，
@@ -2563,6 +2824,7 @@ impl LauncherApp {
                     ("功能", SettingsTab::Features),
                     ("热键", SettingsTab::Hotkeys),
                     ("数据源", SettingsTab::Sources),
+                    ("外观", SettingsTab::Appearance),
                 ] {
                     if ui.selectable_label(self.settings_tab == tab, label).clicked() {
                         self.settings_tab = tab;
@@ -2721,6 +2983,57 @@ impl LauncherApp {
                             ui.label(
                                 egui::RichText::new(
                                     "这一层只在两条目的匹配档位相同时才决定先后，匹配更准的那条永远在前。\n次数优先（默认）＝执行次数多的在前，次数相同才看最近一次。刚用过一次的东西不会把用了几十次的老项挤下去。\n次数 + 时间衰减＝比 log2(1+次数) × 0.5^(距上次使用天数 / 7)：次数照旧计权重但被 log2 压过量级，一条项整整 7 天没用热度掉一半，所以\"上周用过一次的\"不会长期赖在前面。\n置顶（Ctrl+Shift+P）永远压过这一层；想钉住某个条目就用它，不用靠改口径绕。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            // 2026-10-24 用户需求：一屏 10 行；默认按 Delphi 口径（全部结果、滚轮翻）。
+                            ui.label(egui::RichText::new("主界面显示条数").strong());
+                            let mut list_rows = self.prefs.list_rows;
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut list_rows, ListRows::All, "全部（默认）");
+                                ui.selectable_value(&mut list_rows, ListRows::Ten, "10 条");
+                            });
+                            if list_rows != self.prefs.list_rows {
+                                self.prefs.list_rows = list_rows;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：list_rows = {}（已写 settings.json）",
+                                    list_rows.as_str()
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "全部（默认）＝所有结果都进列表；窗口仍是一屏十行高，超出部分用滚轮翻。这一档与 Delphi 版 ALTRun 同口径：它那个「10 行」只是列表的高度，结果从不截断。\n10 条＝列表只出前 10 行，计算器 / 搜索这类提示行也占名额；窗口本来就是一屏十行高，所以不用滚轮。\n两档都只影响显示与键盘能走到哪一行：被截掉的条目不是没匹配上，换「全部」立刻可见（或把查询打得更准）。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            // 批次 F6（2026-10-24 用户正文：「整体界面高度太高了，项与项之间的间距太大了」，
+                            // 并点名「将以上 3 个做成可选择的配置，默认选择使用甲」）。
+                            ui.label(egui::RichText::new("列表行密度").strong());
+                            let mut density = self.prefs.row_density;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.selectable_value(&mut density, RowDensity::Snug, "甲·紧凑（默认）");
+                                ui.selectable_value(&mut density, RowDensity::Roomy, "乙·宽松");
+                                ui.selectable_value(&mut density, RowDensity::Dense, "丙·极紧");
+                                ui.selectable_value(&mut density, RowDensity::Theme, "跟随主题");
+                            });
+                            if density != self.prefs.row_density {
+                                self.prefs.row_density = density;
+                                source::application::save_settings(&self.prefs);
+                                // 换档改的是"一屏正好十行"里的行高，所以窗口高度要立刻跟着重算——
+                                // 与换主题走的是同一个 `resize_to_list`。
+                                let h = default_window_height(&self.theme, density);
+                                self.resize_to_list(ui.ctx(), h, "换行密度");
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "甲·紧凑（默认）＝行高 34 / 图标 24 / 行距 2 ⇒ 窗口高 438。\n乙·宽松＝40 / 28 / 2 ⇒ 498。丙·极紧＝24 / 16 / 0 ⇒ 318。\n跟随主题＝行高与图标交还给主题的 `row_height` / `icon_size`（Light 54/32、Compact 44/26、Modern 56/32），窗口随之变高。\n四档都保持「一屏正好十行」：换档只改行高、窗口高度按新行高重算，不改窗口宽。\n上面那几个总高是按 Light 的内边距 14 算的，换主题只差内边距那几个像素；输入框那一行不受本项影响（高度固定 44，字号仍跟着主题的「输入字号」走）。\n参照系是那两个老版本——Delphi 版行高 16 且不带图标（纯文字才能这么紧），AHK 版行高 54 但行距 0 且窗口宽 700（松是靠宽撑起来的，不是靠行高）。这一套带图标、宽 500，所以默认取中间那一档。\n注意：不在「跟随主题」档时，主题 JSON 里的 `row_height` 与 `icon_size` 这两个键不参与渲染（其余 22 个键照常生效）。",
                                 )
                                 .weak()
                                 .small(),
@@ -3051,9 +3364,10 @@ impl LauncherApp {
                                     ("Space", "执行选中项（默认仅输入为空时；设置页「空格直接执行」可改为始终执行）"),
                                     ("左键拖边缘/角", "改变窗口大小（四边 + 四角各 6px 隐形手柄，最小 360×240）"),
                                     ("Ctrl+= / Ctrl+-", "窗口放大 / 缩小一档（60×40 逻辑像素，键盘路径同上）"),
-                                    ("左键拖空白", "移动窗口：顶栏空白（搜索框与「＋ 新建」之间、设置页标题右侧）或列表右侧空白；中键不再执行任何条目"),
+                                    ("左键拖空白", "移动窗口：顶栏空白（搜索框与 ☰ 之间、设置页标题右侧）或列表右侧空白；中键不再执行任何条目"),
+                                    ("Ctrl+M / ☰", "主菜单：新建、批量导入、设置、速查表、打开日志、退出（批次 F6 起取代顶栏那个「＋ 新建」按钮）"),
                                     ("Enter", "运行选中项；弹窗/确认框确定；无匹配弹新增"),
-                                    ("Esc", "关确认框 → 关弹窗 → 设置页返回 → 清空输入 → 关闭到托盘（按序）"),
+                                    ("Esc", "关 ☰ 菜单 → 关确认框 → 关弹窗 → 设置页返回 → 清空输入 → 关闭到托盘（按序）"),
                                     ("Ctrl+Shift+N", "新建快捷项（选中的是文件行时预填这一行的路径与类型）"),
                                     ("Ctrl+E", "编辑选中项"),
                                     ("Delete", "删除选中项（仅输入为空时；弹确认框）"),
@@ -3125,6 +3439,112 @@ impl LauncherApp {
                                 }
                             }
                         }
+                        SettingsTab::Appearance => {
+                            // 批次 F1（FR-UIX-01）：主题选择。改成即时生效——不重启、不丢焦点。
+                            ui.label(egui::RichText::new("主题").strong());
+                            ui.label(
+                                egui::RichText::new(
+                                    "内置 19 套 + 「跟随系统」。用户主题放程序目录的 Themes 文件夹（exe 同级；不可写时退到 %LOCALAPPDATA%\\egui-launcher\\Themes），文件名即主题名，同名覆盖内置。改主题不重启，隐藏期间改的文件在下次呼出时重读。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            // 用换行布局：500px 最小宽度下「下拉 + 两个按钮」放不进一行，
+                            // 原先的 `horizontal` 会把「恢复 Light」裁在窗口右边缘外。
+                            ui.horizontal_wrapped(|ui| {
+                                let choices = self.theme_choices.clone();
+                                egui::ComboBox::from_id_salt("theme_pick")
+                                    .width(200.0)
+                                    .selected_text(self.prefs.theme.clone())
+                                    .show_ui(ui, |ui| {
+                                        for name in choices {
+                                            if ui
+                                                .selectable_label(self.prefs.theme == name, name.as_str())
+                                                .clicked()
+                                                && self.prefs.theme != name
+                                            {
+                                                self.prefs.theme = name.clone();
+                                                source::application::save_settings(&self.prefs);
+                                                eprintln!(
+                                                    "设置页：主题 → {name}（已写 settings.json）"
+                                                );
+                                                self.sync_theme(ui.ctx());
+                                            }
+                                        }
+                                    });
+                                if ui.button("打开主题文件夹").clicked() {
+                                    let dir = theme::user_dir();
+                                    match std::fs::create_dir_all(&dir) {
+                                        Ok(()) => {
+                                            let _ = std::process::Command::new("explorer.exe")
+                                                .arg(&dir)
+                                                .spawn();
+                                            self.internal_toast(
+                                                ui.ctx(),
+                                                &format!("✓ 已打开 {}", dir.display()),
+                                                true,
+                                            );
+                                        }
+                                        Err(e) => self.internal_toast(
+                                            ui.ctx(),
+                                            &format!("⚠ 建不了主题文件夹：{e}"),
+                                            false,
+                                        ),
+                                    }
+                                }
+                                if ui.button("恢复 Light").clicked()
+                                    && self.prefs.theme != theme::FALLBACK_THEME
+                                {
+                                    self.prefs.theme = theme::FALLBACK_THEME.to_string();
+                                    source::application::save_settings(&self.prefs);
+                                    eprintln!("设置页：主题 → Light（已写 settings.json）");
+                                    self.sync_theme(ui.ctx());
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.separator();
+                            // 生效值摘要：文件和内置到底解析出了什么，一眼能核对。
+                            let t = &self.theme;
+                            ui.label(egui::RichText::new("当前生效").strong());
+                            ui.label(format!(
+                                "{} ｜ 字体 {} ｜ 输入 {}pt 标题 {}pt 副标题 {}pt 快捷键 {}pt",
+                                t.name,
+                                t.font_name,
+                                t.input_font_size,
+                                t.title_font_size,
+                                t.subtitle_font_size,
+                                t.shortcut_font_size
+                            ));
+                            ui.label(format!(
+                                "行高 {} ｜ 图标 {} ｜ 内边距 {} ｜ 选中圆角 {} ｜ 不透明度 {}（{}/255）",
+                                t.row_height, t.icon_size, t.padding, t.selected_radius, t.opacity, t.opacity
+                            ));
+                            // 批次 F6：这两个数字只有在「跟随主题」档下才真的决定列表行，
+                            // 不写这一句就会被读成"改了主题 JSON 行高却没变＝主题坏了"。
+                            if self.prefs.row_density != RowDensity::Theme {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "（当前行密度是「{}」，行高与图标不取上面这两个数——要它们生效，把通用页的「列表行密度」切到「跟随主题」。内边距照旧生效。）",
+                                        self.prefs.row_density.as_str()
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "颜色与其余尺寸请直接改主题 JSON（24 个键见需求书 6.2）；颜色写 RRGGBB，写错的键保留继承值并在日志里留一行。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(format!("主题目录：{}", theme::user_dir().display()))
+                                    .weak()
+                                    .small(),
+                            );
+                        }
                     });
                 }
             );
@@ -3166,6 +3586,9 @@ impl LauncherApp {
         // FR-WIN-04：关闭到托盘时清掉待触发的失焦定时器
         self.hide_at = None;
         self.had_focus_since_show = false;
+        // 批次 F6：☰ 菜单不跨隐藏保留。失焦自动隐藏时 Popup 那一帧不再运行，也就没人把
+        // `menu_open` 写回 false——不在这里清掉，下次呼出会带着一个悬着的菜单出现。
+        self.menu_open = false;
         // 批次 R：窗口一隐藏，eframe 就不再跑 `ui()` ⇒ `hotkey_frame` 末尾那条边沿检测等不到
         // 下一帧。取键态若还开着，全局呼出会一直停在"临时注销"状态（按了没反应），所以在这里
         // 就地退出取键并把键装回。放在这个函数最前面是因为它下面有一条 `return`。
@@ -3676,7 +4099,19 @@ impl Default for LauncherApp {
         let (_t3, r3) = mpsc::channel();
         let (t4, _r4) = mpsc::channel();
         let (_t5, r5) = mpsc::channel();
-        Self::new(r1, r2, r3, t4, r5, None, StartupIntent { visible: true, ..Default::default() })
+        Self::new(
+            r1,
+            r2,
+            r3,
+            t4,
+            r5,
+            None,
+            StartupIntent { visible: true, ..Default::default() },
+            // 测试/兜底用的 `Default` 不读 `Themes\`：给基准 Light 就够了，
+            // 真启动路径由 `main` 解析主题再传进来。
+            theme::Theme::light(),
+            Vec::new(),
+        )
     }
 }
 
@@ -3708,11 +4143,23 @@ impl LauncherApp {
             term_shell,
             source_on: &on,
         };
-        source::dispatch(&mut self.sources, &mut cx, &on)
+        let mut plan = source::dispatch(&mut self.sources, &mut cx, &on);
+        // 2026-10-24：「10 条」档在这里截断，而不是在渲染时截——显示、↑↓、PgUp/PgDn、
+        // Ctrl+J/K、Tab、数字键、空格与 Enter 都读同一份 `plan()`，截在这里它们的落点才不会打架。
+        if self.prefs.list_rows == ListRows::Ten {
+            cap_plan_rows(&mut plan, LIST_ROWS);
+        }
+        plan
     }
 }
 
 impl eframe::App for LauncherApp {
+    /// 批次 F1（FR-UIX-06）：清屏必须全透明。否则中央框圆角以外那一圈会被清成
+    /// egui 主题的底色（不透明），`with_transparent(true)` 就只透了个寂寞。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // eframe 为了保证首帧不出白闪，会在首帧渲染后无条件 set_visible(true)，
         // 把 with_visible(false) 覆盖掉；静默启动（-Startup）在第一帧末显式盖回隐藏。
@@ -4012,6 +4459,9 @@ impl eframe::App for LauncherApp {
             if hit_comma {
                 self.settings_open = !self.settings_open;
                 self.focus_query = true;
+                // 批次 F6：☰ 只在搜索页渲染 ⇒ 进设置页必须先把旗标落下，
+                // 否则回到搜索页的第一帧会带着一个"没人负责关闭"的菜单。
+                self.menu_open = false;
                 eprintln!("快捷键 Ctrl+,：设置页 {}", if self.settings_open { "打开" } else { "返回搜索" });
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
@@ -4030,7 +4480,7 @@ impl eframe::App for LauncherApp {
                     };
                     (hot(egui::Key::N), hot(egui::Key::D), hot(egui::Key::P))
                 };
-                let (hit_n, hit_p, hit_i, hit_e, hit_cd, hit_cf) = {
+                let (hit_n, hit_p, hit_i, hit_e, hit_cd, hit_cf, hit_cm) = {
                     let hot = |mods: egui::Modifiers, k: egui::Key| ui.input_mut(|i| i.consume_key(mods, k));
                     (
                         hot(egui::Modifiers::COMMAND, egui::Key::N),
@@ -4039,6 +4489,7 @@ impl eframe::App for LauncherApp {
                         hot(egui::Modifiers::COMMAND, egui::Key::E),
                         hot(egui::Modifiers::COMMAND, egui::Key::D),
                         hot(egui::Modifiers::COMMAND, egui::Key::F),
+                        hot(egui::Modifiers::COMMAND, egui::Key::M),
                     )
                 };
                 // 裸 Delete 只在搜索框为空时接管：有输入时它是文本编辑键，不能抢。
@@ -4133,7 +4584,16 @@ impl eframe::App for LauncherApp {
                     );
                 }
 
-                if hit_cf {
+                if hit_cm {
+                    // 批次 F6：☰ 主菜单的键盘入口（用户裁定「三条杠菜单 + 快捷键都留」）。
+                    // 这里只翻旗标——菜单项本身在顶栏那帧由 `main_menu_content` 渲染并返回动作。
+                    self.menu_open = !self.menu_open;
+                    eprintln!(
+                        "快捷键 Ctrl+M：☰ 主菜单 {}",
+                        if self.menu_open { "打开" } else { "收起" }
+                    );
+                    ui.ctx().request_repaint();
+                } else if hit_cf {
                     // 批次 X：Ctrl+F 进文件模式 = 在已有输入前补一个 `'` 触发符（打的词留着当过滤词，
                     // 不要用户重打一遍）。已经在文件模式里就不叠第二个前缀——`''词` 会被当成
                     // 文件名的一部分去匹配，那一下按键把用户的查询弄脏了，比没反应更糟。
@@ -4282,7 +4742,14 @@ impl eframe::App for LauncherApp {
                     let plan = self.plan();
                     let len = row_count(plan.results.len(), plan.head.len());
                     if len > 0 {
-                        let rows = page_rows(ui.available_height());
+                        // 批次 F6：一页几行由「行密度」决定，不再读主题的 row_height——
+                        // 除了「跟随主题」档，那一档下主题才是行高的来源。
+                        let (row_h, _, spacing) = self.row_geom();
+                        let rows = page_rows(
+                            ui.available_height(),
+                            row_h + spacing,
+                            list_chrome_h(&self.theme),
+                        );
                         self.selected = page_target(self.selected, rows, len, hit_pgdn);
                         eprintln!(
                             "快捷键 {}：选中第 {} 行（一页 {rows} 行，共 {len} 行）",
@@ -4521,33 +4988,9 @@ impl eframe::App for LauncherApp {
         // egui 的左键一直卡在「按下」——用户复测的三个症状（设置页点不动、右键菜单弹不出、
         // 第二次拖不动）都是这一个根因。改成自己按帧给窗口位移，键鼠状态全程由 egui 正常收发。
         //
-        // 这里先铺「列表右侧真空白」（x 从 260 起、y 从搜索行以下，右缘留 12px 给滚动条）；
+        // 列表那块「右侧真空白」不能在这里铺：它盖在 ScrollArea 上，必须与滚动区域同层，
+        // 否则滚轮会被背景层吃掉（2026-10-24 修，见 `inline_drag_handle` 与它的调用点）。
         // 顶部栏那段空白在 CentralPanel 里量到真实坐标后再铺（见 drag_handle 的两处调用）。
-        // 添加框/确认框打开时整块撤掉：背景层只会在「该点没有任何控件认领拖拽」时赢，
-        // 缩小矩形 + 让开弹窗，就不可能抢走搜索框、新建按钮与行标签的点击。
-        if !(self.dialog.is_some()
-            || self.confirm.is_some()
-            || self.internal_confirm.is_some()
-            || self.about_open
-            || self.help_entry.is_some())
-        {
-            let root = ui.max_rect();
-            let plate = egui::Rect::from_min_max(
-                egui::pos2(root.min.x + 260.0, root.min.y + 40.0),
-                root.max - egui::vec2(12.0, 6.0),
-            );
-            // 设置页整页模式下这块矩形盖的是设置内容，必须让开。
-            if !self.settings_open {
-                self.drag_handle(
-                    ui,
-                    "window_drag_layer_list",
-                    plate,
-                    EDGE_MOVE,
-                    None,
-                    "列表右侧空白",
-                );
-            }
-        }
         if let Some(a) = self.win_drag {
             // 只有真·抬起才结束：中途停手不动还要继续跟着，所以不能拿「本帧零位移」当结束条件。
             if !ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) {
@@ -4601,36 +5044,108 @@ impl eframe::App for LauncherApp {
             }
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        // 批次 F6：☰ 菜单是否开着要在渲染前抄一份。`egui::Popup` 自己就在本帧吃掉 Escape 并把
+        // `menu_open` 写回 false，等下面那段全局 Esc 分段跑到时旗标已经是"关"了——不抄这一份，
+        // Esc 会同时关掉菜单和整窗（用户期望：菜单开着时 Esc 只收菜单）。
+        let menu_was_open = self.menu_open;
+        // 批次 F1（FR-UIX-06）：整窗底色 / 边框 / 圆角 / 内边距 / 不透明度全部走主题。
+        // 圆角以外不画任何东西 ⇒ GL 后端下四角真的透出桌面（E-18）。
+        egui::CentralPanel::default().frame(self.theme.central_frame()).show(ui, |ui| {
             // 设置页整页模式（2026-10-17）：小窗口内独立弹窗会被裁剪，直接替换搜索页渲染。
             if self.settings_open {
                 self.settings_ui(ui);
                 return;
             }
             let search_id = search_field_id();
-            // 顶栏拖动手柄要铺在「搜索框右缘 → ＋新建左缘」这段真空白上，尺寸只能运行时量
+            // 顶栏拖动手柄要铺在「搜索框右缘 → ☰ 左缘」这段真空白上，尺寸只能运行时量
             //（2026-10-18 用户：「顶部输入框右侧点击空白不能拖动，顶部的不是菜单栏吗？」）。
+            // 批次 F6：输入框与 ☰ 改成显式定宽定高（原先 ☰ 那个位置靠嵌套 right_to_left 往左溢出
+            // 对齐，量到的 `pill_right` 其实是整行右缘）。现在三个 x 都是各自控件的真边界，
+            // 手柄不会再铺到输入框身上，也不会在 ☰ 左边留出一段拖不动的死区。
             let mut pill_right = 0.0f32;
-            let mut new_btn_left = f32::MAX;
+            let mut menu_left = f32::MAX;
+            // ☰ 那一列占的宽度（含一个列间距），用来从剩余宽度里先扣掉它。
+            let menu_col_w = MENU_BTN_W + ui.spacing().item_spacing.x;
             let head_row = ui.horizontal(|ui| {
                 ui.label("\u{1F50D} ");
-                let resp = ui.add(
+                let edit_w = (ui.available_width() - menu_col_w - TOP_DRAG_GAP).max(60.0);
+                // 批次 F6（2026-10-24 用户正文：「输入框大一点，像 ahk 版的输入框一样，大气一点」）：
+                // 高度钳到 [`INPUT_MIN_H`] 并让文字垂直居中——原先 TextEdit 只按字体高长到 ~29px。
+                let resp = ui.add_sized(
+                    [edit_w, INPUT_MIN_H],
                     egui::TextEdit::singleline(&mut self.query)
                         .id(search_id)
-                        .hint_text("搜索…（↑↓/PgUp/PgDn/Ctrl+N/P 选择，Enter/空格/1-9 运行，Tab 补全，Ctrl+Shift+N 新建，Ctrl+E 编辑，Delete 删除，Ctrl+D 开目录，Ctrl+Shift+P 置顶，Ctrl+, 设置，? 帮助，Esc 清空/关闭）"),
+                        .font(egui::FontId::proportional(self.theme.input_font_size))
+                        .vertical_align(egui::Align::Center)
+                        .hint_text(SEARCH_HINT),
                 );
                 pill_right = resp.rect.max.x;
+                // 批次 F6：这条缝是给下面「搜索页顶栏空白」那个拖动手柄留的命（见 [`TOP_DRAG_GAP`]）。
+                ui.add_space(TOP_DRAG_GAP);
                 if resp.changed() {
                     self.selected = 0; // 输入变化时选中回到第一行
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 通用「＋ 新建」入口（FR-SRC-20）：打开空白添加对话框
-                    let btn = ui.button("＋ 新建");
-                    new_btn_left = btn.rect.min.x;
-                    if btn.clicked() {
-                        self.dialog = Some(DialogState::blank());
+                // 批次 F6：「＋ 新建」按钮撤掉，换成 ☰ 主菜单（用户点名「换成一个三条杠的菜单，
+                // 点击显示新建按钮和其他设置按钮」）。新建那条路一条没少：菜单第一项 + Ctrl+Shift+N。
+                let menu_btn = ui
+                    .add_sized(
+                        [menu_col_w, INPUT_MIN_H],
+                        egui::Button::new(
+                            egui::RichText::new("\u{2630}").size(self.theme.title_font_size + 5.0),
+                        ),
+                    )
+                    .on_hover_text("主菜单（Ctrl+M）");
+                menu_left = menu_btn.rect.min.x;
+                if menu_btn.clicked() {
+                    // 手动翻转：`open_bool` 覆盖了 `Popup::menu` 自带的 memory toggle，
+                    // 而键盘那条路（Ctrl+M）本来也只能靠这个旗标进菜单。
+                    self.menu_open = !self.menu_open;
+                }
+                let action = egui::Popup::menu(&menu_btn)
+                    .id(egui::Id::new("main_menu_popup"))
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                    .open_bool(&mut self.menu_open)
+                    .show(main_menu_content)
+                    .map_or(MenuAction::None, |r| r.inner);
+                // 借用在这里已经结束（`show` 返回的对象不带 `self` 的生命周期），动作落回 self。
+                // 批次 F6：动作一旦落地就把旗标按下去。`Popup` 自带的 `CloseOnClick` 判据是
+                // `was_open_last_frame && pointer.any_click()`（`popup.rs:608`），只有真鼠标才置
+                // `any_click` ⇒ 用辅助功能（AccessKit/UIA 的 Invoke）点中条目时旗标留在 true，
+                // 下一次 Esc 会跑去"收菜单"、把刚打开的对话框留在原地（2026-10-24 真机抓到）。
+                if !matches!(action, MenuAction::None) {
+                    self.menu_open = false;
+                }
+                match action {
+                    MenuAction::None => {}
+                    MenuAction::NewItem => self.dialog = Some(DialogState::blank()),
+                    MenuAction::BatchImport => {
+                        source::application::spawn_batch_import(self.apps_tx.clone());
+                        self.toast = Some((
+                            "✓ 批量导入已启动，完成后自动合并".to_string(),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                        ui.ctx().request_repaint_after(TOAST_TTL);
+                        eprintln!("☰ 菜单：批量导入全部 已触发（后台扫描开始菜单/桌面）");
                     }
-                });
+                    MenuAction::Settings => {
+                        self.settings_open = true;
+                        eprintln!("☰ 菜单：进设置页");
+                    }
+                    MenuAction::Cheatsheet => {
+                        // 速查表在列表里，入口就是查询框的那个 `?`（批次 A8）：代打字，不另开一套渲染。
+                        self.set_query(ui.ctx(), "?".to_string(), "☰ 菜单：打开速查表");
+                    }
+                    MenuAction::OpenLog => {
+                        open_log_file();
+                        eprintln!("☰ 菜单：打开日志");
+                    }
+                    MenuAction::Exit => {
+                        self.on_hide();
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        eprintln!("☰ 菜单：退出");
+                    }
+                }
             });
             if self.dialog.is_none()
                 && self.confirm.is_none()
@@ -4643,8 +5158,8 @@ impl eframe::App for LauncherApp {
                     ui,
                     "window_drag_layer_search_top",
                     egui::Rect::from_min_max(
-                        egui::pos2(pill_right + 4.0, r.min.y),
-                        egui::pos2(new_btn_left - 4.0, r.max.y),
+                        egui::pos2(pill_right + TOP_DRAG_INSET, r.min.y),
+                        egui::pos2(menu_left - TOP_DRAG_INSET, r.max.y),
                     ),
                     EDGE_MOVE,
                     None,
@@ -4658,6 +5173,25 @@ impl eframe::App for LauncherApp {
                 ui.ctx().request_repaint();
             }
             ui.separator();
+
+            // 2026-10-24 修滚轮：列表右侧那块「拖空白移动窗口」的手柄必须与 ScrollArea 同层。
+            // 原先它铺在独立的 Background `Area` 上（`drag_handle`），指针一进去，
+            // `Context::rect_contains_pointer` 认到的层就不是滚动区域那一层，滚轮整段被吞。
+            // 同层注册后：滚轮照常滚，点击仍归结果行（行是 click，这里是 drag-only，且行在本行之后注册）。
+            // 弹窗/确认框/帮助页打开时整块撤掉，与原来的让位规则一致。
+            if !(self.dialog.is_some()
+                || self.confirm.is_some()
+                || self.internal_confirm.is_some()
+                || self.about_open
+                || self.help_entry.is_some())
+            {
+                let root = ui.ctx().viewport_rect();
+                let plate = egui::Rect::from_min_max(
+                    egui::pos2(root.min.x + 260.0, root.min.y + 40.0),
+                    root.max - egui::vec2(12.0, 6.0),
+                );
+                self.inline_drag_handle(ui, "window_drag_layer_list", plate);
+            }
 
             let q = self.query.trim().to_lowercase();
             // 批次 S/T：列表 = 头段（计算器/搜索/提示）+ 应用结果，`self.selected` 按「合并行号」计
@@ -4673,7 +5207,7 @@ impl eframe::App for LauncherApp {
                 let file_route = source::filesearch::route(&self.query);
                 let in_file_mode = !matches!(file_route, source::filesearch::Route::NotOurs);
                 if q.is_empty() {
-                    ui.label("清单为空——按 Ctrl+Shift+N 或点右上「＋」新建，或按 Ctrl+I 批量导入。");
+                    ui.label("清单为空——按 Ctrl+Shift+N、或点右上 ☰ 里的「新建快捷项」，也可按 Ctrl+I 批量导入。");
                 } else if in_file_mode {
                     if self.prefs.source_on(source::SourceId::Files) {
                         ui.label(match &file_route {
@@ -4762,11 +5296,20 @@ impl eframe::App for LauncherApp {
                 // 列表滚动跟随选中项（FR-ACT-10 验收项）：只在选中变化的那一帧把它居中，
                 // 其余帧不干预用户自己的滚轮位置。
                 let follow_selection = self.selected != self.scroll_followed;
+                // 批次 F6：行高/图标由「行密度」给（默认甲 34/24），只有「跟随主题」档才回落到
+                // 主题的 `row_height` / `icon_size`。`Ui::horizontal` 的行高初值取自
+                // `spacing.interact_size.y` ⇒ 这一处赋值让所有结果行同高（含头段行）；
+                // `item_spacing.y` 就是行与行的间距，窗口高度公式用的是同一对数。
+                let (row_h, icon, row_spacing) = self.row_geom();
+                let sub_size = self.theme.subtitle_font_size;
+                let glyph = (icon * 0.6).max(10.0);
                 // results 是下标（见 MatchIndex::search），逐项回指 self.items。
                 // 套 ScrollArea 才谈得上翻页与滚动跟随：窗口只装得下约十行，清单可达上百行。
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        ui.spacing_mut().interact_size.y = row_h;
+                        ui.spacing_mut().item_spacing.y = row_spacing;
                         for (h, row) in plan.head.iter().enumerate() {
                             let is_sel = self.selected == h;
                             match row {
@@ -4776,11 +5319,11 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "复制");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
                                                 egui::RichText::new("=")
                                                     .monospace()
-                                                    .size(20.0)
+                                                    .size(glyph)
                                                     .weak(),
                                             ),
                                         )
@@ -4790,7 +5333,7 @@ impl eframe::App for LauncherApp {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             copy_text = Some(hit.copy.clone());
@@ -4808,9 +5351,9 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "搜索");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
-                                                egui::RichText::new("\u{1F50D}").size(18.0).weak(),
+                                                egui::RichText::new("\u{1F50D}").size(glyph).weak(),
                                             ),
                                         )
                                         .on_hover_text("网页搜索（FR-SRC-11）");
@@ -4819,7 +5362,7 @@ impl eframe::App for LauncherApp {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             open_hit = Some(hit.clone());
@@ -4831,9 +5374,9 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "查看");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
-                                                egui::RichText::new("…").monospace().size(18.0).weak(),
+                                                egui::RichText::new("…").monospace().size(glyph).weak(),
                                             ),
                                         );
                                         let sel = ui.selectable_label(
@@ -4844,7 +5387,7 @@ impl eframe::App for LauncherApp {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(12.0),
+                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             self.hint_toast(ui.ctx(), hint_message(hint));
@@ -4856,9 +5399,9 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "运行");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
-                                                egui::RichText::new("▸").monospace().size(18.0).weak(),
+                                                egui::RichText::new("▸").monospace().size(glyph).weak(),
                                             ),
                                         )
                                         .on_hover_text("自定义命令（FR-SRC-05）");
@@ -4879,7 +5422,7 @@ impl eframe::App for LauncherApp {
                                             );
                                         }
                                         ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             launch = Some(hit.entry.clone());
@@ -4894,9 +5437,9 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "补全");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
-                                                egui::RichText::new("…").monospace().size(18.0).weak(),
+                                                egui::RichText::new("…").monospace().size(glyph).weak(),
                                             ),
                                         );
                                         let sel = ui.selectable_label(
@@ -4913,11 +5456,11 @@ impl eframe::App for LauncherApp {
                                                 egui::RichText::new(hint.command.as_str())
                                                     .monospace()
                                                     .weak()
-                                                    .size(12.0),
+                                                    .size(sub_size),
                                             );
                                         }
                                         ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(12.0),
+                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             self.custom_hint_activate(ui.ctx(), hint);
@@ -4948,14 +5491,14 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "打开");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
                                                 egui::RichText::new(if hit.is_dir {
                                                     "\u{1F4C1}"
                                                 } else {
                                                     "\u{1F4C4}"
                                                 })
-                                                .size(18.0)
+                                                .size(glyph)
                                                 .weak(),
                                             ),
                                         )
@@ -4969,7 +5512,7 @@ impl eframe::App for LauncherApp {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             open_file = Some(hit.clone());
@@ -4998,9 +5541,9 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "执行");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
-                                                egui::RichText::new(">").monospace().size(20.0).weak(),
+                                                egui::RichText::new(">").monospace().size(glyph).weak(),
                                             ),
                                         )
                                         .on_hover_text("终端命令（FR-SRC-16）");
@@ -5012,7 +5555,7 @@ impl eframe::App for LauncherApp {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(12.0),
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             open_term = Some(hit.clone());
@@ -5024,9 +5567,9 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "查看");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
-                                                egui::RichText::new(">").monospace().size(20.0).weak(),
+                                                egui::RichText::new(">").monospace().size(glyph).weak(),
                                             ),
                                         );
                                         let sel = ui.selectable_label(
@@ -5037,7 +5580,7 @@ impl eframe::App for LauncherApp {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(12.0),
+                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             self.hint_toast(ui.ctx(), source::terminal::USAGE_TOAST);
@@ -5049,9 +5592,9 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "查看");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
-                                                egui::RichText::new("?").monospace().size(20.0).weak(),
+                                                egui::RichText::new("?").monospace().size(glyph).weak(),
                                             ),
                                         )
                                         .on_hover_text(format!(
@@ -5071,7 +5614,7 @@ impl eframe::App for LauncherApp {
                                                 .size(11.0),
                                         );
                                         ui.label(
-                                            egui::RichText::new(hit.entry.summary).weak().size(12.0),
+                                            egui::RichText::new(hit.entry.summary).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             self.help_entry = Some(*hit);
@@ -5083,9 +5626,9 @@ impl eframe::App for LauncherApp {
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "查看");
                                         ui.add_sized(
-                                            [32.0, 32.0],
+                                            [icon, icon],
                                             egui::Label::new(
-                                                egui::RichText::new("?").monospace().size(20.0).weak(),
+                                                egui::RichText::new("?").monospace().size(glyph).weak(),
                                             ),
                                         );
                                         let sel = ui.selectable_label(
@@ -5096,7 +5639,7 @@ impl eframe::App for LauncherApp {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
                                         ui.label(
-                                            egui::RichText::new(hint.subtitle).weak().size(12.0),
+                                            egui::RichText::new(hint.subtitle).weak().size(sub_size),
                                         );
                                         if sel.clicked() {
                                             self.hint_toast(
@@ -5117,9 +5660,9 @@ impl eframe::App for LauncherApp {
                                 // 前 10 行标 1-9/0，第 11 行起留白——那里没有按键，标了反而误导。
                                 row_badge(ui, idx, "执行");
                                 if let Some(texture) = self.icons.get(&item.source_path) {
-                                    ui.image(egui::load::SizedTexture::new(texture.id(), egui::vec2(32.0, 32.0)));
+                                    ui.image(egui::load::SizedTexture::new(texture.id(), egui::vec2(icon, icon)));
                                 } else {
-                                    ui.add_space(32.0);
+                                    ui.add_space(icon);
                                 }
                                 // FR-SRC-19：置顶项名称前加 📌 角标（免鼠标可辨）。
                                 let shown = if item.pinned { format!("📌 {}", item.name) } else { item.name.clone() };
@@ -5406,7 +5949,7 @@ impl eframe::App for LauncherApp {
                     ui.label(egui::RichText::new(format!("目标：{}", c.path)).small());
                     ui.label(
                         egui::RichText::new(
-                            "只从启动器清单移除，不删磁盘上的程序或文件；需要时可再「＋ 新建」或 Ctrl+I 批量导入。",
+                            "只从启动器清单移除，不删磁盘上的程序或文件；需要时可再按 Ctrl+Shift+N 新建（或点 ☰ 菜单第一项），也可 Ctrl+I 批量导入。",
                         )
                         .weak()
                         .small(),
@@ -5701,10 +6244,16 @@ impl eframe::App for LauncherApp {
             }
         }
 
-        // Esc 分段（FR-ACT-10「清空后隐藏」+2026-10-17 设置页一档 +2026-10-18 删除确认一档）：
-        // 确认框→关框；对话框→关框；设置页→回搜索；有字→清空；全空→关闭到托盘。
+        // Esc 分段（FR-ACT-10「清空后隐藏」+2026-10-17 设置页一档 +2026-10-18 删除确认一档
+        // +2026-10-24 批次 F6 菜单一档）：
+        // 菜单→只收菜单；确认框→关框；对话框→关框；设置页→回搜索；有字→清空；全空→关闭到托盘。
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.internal_confirm.is_some() {
+            if menu_was_open {
+                // Popup 在本帧已经把旗标写回 false，这里只补一条日志并接住剩下的分支——
+                // 不接住的话这一次 Esc 会顺路把查询清空、甚至把窗口收进托盘。
+                self.menu_open = false;
+                eprintln!("☰ 菜单：按 Esc 收起（窗口与查询都不动）");
+            } else if self.internal_confirm.is_some() {
                 eprintln!("内部确认：按 Esc 取消，未执行");
                 self.internal_confirm = None;
                 self.focus_query = true;
@@ -5746,22 +6295,6 @@ impl eframe::App for LauncherApp {
         // 放在本帧最后铺设：同为 Background 层时后铺者赢得命中，万一和顶栏/列表空白手柄贴上，
         // 最外圈那 6px 归缩放。
         self.edge_grips(ui);
-    }
-}
-
-fn install_cjk_fallback(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    for (file, index) in [("msyh.ttc", 0u32), ("simhei.ttf", 0), ("STXIHEI.TTF", 0)] {
-        let Ok(bytes) = std::fs::read(format!(r"C:\Windows\Fonts\{file}")) else { continue };
-        if skrifa::FontRef::from_index(&bytes, index).is_err() { continue; }
-        let mut data = egui::FontData::from_owned(bytes);
-        data.index = index;
-        fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(data));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("cjk".to_owned());
-        }
-        ctx.set_fonts(fonts);
-        return;
     }
 }
 
@@ -5962,17 +6495,29 @@ fn main() -> eframe::Result {
     }
     spawn_hotkey_thread(hotkey_tx, configured.toggle_hotkey, configured.typeback_hotkey);
 
+    // 批次 F1 的主题在这里解析一次：默认窗口高度要按主题行高算（一屏正好 10 行），
+    // 同一份再传进 `LauncherApp`——`Themes\` 只读一遍，坏主题文件在日志里也只记一次。
+    // 2026-10-24 用户需求：旧默认 400px 只装得下 6 行，现在按 `LIST_ROWS` 算。
+    let (start_theme, start_theme_choices) = theme::load(&configured.theme);
+    let start_height = default_window_height(&start_theme, configured.row_density);
+
     let mut wgpu_options = eframe::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
-        create_new.instance_descriptor.backends = eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL;
+        // E-18 阶段二硬前置（2026-10-24）：只留 GL，不再带 DX12 兜底。
+        // 透明与否的决定性变量是呈现路径，不是 winit 样式：DX12 的 DXGI 交换链
+        // 在 HWND 上不带 alpha，GL 走 WGL 像素格式 + GDI 重定向面，DWM 认它的 alpha。
+        // 本机实测（`winprobe transparent gl`）：GL 不补任何样式也透、圆角干净。
+        // 代价：WGL 上下文建不起来就没有后备（本机 Intel HD 630 可用）。
+        create_new.instance_descriptor.backends = eframe::wgpu::Backends::GL;
     }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, 400.0])
+            .with_inner_size([500.0, start_height])
             .with_title("")
             .with_decorations(false)
             .with_always_on_top()
+            .with_transparent(true)
             .with_visible(start_visible),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
@@ -5983,7 +6528,8 @@ fn main() -> eframe::Result {
         "egui Launcher",
         options,
         Box::new(move |cc: &eframe::CreationContext<'_>| {
-            install_cjk_fallback(&cc.egui_ctx);
+            // 字体不再在这里装：批次 F1 起由 `sync_theme` 按主题的 `font_name` 一次装好
+            // （`LauncherApp::new` 末尾调用，`CTX` 已经 set）。CJK 回退仍在同一条路径里。
             CTX.set(cc.egui_ctx.clone()).ok();
             // E-05：取本机顶层 HWND，on_show 对它发 WM_IME_CONTROL 切英文模式
             let self_hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
@@ -5994,7 +6540,15 @@ fn main() -> eframe::Result {
                 eprintln!("IME: 无法获取本机 HWND，E-05 英文模式切换将跳过");
             }
             Ok(Box::new(LauncherApp::new(
-                tray_rx, hotkey_rx, ipc_rx, notify_tx, notify_rx, self_hwnd, intent,
+                tray_rx,
+                hotkey_rx,
+                ipc_rx,
+                notify_tx,
+                notify_rx,
+                self_hwnd,
+                intent,
+                start_theme,
+                start_theme_choices,
             )))
         }),
     )
@@ -6184,8 +6738,79 @@ mod nav_tests {
 
     #[test]
     fn page_rows_uses_window_height_but_never_below_one() {
-        assert_eq!(page_rows(400.0), 9, "默认 400px 窗口约九行一页");
-        assert_eq!(page_rows(20.0), 1, "窗口拉到比列表还矮时仍要能动一行");
+        // 批次 F6：Light（内边距 14）的顶栏 + 上下内边距 = 63 + 15 = 78，页高由窗口高现算。
+        let chrome = list_chrome_h(&theme::Theme::light());
+        assert_eq!(chrome, 78.0, "Light 的列表外框占用：顶 63 + 底 15");
+        // 甲档（默认）步进 34 + 2 = 36：438 高的窗口正好十行，手动缩到 400 就只剩八行。
+        assert_eq!(page_rows(438.0, 36.0, chrome), 10);
+        assert_eq!(page_rows(400.0, 36.0, chrome), 8, "窗口比默认矮时按实际高度给行数");
+        assert_eq!(page_rows(20.0, 36.0, chrome), 1, "拉到比列表还矮时仍要能动一行");
+        assert_eq!(page_rows(400.0, 0.0, chrome), 322, "行距为 0 时按 1px 兜底，不许除零");
+    }
+
+    /// 批次 F6 真机抓到的缺陷钉住：输入框改成定宽铺满之后，顶栏那条缝只剩 `item_spacing.x`，
+    /// 手柄两侧一内缩就归零 ⇒ 「拖顶栏空白移动窗口」静默失效（日志里 `搜索页顶栏空白` 零命中）。
+    /// 这一条不测渲染，只测"缝有没有留够"——`TOP_DRAG_GAP` 哪天被删掉，这里就该红。
+    #[test]
+    fn top_drag_strip_stays_wide_enough_to_hit() {
+        // egui 默认行间距 8；主题把 spacing 调紧到 4 时也要还剩 12px 可命中。
+        assert!(top_drag_strip_w(8.0) >= 8.0, "默认行间距下顶栏手柄只有 {} px", top_drag_strip_w(8.0));
+        assert!(top_drag_strip_w(4.0) >= 8.0, "紧行间距下顶栏手柄只有 {} px", top_drag_strip_w(4.0));
+        // 反证：没有预留间隙时，8px 的行间距被两侧内缩吃到只剩 4px——就是本次修掉的形状。
+        assert!(
+            8.0 - 2.0 * TOP_DRAG_INSET < 8.0,
+            "内缩若小到让「零预留」也够用，这条反证就该换掉（当前内缩 {}）",
+            TOP_DRAG_INSET
+        );
+    }
+
+    #[test]
+    fn ten_rows_mode_caps_results_and_counts_head_rows() {
+        let mut plan = Plan::default();
+        plan.results = (0..30).collect();
+        cap_plan_rows(&mut plan, LIST_ROWS);
+        assert_eq!(plan.results, (0..10).collect::<Vec<_>>(), "没有头段时列前 10 条");
+        // 头段行与普通结果共用这 10 行名额。
+        assert_eq!(result_room(2, LIST_ROWS), 8);
+        assert_eq!(result_room(LIST_ROWS, LIST_ROWS), 0, "头段自己占满就不再放结果");
+        assert_eq!(result_room(LIST_ROWS + 2, LIST_ROWS), 0, "头段超了也不下溢");
+    }
+
+    #[test]
+    fn default_window_height_gives_a_full_ten_row_page() {
+        let light = theme::Theme::light();
+        let chrome = list_chrome_h(&light);
+        // 四档各自的窗口高，且每一档都要正好装下 LIST_ROWS 行（2026-10-24 用户的「一屏十行」）。
+        for (density, height, step) in [
+            (RowDensity::Snug, 438.0, 36.0),
+            (RowDensity::Roomy, 498.0, 42.0),
+            (RowDensity::Dense, 318.0, 24.0),
+            (RowDensity::Theme, 658.0, 58.0),
+        ] {
+            let h = default_window_height(&light, density);
+            assert_eq!(h, height, "{} 档窗口高", density.as_str());
+            assert_eq!(
+                page_rows(h, step, chrome),
+                LIST_ROWS,
+                "{} 档默认高度 {h} 要正好装下 {LIST_ROWS} 行（步进 {step}）",
+                density.as_str()
+            );
+            assert!(h >= MIN_H as f32 && h <= 900.0, "夹在缩放下限与上限之间：{h}");
+        }
+        // 行高被主题写成 0（只有「跟随主题」档会读它）时按最小窗口兜底，不许算出比 MIN_H 还矮的窗口。
+        let mut flat = theme::Theme::light();
+        flat.row_height = 0.0;
+        assert_eq!(default_window_height(&flat, RowDensity::Theme), MIN_H as f32);
+        // 换主题仍要重算：主题供 `padding`（内边距）与「跟随主题」档的行高。
+        // 走纯解析那条路（`resolve_with` + 空表），单测不碰磁盘与注册表。
+        let none = std::collections::HashMap::new();
+        // Compact 内边距 10、行高 44 ⇒ 跟随主题 59 + 10×48 + 11 = 550；甲档 59 + 10×36 + 11 = 430。
+        let compact = theme::resolve_with("Compact", &none, false);
+        assert_eq!(default_window_height(&compact, RowDensity::Theme), 550.0);
+        assert_eq!(default_window_height(&compact, RowDensity::Snug), 430.0);
+        // Modern 内边距 16、行高 56 ⇒ 65 + 10×60 + 17 = 682。
+        let modern = theme::resolve_with("Modern", &none, false);
+        assert_eq!(default_window_height(&modern, RowDensity::Theme), 682.0);
     }
 
     #[test]
@@ -6320,12 +6945,19 @@ mod nav_tests {
         assert!(!HotkeySpec::DEFAULT.conflicts_local(LOCAL_TAKEN));
         // 反向也要钉住：这张表只挡"本程序真绑了的键"，不挡一切眼熟的编辑键。
         // Ctrl+A/Ctrl+Z 之类在本程序里没绑（表里当初多写过四条，全是凭印象），系统空着就该让人用。
-        for vk in [0x41u32, 0x42, 0x48, 0x4D, 0x5A] {
+        for vk in [0x41u32, 0x42, 0x48, 0x5A] {
             assert!(
                 !HotkeySpec { mods: HKF_CONTROL | HKF_NOREPEAT, vk }.conflicts_local(LOCAL_TAKEN),
                 "Ctrl+{} 本程序没绑，不该出现在表里",
                 char::from_u32(vk).unwrap()
             );
         }
+        // 【2026-10-24 批次 F6】这一句原本连着上面那个循环里的 `0x4D` 一起写："Ctrl+M 本程序
+        // 没绑"。批次 F6 把顶栏「＋ 新建」换成 ☰ 菜单并给菜单配了 Ctrl+M，那句从此不成立 ⇒
+        // 0x4D 从"没绑"名单挪到这里，改成钉住"绑了就必须进表"（表与 `consume_key` 一一对应）。
+        assert!(
+            HotkeySpec { mods: HKF_CONTROL | HKF_NOREPEAT, vk: 0x4D }.conflicts_local(LOCAL_TAKEN),
+            "Ctrl+M 开 ☰ 主菜单，必须被本地表挡住"
+        );
     }
 }

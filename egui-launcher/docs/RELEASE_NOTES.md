@@ -697,7 +697,78 @@ A4 撤除后用户在选项面板里点了 **A9**。起因是一句实测：本�
 | 真机过程里的一个意外（如实记） | 验「点击行」时实例还停在设置页，我的坐标点击落到了「批量导入全部（Ctrl+I）」上，触发了一次开始菜单扫描：日志 `source: 批量导入 24 个 .lnk … shell:AppsFolder 收 UWP/MSIX 34 条`、`source: 已写清单 user_items.json（294 条）`。复核结果**没有重复**：`user_items.json` **294** 条、按 `kind|path|arguments` 去重后仍是 **294**，文件是合法 JSON 数组（前一日记的 293 是 `drop_hidden` 之后的界面清单数，不是文件条数）。本批**没有回滚这次导入**——它走的是既有「不重复、不删除」的合并路径 |
 | 验证 | `cargo test --bin egui-launcher` **167/167**（162 + 5：`route` 只看第 0 字符、条目 key 唯一且正文/过滤词齐全且无 `**`、需求书点名的四类过滤都能命中、源关掉后条目跟着走且 `?` 回落、`take_over` 独占与裸 `?` 全表）；`cargo check --all-targets` **零警告**；`cargo build` 7.71s 通过（先 `taskkill` 掉我自己那个锁 exe 的实例） |
 | 未做（明写） | ① **数据源关掉后 `?` 回落**只有单测、没有真机（要改 `settings.json` 的 `sources_off`，没拿用户配置试）；② 速查表行上的 `Tab` / `Space` 没专门接（Enter / 数字键 / 点击已接；`Tab` 会落到既有补全路径，`Space` 落空格四档判据）；③ 帮助页里不渲染 Markdown（反引号原样显示），也不提供「复制这一条」 |
+| 提交 | ~~**未提交**。commit / push 仍需用户正文原话~~【2026-10-24 用户正文「提交push后继续下一任务」⇒ 已提交并推送为 **`39f7f56「速查表」`**（6 文件 +864/−19，含新文件 `src/source/cheatsheet.rs`）；`git ls-remote origin main` = `39f7f56e35c2ba4bc6af8143595c1826ecfdffd7` 与本地一致。至此 `ad68ca1 终端` 与 `39f7f56 速查表` 都在远端 ⇒ 之前几节挂着的「本地 `8918849` / `109524a` / `ad3083b` / `30498b0` 仍未 push」一笔作废（推送的是整条 main 历史）】 |
+
+---
+
+### 三十五、F1 主题系统 + E-18 后端落地（FR-UIX，2026-10-24）
+
+排期表 8.10 第 5 项，阶段二的第一批。用户正文「提交push后继续下一任务」⇒ 先提交 A8，再开 F1；开工第一件事按写死的硬前置改渲染后端（E-18）。
+
+| 项 | 现量 |
+| --- | --- |
+| E-18 硬前置 | `src/main.rs` 的 `WgpuSetup::CreateNew` 里 `instance_descriptor.backends` 从 `DX12 \| GL` 改成**只剩 `Backends::GL`**，`ViewportBuilder` 恢复 `.with_transparent(true)`。真机取证：自测实例的模块表里有 `opengl32.dll`、**没有** `d3d12.dll` / `vulkan-1.dll`（`tasklist /FI "PID eq …" /M` 过滤）。内存 134–137MB 是 debug 构建读数，E-18 记的 GL 75MB / DX12 343MB 是另一份测量口径，不作对照 |
+| 新文件 `src/theme.rs`（807 行） | 三层：`ThemeFile`（落盘形态，23 个 `Option` 键 + `base`，缺省 = 继承）→ `Theme`（解析完成，所有键有值）→ `apply(ctx)` 装进 egui。19 套内置写成紧凑的 `Pal([&str; 13])`（13 个颜色键顺序固定），`Theme::light()` = 需求书 6.2 那 24 个键的基准（20 / 13 / 9.5 / 9 pt、行高 54、图标 32、内边距 14、圆角 0、不透明度 255、`FAFAFA`/`C8C8C8`/…/`005FE0`/`0047B8`） |
+| 继承语义 | `base` 缺省 Light；`base` 与自身同名 = 改这个内置主题（先解析内置自己的 base，再叠内置值，最后叠用户文件——否则 `Dark.json` 写 `base:Dark` + 一个背景色会把整套 Dark 配色丢掉）；深度上限 8，成环 / 超深 / 找不到名字都回落 Light 并各记一行日志；颜色写错只保留继承值 + 记一行，不让整份主题失效 |
+| 用户目录与覆盖 | 新增 `application::data_dir()`（exe 同级，不可写退 `%LOCALAPPDATA%\egui-launcher`，与清单 / 设置 / 日志同处），`Themes\` 挂在它下面。用户 `Dark.json` 覆盖同名内置；下拉只列一份（System + 19 内置 + 用户主题，同名不重复）。坏 JSON 只记日志跳过 |
+| `System` 选择项 | 不是第 20 套主题，而是选择项：读 `HKCU\...\Themes\Personalize\AppsUseLightTheme`（0 = 深色，读不到按浅色）。每次呼出重新解析 ⇒ 隐藏期间系统换深浅，下次出现即跟上 |
+| 设置页第 5 页「外观」 | 主题下拉（即时生效、立即写 `settings.json`）+「打开主题文件夹」+「恢复 Light」+「当前生效」摘要（名字 / 字体 / 四个字号 / 行高 / 图标 / 内边距 / 选中圆角 / 不透明度）+ 主题目录路径。默认选择是 **Light** 而不是 System：需求书那条验收是「删光主题文件仍能启动且为浅色」，默认值不能靠"跟随系统"实现 |
+| 主题怎么进界面 | `Theme::apply` 同时写 Light / Dark 两套样式（避免系统明暗切换把选好的主题顶掉）；`CentralPanel` 用 `central_frame()`（底色带 `opacity` 的 alpha + 边框 + 固定圆角 10 + 主题内边距）+ `App::clear_color` 恒为全透明（否则圆角外那一圈会被清成不透明底色）；搜索框字号 = `input_font_size`；列表行高 = `row_height`、图标 = `icon_size`、副标题 / 快捷键字号走主题；选中圆角 = `selected_radius`。不设 `override_text_color`：它会把 `.weak()` 副标题也压成同一种颜色 |
+| 首帧与字体 | 主题在 `LauncherApp::new` 构造时解析（首帧不留"默认外观"），`CTX` 就绪后 `use_theme()` 一次装进 egui；`install_fonts` 默认 `auto` = 只追加 CJK 回退（`msyh.ttc` → `simhei.ttf` → `STXIHEI.TTF`，Proportional + Monospace），主题写了字体名就去 `C:\Windows\Fonts` 按名找并放到 Proportional 首位；`run_native` 里原先那份 `install_cjk_fallback` 删除（字体归主题管） |
+| 真机自查（我自己的隔离实例，自动注入） | 复制 exe 到 `target\f1-theme-test\`（便携目录跟着走，不碰用户 `target\debug` 的数据），依次验：① Light 基准（20pt 输入、行高 54、首屏 6 行）；② 设置页选 Dark 即时换色；③ 用户 `TestTheme.json`（`base:Dark`、`opacity:210`、`selected_background:1D4ED8`、`row_height:48`、圆角 6）⇒ 列表变 7 行、选中行蓝色、**整屏截图能透过窗口看到桌面上的浏览器文字**（逐像素透明真的生效）；④ `System` + 注册表 `AppsUseLightTheme=1` ⇒ 当前生效 Light；⑤ 用户 `Dark.json`（`base:Dark` + 背景 `101010`）⇒ 日志 `底色 101010`，同名覆盖与自继承同时成立；⑥ `BadTheme.json` 坏 JSON ⇒ 只记一行、不下拉、不挡启动；⑦ 把整个 `Themes\` 移走 + `settings.json` 写着 `TestTheme` ⇒ 启动照常、日志 `找不到主题「TestTheme」，按 Light 处理`；⑧ 重启保持所选主题；⑨「恢复 Light」按钮把下拉与文件都改回 Light。验证实例已 `taskkill`（只关我自己起的那几个），`Themes` 目录已还原 |
+| 真机抓到并修掉的两处 | ① **「恢复 Light」在 500px 最小宽度下被右边缘裁掉**（下拉 200 + 两个按钮放不进一行）⇒ 该行改 `ui.horizontal_wrapped`，按钮自动换到第二行；② **坏主题文件在日志里出现两次**（`all_names` 与 `resolve` 各读一遍目录，`new()` 里"首帧"和"末尾装进 ctx"又各读一遍）⇒ 新增 `theme::load()` 一次读盘同时给出主题与下拉选项，`new()` 末尾改用 `use_theme()` 复用构造时那份 ⇒ 现在每次启动 / 呼出各一行 |
+| 验证 | `cargo test --bin egui-launcher` **179/179**（167 + 12：6.2 基准表、19 套各自解析、部分键继承、自继承、成环、深度 8、坏颜色、`RRGGBB` 两种写法、System 明暗、未知选择回落、opacity 进 alpha、深色判据）；`cargo check --all-targets` **零警告**；`cargo build` 7.75s / 6.59s 两次通过 |
+| 未做（明写） | ① FR-UIX-02 的「宽度 / 行数 / 位置 / 淡入淡出」属 `appearance`、不属主题，本批**没做**；FR-UIX-06 的 `DWMWA_CLOAK` 防白闪也没做。② 颜色只能在 JSON 里改，没有取色器；字体只在 `C:\Windows\Fonts` 里按名找，没有选择器。③ 主题切换没有独立快捷键：走 `Ctrl+,` 进设置第 5 页（按「设置页开关类不另配键」的成规）。④ 真机全是在隔离目录里由我注入操作，**用户自己的数据目录与观感没有碰** |
 | 提交 | **未提交**。commit / push 仍需用户正文原话 |
+
+---
+
+### 三十六、主界面滚轮终于能滚 + 一屏十行 + 「显示条数」设置（2026-10-24，用户正文）
+
+用户正文两件事：①「程序主界面无法滚动滚轮」；②「程序主界面默认显示 10 条记录,现在显示 6 条,并添加设置,可以配置默认显示 10 条还是显示所有」。
+
+两道口径分两轮定。第一轮（选项面板）：**固定 10 行**（窗口高度不随档位变）；**「10 条」档只列前 10 条**（头段的计算器 / 搜索提示行也占名额）。第二轮用户正文「这个10条功能可以参考Delphi的AltRun版本」，选项面板据此裁定：**默认改成 Delphi 口径**——默认「全部」不截断、「10 条」仍是可选的截断档；**换主题时按新行高重算窗口高度**（Compact 543 / Modern 663 / Light 643）。
+
+| 项 | 现量 |
+| --- | --- |
+| 滚轮根因 | 列表右侧那块「拖空白移动窗口」的手柄铺在独立的 `Order::Background` `Area` 上；`ScrollArea` 收滚轮的前置是 `ui.rect_contains_pointer(outer_rect)`，而 `Context::rect_contains_pointer` 要求 `layer_id_at(pointer)` 就是自己这一层（`egui-0.36.2/src/containers/scroll_area.rs:1215`）⇒ 指针一进那块矩形，层就变成 Background，滚轮整段被吞。与"行控件挡住"无关：点在行上照旧能滚，进右侧空白就死 |
+| 修法 | 新手柄 `inline_drag_handle`（`main.rs:2248`）在中央面板同一个 `Ui` 里用 `ui.interact(rect, Id, Sense::drag())` 注册，矩形仍是 `(root.min+[260,40]) .. (root.max-[12,6])`，注册位置在 `ui.separator()` 之后、`ScrollArea` 之前（`main.rs:4917`）。命中测试里「拖拽控件先注册、点击控件后注册」两者各归各的 ⇒ 结果行点击照旧；`DragScroll::OnTouch` 在非触摸桌面上不铺竞争拖拽控件（`scroll_area.rs:831`），所以这块空白仍由本程序认领 |
+| Delphi 对照（只读参考 `ALTRun-master`） | `Form/frmALTRun.pas:1101` `lstShortCut.Height := 10 * lstShortCut.ItemHeight` ⇒ Delphi 的「10」只是**列表视口高度**，不是结果上限；`Form/frmALTRun.pas:1104-1107`（启动时 `:528-531`）`if ShowCommandLine then Self.Height := 250 else Self.Height := 230` ⇒ 窗口高是常量、不随结果数变；`Unit/untShortCutMan.pas:1039-1081` 匹配结果**全部**加入并排序，只给前 10 行贴 `1…9,0` 号（最近列表 `:1113-1163` 同）。Delphi 没有行数设置。⇒ 它的行为对应本项目的「全部」，不对应截断式「10 条」 |
+| 窗口高度 | 改成由主题现算：`default_window_height()` = `LIST_TOP_H 48 + 10 × (row_height + ROW_STEP_EXTRA 4) + LIST_BOTTOM_H 15`，Light 下 **500×643**（原来 6 行是 404）。48 / 15 / 4 是 Light 实测值：首行徽标中心 75、行距 58、第 10 行贴底。窗口尺寸仍不持久化，每次启动按主题重算。**2026-10-24 第二轮追加**：`use_theme` 在"主题确实变了"（`theme_applied` 比较不等）时按新行高重发 `ViewportCommand::InnerSize`，启动首帧仍由 `with_inner_size` 给同一个值；手动拖过的尺寸只在**下一次换主题**时被覆盖，呼出 / 隐藏之间不动（`sync_theme` 每呼出都跑，但主题没变时先相等返回） |
+| 两档语义 | `ListRows::{Ten, All}`（`application.rs`，`serde` 落 `settings.json` 的 `list_rows` = `ten` / `all`，~~缺省 `ten`~~【2026-10-24 第二轮按 Delphi 口径改为**缺省 `all`**；`Ten` 变为可选截断档，旧 `settings.json` 里写着 `ten` 的照旧生效】）。`plan()` 末尾 `cap_plan_rows()`：`results.truncate(rows.saturating_sub(head.len()))` ⇒ 「10 条」时头段（计算器 / 搜索 / 提示）也占名额；「全部」只是不截断，窗口仍 10 行高，多出来的靠滚轮翻。显示、↑↓、PgUp/PgDn、`Ctrl+N/P`、`Ctrl+J/K`、Tab、数字键、空格、Enter 全部走同一份截断后的 `plan` ⇒ 「10 条」时键盘能走到的也只有那 10 行 |
+| 设置页 | 通用页尾部新增「主界面显示条数」两个可点选项 ~~「10 条（默认）」/「全部」~~【2026-10-24 第二轮改为 **「全部（默认）」/「10 条」**】，点完立即写 `settings.json` 并记一行 `设置页：list_rows = …（已写 settings.json）`；按「设置页开关类不另配键」的成规，**没有**独立快捷键 |
+| 真机自查（隔离实例 `target\listrows-test\`） | ① 新启动 500×643，恰好 10 行（徽标中心 75 / 133 / … / 597，步长 58），第 10 行贴底、无第 11 行露头；② 「全部」+ 空输入 = 100+ 行（该清单 103 条），右侧出现滚动条；指针在 **x=450、y=300**（原被 Background 层吞掉的区域）滚轮 ↓600 ⇒ 列表从第 1 行翻到第 5–9 行，再 ↑2000、↑400 回到顶 ⇒ 两个方向都真滚；③ 右侧空白拖拽 ⇒ 日志 `左键拖空白移动（列表右侧空白）`，窗口矩形 (232,236) → (262,286)，与 (30,50) 的拖距一致；④ 点结果行「关于本程序」⇒ 程序内关于弹窗正常弹出（同层 drag-only 手柄没有抢走点击）；⑤ 设置页「全部」→「10 条」⇒ 磁盘 `"list_rows": "ten"`、日志一行、返回搜索页恰好 10 行且无滚动条；⑥ **换主题重算**（外观页下拉）：Light→Compact 截图 **500×543**、日志 `主题：行高 44 ⇒ 窗口高度按新行高重算为 543（原 643）`；→Modern **500×663**、日志 `行高 56 … 663（原 543）`；→「恢复 Light」**500×643**、日志 `行高 54 … 643（原 663）`；Esc 回列表仍是 1…0 整十行、无滚动条、无裁切 |
+| 一条没复现的现象 | 第一次合成拖拽（起点正好压在手柄与滚动区域的上边界 y=42）之后，列表跳了 12 行；同坐标再拖两次、以及列表右侧的拖拽都没再出现。现按"合成输入首帧的指针位置"存疑，**没有归因、也没有为它改代码**；真人操作若撞见，再按当轮日志取证 |
+| 验证 | `cargo test --bin egui-launcher` **182/182**（179 + 3：`list_rows` 缺省与两值往返、10 条档截断且头段占名额、窗口高度按主题算并钳在 `MIN_H..900`）。第二轮把第一条改成「缺省 `all`、`ten` 可往返」（`{}` ⇒ `All`、序列化含 `"list_rows":"all"`、`"ten"` ⇒ `Ten`、垃圾值报错），第三条补了 Compact 44⇒543 / Modern 56⇒663 两条断言；**总数仍是 182**。`cargo check --all-targets` 零警告；`cargo build` 通过（未跑 `cargo fmt`） |
+| 未做 / 偏差 | ① 「全部」档的条数上限仍是匹配层 `MAX_RESULTS = 50`（空输入「浏览整张清单」不受此限）——本批没动匹配层；② 「10 条」时 Tab 补全与数字键只在本屏 10 行内挑，被截掉的条目要换「全部」才够得到（设置页文案已写明）；③ 窗口宽度 / 位置 / 淡入淡出仍没做成设置项（FR-UIX-02 的 `appearance`）；④ 真机全在隔离目录里跑，用户自己的数据目录没碰；验证实例已 `taskkill`（只关我自己起的那个） |
+| 提交 | **未提交**。commit / push 仍需用户正文原话 |
+
+---
+
+### 三十七、批次 F6：界面高度收下来（行密度四档）+ 顶栏「＋ 新建」换 ☰ 菜单 + 输入框放大（2026-10-24，用户正文）
+
+用户正文两件事：①「整体界面高度太高了，目前项与项之间的间距太大了, 参考Delphi的AltRun版本,在它的基础上做一个优化版,输入框大一点,像ahk版的AltRun的输入框一样,大气一点」；②「输入框的新建按钮可以去掉,换成快捷键就可以,或者换成一个三条杠的菜单,点击显示新建按钮和其他设置按钮」。
+
+三条裁定来自选项面板（**不构成提交授权**）：行高——「将以上3个做成可选择的配置,默认选择使用甲」⇒ 三档做成设置项，默认甲；新建入口——「甲：☰ 三条杠菜单 + 快捷键都留」；副标题——「甲：标题 + 灰副标题同行」（这一条本批没有改版式，只是把它钉在甲档 34px 里仍然成立）。
+
+| 项 | 现量 |
+| --- | --- |
+| 行密度四档 | `RowDensity::{Snug, Roomy, Dense, Theme}`（`src/source/application.rs:796`），落盘 `settings.json` 的 `row_density` = `snug` / `roomy` / `dense` / `theme`，**缺省 `snug`（甲）**。像素由 `main.rs:862` 的 `row_geometry()` 给：甲 **34 / 24 / 2**、乙 **40 / 28 / 2**、丙 **24 / 16 / 0**（行高 / 图标 / 行距），跟随主题＝主题的 `row_height` + `icon_size` + 行距 `ROW_STEP_EXTRA` 4。设置项落在通用页尾部「列表行密度」四个 `selectable_value`（`main.rs:3020`），点完立即写盘并按新行高重算窗口，日志 `换行密度：行密度 …（行高 … + 行距 …）⇒ 窗口高度重算为 …（原 …）` |
+| 参照系（两个老版本，只读取证） | Delphi 版 `frmALTRun.dfm:3339-3354` 的 `ItemHeight = 16`、行距 0、**无图标**——纯文字才能这么紧，16px 放不下图标和副标题，所以它只做"密"这一头的下限；AHK 版 `ThemeManager.ahk:209-215` 是 `RowHeight 54 / IconSize 32`、行距 0、窗口宽 700——**它不显空是靠宽撑的，不是靠行高**。本项目带图标、只有 500 宽，54+4 的步进就变成"行很松" ⇒ 甲档取 34（图标 24、标题 13pt 与灰副标题同行仍放得下），比 Delphi 松、比 AHK 紧，正是用户点名的默认 |
+| 窗口高度 | `default_window_height(theme, density)`（`main.rs:811`）= `list_top_h + 10 × (行高 + 行距) + list_bottom_h`，钳在 `MIN_H..900`；`list_top_h = 1 + padding + INPUT_MIN_H(44) + 4`、`list_bottom_h = padding + 1` ⇒ Light（内边距 14）下 **甲 438 / 乙 498 / 丙 318 / 跟随主题 658**；「跟随主题」档另两主题 Compact **550**、Modern **682**。四档都保持"一屏正好十行"：换档只改行高与窗口高，**不改宽度** |
+| 主题那两键的去向 | 批次 F1 的 `row_height` / `icon_size` **不再恒生效**——只有切到「跟随主题」档才真的决定列表行；其余三档由密度给。这是四档设计的代价，不换到第四档就改主题行高不起作用，所以设置页文案与速查表那条都把它写明了（需求书 6.2 那 24 个键里没有"行距"这一项 ⇒ 密度档自带行距，「跟随主题」沿用 4） |
+| 输入框 | `INPUT_MIN_H = 44.0`（`main.rs:819`）+ `add_sized([edit_w, 44])` + `vertical_align(Align::Center)`：原先 `TextEdit` 只按字体长到 ~29px。字号 Light 基准 `input_font_size` 由 20 抬到 **22**（`src/theme.rs:117`，只动基准值，自己写了这一键的主题如 Compact 18 照旧覆盖）。AHK 对照：`Src/UI/SearchWindow.ahk:96` `InputHeight := Max(editH, Win.Scale(40))` ⇒ 它的高下限是 40（按 DPI 缩放）、字号 20pt（`ThemeManager.ahk:209`）。**44 与 22 各比 AHK 高一档**——用户点名"大气一点"的有意超出，不是照抄，需求书 6.1 / 6.2 跟着登记 |
+| ☰ 主菜单 | 顶栏那个「＋ 新建」按钮撤除，换 `MENU_BTN_W = 40`（`main.rs:823`）宽、与输入框同高的 ☰（`main.rs:5088`，字号 = 标题字号 + 5，悬停提示「主菜单（Ctrl+M）」）。`egui::Popup::menu(&menu_btn)` + `.close_behavior(CloseOnClick)` + `.open_bool(&mut self.menu_open)`，六项见 `main.rs:340` `main_menu_content`：`＋ 新建快捷项 Ctrl+Shift+N` / `⟳ 批量导入全部 Ctrl+I` / `⚙ 启动器设置 Ctrl+,` / `❓ 速查表 输入 ? 后点行` / `📄 打开日志` / 分隔线 / `✕ 退出`。**为什么是"返回枚举"而不是闭包里直接改 `LauncherApp`**：`open_bool(&mut self.menu_open)` 把 `self` 可变借到了整个 `show()` 期间，闭包里再写 `self.dialog = …` 是二次可变借用（编译不过）⇒ 内容闭包只读 `ui`、返回 `MenuAction`，动作在 `show()` 返回后落。新建那条路一条没少：菜单第一项 + `Ctrl+Shift+N` 照旧 |
+| Ctrl+M | `LOCAL_TAKEN` 新增 `(HKF_CONTROL, 0x4D)`（`main.rs:1288`），`ui()` 里 `hit_cm` → `consume_key` → `self.menu_open = !self.menu_open`（`main.rs:4587`），日志 `快捷键 Ctrl+M：☰ 主菜单 打开` / `收起`。按「☰ 是主界面入口而非设置页开关」的口径，这一档**要**配键 |
+| Esc 新增一档 | 分段最前面加「菜单开着 → 只收菜单」（`main.rs:6254`）。为此渲染前先抄一份 `menu_was_open`（`main.rs:5050`）——`Popup` 自己在**同一帧**吃掉 Escape 并把旗标写回 false，不抄这一份这一次 Esc 会顺路清空查询、甚至把窗口收进托盘。另两处补落旗标：`on_hide`（`main.rs:3591`，隐藏那帧 Popup 不再运行、没人关它，不清就会带着一个悬着的菜单出来）与进设置页（`main.rs:4464`，☰ 只在搜索页渲染） |
+| 占位提示改短 | `SEARCH_HINT`（`main.rs:845`）由原先十来个键名的长串改成「搜索…（Enter 运行 · Ctrl+M 菜单 · ? 帮助 · Esc 关闭）」——22pt 下长提示会被输入框右缘裁掉，留半句话比没有更糟。完整键表两处入口：☰（`Ctrl+M`）与查询框的 `?` 速查表 |
+| **真机抓到并修掉的缺陷①** | 「拖顶栏空白移动窗口」整条**静默失效**：我在 (434,25) 故意拖了一次，`grep -c "搜索页顶栏空白" launcher.log` = **0**。根因不是"手柄没注册"，是**注册了一个零宽矩形**——输入框改成"扣掉 ☰ 之后铺满"的定宽，这一行里只剩 `item_spacing.x`（8px）的缝，而手柄两端各内缩 4px ⇒ 8 − 8 = 0。修法：新增 `TOP_DRAG_GAP = 12.0`（`main.rs:829`）并在 ☰ 之前 `ui.add_space()`（`main.rs:5084`）、`TOP_DRAG_INSET = 2.0`（`main.rs:832`），手柄矩形用 `pill_right + 2 .. menu_left - 2` 的**量到的真边界** ⇒ 视觉空白 ≈ 12 + 8 = 20px、其中可命中 ≈ 16px。2026-10-18 用户就报过一次「顶部输入框右侧点击空白不能拖动」，这条不能又死一次 ⇒ 补单测 `top_drag_strip_stays_wide_enough_to_hit`（`main.rs:6755`）钉"缝有没有留够"，并留一条反证断言：内缩若小到让"零预留"也够用，这条判据就该换掉 |
+| **真机抓到并修掉的缺陷②** | 用**辅助功能**（AccessKit / UIA 的 `Invoke`）点中菜单条目后 `menu_open` 留在 true ⇒ 下一次 Esc 跑去「☰ 菜单：按 Esc 收起」，把刚打开的添加对话框留在原地；随后 `Ctrl+M` 一行日志都没有（对话框开着时快捷键块被门挡着）。根因读自上游：`Popup` 的 `CloseOnClick` 判据是 `was_open_last_frame && ctx.input(\|i\| i.pointer.any_click())`（`egui-0.36.2/src/containers/popup.rs:608`），**只有真鼠标才置 `any_click`**。修法：动作一旦落地就 `self.menu_open = false`（`main.rs:5115`）。真人用鼠标点不会撞这一条，但托盘、辅助技术、自动化路径会 |
+| 速查表 35 → 37 | `grep -c "^    CheatEntry {"` 现量 **37**。新增两条：`Ctrl+M / ☰` 主菜单、`列表行密度`；改文案三条：`Esc` 分段加"收 ☰ 菜单"那一档、`Ctrl+,` 由"四页"改"五页"、`左键拖空白` 的顶栏那半句改成「搜索框与 ☰ 之间那条约 20px 的空白」 |
+| 真机自查（隔离实例 `target\listrows-test\`，全部由我注入操作） | ① 四档窗口高逐条对上：日志 `roomy（行高 40 + 行距 2）⇒ 498（原 438）`、`dense（24 + 0）⇒ 318（原 498）`、`theme（54 + 4）⇒ 658（原 318）`、`snug（34 + 2）⇒ 438（原 658）`；② 甲与丙下截图都恰好十行（丙 318 高里装十行 24+0），超出靠滚轮，列表与设置页两处滚轮都动；③ 顶栏空白拖动在丙档 318 高的窗口上成功：`左键拖空白移动（搜索页顶栏空白）：… 尺寸=(500, 318)`；④ `row_density` 跨重启保持（写 `dense` ⇒ 起来就是 318）；⑤ ☰ 六项逐个走通：新建弹窗 / 批量导入（Toast + 后台扫描，沙箱清单 27993 → 46502 字节、160 条 ⇒ **合并不替换**）/ 设置页 / 速查表（代打字把查询置成 `?`）/ 打开日志（Store 版记事本打开 `launcher.log`）/ 退出（进程终止）；⑥ 点 ☰ 开、再点关，`Ctrl+M` 两个方向都翻得动，菜单开着时 Esc 只收菜单、查询与窗口都不动；⑦ 缺陷② 修后重跑：`Ctrl+M` → Invoke「新建快捷项」→ 单次 Esc ⇒ 对话框关掉、菜单不再抢 Esc；⑧ 收口复查：查询清空后窗口 **500×438**、占位符显示 `Ctrl+M 菜单` 那一串。验证实例仍开着（隐藏到托盘），沙箱 `settings.json` 停在 `row_density: snug` / `list_rows: all`，我打开的那个记事本窗口已关【收口复核：该实例 PID 30208 已 `taskkill`（我自己起的沙箱实例），`tasklist` 复跑确认无残留；沙箱里的 exe 是构建副本，下次复跑要先拷最新二进制】 |
+| 验证 | `cargo test --bin egui-launcher` **184/184**（182 + 2：`row_density_defaults_to_snug_and_round_trips_four_names` 钉缺省甲与四个落盘名往返、`top_drag_strip_stays_wide_enough_to_hit` 钉顶栏那条缝）；`default_window_height_gives_a_full_ten_row_page` 扩了四档断言（438 / 498 / 318 / 658）与 Compact 550 / Modern 682，**总数仍是 184**。另把批次 Q 那条「`Ctrl+M` 本程序没绑，不该出现在表里」的反向断言改成钉"绑了就必须进表"（`main.rs:6955` 带日期说明，旧断言原文留在注释里不删）。`cargo check --all-targets` 零警告；`cargo build` 通过（未跑 `cargo fmt`） |
+| 未做 / 偏差（明写） | ① **需求书 FR-UIX-08 那条 ☰ 与本批的 ☰ 不是同一个东西**：原文要的是"状态栏里的 ☰，菜单 = 偏好设置 / 速查表 / 重建索引 / 检查更新 / 重载 / 退出"，本批交的是**顶栏右缘**的 ☰，六项是 新建 / 批量导入 / 设置 / 速查表 / 打开日志 / 退出。状态栏整条（高约 38、左返回 / 右 `Enter` 键帽）仍未做，重建索引 / 检查更新 / 重载 三项本程序还没有对应功能 ⇒ 已按日期注记登记进 FR-UIX-08，**没有改原文口径**。② 行密度只影响**主界面列表**：设置页、弹窗、帮助页的行距没跟着变。③ 「标题 + 灰副标题同行」这一条甲档下实测仍不裁切，但没有独立的"版式"设置项（`FR-UIX-03` 的右侧提示宽度按实测量分配那条照旧）。④ 窗口宽度 / 位置 / 淡入淡出仍没做成设置项（FR-UIX-02 的 `appearance`）。⑤ 真机全在隔离目录里跑，用户自己的数据目录没碰 |
+| 提交 | **未提交**。commit / push 仍需用户正文原话（选项面板的裁定不构成授权）。F1（第三十五节）、F5（第三十六节）、F6（本节）三批一起挂着 |
 
 ---
 

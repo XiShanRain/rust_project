@@ -58,7 +58,7 @@ pub struct CheatEntry {
     pub group: Group,
     /// 依赖哪个数据源：该源关掉时这一条整条不出现。`None` ＝ 与数据源无关。
     pub source: Option<SourceId>,
-    /// 帮助页上「打开设置页」跳到第几页（1=通用 2=功能 3=热键 4=数据源）。
+    /// 帮助页上「打开设置页」跳到第几页（1=通用 2=功能 3=热键 4=数据源 5=外观）。
     pub settings_page: Option<u32>,
 }
 
@@ -340,8 +340,8 @@ pub const ENTRIES: &[CheatEntry] = &[
     CheatEntry {
         key: "Esc",
         title: "分段返回",
-        summary: "按序：关框 → 清空 → 关闭到托盘",
-        detail: "顺序：关确认框 → 关弹窗/帮助页 → 设置页返回搜索 → 清空输入 → 关闭到托盘。\n\
+        summary: "按序：收菜单 → 关框 → 清空 → 关闭到托盘",
+        detail: "顺序：收 ☰ 菜单 → 关确认框 → 关弹窗/帮助页 → 设置页返回搜索 → 清空输入 → 关闭到托盘。\n\
                  清空那一档会主动把焦点要回搜索框（TextEdit 自己按 Esc 会弃焦点）。",
         tags: "key esc 取消 关闭 返回",
         group: Group::Keys,
@@ -429,9 +429,22 @@ pub const ENTRIES: &[CheatEntry] = &[
     CheatEntry {
         key: "Ctrl+,",
         title: "打开 / 返回设置页",
-        summary: "四页：通用 / 功能 / 热键 / 数据源",
+        summary: "五页：通用 / 功能 / 热键 / 数据源 / 外观",
         detail: "打开设置页；已开着时按它返回搜索页（与 Esc 的「设置页返回搜索」同一档）。",
         tags: "key 设置 settings preferences",
+        group: Group::Keys,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
+        key: "Ctrl+M / ☰",
+        title: "主菜单",
+        summary: "新建、批量导入、设置、速查表、打开日志、退出",
+        detail: "顶栏右上的三条杠。批次 F6（2026-10-24）用它换掉了输入框旁那个「＋ 新建」按钮，\n\
+                 菜单里第一项就是新建；Ctrl+Shift+N 那条路照旧留着。\n\
+                 Esc 只收菜单（不清空输入、不关窗）；点菜单外任意处也收。\n\
+                 窗口一隐藏，菜单状态不保留。",
+        tags: "key 菜单 menu 新建 设置 hamburger",
         group: Group::Keys,
         source: None,
         settings_page: None,
@@ -454,7 +467,7 @@ pub const ENTRIES: &[CheatEntry] = &[
         key: "左键拖空白",
         title: "移动窗口",
         summary: "顶栏空白或列表右侧空白",
-        detail: "顶栏搜索框与「＋ 新建」之间的空白、设置页标题右侧的空白、列表右侧的空白都能拖。\n\
+        detail: "顶栏搜索框与 ☰ 之间那条约 20px 的空白、设置页标题右侧的空白、列表右侧的空白都能拖。\n\
                  中键不再执行任何条目（2026-10-18 已废弃）。",
         tags: "mouse 拖动 移动 窗口 drag",
         group: Group::Window,
@@ -472,6 +485,23 @@ pub const ENTRIES: &[CheatEntry] = &[
         group: Group::Window,
         source: None,
         settings_page: None,
+    },
+    CheatEntry {
+        key: "列表行密度",
+        title: "一行的松紧与窗口高度",
+        summary: "甲·紧凑（默认）/ 乙·宽松 / 丙·极紧 / 跟随主题",
+        detail: "设置页「通用 → 列表行密度」（批次 F6，2026-10-24 用户：「整体界面高度太高了，\n\
+                 项与项之间的间距太大了」，并点名把三档做成可选项、默认甲）。\n\
+                 甲＝行高 34 / 图标 24 / 行距 2 ⇒ 窗口高 438；乙＝40 / 28 / 2 ⇒ 498；\n\
+                 丙＝24 / 16 / 0 ⇒ 318；跟随主题＝回到主题 JSON 的 row_height 与 icon_size。\n\
+                 四档都保持「一屏正好十行」：换档时窗口高度按新行高立刻重算，宽度不动。\n\
+                 不在「跟随主题」档时，主题的这两个键不参与渲染（其余键照常生效）。\n\
+                 上面那几个总高是按 Light 的内边距 14 算的，换主题只差内边距那几个像素。\n\
+                 输入框那一行不受行密度影响：高度固定 44，字号仍跟着主题的「输入字号」走。",
+        tags: "行高 图标 密度 高度 间距 列表 density row theme spacing",
+        group: Group::Window,
+        source: None,
+        settings_page: Some(1),
     },
 ];
 
@@ -580,7 +610,8 @@ mod tests {
             assert!(!e.title.is_empty() && !e.summary.is_empty() && !e.detail.is_empty());
             assert!(!e.tags.is_empty(), "「{}」没有过滤词，`? 关键词` 搜不到它", e.title);
             if let Some(page) = e.settings_page {
-                assert!((1..=4).contains(&page), "「{}」指向不存在的设置页 {page}", e.title);
+                // 批次 F1 加了第 5 页「外观」，上界跟着走（现量：SettingsTab::from_page 认 1..=5）。
+                assert!((1..=5).contains(&page), "「{}」指向不存在的设置页 {page}", e.title);
             }
             // 列表与帮助页都是纯 `ui.label`，不解析 Markdown：`**粗体**` 会原样带着星号出场
             //（2026-10-23 真机截图里就是这么露的）。

@@ -138,6 +138,12 @@ fn appdata_dir() -> PathBuf {
         .join("egui-launcher")
 }
 
+/// 便携数据目录（清单 / 设置 / 日志 / 主题同处，FR-CFG-03）。
+/// 主题目录（`Themes\`，FR-UIX-01）也挂在这里——用户把程序拷到 U 盘，皮肤跟着走。
+pub fn data_dir() -> PathBuf {
+    user_list_path().parent().map(Path::to_path_buf).unwrap_or_else(appdata_dir)
+}
+
 /// 以真实写入试探目录可写性（Program Files 等受 ACL 保护的目录会失败→自动退化）。
 fn dir_writable(dir: &Path) -> bool {
     let probe = dir.join(".write-probe.tmp");
@@ -381,10 +387,34 @@ pub struct AppSettings {
     /// 与 `sources_off` 同一口径：本程序不认识的名字回落 `cmd`，不让整份配置判坏。
     #[serde(default = "default_terminal_shell")]
     pub terminal_shell: String,
+
+    /// 当前主题（FR-UIX-01 / 批次 F1）。存主题名；`System` = 跟随系统深浅，
+    /// 其余名字先找用户 `Themes\<name>.json`、再找内置。缺省 `Light`：
+    /// 需求书那条验收是「删光主题文件仍能启动且为浅色」，默认值不能靠"跟随系统"实现。
+    /// 不认识的用户主题在解析侧回落 Light 并记日志，不影响本文件其余字段。
+    #[serde(default = "default_theme")]
+    pub theme: String,
+
+    /// 主界面列表一屏列多少行（2026-10-24 用户需求：「默认显示 10 条，可配置 10 条 / 全部」）。
+    /// 窗口默认高度按 10 行算，两个档位都不改变窗口大小——「全部」只是把截断去掉、靠滚轮翻。
+    /// 默认值后来按用户正文改成了 [`ListRows::All`]（Delphi 口径），「10 条」是可选的截断档。
+    #[serde(default)]
+    pub list_rows: ListRows,
+
+    /// 主界面一行的松紧（2026-10-24 用户正文：「整体界面高度太高了，项与项之间的间距太大了」）。
+    /// 三档是用户点名的可选项，默认 [`RowDensity::Snug`]（甲）；第四档 [`RowDensity::Theme`]
+    /// 把行高与图标尺寸交还给主题的 `row_height` / `icon_size`（批次 F1 那 24 个键里的两个），
+    /// 不换这一档时主题里的这两个键不生效——明写在设置页文案里。
+    #[serde(default)]
+    pub row_density: RowDensity,
 }
 
 fn default_terminal_shell() -> String {
     crate::source::terminal::TermShell::default().as_str().to_string()
+}
+
+fn default_theme() -> String {
+    crate::theme::FALLBACK_THEME.to_string()
 }
 
 fn default_true() -> bool {
@@ -409,6 +439,9 @@ impl Default for AppSettings {
             hidden: Vec::new(),
             confirm_actions: true,
             terminal_shell: default_terminal_shell(),
+            theme: default_theme(),
+            list_rows: ListRows::default(),
+            row_density: RowDensity::default(),
         }
     }
 }
@@ -714,6 +747,73 @@ impl LearnRank {
         match self {
             Self::Count => "count",
             Self::Decay => "decay",
+        }
+    }
+}
+
+/// 主界面列表的两种列法（2026-10-24 用户需求）。
+///
+/// 两档都不改窗口高度：窗口一开始就建到 10 行高，「全部」不是把窗口拉长，而是把
+/// [`Self::Ten`] 那道截断去掉、让滚轮去翻。这样"写查询时扫一眼十行"和"翻整张清单"
+/// 是同一个窗口的两种用法，不会一换档就跳一下大小。
+///
+/// 默认 [`Self::All`]＝Delphi 版 ALTRun 的口径（`lstShortCut.Height := 10 * ItemHeight`
+/// 只是视口高度，结果从不截断）。2026-10-24 用户正文「这个10条功能可以参考Delphi的
+/// AltRun版本」⇒ 两个选项保留，但默认从「10 条」改成 Delphi 这一档。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListRows {
+    /// 只列前 10 行（头段行算在内）——窗口正好一屏，不用滚轮。
+    Ten,
+    /// 默认：全部结果都列出来，窗口仍 10 行高，超出部分用滚轮翻。
+    #[default]
+    All,
+}
+
+impl ListRows {
+    /// 落盘与设置页用的档位名（与 `SpaceRun`/`TabMode`/`LearnRank` 同口径）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ten => "ten",
+            Self::All => "all",
+        }
+    }
+}
+
+/// 主界面一行的松紧（2026-10-24 用户正文：「整体界面高度太高了，项与项之间的间距太大了，
+/// 参考 Delphi 的 AltRun 版本，在它的基础上做一个优化版」）。
+///
+/// 三档的具体像素在 `main.rs` 的 [`crate::row_geometry`] 里给（那里才知道主题的 `padding`），
+/// 这一层只管"选哪一档"与落盘名。取舍依据：
+/// - Delphi 版 `lstShortCut` 的 `ItemHeight = 16`、行距 0、无图标（`frmALTRun.dfm:3339-3354`）
+///   ——最密，但 16px 放不下图标和副标题，所以只做"密"这一头的参照；
+/// - AHK 版 Light 主题 `RowHeight 54 / IconSize 32`、行距 0、宽 700（`ThemeManager.ahk:209-215`）
+///   ——行高与我们原来的 Light 相同，它不显空是因为**行距 0 且窗口宽**；
+/// - 我们窗口只有 500 宽，54 + 4 的步进就变成"行很松"。⇒ 甲档取 34（图标 24、标题 13pt
+///   与灰副标题仍放得下），比 Delphi 松、比 AHK 紧，是用户点名的默认。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowDensity {
+    /// 甲（默认）：行高 34、图标 24、行距 2 ⇒ Light 下窗口高 438（一屏正好十行）。
+    #[default]
+    Snug,
+    /// 乙：行高 40、图标 28、行距 2 ⇒ 498，比甲透气一档。
+    Roomy,
+    /// 丙：行高 24、图标 16、行距 0 ⇒ 318，最接近 Delphi 的密但仍留图标。
+    Dense,
+    /// 跟随主题：用主题 JSON 里的 `row_height` / `icon_size`（批次 F1 那两键），行距 4。
+    /// 不换到这一档，主题里的这两个键对主界面列表不生效。
+    Theme,
+}
+
+impl RowDensity {
+    /// 落盘与设置页用的档位名（与 [`ListRows::as_str`] 同口径）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Snug => "snug",
+            Self::Roomy => "roomy",
+            Self::Dense => "dense",
+            Self::Theme => "theme",
         }
     }
 }
@@ -2555,6 +2655,56 @@ mod hotkey_tests {
         let nul = br#"{"toggle_hotkey":{"mods":3,"vk":32},"typeback_hotkey":null}"#;
         let s: AppSettings = serde_json::from_slice(nul).expect("null 应能解析");
         assert_eq!(s.typeback_hotkey, None);
+    }
+
+    /// 2026-10-24 用户需求：主界面一屏 10 行；默认按 Delphi 口径（全部结果、滚轮翻），
+    /// 「10 条」是可选截断档。缺字段必须读成默认档，而两档的名字要能原样落盘再读回
+    /// （设置页改完立刻写盘，重启后得还是那一档）。
+    #[test]
+    fn list_rows_defaults_to_all_and_round_trips_both_names() {
+        let s: AppSettings = serde_json::from_str("{}").expect("空偏好应可解析");
+        assert_eq!(s.list_rows, ListRows::All, "缺字段 / 整份缺失都按 Delphi 口径");
+        assert!(
+            serde_json::to_string(&s).unwrap().contains(r#""list_rows":"all""#),
+            "落盘用稳定名 all"
+        );
+
+        let ten: AppSettings =
+            serde_json::from_str(r#"{"list_rows":"ten"}"#).expect("截断档应可解析");
+        assert_eq!(ten.list_rows, ListRows::Ten);
+        assert_eq!(ListRows::Ten.as_str(), "ten");
+
+        // 不认识的档位名照其余档位（space_to_run / learn_rank）的口径直接报错：
+        // 静默回落会让用户以为开了「全部」，实际仍是 10 条。
+        assert!(serde_json::from_str::<AppSettings>(r#"{"list_rows":"everything"}"#).is_err());
+    }
+
+    #[test]
+    fn row_density_defaults_to_snug_and_round_trips_four_names() {
+        // 缺字段＝甲：老 settings.json（批次 F5 那批文件里根本没有这个键）升级后观感要一致，
+        // 不能因为"没写"就掉到「跟随主题」那种高行档。
+        let s: AppSettings = serde_json::from_str("{}").expect("空偏好应可解析");
+        assert_eq!(s.row_density, RowDensity::Snug, "缺字段 / 整份缺失都按甲档");
+        assert!(
+            serde_json::to_string(&s).unwrap().contains(r#""row_density":"snug""#),
+            "落盘用稳定名 snug"
+        );
+
+        // 四个稳定名逐个回读：输入照设置页真正写出去的那些串，不造花样。
+        for (name, want) in [
+            ("snug", RowDensity::Snug),
+            ("roomy", RowDensity::Roomy),
+            ("dense", RowDensity::Dense),
+            ("theme", RowDensity::Theme),
+        ] {
+            let json = format!(r#"{{"row_density":"{name}"}}"#);
+            let got: AppSettings = serde_json::from_str(&json).expect("四个档位名都应可解析");
+            assert_eq!(got.row_density, want, "稳定名 {name} 读错了档");
+            assert_eq!(want.as_str(), name, "as_str 与 serde 名不一致：日志会说出另一个档");
+        }
+
+        // 与 list_rows 同口径：不认识的档位名报错，不静默回落。
+        assert!(serde_json::from_str::<AppSettings>(r#"{"row_density":"tight"}"#).is_err());
     }
 
     /// 批次 A10：每源开关的落盘口径。`sources_off` 存名字不存枚举值 ⇒ 将来插件源的名字
