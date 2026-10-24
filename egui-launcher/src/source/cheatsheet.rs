@@ -469,12 +469,14 @@ pub const ENTRIES: &[CheatEntry] = &[
     CheatEntry {
         key: "Ctrl+Del",
         title: "隐藏选中项",
-        summary: "只对出厂条目；设置 → 高级 可恢复",
-        detail: "把选中的出厂条目写进 `hidden[]` 并从列表剔除；不删磁盘文件，也不删清单里的其它字段。\n\
+        summary: "出厂 / 扫描 / 自定义条目都行；设置 → 高级 可恢复",
+        detail: "把选中条目写进 `hidden[]` 并从列表剔除，同时在 settings.json 里存一份完整快照；\n\
+                 不删磁盘文件，也不删清单里的其它字段。\n\
                  只在搜索框为空时生效——有字时 Ctrl+Del 是输入框的「删除后一个词」。\n\
-                 自定义条目不给隐藏：它们在设置页里没有名称可回显，也不需要「补回」这一层，直接用 Ctrl+Shift+D 删除。\n\
+                 重新扫描或「补回缺失的出厂命令」都不会把它塞回来；恢复后置顶与学习计数一起回来。\n\
+                 要彻底删掉用 Delete / Ctrl+Shift+D（会弹确认框）。\n\
                  恢复入口：设置 → 高级 →「隐藏的条目」。",
-        tags: "key 隐藏 hide hidden 出厂 条目",
+        tags: "key 隐藏 hide hidden 条目 扫描 恢复",
         group: Group::Keys,
         source: None,
         settings_page: Some(6),

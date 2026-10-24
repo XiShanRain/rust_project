@@ -2647,14 +2647,14 @@ impl LauncherApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=外观）。
+    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=外观 6=高级）。
     fn open_settings_page(&mut self, page: u32) {
         self.settings_open = true;
         self.settings_tab = match SettingsTab::from_page(page) {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=外观），落回通用"
+                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=外观 6=高级），落回通用"
                 );
                 SettingsTab::General
             }
@@ -2673,6 +2673,17 @@ impl LauncherApp {
             .iter()
             .map(|p| dialog_for_sent_path(p).to_item())
             .collect();
+        // 批次 D6：显式 SendTo 等于用户点名要它回来 ⇒ 撤销同名隐藏，
+        // 否则界面报「已添加」，下一次启动又被 hidden[] 静默剔掉。
+        let incoming_uids: Vec<String> = incoming.iter().map(|i| i.uid()).collect();
+        if source::application::unhide_uids(
+            &mut self.prefs.hidden,
+            &mut self.prefs.hidden_stash,
+            &incoming_uids,
+        ) > 0
+        {
+            source::application::save_settings(&self.prefs);
+        }
         let mut missing: Vec<String> = incoming
             .iter()
             .map(|i| i.source_path.clone())
@@ -4088,11 +4099,14 @@ impl LauncherApp {
                             ui.separator();
                             // 批次 F7（D6 / FR-SRC-17）：隐藏的条目。
                             ui.label(egui::RichText::new("隐藏的条目").strong());
-                            let rows = source::application::hidden_rows(&self.prefs.hidden);
+                            let rows = source::application::hidden_rows(
+                                &self.prefs.hidden,
+                                &self.prefs.hidden_stash,
+                            );
                             if rows.is_empty() {
                                 ui.label(
                                     egui::RichText::new(
-                                        "没有隐藏的条目。在主界面把查询框清空、选中一条出厂命令后按 Ctrl+Del 即可隐藏（自定义条目请用 Ctrl+Shift+D 删除）。",
+                                        "没有隐藏的条目。在主界面把查询框清空、选中一条后按 Ctrl+Del 即可隐藏——出厂命令、扫描导入的条目、自定义条目都行。",
                                     )
                                     .weak()
                                     .small(),
@@ -4100,7 +4114,7 @@ impl LauncherApp {
                             } else {
                                 ui.label(
                                     egui::RichText::new(
-                                        "隐藏不是删除：条目不进列表，但「补回缺失的出厂命令」也不会把它塞回来。恢复后置顶与学习计数不保留（隐藏时条目已从清单落盘移除）。",
+                                        "隐藏不是删除：条目不进列表，重新扫描 /「补回缺失的出厂命令」都不会把它塞回来。恢复后置顶与学习计数一起回来。",
                                     )
                                     .weak()
                                     .small(),
@@ -4116,7 +4130,8 @@ impl LauncherApp {
                                             }
                                         }
                                         None => {
-                                            // 对不上出厂种子：目前只有启动时自动去重的 Store 版「设置」。
+                                            // 既没有隐藏快照、也对不上出厂种子：目前只有启动时
+                                            // 自动去重写进去的 Store 版「设置」会落到这一格。
                                             ui.label(
                                                 egui::RichText::new("（程序自动隐藏，不需要恢复）")
                                                     .weak()
@@ -4140,6 +4155,7 @@ impl LauncherApp {
                                     if source::application::restore_hidden(
                                         &mut self.items,
                                         &mut self.prefs.hidden,
+                                        &mut self.prefs.hidden_stash,
                                         &uid,
                                     ) {
                                         self.after_unhide(ui.ctx(), &uid);
@@ -4155,6 +4171,7 @@ impl LauncherApp {
                                     let n = source::application::restore_all_hidden(
                                         &mut self.items,
                                         &mut self.prefs.hidden,
+                                        &mut self.prefs.hidden_stash,
                                     );
                                     if n > 0 {
                                         self.save_items();
@@ -4749,7 +4766,8 @@ impl LauncherApp {
     }
 
     /// 批次 F7：从「高级」页恢复一条隐藏条目之后的收尾——两份落盘、补取图标、刷新路径态。
-    /// 恢复出来的条目是从出厂种子现补的，图标纹理与路径四态都还没有缓存。
+    /// 恢复出来的条目来自隐藏快照（老记录没有快照时才按出厂种子重建），
+    /// 图标纹理与路径四态都还没有缓存。
     fn after_unhide(&mut self, ctx: &egui::Context, uid: &str) {
         self.save_items();
         source::application::save_settings(&self.prefs);
@@ -5055,7 +5073,14 @@ impl eframe::App for LauncherApp {
         // 先收干通道到局部变量（try_iter 借用 self.apps_rx，头表达式若含循环体会把借用拖满全循环）。
         let batches: Vec<Vec<LaunchItem>> = self.apps_rx.try_iter().collect();
         let mut items_changed = false;
-        for imported in batches {
+        for mut imported in batches {
+            // 批次 D6：隐藏项即使被重新扫描到也不许复活——进清单之前先按 hidden[] 剔掉。
+            let hidden_hits = source::application::drop_hidden(&mut imported, &self.prefs.hidden);
+            if hidden_hits > 0 {
+                eprintln!(
+                    "批量导入：{hidden_hits} 条在 hidden[] 里，已跳过（设置 → 高级 可恢复）"
+                );
+            }
             let old = self.items.clone();
             self.items = dedup_items([std::mem::take(&mut self.items), imported].concat());
             // dedup 保留的先出现项仍持旧对象（学习统计天然在）；若重复项出现在后位被剔前，
@@ -5464,37 +5489,27 @@ impl eframe::App for LauncherApp {
                                 eprintln!("快捷键 Ctrl+Shift+P：置顶切换 {uid} → {on}");
                             }
                         } else if hit_cdel {
-                            // 批次 F7（D6）：隐藏只对出厂条目开放——它们的 uid 能反查回名称，
-                            // 也能在设置页「高级」页里一条条恢复；用户条目没有名称可回显，
-                            // 而且不会自己回来，删掉更干脆。
-                            if !source::application::is_factory_uid(&uid) {
-                                self.toast = Some((
-                                    "⚠ 隐藏只用于出厂条目；自定义条目请用 Ctrl+Shift+D 删除"
-                                        .to_string(),
-                                    Instant::now() + TOAST_TTL,
-                                    TOAST_ERR,
-                                ));
-                                ui.ctx().request_repaint_after(TOAST_TTL);
-                                eprintln!("快捷键 Ctrl+Del：{uid} 不是出厂条目，未隐藏");
-                            } else {
-                                if !self.prefs.hidden.iter().any(|h| h == &uid) {
-                                    self.prefs.hidden.push(uid.clone());
-                                }
-                                self.items.retain(|i| i.uid() != uid);
-                                self.selected = 0;
-                                self.save_items();
-                                source::application::save_settings(&self.prefs);
-                                self.refresh_path_states(true);
-                                self.toast = Some((
-                                    format!("✓ 已隐藏「{name}」（设置 → 高级 可恢复）"),
-                                    Instant::now() + TOAST_TTL,
-                                    TOAST_OK,
-                                ));
-                                ui.ctx().request_repaint_after(TOAST_TTL);
-                                eprintln!(
-                                    "快捷键 Ctrl+Del：隐藏出厂条目 {uid}（已写 hidden[]，不删磁盘文件）"
-                                );
+                            // 批次 D6：任何条目都能隐藏——出厂的、扫描导入的、自定义的都行。
+                            // 隐藏前先按 uid 存一份完整快照，「高级」页靠它显示原名并原样恢复；
+                            // 扫描项没有出厂种子，没有快照就永远回不来。
+                            if !self.prefs.hidden.iter().any(|h| h == &uid) {
+                                self.prefs.hidden.push(uid.clone());
                             }
+                            source::application::stash_hidden(&mut self.prefs.hidden_stash, &s);
+                            self.items.retain(|i| i.uid() != uid);
+                            self.selected = 0;
+                            self.save_items();
+                            source::application::save_settings(&self.prefs);
+                            self.refresh_path_states(true);
+                            self.toast = Some((
+                                format!("✓ 已隐藏「{name}」（设置 → 高级 可恢复）"),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_OK,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                            eprintln!(
+                                "快捷键 Ctrl+Del：隐藏条目 {uid}（已写 hidden[] 与快照，不删磁盘文件）"
+                            );
                         } else if hit_del || hit_csd {
                             // 2026-10-18 用户要求（选中「控制面板」被误删过一次）：删除一律先弹确认，
                             // 按键不再一键生效；真正的移除在确认弹窗按「确定」那一帧才做。
@@ -6838,6 +6853,15 @@ impl eframe::App for LauncherApp {
                             // 快照回填只兜新建项撞上既有 uid（dedup 留旧剔新）的情况。
                             let old = self.items.clone();
                             let mut item = item;
+                            // 批次 D6：显式添加撞上 hidden[] ⇒ 以这次添加为准撤销隐藏。
+                            if source::application::unhide_uids(
+                                &mut self.prefs.hidden,
+                                &mut self.prefs.hidden_stash,
+                                &[item.uid()],
+                            ) > 0
+                            {
+                                source::application::save_settings(&self.prefs);
+                            }
                             match dg.edit_uid {
                                 Some(u) => {
                                     if let Some(prev) = old.iter().find(|i| i.uid() == u) {

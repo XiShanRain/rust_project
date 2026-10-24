@@ -395,8 +395,17 @@ pub struct AppSettings {
     /// 仍会被剔除，而删掉的条目会回来（再由用户自己再删）。本批没有 UI 入口——手改这个数组。
     /// 【2026-10-24 批次 F7：有了 UI 入口——主界面空查询下 Ctrl+Del 隐藏出厂条目，
     /// 设置页「高级」页列出并恢复。上一句"没有 UI 入口"保留为当时的记录。】
+    /// 【2026-10-24 批次 D6：不再限出厂条目——扫描导入的 .lnk / Store 应用也能隐藏，
+    /// 名称与恢复靠下面的 [`Self::hidden_stash`]。】
     #[serde(default)]
     pub hidden: Vec<String>,
+
+    /// 批次 D6：被隐藏条目的完整快照（按派生 uid 覆盖式保存）。
+    /// `hidden[]` 只存 uid；出厂条目还能从 [`builtin_seeds`] 重建，而扫描项没有种子，
+    /// 一旦丢了快照就永远恢复不了 ⇒ 隐藏时一律存一份，恢复时连置顶与学习计数一起回来。
+    /// 老配置没有这一格（`#[serde(default)]`）⇒ 空表，恢复退回按种子重建。
+    #[serde(default)]
+    pub hidden_stash: Vec<LaunchItem>,
 
     /// 危险操作（关机 / 重启 / 注销 / 清空回收站）执行前先弹确认（FR-SRC-17 `confirm_actions`）。
     /// **默认开**：这四条都不可撤销，误按一次就丢工作；关掉它等于把回车键直接接到关机命令上。
@@ -469,6 +478,7 @@ impl Default for AppSettings {
             seed_round: 0,
             sources_off: Vec::new(),
             hidden: Vec::new(),
+            hidden_stash: Vec::new(),
             confirm_actions: true,
             terminal_shell: default_terminal_shell(),
             theme: default_theme(),
@@ -1501,8 +1511,8 @@ pub fn dedup_items(items: Vec<LaunchItem>) -> Vec<LaunchItem> {
 
 /// FR-SRC-17 的 `hidden[]`：按派生 uid 把用户隐藏的条目从清单里剔掉，返回剔了几条。
 /// 只认 uid（`uid()` 本身就小写）——同名但路径不同的两条不会互相牵连。
-/// 调用时机只有两处：启动读完配置之后、以及「补回缺失的出厂命令」之后
-/// （否则补回来的条目会把隐藏项又塞回清单）。
+/// 调用时机四处：启动 / 重新载入配置之后、「补回缺失的出厂命令」之后、批量导入合并之前
+/// （否则补回来或重新扫描到的条目会把隐藏项又塞回清单）。
 pub fn drop_hidden(items: &mut Vec<LaunchItem>, hidden: &[String]) -> usize {
     if hidden.is_empty() {
         return 0;
@@ -1537,7 +1547,7 @@ pub fn reset_learning(items: &mut [LaunchItem]) -> usize {
 /// 批次 F7（FR-CFG-08）：恢复默认**只重置偏好里的口径类字段**，用户资产一概不动。
 ///
 /// 保留：`toggle_hotkey` / `typeback_hotkey`（热键）、`web_engines`（自定义引擎）、
-/// `hidden`（被隐藏的条目）、`seed_round`（已补种到第几轮——重置它会让下一轮启动
+/// `hidden` 与 `hidden_stash`（被隐藏的条目及其快照）、`seed_round`（已补种到第几轮——重置它会让下一轮启动
 /// 把用户删掉的出厂条目整批复活）。`user_items.json` 里的自定义命令、置顶、学习统计、
 /// 分类标签也不经过这里。
 pub fn restore_defaults(s: &mut AppSettings) {
@@ -1581,13 +1591,7 @@ pub fn backup_file(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// 这个 uid 是否属于出厂命令集。隐藏只对出厂条目开放：它们的 uid 能反查回名称，
-/// 也能在「高级」页里原样恢复；用户条目与扫描项没有名称可回显，走删除。
-pub fn is_factory_uid(uid: &str) -> bool {
-    builtin_seeds().iter().any(|s| s.uid() == uid)
-}
-
-/// 设置页「高级 → 隐藏的条目」一行。`name` 为 `None` ＝ 对不上任何出厂种子
+/// 设置页「高级 → 隐藏的条目」一行。`name` 为 `None` ＝ 既没有快照、也对不上出厂种子
 /// （目前唯一来源是启动时自动去重写进去的 Store 版「设置」），只显示原文、不给恢复按钮。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HiddenRow {
@@ -1595,11 +1599,24 @@ pub struct HiddenRow {
     pub name: Option<String>,
 }
 
+/// 记一份隐藏快照（批次 D6）。同一个 uid 再藏一次就覆盖旧快照，不堆重复行。
+pub fn stash_hidden(stash: &mut Vec<LaunchItem>, item: &LaunchItem) {
+    let uid = item.uid();
+    stash.retain(|i| i.uid() != uid);
+    stash.push(item.clone());
+}
+
 /// 把 `hidden[]` 里的 uid 逐条翻译成可展示的行（顺序照配置原样）。
-pub fn hidden_rows(hidden: &[String]) -> Vec<HiddenRow> {
-    let by_uid: std::collections::HashMap<String, String> = builtin_seeds()
+/// 名称有两个来源：先看快照（扫描项只有这一条路），再看出厂种子
+/// （F7 时代没有快照的老记录仍能按种子回显名称）。
+pub fn hidden_rows(hidden: &[String], stash: &[LaunchItem]) -> Vec<HiddenRow> {
+    let seeds: std::collections::HashMap<String, String> = builtin_seeds()
         .into_iter()
         .map(|s| (s.uid(), s.name))
+        .collect();
+    let stashed: std::collections::HashMap<String, String> = stash
+        .iter()
+        .map(|i| (i.uid(), i.name.clone()))
         .collect();
     hidden
         .iter()
@@ -1607,42 +1624,57 @@ pub fn hidden_rows(hidden: &[String]) -> Vec<HiddenRow> {
         .filter(|u| !u.is_empty())
         .map(|u| HiddenRow {
             uid: u.to_string(),
-            name: by_uid.get(u).cloned(),
+            name: stashed.get(u).or_else(|| seeds.get(u)).cloned(),
         })
         .collect()
 }
 
-/// 逐条恢复：从 `hidden[]` 撤掉这个 uid，并把对应的出厂条目补回清单末尾。
+/// 取回一条隐藏条目的原始内容：先查快照（扫描项唯一来源），没有再按出厂种子重建。
+/// 快照取到即从表里移除（`hidden[]` 的增删由调用方负责）。
+fn hidden_payload(stash: &mut Vec<LaunchItem>, uid: &str) -> Option<LaunchItem> {
+    if let Some(pos) = stash.iter().position(|i| i.uid() == uid) {
+        return Some(stash.remove(pos));
+    }
+    builtin_seeds().into_iter().find(|s| s.uid() == uid)
+}
+
+/// 逐条恢复：从 `hidden[]` 撤掉这个 uid，并把条目补回清单末尾。
+/// 优先用快照——置顶 / 学习计数 / 别名原样回来；没有快照再按出厂种子重建。
 /// 只补这一条，不碰其它缺项（与设置页「补回缺失的出厂命令」的整批语义区分开）。
-/// 对不上种子的孤儿 uid 不在这里动，返回 `false`。
-pub fn restore_hidden(items: &mut Vec<LaunchItem>, hidden: &mut Vec<String>, uid: &str) -> bool {
+/// 既没有快照也对不上种子的孤儿 uid 不在这里动，返回 `false`。
+pub fn restore_hidden(
+    items: &mut Vec<LaunchItem>,
+    hidden: &mut Vec<String>,
+    stash: &mut Vec<LaunchItem>,
+    uid: &str,
+) -> bool {
     let Some(pos) = hidden.iter().position(|h| h == uid) else {
         return false;
     };
-    let Some(seed) = builtin_seeds().into_iter().find(|s| s.uid() == uid) else {
+    let Some(item) = hidden_payload(stash, uid) else {
         return false;
     };
     hidden.remove(pos);
     if !items.iter().any(|i| i.uid() == uid) {
-        items.push(seed);
+        items.push(item);
     }
     true
 }
 
-/// 全部恢复：能对上出厂种子的一律撤掉并补回；孤儿 uid 原样留在 `hidden[]`。
+/// 全部恢复：有快照或有出厂种子的都撤掉并补回；孤儿 uid 原样留在 `hidden[]`。
 /// 返回恢复了多少条。
-pub fn restore_all_hidden(items: &mut Vec<LaunchItem>, hidden: &mut Vec<String>) -> usize {
-    let seeds: std::collections::HashMap<String, LaunchItem> = builtin_seeds()
-        .into_iter()
-        .map(|s| (s.uid(), s))
-        .collect();
+pub fn restore_all_hidden(
+    items: &mut Vec<LaunchItem>,
+    hidden: &mut Vec<String>,
+    stash: &mut Vec<LaunchItem>,
+) -> usize {
     let mut restored = 0;
     let mut keep: Vec<String> = Vec::with_capacity(hidden.len());
     for uid in hidden.drain(..) {
-        match seeds.get(&uid) {
-            Some(seed) => {
+        match hidden_payload(stash, &uid) {
+            Some(item) => {
                 if !items.iter().any(|i| i.uid() == uid) {
-                    items.push(seed.clone());
+                    items.push(item);
                 }
                 restored += 1;
             }
@@ -1651,6 +1683,20 @@ pub fn restore_all_hidden(items: &mut Vec<LaunchItem>, hidden: &mut Vec<String>)
     }
     *hidden = keep;
     restored
+}
+
+/// 显式添加（添加弹窗 / SendTo）撞上 `hidden[]` 时以用户这次动作为准：撤掉 uid 与它的快照。
+/// 否则界面说「已添加」，下一次启动又被 [`drop_hidden`] 静默剔掉。返回撤销了几条。
+pub fn unhide_uids(hidden: &mut Vec<String>, stash: &mut Vec<LaunchItem>, uids: &[String]) -> usize {
+    let mut cleared = 0;
+    for uid in uids {
+        if let Some(pos) = hidden.iter().position(|h| h == uid) {
+            hidden.remove(pos);
+            stash.retain(|i| i.uid() != *uid);
+            cleared += 1;
+        }
+    }
+    cleared
 }
 
 /// 判断输入是否像 URL/协议（FR-SRC-23）：含 `://`、以 `www.` 起、或是 ≥2 字母的方案名后跟 `:`。
@@ -2952,6 +2998,11 @@ mod dedup_tests {
         s.appearance.status_bar = false;
         s.appearance.fade = true;
         s.hidden = vec!["custom:app|c:\\x.exe|".into()];
+        s.hidden_stash = vec![LaunchItem {
+            name: "藏着".into(),
+            path: "c:\\x.exe".into(),
+            ..Default::default()
+        }];
         s.seed_round = 99;
 
         restore_defaults(&mut s);
@@ -2975,6 +3026,7 @@ mod dedup_tests {
         assert_eq!(s.typeback_hotkey, typeback, "补字符热键保留");
         assert_eq!(s.web_engines.len(), engines, "网页引擎保留");
         assert_eq!(s.hidden.len(), 1, "隐藏项保留（否则删掉的条目会复活）");
+        assert_eq!(s.hidden_stash.len(), 1, "隐藏快照跟着 hidden[] 一起保留");
         assert_eq!(s.seed_round, 99, "补种轮次保留");
     }
 
@@ -3023,12 +3075,30 @@ mod dedup_tests {
     fn hidden_rows_resolve_factory_names_and_keep_orphans() {
         let seed = builtin_seeds().into_iter().next().unwrap();
         let orphan = "custom:app|z:\\none|".to_string();
-        let rows = hidden_rows(&[seed.uid(), orphan.clone(), "   ".to_string()]);
+        let rows = hidden_rows(&[seed.uid(), orphan.clone(), "   ".to_string()], &[]);
         assert_eq!(rows.len(), 2, "空白项不占一行");
         assert_eq!(rows[0].name.as_deref(), Some(seed.name.as_str()));
         assert_eq!(rows[1].name, None);
-        assert!(is_factory_uid(&seed.uid()));
-        assert!(!is_factory_uid(&orphan));
+    }
+
+    /// 批次 D6：扫描项没有出厂种子，名称只能从隐藏快照里读；同 uid 再藏只覆盖不堆积。
+    #[test]
+    fn hidden_rows_read_stashed_scan_names() {
+        let scan = LaunchItem {
+            name: "扫描应用".to_string(),
+            path: r"C:\tools\scan.exe".to_string(),
+            kind: ItemKind::App,
+            ..Default::default()
+        };
+        let uid = scan.uid();
+        let mut stash: Vec<LaunchItem> = Vec::new();
+        stash_hidden(&mut stash, &scan);
+        stash_hidden(&mut stash, &scan);
+        assert_eq!(stash.len(), 1, "同一 uid 再藏一次只覆盖");
+
+        let rows = hidden_rows(&[uid, "custom:app|z:\\none|".to_string()], &stash);
+        assert_eq!(rows[0].name.as_deref(), Some("扫描应用"));
+        assert_eq!(rows[1].name, None, "既无快照也无种子才是孤儿");
     }
 
     /// 批次 F7（D6）：逐条恢复只补点名那一条；孤儿留在 `hidden[]` 里；全部恢复跳过孤儿。
@@ -3039,22 +3109,103 @@ mod dedup_tests {
         let orphan = "custom:app|z:\\gone|".to_string();
         let mut items: Vec<LaunchItem> = Vec::new();
         let mut hidden = vec![seed.uid(), other.uid(), orphan.clone()];
+        let mut stash: Vec<LaunchItem> = Vec::new();
 
-        assert!(restore_hidden(&mut items, &mut hidden, &seed.uid()));
+        assert!(restore_hidden(
+            &mut items,
+            &mut hidden,
+            &mut stash,
+            &seed.uid()
+        ));
         assert_eq!(items.len(), 1, "只补点名的这一条");
         assert_eq!(items[0].uid(), seed.uid());
         assert!(!hidden.contains(&seed.uid()));
         assert!(hidden.contains(&other.uid()), "别的隐藏项不动");
 
         assert!(
-            !restore_hidden(&mut items, &mut hidden, &orphan),
+            !restore_hidden(&mut items, &mut hidden, &mut stash, &orphan),
             "孤儿 uid 不给恢复"
         );
         assert!(hidden.contains(&orphan));
 
-        assert_eq!(restore_all_hidden(&mut items, &mut hidden), 1);
+        assert_eq!(restore_all_hidden(&mut items, &mut hidden, &mut stash), 1);
         assert_eq!(items.len(), 2);
         assert_eq!(hidden, vec![orphan], "孤儿原样留在表里");
+    }
+
+    /// 批次 D6：隐藏 → 恢复要把扫描项原样带回（置顶 / 学习计数不丢），快照用完即清。
+    #[test]
+    fn restore_hidden_brings_back_a_scanned_item_with_its_stats() {
+        let mut scan = LaunchItem {
+            name: "扫描应用".to_string(),
+            path: r"C:\tools\scan.exe".to_string(),
+            kind: ItemKind::App,
+            ..Default::default()
+        };
+        scan.pinned = true;
+        scan.use_count = 7;
+        let uid = scan.uid();
+        let mut items: Vec<LaunchItem> = Vec::new();
+        let mut hidden = vec![uid.clone()];
+        let mut stash: Vec<LaunchItem> = Vec::new();
+        stash_hidden(&mut stash, &scan);
+
+        assert!(restore_hidden(&mut items, &mut hidden, &mut stash, &uid));
+        assert!(hidden.is_empty());
+        assert!(stash.is_empty(), "恢复后快照不留在配置里");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].uid(), uid);
+        assert!(items[0].pinned, "置顶跟着快照回来");
+        assert_eq!(items[0].use_count, 7, "学习计数跟着快照回来");
+    }
+
+    /// 批次 D6：重新扫描导入的结果进清单前先按 `hidden[]` 剔掉，隐藏项不会复活。
+    #[test]
+    fn rescan_results_are_filtered_by_hidden() {
+        let hidden_scan = LaunchItem {
+            name: "藏起来的扫描项".to_string(),
+            path: r"C:\tools\hidden.exe".to_string(),
+            kind: ItemKind::App,
+            ..Default::default()
+        };
+        let fresh_scan = LaunchItem {
+            name: "新扫描到的".to_string(),
+            path: r"C:\tools\fresh.exe".to_string(),
+            kind: ItemKind::App,
+            ..Default::default()
+        };
+        let mut hidden = vec![hidden_scan.uid()];
+        let mut stash: Vec<LaunchItem> = Vec::new();
+        stash_hidden(&mut stash, &hidden_scan);
+
+        let mut imported = vec![hidden_scan.clone(), fresh_scan.clone()];
+        assert_eq!(drop_hidden(&mut imported, &hidden), 1);
+        let merged = dedup_items(imported);
+        assert_eq!(merged.len(), 1, "隐藏项没被重新导入");
+        assert_eq!(merged[0].uid(), fresh_scan.uid());
+        assert_eq!(stash.len(), 1, "快照还在，随时能在高级页恢复");
+        hidden.clear();
+    }
+
+    /// 批次 D6：显式添加（弹窗 / SendTo）撤销同名隐藏，否则下次启动会被静默剔掉。
+    #[test]
+    fn explicit_add_clears_the_hidden_record() {
+        let scan = LaunchItem {
+            name: "扫描应用".to_string(),
+            path: r"C:\tools\scan.exe".to_string(),
+            kind: ItemKind::App,
+            ..Default::default()
+        };
+        let uid = scan.uid();
+        let mut hidden = vec![uid.clone(), "custom:app|z:\\keep|".to_string()];
+        let mut stash: Vec<LaunchItem> = Vec::new();
+        stash_hidden(&mut stash, &scan);
+
+        assert_eq!(unhide_uids(&mut hidden, &mut stash, &[uid.clone()]), 1);
+        assert!(!hidden.contains(&uid));
+        assert!(stash.is_empty(), "快照一起撤掉，免得留成孤儿");
+        assert_eq!(hidden.len(), 1, "别的隐藏项不动");
+        assert_eq!(unhide_uids(&mut hidden, &mut stash, &[uid]), 0, "重复撤销恒 0");
     }
 
     /// 出厂种子必须真的包含 A2 的五组（自测一遍，防止 `system_seeds()` 没接上）。
