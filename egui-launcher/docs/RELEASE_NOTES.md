@@ -853,6 +853,27 @@ F7 把「隐藏只对出厂条目开放」写成了明示偏差①：扫描导�
 | 未做 / 偏差（明写） | ① 隐藏只对**已入库**条目生效——批量导入对话框里尚未勾选的扫描项没法「隐藏」，下次扫描还会列出来（不勾选即可，只是没有持久约束）；② 老隐藏记录（F7 时期写入、没有快照）恢复时仍按出厂种子重建，统计与置顶不回；③ 恢复默认仍不清理 `hidden[]` 的孤儿 uid（F7 偏差②不变）；④ 隐藏后的条目在本程序里没有「彻底删除」入口以外的去向——`hidden_stash` 只随恢复清空，用户永远不恢复就会一直留在 settings.json 里（一条几十字节，未做清理界面）；⑤ 用户自己的数据目录没碰，沙箱产物全在 `target\d6-test\` |
 | 提交 | **未提交**。commit / push 需用户正文原话；本批与需求书、开发计划的改动一起等授权 |
 
+### 四十二、FR-UIX-09 HUD 通知层：回执送到窗口外（2026-10-24，用户正文「启动 FR-UIX-09 HUD 功能开发」）
+
+计算器的 `Enter` 复制路径一直是「写剪贴板 → 置 Toast → 立刻 `visible=false` + 关到托盘」，那条 Toast 画在一个已经隐藏的窗口里，用户能拿到的回执只有 `launcher.log` 的一行。本批补的是这层缺口：一个独立、置顶、点击穿透、永不抢焦点的提示窗。**不新增快捷键**——HUD 是反馈层，触发入口仍是既有的 `Enter`（复制数字）。
+
+| 项 | 现量 |
+| --- | --- |
+| 实现形态 | 新文件 `src/hud.rs`：`ctx.show_viewport_deferred` 声明独立视口，`ViewportId::from_hash_of("alt-run-hud")`、标题 `ALTRun HUD <pid>`（供 Win32 按标题回查句柄）。状态 `Arc<Mutex<Shared>>`，主窗侧只有 `notify(ctx, text, theme, hold)` 与 `render(ctx)` |
+| 穿透与不抢焦点 | `with_active(false)` + `with_mouse_passthrough(true)` + `with_always_on_top()` + `with_decorations(false)` + `with_transparent(true)` + `with_taskbar(false)`；E-08 的四条判据（穿透 / 不抢焦点 / 主窗隐藏后继续画 / 可再次唤起）探针期全过 |
+| 补窗口样式 | winit 的 `with_taskbar(false)` 只摘任务栏按钮、**不设 `WS_EX_TOOLWINDOW`** ⇒ 首帧起 `patch_window_style()` 用 `FindWindowW` 找自家句柄，置 `WS_EX_NOACTIVATE\|WS_EX_TOOLWINDOW`、清 `WS_EX_APPWINDOW`。真机落地值 `0x80801B8`（NOACTIVATE + LAYERED + WINDOWEDGE + TOOLWINDOW + TRANSPARENT + 0x10 + TOPMOST）。代价：创建到首帧约 270ms 内仍是 winit 默认 `0xC0138`（含 APPWINDOW），这期间会短暂出现在 Alt+Tab |
+| 位置 | 主窗下方居中、`GAP=8`、`SCREEN_MARGIN=8`；下方放不下翻上方，上方也放不下夹到工作区底边；主窗未开时 y = 工作区顶 + 2/3 高。工作区由 `MonitorFromPoint(MONITOR_DEFAULTTONEAREST)` + `GetMonitorInfoW().rcWork` 取 |
+| 尺寸与换行 | 先 `ctx.fonts_mut(\|f\| f.layout(...))` 测自然宽，再 `min(自然宽 + 2*PAD + 2, 520, 工作区宽 - 2*边距)`；高 = 行高 + 2*PAD + 2，下限 44；内边距 14、圆角 10 |
+| 时间轴 | 淡入 100ms cubic ease-out（`1-(1-t)^3`）、淡出 150ms 线性、停留由调用方给（`HOLD_FOREGROUND = 1500ms`）；到 `hold + 150ms` 清 `showing`、发 `Visible(false)` 交给 eframe 回收；期间逐帧 `request_repaint` |
+| 主题取键 | `background` / `input_text` / `border` / `input_font_size`（夹 14–26，Light 为 22）；alpha **固定 240**，不读主题 `opacity` |
+| 主窗隐藏后的驱动 | 主窗 `Visible(false)` 后 `ui()` 停摆，淡入淡出与计时只能写在 HUD 自己的回调里——E-08 实测导出的硬约束，不是实现口味 |
+| 接线点 | 只有一处：计算器复制成功分支，在窗口隐藏之前调 `self.hud.notify(...)`；`ui()` 末尾每帧 `self.hud.render(ui.ctx())`（主窗可见时也要声明，否则 eframe 的 `remove_viewports_not_in` 会把它回收） |
+| 单测 | 6 条纯函数：下方放得下 / 放不下翻上方 / 主窗未开走 2/3 / 始终夹在工作区 / 宽度封顶 520 / 窄屏按工作区收窄 |
+| 真机自查（隔离沙箱 `target\hud-test\`，全部由我注入操作） | ① 计算器 `7` → `Enter` → 日志「HUD：显示（7 个字符，停留 1500 ms）」「计算器：结果已复制（1 个字符，表达式原文不落日志）→ 关闭到托盘」；② 主窗 `[126,96-926,578]` → HUD `[455,586-596,641]`（中心 525.5 对 526、y = 578+8），50ms 采样里 64 帧全为 `vis=True ex=0x80801B8`；③ 全程 `fg=external(0x4304D4)` ⇒ 一次也没抢焦点；④ 日志「HUD：收起（显示 1659 ms）」= 1500 + 150 + 帧粒度；⑤ 截图 `shot-hud.png`：白底圆角气泡落在已隐藏的主窗下方；⑥ 长文探针（临时 example，已删）：宽 506 ≤ 520、高 255（多行）⇒ 换行与封顶都生效 |
+| 验证 | `cargo test --bin egui-launcher` **215/215**（209 + HUD 6 条）；`cargo check --all-targets` 零警告；`cargo build` 通过（未跑 `cargo fmt`） |
+| 未做 / 偏差（明写） | ① `show_on`（FR-WIN-09）未实现 ⇒「按落点屏」退化为「主窗屏 → 3s 内上次用过的屏 → 鼠标屏」，3s 复用靠 `last_work` 缓存；② 后台事件 5000ms 停留没有接线点——目前只有前台复制这一条 1500ms 路径，常量已备；③ 不透明度 240 在浅色主题上肉眼几乎与不透明无差别（截图上分不出），240 是按原文写的值，没有另做视觉调优；④ 工作区物理像素 → 逻辑点用主窗 `pixels_per_point`，跨不同 DPI 显示器时位置可能有偏差，未实测；⑤ 样式补齐前约 270ms 的窗口带 APPWINDOW；⑥ Alt+Tab 没有逐帧枚举，证据是扩展样式位（TOOLWINDOW 置位、APPWINDOW 清零） |
+| 提交 | **未提交**。commit / push 需用户正文原话；本批与需求书、开发计划的改动一起等授权 |
+
 ---
 
 ## v0.1.0-dev · 2026-10-17

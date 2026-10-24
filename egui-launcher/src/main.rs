@@ -66,6 +66,7 @@ const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_TYPEBACK: i32 = 2;
 
 mod cli;
+mod hud;
 mod matching;
 mod source;
 mod theme;
@@ -730,6 +731,8 @@ struct LauncherApp {
     had_focus_since_show: bool, // 呼出后是否真正拿到过焦点（守卫：防异步 Focus 未生效那一帧误关闭）
     // 底部居中悬浮 Toast（FR-ACT-02 启动失败 + 各操作回执；deadline 到点自动消失）
     toast: Option<(String, Instant, egui::Color32)>,
+    // ---- FR-UIX-09：独立提示层（HUD，`src/hud.rs`）----
+    hud: hud::Hud,
     // ---- FR-WIN-02 热键可配置（批次 Q）----
     /// 设置页正在录制新组合：为真时本帧按键由录制端独占，快捷键分支与 Esc 链整体跳过。
     hotkey_recording: bool,
@@ -2402,6 +2405,7 @@ impl LauncherApp {
             hide_at: None,
             had_focus_since_show: false,
             toast: None,
+            hud: hud::Hud::new(),
             hotkey_recording: false,
             // 先按配置值显示；第一帧再从 HOTKEY_ACTIVE 校正（启动可能退回过出厂值）。
             hotkey_active,
@@ -7321,11 +7325,11 @@ impl eframe::App for LauncherApp {
                         "计算器：结果已复制（{} 个字符，表达式原文不落日志）→ 关闭到托盘",
                         text.chars().count()
                     );
-                    self.toast = Some((
-                        format!("✓ 已复制 {text}"),
-                        Instant::now() + TOAST_TTL,
-                        TOAST_OK,
-                    ));
+                    // FR-UIX-09：主窗随即关到托盘，所以回执只能靠 HUD 送到窗口外。
+                    let msg = format!("✓ 已复制 {text}");
+                    self.toast = Some((msg.clone(), Instant::now() + TOAST_TTL, TOAST_OK));
+                    self.hud
+                        .notify(ui.ctx(), msg, &self.theme, hud::HOLD_FOREGROUND);
                     self.clear_query_next_frame = true;
                     self.selected = 0;
                     self.visible = false;
@@ -7408,6 +7412,10 @@ impl eframe::App for LauncherApp {
         // 放在本帧最后铺设：同为 Background 层时后铺者赢得命中，万一和顶栏/列表空白手柄贴上，
         // 最外圈那 6px 归缩放。
         self.edge_grips(ui);
+
+        // FR-UIX-09：本帧仍在显示期的 HUD 子视口。主窗隐藏后这里不再跑，但已声明的视口
+        // 由 HUD 自己的回调续命（E-08 实测）。
+        self.hud.render(ui.ctx());
     }
 }
 
