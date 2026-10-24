@@ -433,6 +433,10 @@ pub struct AppSettings {
     /// 显式 `@分类` 临时并进来，不经过这一格。
     #[serde(default)]
     pub default_scope: Scope,
+
+    /// 窗口宽度 / 记住位置 / 状态栏 / 淡入（批次 F8）。见 [`Appearance`]。
+    #[serde(default)]
+    pub appearance: Appearance,
 }
 
 fn default_terminal_shell() -> String {
@@ -471,6 +475,7 @@ impl Default for AppSettings {
             list_rows: ListRows::default(),
             row_density: RowDensity::default(),
             default_scope: Scope::default(),
+            appearance: Appearance::default(),
         }
     }
 }
@@ -878,6 +883,53 @@ impl Scope {
             Self::All => "全部",
             Self::Basic => "基本",
         }
+    }
+}
+
+/// 批次 F8（FR-UIX-02）：`settings.json` 的 `appearance` 段。
+///
+/// 需求书那句「宽度 / 行数 / 位置 / 淡入淡出属 `appearance` 不属主题」是这一格的来由：
+/// 换主题不碰它，主题文件里写这些键也不会生效。「行数」后来由 `list_rows` 以另一种形态落地，
+/// 剩下的四项在这里。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    /// 主界面宽度（96 DPI 逻辑像素）。范围见 [`WINDOW_WIDTH_MIN`] / [`WINDOW_WIDTH_MAX`]，
+    /// 读盘与用之前都过 [`clamp_window_width`]——这个文件用户手改得动，0 不能原样进窗口。
+    pub width: f32,
+    /// 记住上次窗口位置（FR-UIX-03 的 `RememberPosition`）。
+    pub remember_position: bool,
+    /// 上次隐藏时的窗口左上角（屏幕坐标；多显示器在主屏左侧时为负）。
+    /// 启动时要先问系统这个点还在不在显示器上，不在就落回默认位置。
+    pub last_pos: Option<[i32; 2]>,
+    /// 底部状态栏（FR-UIX-08 的 `status_bar`，默认开）。
+    pub status_bar: bool,
+    /// 显示时淡入（FR-UIX-07；原文就定的默认关）。
+    pub fade: bool,
+}
+
+pub const WINDOW_WIDTH_MIN: f32 = 360.0;
+pub const WINDOW_WIDTH_MAX: f32 = 900.0;
+const WINDOW_WIDTH_DEFAULT: f32 = 500.0;
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            width: WINDOW_WIDTH_DEFAULT,
+            remember_position: true,
+            last_pos: None,
+            status_bar: true,
+            fade: false,
+        }
+    }
+}
+
+/// 宽度钳制。非有限值（手改成 `null` 之外的怪数）落回默认宽度。
+pub fn clamp_window_width(w: f32) -> f32 {
+    if w.is_finite() {
+        w.clamp(WINDOW_WIDTH_MIN, WINDOW_WIDTH_MAX)
+    } else {
+        WINDOW_WIDTH_DEFAULT
     }
 }
 
@@ -1499,6 +1551,8 @@ pub fn restore_defaults(s: &mut AppSettings) {
     s.list_rows = ListRows::default();
     s.row_density = RowDensity::default();
     s.default_scope = Scope::default();
+    // 批次 F8：宽度 / 记住位置 / 状态栏 / 淡入也回厂，位置一起清掉（下次启动居中）。
+    s.appearance = Appearance::default();
 }
 
 /// 破坏性操作前的编号备份（FR-CFG-08「Restore Defaults 前写 `.bak`」）。
@@ -2892,6 +2946,11 @@ mod dedup_tests {
         s.list_rows = ListRows::Ten;
         s.row_density = RowDensity::Dense;
         s.default_scope = Scope::Basic;
+        s.appearance.width = 820.0;
+        s.appearance.remember_position = false;
+        s.appearance.last_pos = Some([100, 200]);
+        s.appearance.status_bar = false;
+        s.appearance.fade = true;
         s.hidden = vec!["custom:app|c:\\x.exe|".into()];
         s.seed_round = 99;
 
@@ -2907,11 +2966,39 @@ mod dedup_tests {
         assert_eq!(s.list_rows, ListRows::default());
         assert_eq!(s.row_density, RowDensity::default());
         assert_eq!(s.default_scope, Scope::default());
+        assert_eq!(
+            s.appearance,
+            Appearance::default(),
+            "外观段整段回厂（含记住位置与上次坐标）"
+        );
         assert_eq!(s.toggle_hotkey, hot, "热键保留");
         assert_eq!(s.typeback_hotkey, typeback, "补字符热键保留");
         assert_eq!(s.web_engines.len(), engines, "网页引擎保留");
         assert_eq!(s.hidden.len(), 1, "隐藏项保留（否则删掉的条目会复活）");
         assert_eq!(s.seed_round, 99, "补种轮次保留");
+    }
+
+    /// 批次 F8（FR-UIX-02）：宽度是手改得动的配置，越界要钳、怪数要落回默认。
+    #[test]
+    fn window_width_is_clamped_to_range() {
+        assert_eq!(clamp_window_width(500.0), 500.0);
+        assert_eq!(clamp_window_width(100.0), WINDOW_WIDTH_MIN);
+        assert_eq!(clamp_window_width(5000.0), WINDOW_WIDTH_MAX);
+        assert_eq!(clamp_window_width(0.0), WINDOW_WIDTH_MIN);
+        assert_eq!(
+            clamp_window_width(f32::NAN),
+            Appearance::default().width,
+            "非有限值不能原样进窗口"
+        );
+    }
+
+    /// 批次 F8：旧 `settings.json` 没有 `appearance` 键 ⇒ 整段取默认（零迁移）。
+    #[test]
+    fn appearance_section_is_optional_in_old_settings() {
+        let s: AppSettings = serde_json::from_str("{\"theme\":\"Modern\"}").unwrap();
+        assert_eq!(s.appearance, Appearance::default());
+        assert!(s.appearance.status_bar, "状态栏默认开");
+        assert!(!s.appearance.fade, "淡入默认关（FR-UIX-07）");
     }
 
     /// 批次 F7（FR-CFG-08）：备份名带编号，同一秒内第二份也不覆盖；源文件不在就不造。

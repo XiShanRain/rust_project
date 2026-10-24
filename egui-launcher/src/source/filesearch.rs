@@ -473,6 +473,26 @@ fn split_parent(p: &str) -> (String, String) {
     }
 }
 
+/// 批次 F8（FR-SRC-14）：目录浏览里按 Esc 要回到的上一级查询串（以 `\` 结尾）。
+/// 输入是 [`Route::Browse`] 的 `dir`（保证以分隔符结尾）。盘根与 UNC 共享根没有上一级
+/// ⇒ `None`，调用方保持"清空查询"的旧行为。
+pub fn parent_query(dir: &str) -> Option<String> {
+    let trimmed = dir.trim_end_matches(['\\', '/']);
+    if trimmed.len() <= 2 && trimmed.ends_with(':') {
+        return None; // `D:\`
+    }
+    let unc = trimmed.starts_with("\\\\");
+    let tail = if unc { &trimmed[2..] } else { trimmed };
+    let rel = tail.rfind(['\\', '/'])?;
+    let cut = rel + if unc { 2 } else { 0 };
+    let parent = &trimmed[..cut];
+    // `\\srv\share` 再往上只剩服务器名，不是能浏览的目录。
+    if parent.is_empty() || (unc && !parent[2..].contains('\\')) {
+        return None;
+    }
+    Some(format!("{parent}\\"))
+}
+
 // ---- 索引构建（后台线程）----
 
 pub fn build_index() -> Vec<FileEntry> {
@@ -859,6 +879,24 @@ mod tests {
         let (dir, filter) = browse_parts(r"%USERPROFILE%\Down").expect("应识别成路径");
         assert_eq!(dir, format!(r"{}\", profile));
         assert_eq!(filter, "Down");
+    }
+
+    /// 批次 F8：Esc 返回上级——逐级往上，盘根与 UNC 共享根到头。
+    #[test]
+    fn parent_query_stops_at_roots() {
+        assert_eq!(parent_query("D:\\a\\b\\"), Some("D:\\a\\".to_string()));
+        assert_eq!(
+            parent_query("D:\\a\\b"),
+            Some("D:\\a\\".to_string()),
+            "不带结尾分隔符也认"
+        );
+        assert_eq!(parent_query("D:\\a\\"), Some("D:\\".to_string()));
+        assert_eq!(parent_query("D:\\"), None, "盘根没有上一级");
+        assert_eq!(
+            parent_query("\\\\srv\\share\\a\\"),
+            Some("\\\\srv\\share\\".to_string())
+        );
+        assert_eq!(parent_query("\\\\srv\\share\\"), None, "共享根没有上一级");
     }
 
     #[test]

@@ -19,6 +19,7 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM,
     LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
 use windows::core::PCWSTR;
@@ -633,6 +634,21 @@ fn win_origin(hwnd: HWND) -> Option<(i32, i32)> {
         .map(|_| (r.left, r.top))
 }
 
+/// 批次 F8：这个屏幕坐标还在不在某台显示器上。`MONITOR_DEFAULTTONULL` 让不在时返回空句柄，
+/// 而不是就近吸附到主屏——吸过去等于"记住了却没记住"。
+fn pos_on_screen(pos: [i32; 2]) -> bool {
+    !unsafe {
+        MonitorFromPoint(
+            POINT {
+                x: pos[0],
+                y: pos[1],
+            },
+            MONITOR_DEFAULTTONULL,
+        )
+    }
+    .is_invalid()
+}
+
 fn win_size(hwnd: HWND) -> Option<(i32, i32)> {
     let mut r = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut r) }
@@ -705,6 +721,8 @@ struct LauncherApp {
     notify_tx: mpsc::Sender<Result<String, String>>,
     notify_rx: mpsc::Receiver<Result<String, String>>,
     visible: bool,
+    /// 批次 F8（FR-UIX-07）：本次显示的开始时刻；淡入进度按它算（`None` = 没在淡）。
+    shown_at: Option<Instant>,
     ime_before: Option<ImeState>, // E-05 呼出前的输入法状态
     self_hwnd: Option<HWND>,      // E-05 本机顶层窗口，切英文模式时对它发 WM_IME_CONTROL
     // FR-WIN-04 失焦关闭到托盘
@@ -873,6 +891,35 @@ fn default_window_height(theme: &theme::Theme, density: RowDensity) -> f32 {
         .clamp(MIN_H as f32, 900.0)
 }
 
+/// 状态栏行高（FR-UIX-08 原文「高约 38」）。不随行密度缩放：甲档一行 34+2 也只比它矮 2px。
+const STATUS_BAR_H: f32 = 38.0;
+/// 状态栏上面的分隔线与留白，和行高一起从列表可视区里扣。
+const STATUS_BAR_GAP: f32 = 6.0;
+const STATUS_BAR_BLOCK: f32 = STATUS_BAR_H + STATUS_BAR_GAP;
+
+/// 实际窗口高度 = 一屏十行 +（状态栏开着时的状态栏那一块）。
+/// 分成两函数而不是给 [`default_window_height`] 加参数：它那几条绝对值单测钉的是"十行本身"，
+/// 状态栏是叠加项，混在一起会让那组数随开关漂移。
+fn window_height(theme: &theme::Theme, density: RowDensity, status_bar: bool) -> f32 {
+    default_window_height(theme, density)
+        + if status_bar { STATUS_BAR_BLOCK } else { 0.0 }
+}
+
+/// 淡入时长（FR-UIX-07 原文「入 120ms」）。淡出这一半本批不做：原文要求影子窗口，
+/// 而"先淡 100ms 再隐藏"会违反同一条里的「隐藏不阻塞下一次热键唤起」。
+const FADE_IN_SECS: f32 = 0.120;
+
+/// 淡入时按进度压颜色 Alpha。`CentralPanel` 的底色与描边由面板自己画，
+/// `ui.set_opacity` 管不到它们 ⇒ 面板框架这层得单独乘一次。
+fn with_alpha(c: egui::Color32, alpha: f32) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        c.r(),
+        c.g(),
+        c.b(),
+        (c.a() as f32 * alpha.clamp(0.0, 1.0)) as u8,
+    )
+}
+
 /// 输入框的最小高度（2026-10-24 用户正文：「输入框大一点，像 ahk 版的输入框一样，大气一点」）。
 /// AHK 版是 `InputHeight := Max(editH, Win.Scale(40))`（`SearchWindow.ahk:92-96`），取 44 再高一档。
 const INPUT_MIN_H: f32 = 44.0;
@@ -902,6 +949,10 @@ fn top_drag_strip_w(item_spacing_x: f32) -> f32 {
 /// 会被输入框右缘裁掉（留半句话比没有更糟）。完整键表有两处入口——☰ 菜单本身（Ctrl+M）
 /// 和查询框打 `?` 的速查表（批次 A8，2026-10-24 批次 F6 起 **37 条**）。
 const SEARCH_HINT: &str = "搜索…（Enter 运行 · Ctrl+M 菜单 · ? 帮助 · Esc 关闭）";
+
+/// 状态栏开着时的占位提示（FR-UIX-08「两者耦合」的定义）：键位说明已经落在状态栏左/右两格，
+/// 输入框这边只留一句「搜索…」。状态栏关掉时回落到 [`SEARCH_HINT`] 那一整句。
+const SEARCH_HINT_SHORT: &str = "搜索…";
 
 /// 列表可视区之上的占用：外框 1 + 主题内边距 + 输入框 + 4（行距与分隔线，Light 实测值）。
 fn list_top_h(theme: &theme::Theme) -> f32 {
@@ -1017,6 +1068,75 @@ fn hint_message(hint: &source::websearch::EngineHint) -> &'static str {
         "文件索引还在后台建立，稍等片刻再回车"
     } else {
         "继续输入关键词后再回车"
+    }
+}
+
+/// 状态栏左侧那一格（FR-UIX-08「左 = 面板返回 / 文件模式 / 轮换提示」）。
+///
+/// 三档按「此刻最有用」排序，不是并列展示：目录浏览时用户下一步多半是返回，先把返回键说出来；
+/// 文件模式其次；平时才轮到 Tab 轮换。「基本」分类范围只在这一格里追加——它是清单层的筛子，
+/// 目录浏览/文件模式两档下说它会让人误以为是文件范围。
+///
+/// 目录那一档的 Esc 文案按 [`browse_parent_of`] 的真实落点说：带过滤词时先去词（不是退目录），
+/// 盘根再按下去是清空查询——三处说成同一句话会教坏用户。
+fn status_left_text(
+    browse: Option<(&str, &str)>,
+    file_mode: bool,
+    tab: TabMode,
+    basic_scope: bool,
+) -> String {
+    if let Some((dir, filter)) = browse {
+        let esc = if !filter.is_empty() {
+            "Esc 清除筛选"
+        } else if source::filesearch::parent_query(dir).is_some() {
+            "Esc 返回上级"
+        } else {
+            "Esc 清空"
+        };
+        return format!("目录 {dir} · {esc}");
+    }
+    if file_mode {
+        return "文件模式 · Esc 清空".to_string();
+    }
+    let mut text = match tab {
+        TabMode::Complete => "Tab 补全 / 下一项",
+        TabMode::Navigate => "Tab 下一项 · Shift+Tab 上一项",
+    }
+    .to_string();
+    if basic_scope {
+        text.push_str(" · 分类：基本");
+    }
+    text
+}
+
+/// 状态栏右侧 `Enter` 键帽后面的动作词（FR-UIX-08「右 = Enter 行为标签」）。
+///
+/// 与行首徽标同口径，但这里要能直接接在键帽后面读（「Enter 打开」），所以用动词短语。
+/// 四类不可执行行跟着徽标说「查看」——它们按下去只给一句话，与徽标说同一件事比换词更不容易误会。
+fn enter_action_label(row: Option<&HeadRow>) -> &'static str {
+    match row {
+        None => "运行",
+        Some(HeadRow::Calc(_)) => "复制数字",
+        Some(HeadRow::Search(_)) => "搜索",
+        Some(HeadRow::Hint(_))
+        | Some(HeadRow::TermHint(_))
+        | Some(HeadRow::CheatHint(_))
+        | Some(HeadRow::ScopeTags(_)) => "查看",
+        Some(HeadRow::Custom(_)) => "运行",
+        Some(HeadRow::CustomHint(_)) => "补全参数",
+        Some(HeadRow::File(_)) => "打开",
+        Some(HeadRow::Terminal(_)) => "执行命令",
+        Some(HeadRow::Cheat(_)) => "查看",
+    }
+}
+
+/// 目录浏览时 Esc 的落点：先把当前的过滤词去掉（留在本目录），再逐级上溯。
+/// 盘根 / UNC 共享根 / 不是浏览态一律 `None`——调用方保持"清空查询"的旧行为。
+fn browse_parent_of(raw: &str) -> Option<String> {
+    match source::filesearch::route(raw) {
+        source::filesearch::Route::Browse { dir, filter } if !filter.is_empty() => Some(dir),
+        source::filesearch::Route::Browse { dir, .. } => source::filesearch::parent_query(&dir),
+        _ => None,
     }
 }
 
@@ -2276,6 +2396,7 @@ impl LauncherApp {
             notify_tx,
             notify_rx,
             visible: intent.visible,
+            shown_at: None,
             ime_before: None,
             self_hwnd,
             hide_at: None,
@@ -2369,7 +2490,11 @@ impl LauncherApp {
         // 的尺寸在呼出/隐藏之间也不动——`sync_theme` 每次呼出都会跑，但主题没变时上面那个
         // 相等判断已经先返回了。
         let first_apply = self.theme_applied.is_none();
-        let height = default_window_height(&theme, self.prefs.row_density);
+        let height = window_height(
+            &theme,
+            self.prefs.row_density,
+            self.prefs.appearance.status_bar,
+        );
         self.theme = theme.clone();
         self.theme_applied = Some(theme);
         if !first_apply {
@@ -2397,6 +2522,30 @@ impl LauncherApp {
     /// `row_density`（[`crate::row_geometry`]）；「跟随主题」档才回落到主题的 `row_height`。
     fn row_geom(&self) -> (f32, f32, f32) {
         row_geometry(self.prefs.row_density, &self.theme)
+    }
+
+    /// 批次 F8（FR-UIX-02）：宽度设置即时生效。高度保持现状——宽度不参与"一屏十行"。
+    fn apply_width(&self, ctx: &egui::Context, width: f32, why: &str) {
+        let w = source::application::clamp_window_width(width);
+        let size = ctx.viewport_rect().size();
+        if (size.x - w).abs() < 0.5 {
+            return; // 已经是这个宽度：别每帧都发一条视图命令
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            w,
+            size.y.max(MIN_H as f32),
+        )));
+        eprintln!("{why}：窗口宽度 → {w}（原 {}）", size.x.round());
+    }
+
+    /// 批次 F8（FR-UIX-07）：淡入进度 0..1。没开、已经到位、或正开着设置页都返回 `None`
+    /// （设置页是低频界面，不做淡入）。
+    fn fade_progress(&self) -> Option<f32> {
+        if !self.prefs.appearance.fade || self.settings_open {
+            return None;
+        }
+        let t = self.shown_at?.elapsed().as_secs_f32() / FADE_IN_SECS;
+        (t < 1.0).then(|| 1.0 - (1.0 - t).powi(3))
     }
 
     /// FR-SRC-06：派一轮后台路径四态检查。`force` = 忽略最小间隔（呼出时总想拿最新结果）。
@@ -3283,7 +3432,11 @@ impl LauncherApp {
                                 source::application::save_settings(&self.prefs);
                                 // 换档改的是"一屏正好十行"里的行高，所以窗口高度要立刻跟着重算——
                                 // 与换主题走的是同一个 `resize_to_list`。
-                                let h = default_window_height(&self.theme, density);
+                                let h = window_height(
+                                    &self.theme,
+                                    density,
+                                    self.prefs.appearance.status_bar,
+                                );
                                 self.resize_to_list(ui.ctx(), h, "换行密度");
                                 ui.ctx().request_repaint();
                             }
@@ -3720,6 +3873,83 @@ impl LauncherApp {
                             }
                         }
                         SettingsTab::Appearance => {
+                            // 批次 F8（FR-UIX-02/03/07/08）：窗口小节。宽度即时生效；记住位置、
+                            // 状态栏、淡入三项下一次呼出/隐藏时才看得出差别。
+                            ui.label(egui::RichText::new("窗口").strong());
+                            let mut width = self.prefs.appearance.width;
+                            let wr = ui.add(
+                                egui::Slider::new(
+                                    &mut width,
+                                    source::application::WINDOW_WIDTH_MIN
+                                        ..=source::application::WINDOW_WIDTH_MAX,
+                                )
+                                .step_by(10.0)
+                                .fixed_decimals(0)
+                                .text("宽度"),
+                            );
+                            if wr.changed() {
+                                self.prefs.appearance.width =
+                                    source::application::clamp_window_width(width);
+                                self.apply_width(ui.ctx(), width, "设置页：窗口宽度");
+                            }
+                            // 拖滑块时每帧写盘会把 settings.json 的 mtime 刷成心跳；
+                            // 松手（或键盘调完）才落一次盘。
+                            if wr.drag_stopped()
+                                || (wr.changed() && !ui.input(|i| i.pointer.primary_down()))
+                            {
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：窗口宽度 = {}（已写 settings.json）",
+                                    self.prefs.appearance.width.round()
+                                );
+                            }
+                            let mut remember = self.prefs.appearance.remember_position;
+                            if ui
+                                .checkbox(&mut remember, "记住窗口位置（下次呼出回到原处）")
+                                .changed()
+                            {
+                                self.prefs.appearance.remember_position = remember;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：remember_position = {remember}（已写 settings.json）"
+                                );
+                            }
+                            let mut bar = self.prefs.appearance.status_bar;
+                            if ui
+                                .checkbox(&mut bar, "显示底部状态栏（高 38px，仅有结果时出现）")
+                                .changed()
+                            {
+                                self.prefs.appearance.status_bar = bar;
+                                // 状态栏是叠加在"一屏十行"上的 44px：窗口跟着长/缩，
+                                // 列表本身的行数不变（FR-UIX-08「仅在有结果时显示」）。
+                                let h =
+                                    window_height(&self.theme, self.prefs.row_density, bar);
+                                self.resize_to_list(ui.ctx(), h, "切换状态栏");
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：status_bar = {bar}（窗口高度 → {h}，已写 settings.json）"
+                                );
+                            }
+                            let mut fade = self.prefs.appearance.fade;
+                            if ui
+                                .checkbox(&mut fade, "呼出时淡入（120ms，cubic ease-out）")
+                                .changed()
+                            {
+                                self.prefs.appearance.fade = fade;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：fade = {fade}（已写 settings.json；下一次呼出生效）"
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "宽度范围 360–900（默认 500）。淡出未做：需求书原文要求影子窗口，而「先淡再隐藏」会违反同一条里的「隐藏不阻塞下一次热键唤起」。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.add_space(8.0);
+                            ui.separator();
                             // 批次 F1（FR-UIX-01）：主题选择。改成即时生效——不重启、不丢焦点。
                             ui.label(egui::RichText::new("主题").strong());
                             ui.label(
@@ -3957,6 +4187,8 @@ impl LauncherApp {
         self.hide_at = None;
         self.had_focus_since_show = false;
         self.toast = None; // 陈旧提示不跨呼出周期存活
+        // 批次 F8（FR-UIX-07）：淡入从这一刻起算。没开淡入时这个值也没人读。
+        self.shown_at = Some(Instant::now());
         // 呼出后把键盘焦点给搜索框（下一帧渲染 TextEdit 时 request_focus）
         self.focus_query = true;
         self.selected = 0;
@@ -3986,6 +4218,21 @@ impl LauncherApp {
         // FR-WIN-04：关闭到托盘时清掉待触发的失焦定时器
         self.hide_at = None;
         self.had_focus_since_show = false;
+        // 批次 F8（FR-UIX-07）：这一轮显示结束，淡入进度清零；下次 on_show 重新起算。
+        self.shown_at = None;
+        // 批次 F8（FR-UIX-03 RememberPosition）：拖窗走的是 `SetWindowPos`，隐藏这一刻
+        // `GetWindowRect` 读到的就是终值。与上次存的不同才写盘——每次隐藏都写会把
+        // settings.json 的 mtime 刷得像心跳。
+        if self.prefs.appearance.remember_position {
+            if let Some(pos) = self.self_hwnd.and_then(win_origin) {
+                let pos = [pos.0, pos.1];
+                if self.prefs.appearance.last_pos != Some(pos) {
+                    self.prefs.appearance.last_pos = Some(pos);
+                    source::application::save_settings(&self.prefs);
+                    eprintln!("窗口：记住位置 ({}, {})", pos[0], pos[1]);
+                }
+            }
+        }
         // 批次 F6：☰ 菜单不跨隐藏保留。失焦自动隐藏时 Popup 那一帧不再运行，也就没人把
         // `menu_open` 写回 false——不在这里清掉，下次呼出会带着一个悬着的菜单出现。
         self.menu_open = false;
@@ -5614,12 +5861,26 @@ impl eframe::App for LauncherApp {
         let menu_was_open = self.menu_open;
         // 批次 F1（FR-UIX-06）：整窗底色 / 边框 / 圆角 / 内边距 / 不透明度全部走主题。
         // 圆角以外不画任何东西 ⇒ GL 后端下四角真的透出桌面（E-18）。
-        egui::CentralPanel::default().frame(self.theme.central_frame()).show(ui, |ui| {
+        // 批次 F8（FR-UIX-07）：淡入只做"入"这一半，120ms cubic ease-out。面板框架由
+        // `CentralPanel` 自己画，`set_opacity` 管不到 ⇒ 底色与描边先乘一次同样的进度。
+        let fade = self.fade_progress();
+        let mut frame = self.theme.central_frame();
+        if let Some(t) = fade {
+            frame.fill = with_alpha(frame.fill, t);
+            frame.stroke.color = with_alpha(frame.stroke.color, t);
+            ui.ctx().request_repaint();
+        }
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            if let Some(t) = fade {
+                ui.set_opacity(t);
+            }
             // 设置页整页模式（2026-10-17）：小窗口内独立弹窗会被裁剪，直接替换搜索页渲染。
             if self.settings_open {
                 self.settings_ui(ui);
                 return;
             }
+            // 状态栏要钉在面板底边，列表可视区按它让出一块；先在加任何控件之前量下整块内容区。
+            let content_rect = ui.max_rect();
             let search_id = search_field_id();
             // 顶栏拖动手柄要铺在「搜索框右缘 → ☰ 左缘」这段真空白上，尺寸只能运行时量
             //（2026-10-18 用户：「顶部输入框右侧点击空白不能拖动，顶部的不是菜单栏吗？」）。
@@ -5635,13 +5896,20 @@ impl eframe::App for LauncherApp {
                 let edit_w = (ui.available_width() - menu_col_w - TOP_DRAG_GAP).max(60.0);
                 // 批次 F6（2026-10-24 用户正文：「输入框大一点，像 ahk 版的输入框一样，大气一点」）：
                 // 高度钳到 [`INPUT_MIN_H`] 并让文字垂直居中——原先 TextEdit 只按字体高长到 ~29px。
+                // 批次 F8（FR-UIX-08）：状态栏开着时键位说明在栏里，输入框只留一句；
+                // 关掉状态栏则回落到那一整句长提示（两者的耦合口径就这一处）。
+                let hint = if self.prefs.appearance.status_bar {
+                    SEARCH_HINT_SHORT
+                } else {
+                    SEARCH_HINT
+                };
                 let resp = ui.add_sized(
                     [edit_w, INPUT_MIN_H],
                     egui::TextEdit::singleline(&mut self.query)
                         .id(search_id)
                         .font(egui::FontId::proportional(self.theme.input_font_size))
                         .vertical_align(egui::Align::Center)
-                        .hint_text(SEARCH_HINT),
+                        .hint_text(hint),
                 );
                 pill_right = resp.rect.max.x;
                 // 批次 F6：这条缝是给下面「搜索页顶栏空白」那个拖动手柄留的命（见 [`TOP_DRAG_GAP`]）。
@@ -5738,6 +6006,19 @@ impl eframe::App for LauncherApp {
             }
             ui.separator();
 
+            // 批次 S/T：列表 = 头段（计算器/搜索/提示）+ 应用结果，`self.selected` 按「合并行号」计
+            //（换算全走 `row_at`/`item_rank` 这两个纯函数，见它们各自的判据注释）。
+            // 批次 F8：计划要早于拖窗手柄算——状态栏只在有结果时占那 44px，
+            // 手柄底边得跟着让，不然它盖住状态栏的右半边、点上去是拖窗而不是点键帽。
+            let q = self.query.trim().to_lowercase();
+            let plan = self.plan();
+            let head_len = plan.head.len();
+            let results = plan.results;
+            let total = row_count(results.len(), head_len);
+            let status_shown = self.prefs.appearance.status_bar && total > 0;
+            let file_route = source::filesearch::route(&self.query);
+            let in_file_mode = !matches!(file_route, source::filesearch::Route::NotOurs);
+
             // 2026-10-24 修滚轮：列表右侧那块「拖空白移动窗口」的手柄必须与 ScrollArea 同层。
             // 原先它铺在独立的 Background `Area` 上（`drag_handle`），指针一进去，
             // `Context::rect_contains_pointer` 认到的层就不是滚动区域那一层，滚轮整段被吞。
@@ -5752,24 +6033,19 @@ impl eframe::App for LauncherApp {
                 let root = ui.ctx().viewport_rect();
                 let plate = egui::Rect::from_min_max(
                     egui::pos2(root.min.x + 260.0, root.min.y + 40.0),
-                    root.max - egui::vec2(12.0, 6.0),
+                    root.max
+                        - egui::vec2(
+                            12.0,
+                            6.0 + if status_shown { STATUS_BAR_BLOCK } else { 0.0 },
+                        ),
                 );
                 self.inline_drag_handle(ui, "window_drag_layer_list", plate);
             }
 
-            let q = self.query.trim().to_lowercase();
-            // 批次 S/T：列表 = 头段（计算器/搜索/提示）+ 应用结果，`self.selected` 按「合并行号」计
-            //（换算全走 `row_at`/`item_rank` 这两个纯函数，见它们各自的判据注释）。
-            let plan = self.plan();
-            let head_len = plan.head.len();
-            let results = plan.results;
-            let total = row_count(results.len(), head_len);
             if total == 0 {
                 // 批次 X：文件模式下"未找到"这三行字会说错两件事——范围（不是"清单里没有"，
                 // 是"索引范围里没有"或"这个目录空/读不到"）与预填（`'报告`、`pic 报告` 这种带
                 // 触发符的串喂给 `from_input` 会生成一条命令行是乱码的条目）。所以另起一格。
-                let file_route = source::filesearch::route(&self.query);
-                let in_file_mode = !matches!(file_route, source::filesearch::Route::NotOurs);
                 if q.is_empty() {
                     ui.label("清单为空——按 Ctrl+Shift+N、或点右上 ☰ 里的「新建快捷项」，也可按 Ctrl+I 批量导入。");
                 } else if in_file_mode {
@@ -5872,8 +6148,13 @@ impl eframe::App for LauncherApp {
                 let glyph = (icon * 0.6).max(10.0);
                 // results 是下标（见 MatchIndex::search），逐项回指 self.items。
                 // 套 ScrollArea 才谈得上翻页与滚动跟随：窗口只装得下约十行，清单可达上百行。
+                // 批次 F8：状态栏要占底部 38 + 6，滚动区先把它让出来（否则列表会垫在栏下面）。
+                let list_h = (ui.available_height()
+                    - if status_shown { STATUS_BAR_BLOCK } else { 0.0 })
+                .max(1.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .max_height(list_h)
                     .show(ui, |ui| {
                         ui.spacing_mut().interact_size.y = row_h;
                         ui.spacing_mut().item_spacing.y = row_spacing;
@@ -6303,6 +6584,72 @@ impl eframe::App for LauncherApp {
                     });
                 self.scroll_followed = self.selected;
             }
+
+            // FR-UIX-08：底部状态栏。只在有结果时出现；列表已在上面让出这一块。
+            // 左格说"此刻按下去最有用的事"（返回 / 模式 / Tab），右格是 Enter 的行为标签。
+            // 不填底色：整窗底色与透明都交给主题框架，状态栏只画一条分隔线 + 两段文字。
+            if status_shown {
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(content_rect.min.x, content_rect.max.y - STATUS_BAR_H),
+                    content_rect.max,
+                );
+                ui.painter().hline(
+                    bar.x_range(),
+                    bar.min.y,
+                    egui::Stroke::new(1.0, self.theme.separator),
+                );
+                let browse = match &file_route {
+                    source::filesearch::Route::Browse { dir, filter } => {
+                        Some((dir.as_str(), filter.as_str()))
+                    }
+                    _ => None,
+                };
+                let left = status_left_text(
+                    browse,
+                    in_file_mode,
+                    self.prefs.tab_mode,
+                    matches!(self.prefs.default_scope, Scope::Basic),
+                );
+                // 左格剪到右格之前：360 宽 + 长路径时宁可截断，也不让两段字叠在一起。
+                let left_rect = egui::Rect::from_min_max(
+                    bar.min,
+                    egui::pos2((bar.max.x - 170.0).max(bar.min.x + 40.0), bar.max.y),
+                );
+                ui.painter().with_clip_rect(left_rect).text(
+                    egui::pos2(bar.min.x, bar.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    left,
+                    egui::FontId::proportional(self.theme.title_font_size),
+                    self.theme.subtitle,
+                );
+                let action = match row_at(self.selected, total - head_len, head_len) {
+                    Some(Row::Head(h)) => enter_action_label(plan.head.get(h)),
+                    _ => enter_action_label(None),
+                };
+                let mut right = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(bar.shrink2(egui::vec2(0.0, 4.0)))
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                right.label(
+                    egui::RichText::new(action)
+                        .size(self.theme.title_font_size)
+                        .color(self.theme.title),
+                );
+                egui::Frame::new()
+                    .fill(self.theme.selected_background)
+                    .stroke(egui::Stroke::new(1.0, self.theme.border))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(7, 2))
+                    .show(&mut right, |ui| {
+                        ui.label(
+                            egui::RichText::new("Enter")
+                                .monospace()
+                                .size(self.theme.shortcut_font_size + 1.0)
+                                .color(self.theme.input_text),
+                        );
+                    });
+            }
         });
 
         // 通用 Toast：底部居中悬浮圆角胶囊，TTL 尾段淡出（2026-10-17 用户反馈内联红字不优雅）。
@@ -6695,8 +7042,14 @@ impl eframe::App for LauncherApp {
                                 s.init();
                             }
                             self.sync_theme(ui.ctx());
-                            let h = default_window_height(&self.theme, self.prefs.row_density);
+                            let h = window_height(
+                                &self.theme,
+                                self.prefs.row_density,
+                                self.prefs.appearance.status_bar,
+                            );
                             self.resize_to_list(ui.ctx(), h, "恢复默认");
+                            // 宽度也回厂（设置页那一格恢复默认后要立刻看得见）。
+                            self.apply_width(ui.ctx(), self.prefs.appearance.width, "恢复默认");
                             let bak_note = match &bak {
                                 Some(p) => format!("已备份到 {}", p.display()),
                                 None => "settings.json 不存在，未写备份".to_string(),
@@ -7009,6 +7362,11 @@ impl eframe::App for LauncherApp {
                 self.settings_open = false;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
+            } else if let Some(parent) = browse_parent_of(&self.query) {
+                // 批次 F8（FR-SRC-14 附带）：目录浏览里 Esc 逐级返回；先去过滤词再上溯。
+                // 盘根返回 None ⇒ 落到下面"清空查询"那一档，行为与以前一致。
+                // 日志只记动作，路径原文不落盘（FR-SYS-03）。
+                self.set_query(ui.ctx(), parent, "Esc：目录浏览返回上级");
             } else if !self.query.is_empty() {
                 self.query.clear();
                 self.selected = 0;
@@ -7244,7 +7602,12 @@ fn main() -> eframe::Result {
     // 同一份再传进 `LauncherApp`——`Themes\` 只读一遍，坏主题文件在日志里也只记一次。
     // 2026-10-24 用户需求：旧默认 400px 只装得下 6 行，现在按 `LIST_ROWS` 算。
     let (start_theme, start_theme_choices) = theme::load(&configured.theme);
-    let start_height = default_window_height(&start_theme, configured.row_density);
+    let start_height = window_height(
+        &start_theme,
+        configured.row_density,
+        configured.appearance.status_bar,
+    );
+    let start_width = source::application::clamp_window_width(configured.appearance.width);
 
     let mut wgpu_options = eframe::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
@@ -7256,14 +7619,30 @@ fn main() -> eframe::Result {
         create_new.instance_descriptor.backends = eframe::wgpu::Backends::GL;
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([start_width, start_height])
+        .with_title("")
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_transparent(true)
+        .with_visible(start_visible);
+    // 批次 F8（FR-UIX-03 RememberPosition）：上次的位置还要在显示器上才用。
+    // 拔掉副屏、改分辨率之后，旧坐标可能整块落在不存在的区域——那样窗口会"启动成功但看不见"。
+    if configured.appearance.remember_position {
+        match configured.appearance.last_pos {
+            Some([x, y]) if pos_on_screen([x, y]) => {
+                viewport = viewport.with_position([x as f32, y as f32]);
+                eprintln!("窗口：使用上次位置 ({x}, {y})");
+            }
+            Some([x, y]) => {
+                eprintln!("窗口：上次位置 ({x}, {y}) 已不在任何显示器上 ⇒ 落回系统默认位置");
+            }
+            None => {}
+        }
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, start_height])
-            .with_title("")
-            .with_decorations(false)
-            .with_always_on_top()
-            .with_transparent(true)
-            .with_visible(start_visible),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
         ..Default::default()
@@ -7702,6 +8081,149 @@ mod nav_tests {
         // Modern 内边距 16、行高 56 ⇒ 65 + 10×60 + 17 = 682。
         let modern = theme::resolve_with("Modern", &none, false);
         assert_eq!(default_window_height(&modern, RowDensity::Theme), 682.0);
+    }
+
+    #[test]
+    fn window_height_stacks_the_status_bar_on_top_of_ten_rows() {
+        let light = theme::Theme::light();
+        // 状态栏是叠加项，不是从十行里扣：开关只在 438 上加/减一整块。
+        assert_eq!(window_height(&light, RowDensity::Snug, false), 438.0);
+        assert_eq!(
+            window_height(&light, RowDensity::Snug, true),
+            438.0 + STATUS_BAR_BLOCK
+        );
+        assert_eq!(
+            window_height(&light, RowDensity::Theme, true),
+            default_window_height(&light, RowDensity::Theme) + STATUS_BAR_BLOCK
+        );
+        assert_eq!(STATUS_BAR_BLOCK, STATUS_BAR_H + STATUS_BAR_GAP);
+    }
+
+    #[test]
+    fn status_left_text_puts_the_next_escape_first() {
+        // 目录浏览三档 Esc 文案各说各的真实落点：退目录 / 去过滤词 / 盘根清空。
+        assert_eq!(
+            status_left_text(
+                Some(("D:\\a\\b\\", "")),
+                false,
+                TabMode::Navigate,
+                true
+            ),
+            "目录 D:\\a\\b\\ · Esc 返回上级"
+        );
+        assert_eq!(
+            status_left_text(Some(("D:\\a\\b\\", "re")), false, TabMode::Complete, false),
+            "目录 D:\\a\\b\\ · Esc 清除筛选"
+        );
+        assert_eq!(
+            status_left_text(Some(("D:\\", "")), false, TabMode::Complete, false),
+            "目录 D:\\ · Esc 清空"
+        );
+        assert_eq!(
+            status_left_text(None, true, TabMode::Complete, true),
+            "文件模式 · Esc 清空"
+        );
+        // 平时两档 Tab 口径，各自原样出场；「基本」只在平时那一档追加。
+        assert_eq!(
+            status_left_text(None, false, TabMode::Complete, false),
+            "Tab 补全 / 下一项"
+        );
+        assert_eq!(
+            status_left_text(None, false, TabMode::Complete, true),
+            "Tab 补全 / 下一项 · 分类：基本"
+        );
+        assert_eq!(
+            status_left_text(None, false, TabMode::Navigate, false),
+            "Tab 下一项 · Shift+Tab 上一项"
+        );
+    }
+
+    #[test]
+    fn enter_action_labels_say_what_enter_will_do() {
+        assert_eq!(enter_action_label(None), "运行");
+        let calc = HeadRow::Calc(source::calc::CalcHit {
+            title: "= 2".into(),
+            subtitle: String::new(),
+            copy: "2".into(),
+        });
+        assert_eq!(enter_action_label(Some(&calc)), "复制数字");
+        let search = HeadRow::Search(source::websearch::SearchHit {
+            engine_id: "g".into(),
+            title: "Google「x」".into(),
+            subtitle: String::new(),
+            url: "https://example.com/?q=x".into(),
+        });
+        assert_eq!(enter_action_label(Some(&search)), "搜索");
+        let hint = HeadRow::Hint(source::websearch::EngineHint {
+            engine_id: "g".into(),
+            title: String::new(),
+            subtitle: String::new(),
+            completion: String::new(),
+        });
+        assert_eq!(enter_action_label(Some(&hint)), "查看");
+        let custom = HeadRow::Custom(source::custom::CustomHit {
+            uid: "u".into(),
+            name: "ping".into(),
+            entry: LaunchItem::default(),
+            subtitle: String::new(),
+        });
+        assert_eq!(enter_action_label(Some(&custom)), "运行");
+        let custom_hint = HeadRow::CustomHint(source::custom::CustomHint {
+            uid: "u".into(),
+            title: String::new(),
+            subtitle: String::new(),
+            completion: "ping ".into(),
+            command: String::new(),
+        });
+        assert_eq!(enter_action_label(Some(&custom_hint)), "补全参数");
+        let file = HeadRow::File(source::filesearch::FileHit {
+            title: "a.txt".into(),
+            path: "D:\\a.txt".into(),
+            is_dir: false,
+            subtitle: String::new(),
+        });
+        assert_eq!(enter_action_label(Some(&file)), "打开");
+        let term = HeadRow::Terminal(source::terminal::TermHit {
+            shell: source::terminal::TermShell::Cmd,
+            command: "ipconfig".into(),
+            title: "ipconfig".into(),
+            subtitle: String::new(),
+        });
+        assert_eq!(enter_action_label(Some(&term)), "执行命令");
+        let term_hint = HeadRow::TermHint(source::terminal::TermHint {
+            title: String::new(),
+            subtitle: String::new(),
+        });
+        assert_eq!(enter_action_label(Some(&term_hint)), "查看");
+        let cheat = HeadRow::Cheat(source::cheatsheet::CheatHit {
+            entry: &source::cheatsheet::ENTRIES[0],
+        });
+        assert_eq!(enter_action_label(Some(&cheat)), "查看");
+        let cheat_hint = HeadRow::CheatHint(source::cheatsheet::CheatHint {
+            title: String::new(),
+            subtitle: source::cheatsheet::NO_MATCH_TOAST,
+        });
+        assert_eq!(enter_action_label(Some(&cheat_hint)), "查看");
+        let scope = HeadRow::ScopeTags(source::application::ScopeTagHint {
+            title: String::new(),
+            subtitle: String::new(),
+        });
+        assert_eq!(enter_action_label(Some(&scope)), "查看");
+    }
+
+    #[test]
+    fn browse_esc_strips_the_filter_then_walks_up() {
+        // 先去掉过滤词（留在本目录），再逐级上溯；盘根交给调用方的"清空查询"。
+        assert_eq!(
+            browse_parent_of("D:\\a\\b\\re").as_deref(),
+            Some("D:\\a\\b\\")
+        );
+        assert_eq!(browse_parent_of("D:\\a\\b\\").as_deref(), Some("D:\\a\\"));
+        assert_eq!(browse_parent_of("D:\\a\\").as_deref(), Some("D:\\"));
+        assert_eq!(browse_parent_of("D:\\").as_deref(), None);
+        // 不是浏览态（索引搜索 / 普通查询）：Esc 不该把查询换成一条路径。
+        assert_eq!(browse_parent_of("'报告"), None);
+        assert_eq!(browse_parent_of("note"), None);
     }
 
     #[test]

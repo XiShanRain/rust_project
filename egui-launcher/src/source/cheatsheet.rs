@@ -247,6 +247,20 @@ pub const ENTRIES: &[CheatEntry] = &[
         source: Some(SourceId::Files),
         settings_page: None,
     },
+    CheatEntry {
+        key: "Esc 返回上级",
+        title: "目录浏览：逐级返回",
+        summary: "目录里按 Esc 退一层",
+        detail: "在目录浏览（`D:\\proj\\` 或 `D:\\proj\\rep`）里按 Esc：先去掉过滤词、留在本目录，\
+                 再按就退到上一级；退到盘根后再按 Esc 才是清空查询。\n\
+                 UNC 共享根（`\\\\srv\\share\\`）与盘根一样，再往上没有能浏览的目录。\n\
+                 普通查询与文件索引搜索里 Esc 仍是原来的「清空查询」。\n\
+                 状态栏左侧会写着这一刻按 Esc 会发生什么（返回上级 / 清除筛选 / 清空）。",
+        tags: "esc 返回 上级 目录 browse parent back",
+        group: Group::Files,
+        source: Some(SourceId::Files),
+        settings_page: None,
+    },
     // ---------- 终端（FR-SRC-16） ----------
     CheatEntry {
         key: ">ipconfig /all",
