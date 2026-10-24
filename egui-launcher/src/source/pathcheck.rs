@@ -17,13 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
 };
+use windows::core::PCWSTR;
 
-use crate::source::application::{is_url, ItemKind, LaunchItem};
+use crate::source::application::{ItemKind, LaunchItem, is_url};
 use crate::source::custom;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,7 +76,11 @@ pub fn check(path: &str, kind: ItemKind) -> PathState {
     // 裸程序名先走 PATH/App Paths：`Path::exists()` 会看当前工作目录，
     // 把一条「其实找不到的命令」误判成存在。
     if kind == ItemKind::Command && is_bare_name(&expanded) {
-        return if lookup_program(&expanded) { PathState::Ok } else { PathState::NotFound };
+        return if lookup_program(&expanded) {
+            PathState::Ok
+        } else {
+            PathState::NotFound
+        };
     }
 
     let p = PathBuf::from(&expanded);
@@ -85,10 +89,18 @@ pub fn check(path: &str, kind: ItemKind) -> PathState {
     }
     match root_of(&p) {
         RootKind::Drive(root) => {
-            if root.exists() { PathState::NotFound } else { PathState::Offline }
+            if root.exists() {
+                PathState::NotFound
+            } else {
+                PathState::Offline
+            }
         }
         RootKind::Unc(root) => {
-            if root.exists() { PathState::NotFound } else { PathState::Offline }
+            if root.exists() {
+                PathState::NotFound
+            } else {
+                PathState::Offline
+            }
         }
         RootKind::None => PathState::NotFound,
     }
@@ -124,7 +136,11 @@ fn path_exts() -> Vec<String> {
         .filter(|e| !e.trim().is_empty())
         .map(|e| {
             let e = e.trim().to_ascii_lowercase();
-            if e.starts_with('.') { e } else { format!(".{e}") }
+            if e.starts_with('.') {
+                e
+            } else {
+                format!(".{e}")
+            }
         })
         .collect();
     if exts.is_empty() {
@@ -231,21 +247,41 @@ mod tests {
 
     #[test]
     fn url_and_shell_targets_are_not_checked() {
-        for path in ["https://example.com/x", "ms-settings:windowsupdate", "shell:MyComputerFolder"] {
+        for path in [
+            "https://example.com/x",
+            "ms-settings:windowsupdate",
+            "shell:MyComputerFolder",
+        ] {
             assert_eq!(check(path, ItemKind::Url), PathState::NotChecked, "{path}");
-            assert_eq!(check(path, ItemKind::Command), PathState::NotChecked, "{path}");
+            assert_eq!(
+                check(path, ItemKind::Command),
+                PathState::NotChecked,
+                "{path}"
+            );
         }
         assert_eq!(check("   ", ItemKind::File), PathState::NotChecked);
         // 批次 A2：内置动作的 `internal:<id>` 不是磁盘目标，必须免检——
         // 否则每条系统命令都会挂一个假的 `Not found`。
-        assert_eq!(check("internal:shutdown", ItemKind::Internal), PathState::NotChecked);
-        assert_eq!(check("internal:settings:2", ItemKind::Internal), PathState::NotChecked);
+        assert_eq!(
+            check("internal:shutdown", ItemKind::Internal),
+            PathState::NotChecked
+        );
+        assert_eq!(
+            check("internal:settings:2", ItemKind::Internal),
+            PathState::NotChecked
+        );
     }
 
     #[test]
     fn placeholder_paths_are_not_checked() {
-        assert_eq!(check(r"%USERPROFILE%\Documents\{query}", ItemKind::Folder), PathState::NotChecked);
-        assert_eq!(check("C:\\x\\{query|默认}.txt", ItemKind::File), PathState::NotChecked);
+        assert_eq!(
+            check(r"%USERPROFILE%\Documents\{query}", ItemKind::Folder),
+            PathState::NotChecked
+        );
+        assert_eq!(
+            check("C:\\x\\{query|默认}.txt", ItemKind::File),
+            PathState::NotChecked
+        );
     }
 
     /// 「启动器目录」把路径存成占位符：校验前必须解析成当前 exe 所在目录，
@@ -253,7 +289,10 @@ mod tests {
     #[test]
     fn launcher_dir_placeholder_resolves() {
         assert_eq!(
-            check(crate::source::custom::LAUNCHER_DIR_PLACEHOLDER, ItemKind::Folder),
+            check(
+                crate::source::custom::LAUNCHER_DIR_PLACEHOLDER,
+                ItemKind::Folder
+            ),
             PathState::Ok
         );
     }
@@ -287,8 +326,12 @@ mod tests {
 
     #[test]
     fn root_classification() {
-        assert!(matches!(root_of(Path::new(r"C:\a\b")), RootKind::Drive(r) if r == Path::new(r"C:\")));
-        assert!(matches!(root_of(Path::new(r"\\srv\share\a\b")), RootKind::Unc(r) if r == Path::new(r"\\srv\share")));
+        assert!(
+            matches!(root_of(Path::new(r"C:\a\b")), RootKind::Drive(r) if r == Path::new(r"C:\"))
+        );
+        assert!(
+            matches!(root_of(Path::new(r"\\srv\share\a\b")), RootKind::Unc(r) if r == Path::new(r"\\srv\share"))
+        );
         assert!(matches!(root_of(Path::new(r"relative\a")), RootKind::None));
     }
 

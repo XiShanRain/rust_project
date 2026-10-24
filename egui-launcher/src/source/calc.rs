@@ -200,7 +200,10 @@ enum Tok {
 enum Val {
     Num(f64),
     /// `base` 已折算到该维度的基准单位；`unit` 只决定怎么展示
-    Qty { base: f64, unit: Unit },
+    Qty {
+        base: f64,
+        unit: Unit,
+    },
     Date(i64),
 }
 
@@ -403,11 +406,7 @@ fn lex(s: &str, today: i64) -> Option<Vec<Tok>> {
         }
         return None;
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// 十进制数：可选小数与 `e` 科学计数。返回 (值, 下一个下标)。
@@ -452,7 +451,11 @@ fn try_date(b: &[u8], i: usize) -> Option<(i64, usize)> {
     if sep != b'-' && sep != b'/' && sep != b'.' {
         return None;
     }
-    if !b.get(i..i + 4)?.iter().all(|c| (*c as char).is_ascii_digit()) {
+    if !b
+        .get(i..i + 4)?
+        .iter()
+        .all(|c| (*c as char).is_ascii_digit())
+    {
         return None;
     }
     let y: i64 = s_slice(b, i, i + 4)?.parse().ok()?;
@@ -578,7 +581,10 @@ impl Parser<'_> {
                 // 单独一个单位＝「1 个该单位」，`km/h`、`g/ml` 这类写法因此不必专门加词法
                 match u.dim {
                     Dim::Temp => return None,
-                    _ => Val::Qty { base: u.to_base, unit: u },
+                    _ => Val::Qty {
+                        base: u.to_base,
+                        unit: u,
+                    },
                 }
             }
             Some(Tok::Op('(')) => {
@@ -595,7 +601,10 @@ impl Parser<'_> {
         match (v, self.peek()) {
             (Val::Num(x), Some(Tok::Unit(u))) => {
                 self.pos += 1;
-                Some(Val::Qty { base: x * u.to_base, unit: u })
+                Some(Val::Qty {
+                    base: x * u.to_base,
+                    unit: u,
+                })
             }
             (other, _) => Some(other),
         }
@@ -605,9 +614,7 @@ impl Parser<'_> {
 fn neg(v: Val) -> Option<Val> {
     match v {
         Val::Num(x) => Some(Val::Num(-x)),
-        Val::Qty { base, unit } if unit.dim != Dim::Temp => {
-            Some(Val::Qty { base: -base, unit })
-        }
+        Val::Qty { base, unit } if unit.dim != Dim::Temp => Some(Val::Qty { base: -base, unit }),
         _ => None,
     }
 }
@@ -616,11 +623,17 @@ fn add(a: Val, b: Val) -> Option<Val> {
     match (a, b) {
         (Val::Num(x), Val::Num(y)) => Some(Val::Num(x + y)),
         (Val::Qty { base, unit }, Val::Qty { base: b2, unit: u2 }) if unit.dim == u2.dim => {
-            Some(Val::Qty { base: base + b2, unit })
+            Some(Val::Qty {
+                base: base + b2,
+                unit,
+            })
         }
         (Val::Qty { base, unit }, Val::Num(n)) | (Val::Num(n), Val::Qty { base, unit }) => {
             // 裸数字沿用带单位那一侧的单位：`1 day + 7` ＝ 8 天
-            Some(Val::Qty { base: base + n * unit.to_base, unit })
+            Some(Val::Qty {
+                base: base + n * unit.to_base,
+                unit,
+            })
         }
         (Val::Date(d), Val::Qty { base, unit }) | (Val::Qty { base, unit }, Val::Date(d)) => {
             date_add(d, base, unit)
@@ -634,7 +647,10 @@ fn add(a: Val, b: Val) -> Option<Val> {
 /// （日期本身没有负语义，`neg` 会直接判不适用）。
 fn sub(a: Val, b: Val) -> Option<Val> {
     if let (Val::Date(x), Val::Date(y)) = (a, b) {
-        return Some(Val::Qty { base: ((x - y) as f64) * 86400.0, unit: day_unit() });
+        return Some(Val::Qty {
+            base: ((x - y) as f64) * 86400.0,
+            unit: day_unit(),
+        });
     }
     add(a, neg(b)?)
 }
@@ -651,7 +667,11 @@ fn date_add(d: i64, value: f64, unit: Unit) -> Option<Val> {
     if is_calendar_unit(unit.sym) {
         let n = value / unit.to_base;
         let n = n.round() as i64;
-        let months = if unit.sym.starts_with("year") { n * 12 } else { n };
+        let months = if unit.sym.starts_with("year") {
+            n * 12
+        } else {
+            n
+        };
         return Some(Val::Date(add_months(d, months)));
     }
     Some(Val::Date((d as f64 + value / 86400.0).round() as i64))
@@ -661,7 +681,10 @@ fn mul(a: Val, b: Val) -> Option<Val> {
     match (a, b) {
         (Val::Num(x), Val::Num(y)) => Some(Val::Num(x * y)),
         (Val::Qty { base, unit }, Val::Num(n)) | (Val::Num(n), Val::Qty { base, unit }) => {
-            Some(Val::Qty { base: base * n, unit })
+            Some(Val::Qty {
+                base: base * n,
+                unit,
+            })
         }
         _ => None,
     }
@@ -670,7 +693,10 @@ fn mul(a: Val, b: Val) -> Option<Val> {
 fn div(a: Val, b: Val) -> Option<Val> {
     let r = match (a, b) {
         (Val::Num(x), Val::Num(y)) => return finite(x / y).map(Val::Num),
-        (Val::Qty { base, unit }, Val::Num(n)) => Some(Val::Qty { base: base / n, unit }),
+        (Val::Qty { base, unit }, Val::Num(n)) => Some(Val::Qty {
+            base: base / n,
+            unit,
+        }),
         (Val::Qty { base: x, unit: ux }, Val::Qty { base: y, unit: uy }) if ux.dim == uy.dim => {
             Some(Val::Num(x / y))
         }
@@ -880,7 +906,10 @@ impl DataSource for CalcSource {
     fn head(&mut self, cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {
         // "今天"在 `SearchCtx` 里只有毫秒时间戳，日期加减要的是本地日序 ⇒ 这里现取一次。
         // 它与 `cx.now_ms` 取自同一帧，不会跨日抖动。
-        evaluate(cx.query, today_day()).map(SourceRow::Calc).into_iter().collect()
+        evaluate(cx.query, today_day())
+            .map(SourceRow::Calc)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -998,7 +1027,9 @@ mod tests {
 
     #[test]
     fn syntax_errors_stay_silent() {
-        for raw in ["1+", "(1+2", "2 ** 3", "jsb", "1 2", "1,024", "%", "km", "1 in 2", "1 ?? 2"] {
+        for raw in [
+            "1+", "(1+2", "2 ** 3", "jsb", "1 2", "1,024", "%", "km", "1 in 2", "1 ?? 2",
+        ] {
             assert!(hit(raw).is_none(), "{raw} 不该出行");
         }
     }
@@ -1015,9 +1046,17 @@ mod tests {
     fn date_arithmetic_is_calendar_aware() {
         assert_eq!(val("2026-10-20 + 7 days").as_deref(), Some("2026-10-27"));
         assert_eq!(val("today + 1 day + 7").as_deref(), Some("2026-10-28"));
-        assert_eq!(val("2026-01-31 + 1 month").as_deref(), Some("2026-02-28"), "月末夹住");
+        assert_eq!(
+            val("2026-01-31 + 1 month").as_deref(),
+            Some("2026-02-28"),
+            "月末夹住"
+        );
         assert_eq!(val("2024-02-29 + 1 year").as_deref(), Some("2025-02-28"));
-        assert_eq!(val("2026-12-25 - today").as_deref(), Some("66"), "日期差＝天数");
+        assert_eq!(
+            val("2026-12-25 - today").as_deref(),
+            Some("66"),
+            "日期差＝天数"
+        );
         assert_eq!(val("2026-10-20 - 1 week").as_deref(), Some("2026-10-13"));
     }
 
@@ -1058,8 +1097,20 @@ mod tests {
         // `split_conversion` 把 `word_start` 停在多字节字符的中间字节上再切片 ⇒ panic。
         // 计算器对中文查询的正确答案只有"不出行"，绝不许是"整个程序退出"。
         for q in [
-            "报", "报告", "'报", "'报告", "pic 报", "folder 项", "记事本", "计算器", "你好",
-            "10 公里 in cm", "2 in 你好", "今天 + 7 天", "米", "°C → °F",
+            "报",
+            "报告",
+            "'报",
+            "'报告",
+            "pic 报",
+            "folder 项",
+            "记事本",
+            "计算器",
+            "你好",
+            "10 公里 in cm",
+            "2 in 你好",
+            "今天 + 7 天",
+            "米",
+            "°C → °F",
         ] {
             assert!(
                 evaluate(q, today_day()).is_none(),

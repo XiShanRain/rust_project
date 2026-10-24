@@ -64,15 +64,26 @@ const EXCLUDE_DIRS: [&str; 7] = [
 pub const TYPE_WORDS: [(&str, &[&str]); 7] = [
     (
         "doc",
-        &["doc", "docx", "xls", "xlsx", "xlsm", "csv", "ppt", "pptx", "pdf", "txt", "md", "rtf", "odt", "ods"],
+        &[
+            "doc", "docx", "xls", "xlsx", "xlsm", "csv", "ppt", "pptx", "pdf", "txt", "md", "rtf",
+            "odt", "ods",
+        ],
     ),
     (
         "pic",
-        &["jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "svg", "ico", "heic"],
+        &[
+            "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "svg", "ico", "heic",
+        ],
     ),
-    ("video", &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"]),
+    (
+        "video",
+        &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"],
+    ),
     ("audio", &["mp3", "wav", "flac", "aac", "m4a", "ogg", "wma"]),
-    ("zip", &["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "iso"]),
+    (
+        "zip",
+        &["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "iso"],
+    ),
     ("exe", &["exe", "msi", "bat", "cmd", "ps1", "lnk"]),
     ("cad", &["dwg", "dxf", "dgn", "dwf", "rvt", "ifc", "skp"]),
 ];
@@ -109,7 +120,11 @@ pub enum Route {
     /// 即时列目录，不查索引。
     Browse { dir: String, filter: String },
     /// 索引搜索。`exts` 空＝不限类型。
-    Search { words: Vec<String>, exts: Vec<String>, dirs_only: bool },
+    Search {
+        words: Vec<String>,
+        exts: Vec<String>,
+        dirs_only: bool,
+    },
 }
 
 /// 后台线程回报给主线程的两类结果。
@@ -119,7 +134,11 @@ pub enum FileUpdate {
     Index(Vec<FileEntry>),
     /// 一次目录浏览的回报。带上 `(dir, filter)` 是给主线程核对用的：查询已经变了的话
     /// 这一份就是过期的，列错目录比空一帧严重得多。
-    Dir { dir: String, filter: String, hits: Vec<FileHit> },
+    Dir {
+        dir: String,
+        filter: String,
+        hits: Vec<FileHit>,
+    },
 }
 
 /// 实际进入索引范围的目录（存在的才算）。
@@ -210,8 +229,14 @@ impl FileSource {
     /// 别的组合照样派——打字途中旧的在途请求会被 [`Self::plan`] 的核对判据丢掉，
     /// 宁可多开几个短命线程，也不能让「最新那一次」因为限流而永远没结果。
     fn request_browse(&mut self, dir: &str, filter: &str) {
-        if self.dir_hits.as_ref().is_some_and(|(d, f, _)| d == dir && f == filter)
-            || self.dir_in_flight.as_ref().is_some_and(|(d, f)| d == dir && f == filter)
+        if self
+            .dir_hits
+            .as_ref()
+            .is_some_and(|(d, f, _)| d == dir && f == filter)
+            || self
+                .dir_in_flight
+                .as_ref()
+                .is_some_and(|(d, f)| d == dir && f == filter)
         {
             return;
         }
@@ -232,16 +257,22 @@ impl FileSource {
                 };
                 Some(hits.into_iter().map(SourceRow::File).collect())
             }
-            Route::Search { words, exts, dirs_only } => {
+            Route::Search {
+                words,
+                exts,
+                dirs_only,
+            } => {
                 self.refresh_index(false);
                 // 冷启动那一阵索引还在后台：给一行说明，而不是让用户对着空列表猜是不是搜坏了。
                 if self.indexed_at.is_none() {
-                    return Some(vec![SourceRow::Hint(crate::source::websearch::EngineHint {
-                        engine_id: "filesearch".to_string(),
-                        title: "文件索引建立中".to_string(),
-                        subtitle: "首次扫描正在后台进行，稍后再试一次".to_string(),
-                        completion: String::new(),
-                    })]);
+                    return Some(vec![SourceRow::Hint(
+                        crate::source::websearch::EngineHint {
+                            engine_id: "filesearch".to_string(),
+                            title: "文件索引建立中".to_string(),
+                            subtitle: "首次扫描正在后台进行，稍后再试一次".to_string(),
+                            completion: String::new(),
+                        },
+                    )]);
                 }
                 let cached = self
                     .hits_cache
@@ -295,13 +326,19 @@ impl DataSource for FileSource {
                     self.rebuild_in_flight = false;
                     // 新索引配旧缓存就是"用上一轮的命中回答这一轮的查询"⇒ 一起清掉。
                     self.hits_cache = None;
-                    eprintln!("文件索引：本轮建成 {n} 条（范围＝桌面/下载/文档，深度 4，上限 3 万）");
+                    eprintln!(
+                        "文件索引：本轮建成 {n} 条（范围＝桌面/下载/文档，深度 4，上限 3 万）"
+                    );
                     changed = true;
                 }
                 FileUpdate::Dir { dir, filter, hits } => {
                     // 只认"当前还在等的那一份"。打字途中派出去的旧请求回来得晚，采纳它会让列表
                     // 显示另一个目录的内容——列错目录比空一帧严重得多。
-                    if self.dir_in_flight.as_ref().is_some_and(|(d, f)| *d == dir && *f == filter) {
+                    if self
+                        .dir_in_flight
+                        .as_ref()
+                        .is_some_and(|(d, f)| *d == dir && *f == filter)
+                    {
                         self.dir_in_flight = None;
                         let n = hits.len();
                         self.dir_hits = Some((dir, filter, hits));
@@ -388,7 +425,11 @@ pub fn route(raw: &str) -> Route {
     if words.iter().map(|w| w.chars().count()).sum::<usize>() < MIN_QUERY_LEN {
         return Route::NotOurs;
     }
-    Route::Search { words, exts, dirs_only }
+    Route::Search {
+        words,
+        exts,
+        dirs_only,
+    }
 }
 
 /// 把查询串认成一个路径并切成（目录, 过滤词）。目录那半保证以 `\` 结尾。
@@ -452,7 +493,9 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
     }
     // 打不开的目录（拒绝访问、正在断开的网络位置）静默跳过：NFR-04，一个目录读不动
     // 不该让整轮索引失败。
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         if out.len() >= MAX_ENTRIES {
             return;
@@ -478,7 +521,12 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
 // ---- 匹配与排序 ----
 
 /// 索引搜索：多词 AND，每词各自打分取最低分（"最弱的那个词"决定这一条排哪儿）。
-pub fn search(index: &[FileEntry], words: &[String], exts: &[String], dirs_only: bool) -> Vec<FileHit> {
+pub fn search(
+    index: &[FileEntry],
+    words: &[String],
+    exts: &[String],
+    dirs_only: bool,
+) -> Vec<FileHit> {
     pick(index.iter(), words, exts, dirs_only)
 }
 
@@ -486,14 +534,19 @@ pub fn search(index: &[FileEntry], words: &[String], exts: &[String], dirs_only:
 /// 上限同样是 `MAX_ENTRIES`（读条目的次数），十万文件的目录在这里也只会扫到前 3 万条就收手。
 pub fn browse_hits(dir: &str, filter: &str) -> Vec<FileHit> {
     let entries = scan_dir(dir);
-    let words: Vec<String> =
-        if filter.trim().is_empty() { Vec::new() } else { vec![filter.trim().to_lowercase()] };
+    let words: Vec<String> = if filter.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![filter.trim().to_lowercase()]
+    };
     pick(entries.iter(), &words, &[], false)
 }
 
 fn scan_dir(dir: &str) -> Vec<FileEntry> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for entry in rd.flatten().take(MAX_ENTRIES) {
         let is_dir = matches!(entry.file_type(), Ok(t) if t.is_dir());
         out.push(FileEntry {
@@ -519,13 +572,16 @@ fn pick<'a>(
         if !exts.is_empty() {
             // 类型词筛的是扩展名 ⇒ 目录一并排除：`C:\Users\pic` 这种目录名不是图片文件，
             // 留着只会让用户以为过滤器坏了。
-            match extension(&entry.name).filter(|e| exts.iter().any(|t| t.eq_ignore_ascii_case(e))) {
+            match extension(&entry.name).filter(|e| exts.iter().any(|t| t.eq_ignore_ascii_case(e)))
+            {
                 Some(_) => {}
                 None => continue,
             }
         }
         let name = entry.name.to_lowercase();
-        let Some(score) = words_score(&name, words) else { continue };
+        let Some(score) = words_score(&name, words) else {
+            continue;
+        };
         // 无过滤词（浏览一个空过滤词的目录）⇒ 全部同分，次序只看下面的名称。
         let score = if words.is_empty() { 60 } else { score };
         scored.push((score, name, entry.path.clone(), entry));
@@ -623,7 +679,11 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, path: &str, is_dir: bool) -> FileEntry {
-        FileEntry { name: name.to_string(), path: path.to_string(), is_dir }
+        FileEntry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir,
+        }
     }
 
     fn words(s: &str) -> Vec<String> {
@@ -634,7 +694,11 @@ mod tests {
     fn only_an_explicit_trigger_enters_file_mode() {
         // 没有触发符 ⇒ 普通搜索照常。这一条是"列表不许在用户打字途中塌掉"的闸门。
         assert_eq!(route("报告"), Route::NotOurs);
-        assert_eq!(route("pic"), Route::NotOurs, "类型词单独出现说明还在打第一个词");
+        assert_eq!(
+            route("pic"),
+            Route::NotOurs,
+            "类型词单独出现说明还在打第一个词"
+        );
         assert_eq!(route("folder"), Route::NotOurs);
         assert_eq!(route("open"), Route::NotOurs);
         assert_eq!(route(""), Route::NotOurs);
@@ -649,13 +713,52 @@ mod tests {
         );
         assert_eq!(
             route("folder 项目"),
-            Route::Search { words: words("项目"), exts: vec![], dirs_only: true }
+            Route::Search {
+                words: words("项目"),
+                exts: vec![],
+                dirs_only: true
+            }
         );
-        assert_eq!(route("open 报告"), Route::Search { words: words("报告"), exts: vec![], dirs_only: false });
-        assert_eq!(route("find 报告"), Route::Search { words: words("报告"), exts: vec![], dirs_only: false });
-        assert_eq!(route("file 报告"), Route::Search { words: words("报告"), exts: vec![], dirs_only: false });
-        assert_eq!(route("'报告"), Route::Search { words: words("报告"), exts: vec![], dirs_only: false });
-        assert_eq!(route(" 报告"), Route::Search { words: words("报告"), exts: vec![], dirs_only: false });
+        assert_eq!(
+            route("open 报告"),
+            Route::Search {
+                words: words("报告"),
+                exts: vec![],
+                dirs_only: false
+            }
+        );
+        assert_eq!(
+            route("find 报告"),
+            Route::Search {
+                words: words("报告"),
+                exts: vec![],
+                dirs_only: false
+            }
+        );
+        assert_eq!(
+            route("file 报告"),
+            Route::Search {
+                words: words("报告"),
+                exts: vec![],
+                dirs_only: false
+            }
+        );
+        assert_eq!(
+            route("'报告"),
+            Route::Search {
+                words: words("报告"),
+                exts: vec![],
+                dirs_only: false
+            }
+        );
+        assert_eq!(
+            route(" 报告"),
+            Route::Search {
+                words: words("报告"),
+                exts: vec![],
+                dirs_only: false
+            }
+        );
     }
 
     #[test]
@@ -665,7 +768,11 @@ mod tests {
         for q in ["'报告", "‘报告", "’报告", "＇报告"] {
             assert_eq!(
                 route(q),
-                Route::Search { words: words("报告"), exts: vec![], dirs_only: false },
+                Route::Search {
+                    words: words("报告"),
+                    exts: vec![],
+                    dirs_only: false
+                },
                 "触发符 {q:?} 应进文件模式"
             );
         }
@@ -684,7 +791,10 @@ mod tests {
     #[test]
     fn two_words_after_a_type_prefix_stay_a_file_query() {
         // `pic 报告 最终` ⇒ 两个过滤词都留着（多词 AND），触发词自己不算词。
-        let Route::Search { words: got, exts, .. } = route("pic 报告 最终") else {
+        let Route::Search {
+            words: got, exts, ..
+        } = route("pic 报告 最终")
+        else {
             panic!("类型词 + 两个词应是索引搜索");
         };
         assert_eq!(got, words("报告 最终"));
@@ -719,15 +829,28 @@ mod tests {
             Some((r"C:\Users\a\".to_string(), "Doc".to_string()))
         );
         // 盘根。
-        assert_eq!(browse_parts(r"C:\"), Some((r"C:\".to_string(), String::new())));
+        assert_eq!(
+            browse_parts(r"C:\"),
+            Some((r"C:\".to_string(), String::new()))
+        );
         // UNC：服务器名那一层不能当目录，切分要跳过开头的两个反斜杠。
-        assert_eq!(browse_parts(r"\\srv\share\报"), Some((r"\\srv\share\".to_string(), "报".to_string())));
+        assert_eq!(
+            browse_parts(r"\\srv\share\报"),
+            Some((r"\\srv\share\".to_string(), "报".to_string()))
+        );
         // 打到共享名一半时列的是服务器根（`\\srv\`）并用 `share` 过滤——与 `D:\proj\rep` 同一口径。
-        assert_eq!(browse_parts(r"\\srv\share"), Some((r"\\srv\".to_string(), "share".to_string())));
+        assert_eq!(
+            browse_parts(r"\\srv\share"),
+            Some((r"\\srv\".to_string(), "share".to_string()))
+        );
         // 不像绝对路径的一律不浏览（相对路径交给索引搜索/普通搜索）。
         assert_eq!(browse_parts("src\\main.rs"), None);
         assert_eq!(browse_parts("main.rs"), None);
-        assert_eq!(browse_parts("%USERPROFILE%\\{query}"), None, "含占位符的是命令模板");
+        assert_eq!(
+            browse_parts("%USERPROFILE%\\{query}"),
+            None,
+            "含占位符的是命令模板"
+        );
     }
 
     #[test]
@@ -746,14 +869,26 @@ mod tests {
 
     #[test]
     fn score_ladder_is_ordered_and_extensible() {
-        assert_eq!(score_name("report.docx", "report", "report.docx"), 100, "整名精确");
-        assert_eq!(score_name("report.docx", "report", "report"), 100, "去扩展名后精确");
+        assert_eq!(
+            score_name("report.docx", "report", "report.docx"),
+            100,
+            "整名精确"
+        );
+        assert_eq!(
+            score_name("report.docx", "report", "report"),
+            100,
+            "去扩展名后精确"
+        );
         assert_eq!(score_name("report.docx", "report", "repo"), 90, "前缀");
         assert_eq!(score_name("my_report.docx", "my_report", "rep"), 80, "词首");
         assert_eq!(score_name("areport.docx", "areport", "port"), 60, "包含");
         assert_eq!(score_name("rte.docx", "rte", "re"), 30, "子序列");
         assert_eq!(score_name("report.docx", "report", "zzz"), 0);
-        assert_eq!(score_name("report.docx", "report", ""), 0, "空词不给分，否则人人 100");
+        assert_eq!(
+            score_name("report.docx", "report", ""),
+            0,
+            "空词不给分，否则人人 100"
+        );
     }
 
     #[test]
@@ -780,8 +915,11 @@ mod tests {
         assert_eq!(pic[0].subtitle, r"C:\u\pic", "副标题是所在目录");
 
         let doc = search(&index, &words("报告"), &extension_list("doc"), false);
-        assert_eq!(doc.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(), ["报告.docx"],
-            "同名目录不是文档，类型词过滤下不该混进来");
+        assert_eq!(
+            doc.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(),
+            ["报告.docx"],
+            "同名目录不是文档，类型词过滤下不该混进来"
+        );
 
         let dirs = search(&index, &words("报告"), &[], true);
         assert_eq!(dirs.len(), 1);
@@ -795,9 +933,18 @@ mod tests {
     #[test]
     fn search_caps_at_max_results() {
         let index: Vec<FileEntry> = (0..MAX_RESULTS + 40)
-            .map(|i| entry(&format!("report{i:03}.txt"), &format!(r"C:\u\report{i:03}.txt"), false))
+            .map(|i| {
+                entry(
+                    &format!("report{i:03}.txt"),
+                    &format!(r"C:\u\report{i:03}.txt"),
+                    false,
+                )
+            })
             .collect();
-        assert_eq!(search(&index, &words("report"), &[], false).len(), MAX_RESULTS);
+        assert_eq!(
+            search(&index, &words("report"), &[], false).len(),
+            MAX_RESULTS
+        );
     }
 
     #[test]
@@ -823,7 +970,10 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].title, "beta.md");
         assert!(browse_hits(&dir_str, "nomatch").is_empty());
-        assert!(browse_hits(r"Z:\no-such-dir-9f3a1c\", "").is_empty(), "读不到的目录给空清单而不是崩");
+        assert!(
+            browse_hits(r"Z:\no-such-dir-9f3a1c\", "").is_empty(),
+            "读不到的目录给空清单而不是崩"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -854,7 +1004,10 @@ mod tests {
         let mut shallow = Vec::new();
         walk(&dir, 1, &mut shallow);
         assert!(shallow.iter().any(|e| e.name == "child"));
-        assert!(!shallow.iter().any(|e| e.name == "leaf.txt"), "深度到顶就该停");
+        assert!(
+            !shallow.iter().any(|e| e.name == "leaf.txt"),
+            "深度到顶就该停"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

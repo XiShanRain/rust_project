@@ -11,7 +11,7 @@
 //! - **Url 类型才百分号编码**：`{query}` 填进命令行参数时必须原样（`ping 10.0.0.1`
 //!   不能变成 `10.0.0.1` 的编码串），填进 URL 时才编码——复用 FR-SRC-11 的模板语法。
 
-use crate::source::application::{is_url, ItemKind, LaunchItem};
+use crate::source::application::{ItemKind, LaunchItem, is_url};
 use crate::source::websearch;
 use crate::source::{DataSource, SearchCtx, SourceId, SourceRow};
 
@@ -133,7 +133,9 @@ pub fn needs_query(item: &LaunchItem) -> bool {
 /// 在条目的别名词表里找出与 `typed` 精确相等的那一个（返回条目里存的原样大小写，
 /// 补全出去的是用户自己配置的写法，不是他这次敲进来的大小写）。
 fn keyword_word<'a>(item: &'a LaunchItem, typed: &str) -> Option<&'a str> {
-    item.keyword.split_whitespace().find(|w| w.eq_ignore_ascii_case(typed))
+    item.keyword
+        .split_whitespace()
+        .find(|w| w.eq_ignore_ascii_case(typed))
 }
 
 /// 按配置数组顺序找第一个关键字精确命中的条目（TC-SRC 05-3：重复只取先出现的一条）。
@@ -141,7 +143,9 @@ pub fn find_by_keyword<'a>(items: &'a [LaunchItem], keyword: &str) -> Option<&'a
     if keyword.trim().is_empty() {
         return None;
     }
-    items.iter().find(|it| keyword_word(it, keyword.trim()).is_some())
+    items
+        .iter()
+        .find(|it| keyword_word(it, keyword.trim()).is_some())
 }
 
 fn hint_for(item: &LaunchItem, typed: &str) -> CustomHint {
@@ -215,20 +219,30 @@ fn build_hit(item: &LaunchItem, query: &str) -> Option<CustomHit> {
     entry.working_dir = working_dir;
     // 走到这里必定是含 `{query}` 的条目——[`exclusive`] 已把没有占位符的挡在外面。
     let subtitle = "回车运行（参数已填入）".to_string();
-    Some(CustomHit { uid: item.uid(), name: item.name.clone(), entry, subtitle })
+    Some(CustomHit {
+        uid: item.uid(),
+        name: item.name.clone(),
+        entry,
+        subtitle,
+    })
 }
 
 /// 设置页 FR-SRC-05 的「关键字唯一性」提示：返回 `(重复的词, 撞名的条目名)`。
 /// 只提示、不阻断（需求书明写「不阻断启动，避免影响 S3」）；同名取先出现的一条由
 /// [`find_by_keyword`] 保证。空关键字不参与。
 pub fn duplicate_keywords(items: &[LaunchItem]) -> Vec<(String, Vec<String>)> {
-    let mut map: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut map: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for item in items {
         for word in item.keyword.split_whitespace() {
-            map.entry(word.to_lowercase()).or_default().push(item.name.clone());
+            map.entry(word.to_lowercase())
+                .or_default()
+                .push(item.name.clone());
         }
     }
-    map.into_iter().filter(|(_, names)| names.len() > 1).collect()
+    map.into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .collect()
 }
 
 /// 批次 A10：把本模块接进数据源注册表。独占与头段各走各的判据，正是
@@ -258,7 +272,10 @@ impl DataSource for CustomSource {
     }
 
     fn head(&mut self, cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {
-        keyword_hint(cx.items, cx.query).map(SourceRow::CustomHint).into_iter().collect()
+        keyword_hint(cx.items, cx.query)
+            .map(SourceRow::CustomHint)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -278,7 +295,13 @@ mod tests {
     }
 
     fn ping() -> LaunchItem {
-        item("Ping", "ping", ItemKind::Command, "cmd.exe", "/k ping {query}")
+        item(
+            "Ping",
+            "ping",
+            ItemKind::Command,
+            "cmd.exe",
+            "/k ping {query}",
+        )
     }
 
     #[test]
@@ -294,12 +317,21 @@ mod tests {
     fn exclusive_needs_a_query_placeholder() {
         // 需求书把独占限定在「`{query}` 时」：没有占位符的条目吃掉后半截，等于把用户
         // 敲的字静默扔掉（`np 报告.txt` → 直接开一个空白记事本）。
-        let items = vec![item("记事本", "jsb np", ItemKind::Command, "notepad.exe", "")];
+        let items = vec![item(
+            "记事本",
+            "jsb np",
+            ItemKind::Command,
+            "notepad.exe",
+            "",
+        )];
         assert_eq!(exclusive(&items, "np 报告.txt"), Exclusive::NotOurs);
         assert_eq!(exclusive(&items, "np "), Exclusive::NotOurs);
         // 同一张表里带占位符的那条照旧独占。
         let items = vec![ping()];
-        assert!(matches!(exclusive(&items, "ping 1.1.1.1"), Exclusive::Rows(_)));
+        assert!(matches!(
+            exclusive(&items, "ping 1.1.1.1"),
+            Exclusive::Rows(_)
+        ));
     }
 
     #[test]
@@ -336,35 +368,57 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].completion, "ping ");
         assert_eq!(hints[0].subtitle, "在 'ping ' 后输入，然后回车");
-        assert_eq!(hints[0].command, "cmd.exe /k ping {query}", "提示行要报出它是哪一条命令");
+        assert_eq!(
+            hints[0].command, "cmd.exe /k ping {query}",
+            "提示行要报出它是哪一条命令"
+        );
         // 两个空格是同一个空词，不能因为空白差异变成可执行行。
         assert!(matches!(exclusive(&items, "ping   "), Exclusive::Hints(_)));
     }
 
     #[test]
     fn keyword_hint_only_for_commands_that_need_a_query() {
-        let items = vec![ping(), item("画图", "ht", ItemKind::Command, "mspaint.exe", "")];
+        let items = vec![
+            ping(),
+            item("画图", "ht", ItemKind::Command, "mspaint.exe", ""),
+        ];
         let hint = keyword_hint(&items, "ping").expect("`ping` 应给补全提示");
         assert_eq!(hint.completion, "ping ");
         assert!(keyword_hint(&items, "pin").is_none(), "前缀不提示");
         assert!(keyword_hint(&items, "ping x").is_none(), "已带参数不提示");
-        assert!(keyword_hint(&items, "ht").is_none(), "不需要参数的条目不提示");
+        assert!(
+            keyword_hint(&items, "ht").is_none(),
+            "不需要参数的条目不提示"
+        );
     }
 
     #[test]
     fn url_query_is_percent_encoded_but_arguments_are_not() {
         let url = item("搜索", "s", ItemKind::Url, "https://x.test/?q={query}", "");
-        let Exclusive::Rows(rows) = exclusive(&[url], "s 你 好") else { panic!() };
-        assert_eq!(rows[0].entry.path, "https://x.test/?q=%E4%BD%A0%20%E5%A5%BD");
+        let Exclusive::Rows(rows) = exclusive(&[url], "s 你 好") else {
+            panic!()
+        };
+        assert_eq!(
+            rows[0].entry.path,
+            "https://x.test/?q=%E4%BD%A0%20%E5%A5%BD"
+        );
 
         let cmd = item("回显", "e", ItemKind::Command, "cmd.exe", "/c echo {query}");
-        let Exclusive::Rows(rows) = exclusive(&[cmd], "e 你 好") else { panic!() };
+        let Exclusive::Rows(rows) = exclusive(&[cmd], "e 你 好") else {
+            panic!()
+        };
         assert_eq!(rows[0].entry.arguments, "/c echo 你 好");
     }
 
     #[test]
     fn default_value_fills_an_empty_rest() {
-        let local = item("本地", "lh", ItemKind::Url, "http://localhost:{query|8000}", "");
+        let local = item(
+            "本地",
+            "lh",
+            ItemKind::Url,
+            "http://localhost:{query|8000}",
+            "",
+        );
         let Exclusive::Rows(rows) = exclusive(&[local], "lh ") else {
             panic!("带默认值的模板在空词时应给出可执行行");
         };
@@ -373,7 +427,13 @@ mod tests {
 
     #[test]
     fn env_vars_expand_before_the_query_is_filled() {
-        let docs = item("文档", "docs", ItemKind::Folder, "%USERPROFILE%\\Documents\\{query}", "");
+        let docs = item(
+            "文档",
+            "docs",
+            ItemKind::Folder,
+            "%USERPROFILE%\\Documents\\{query}",
+            "",
+        );
         let Exclusive::Rows(rows) = exclusive(&[docs], "docs 报表") else {
             panic!("`docs 报表` 应是独占可执行行");
         };
@@ -387,7 +447,9 @@ mod tests {
             item("第一个", "dup", ItemKind::Command, "a.exe", "{query}"),
             item("第二个", "dup", ItemKind::Command, "b.exe", "{query}"),
         ];
-        let Exclusive::Rows(rows) = exclusive(&items, "DUP x") else { panic!() };
+        let Exclusive::Rows(rows) = exclusive(&items, "DUP x") else {
+            panic!()
+        };
         assert_eq!(rows[0].name, "第一个");
         assert_eq!(rows[0].entry.path, "a.exe");
         let dups = duplicate_keywords(&items);
@@ -405,7 +467,10 @@ mod tests {
     #[test]
     fn command_without_placeholder_never_takes_the_exclusive_view() {
         let paint = item("画图", "ht", ItemKind::Command, "mspaint.exe", "");
-        assert_eq!(exclusive(&[paint.clone()], "ht 多打的词"), Exclusive::NotOurs);
+        assert_eq!(
+            exclusive(&[paint.clone()], "ht 多打的词"),
+            Exclusive::NotOurs
+        );
         assert_eq!(exclusive(&[paint], "ht "), Exclusive::NotOurs);
     }
 }

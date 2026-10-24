@@ -56,15 +56,55 @@ pub fn builtin_engines() -> Vec<WebEngine> {
         icon: String::new(),
     };
     vec![
-        e("google", "g", "Google", "https://www.google.com/search?q={query}"),
-        e("bing", "bing", "Bing", "https://www.bing.com/search?q={query}"),
+        e(
+            "google",
+            "g",
+            "Google",
+            "https://www.google.com/search?q={query}",
+        ),
+        e(
+            "bing",
+            "bing",
+            "Bing",
+            "https://www.bing.com/search?q={query}",
+        ),
         e("baidu", "bd", "百度", "https://www.baidu.com/s?wd={query}"),
-        e("github", "gh", "GitHub", "https://github.com/search?q={query}"),
-        e("wikipedia", "wiki", "维基百科", "https://zh.wikipedia.org/wiki/Special:Search?search={query}"),
-        e("youtube", "yt", "YouTube", "https://www.youtube.com/results?search_query={query}"),
-        e("taobao", "tb", "淘宝", "https://s.taobao.com/search?q={query}"),
-        e("jd", "jd", "京东", "https://search.jd.com/Search?keyword={query}"),
-        e("translate", "tr", "Google 翻译", "https://translate.google.com/?text={query}"),
+        e(
+            "github",
+            "gh",
+            "GitHub",
+            "https://github.com/search?q={query}",
+        ),
+        e(
+            "wikipedia",
+            "wiki",
+            "维基百科",
+            "https://zh.wikipedia.org/wiki/Special:Search?search={query}",
+        ),
+        e(
+            "youtube",
+            "yt",
+            "YouTube",
+            "https://www.youtube.com/results?search_query={query}",
+        ),
+        e(
+            "taobao",
+            "tb",
+            "淘宝",
+            "https://s.taobao.com/search?q={query}",
+        ),
+        e(
+            "jd",
+            "jd",
+            "京东",
+            "https://search.jd.com/Search?keyword={query}",
+        ),
+        e(
+            "translate",
+            "tr",
+            "Google 翻译",
+            "https://translate.google.com/?text={query}",
+        ),
     ]
 }
 
@@ -184,7 +224,9 @@ pub enum Exclusive {
 /// 后者返回 `None` 只可能是「空词 + 该占位符没有默认值」这一种，于是 `Hints` 与 `Rows`
 /// 天然互斥，不需要再单独判一次空词。
 pub fn exclusive_rows(engines: &[WebEngine], keyword: &str, rest: &str) -> Exclusive {
-    let Some(engine) = find(engines, keyword) else { return Exclusive::NotOurs };
+    let Some(engine) = find(engines, keyword) else {
+        return Exclusive::NotOurs;
+    };
     let word = rest.trim();
     let Some(url) = fill_template(&engine.url, word) else {
         return Exclusive::Hints(vec![EngineHint {
@@ -196,8 +238,11 @@ pub fn exclusive_rows(engines: &[WebEngine], keyword: &str, rest: &str) -> Exclu
     };
     // 空词能走到这儿只可能是模板自带默认值（`http://localhost:{query|8000}`），
     // 这时标题不再重复那对空书名号。
-    let title =
-        if word.is_empty() { engine.title.clone() } else { format!("{}「{}」", engine.title, word) };
+    let title = if word.is_empty() {
+        engine.title.clone()
+    } else {
+        format!("{}「{}」", engine.title, word)
+    };
     Exclusive::Rows(vec![SearchHit {
         engine_id: engine.id.clone(),
         title,
@@ -276,7 +321,10 @@ impl DataSource for WebSource {
     }
 
     fn fallback(&mut self, cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {
-        fallback_rows(cx.engines, cx.query).into_iter().map(SourceRow::Search).collect()
+        fallback_rows(cx.engines, cx.query)
+            .into_iter()
+            .map(SourceRow::Search)
+            .collect()
     }
 }
 
@@ -290,8 +338,10 @@ mod tests {
 
     #[test]
     fn builtin_table_matches_the_nine_engines_the_spec_names() {
-        let list: Vec<(String, String)> =
-            engines().iter().map(|e| (e.id.clone(), e.keyword.clone())).collect();
+        let list: Vec<(String, String)> = engines()
+            .iter()
+            .map(|e| (e.id.clone(), e.keyword.clone()))
+            .collect();
         assert_eq!(
             list,
             vec![
@@ -342,7 +392,11 @@ mod tests {
             fill_template("https://x/{query}/y/{query}", "a b").as_deref(),
             Some("https://x/a%20b/y/a%20b")
         );
-        assert_eq!(fill_template("https://x?q={query}", ""), None, "空词无默认 ⇒ valid=false");
+        assert_eq!(
+            fill_template("https://x?q={query}", ""),
+            None,
+            "空词无默认 ⇒ valid=false"
+        );
         assert_eq!(
             fill_template("https://x?q={query|}", "").as_deref(),
             Some("https://x?q="),
@@ -367,12 +421,22 @@ mod tests {
         };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].engine_id, "google");
-        assert_eq!(rows[0].url, "https://www.google.com/search?q=autohotkey%20v2");
+        assert_eq!(
+            rows[0].url,
+            "https://www.google.com/search?q=autohotkey%20v2"
+        );
         assert!(rows[0].title.contains("autohotkey v2"));
         // 关键字大小写不敏感，但只有精确相等才算命中（`gg` 不是引擎）。
-        assert!(matches!(exclusive_rows(&engines(), "G", "x"), Exclusive::Rows(_)));
+        assert!(matches!(
+            exclusive_rows(&engines(), "G", "x"),
+            Exclusive::Rows(_)
+        ));
         assert_eq!(exclusive_rows(&engines(), "gg", "x"), Exclusive::NotOurs);
-        assert_eq!(exclusive_rows(&engines(), "gogle", "x"), Exclusive::NotOurs, "前缀不独占");
+        assert_eq!(
+            exclusive_rows(&engines(), "gogle", "x"),
+            Exclusive::NotOurs,
+            "前缀不独占"
+        );
     }
 
     #[test]
@@ -384,8 +448,14 @@ mod tests {
         assert_eq!(hints[0].engine_id, "google");
         assert_eq!(hints[0].completion, "g ");
         // 只剩空白也算空词：`g ` 之后还没打字就被回车，不该打开一次空搜索。
-        assert!(matches!(exclusive_rows(&engines(), "g", "  "), Exclusive::Hints(_)));
-        assert!(matches!(exclusive_rows(&engines(), "g", "foo"), Exclusive::Rows(_)));
+        assert!(matches!(
+            exclusive_rows(&engines(), "g", "  "),
+            Exclusive::Hints(_)
+        ));
+        assert!(matches!(
+            exclusive_rows(&engines(), "g", "foo"),
+            Exclusive::Rows(_)
+        ));
         assert_eq!(exclusive_rows(&engines(), "zz", ""), Exclusive::NotOurs);
     }
 
@@ -393,7 +463,9 @@ mod tests {
     fn fallback_skips_sources_that_do_not_exist_yet() {
         let rows = fallback_rows(&engines(), "zzzz");
         assert_eq!(
-            rows.iter().map(|r| r.engine_id.as_str()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.engine_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["google", "bing"],
             "files 源（FR-SRC-14）还没落地 ⇒ 跳过，不拖垮整条兜底"
         );
@@ -422,9 +494,10 @@ mod tests {
 
     #[test]
     fn missing_icon_field_still_parses() {
-        let e: WebEngine =
-            serde_json::from_str(r#"{"id":"a","keyword":"a","title":"A","url":"https://a/{query}"}"#)
-                .expect("icon 缺字段应走 default");
+        let e: WebEngine = serde_json::from_str(
+            r#"{"id":"a","keyword":"a","title":"A","url":"https://a/{query}"}"#,
+        )
+        .expect("icon 缺字段应走 default");
         assert_eq!(e.icon, "");
     }
 }

@@ -46,7 +46,12 @@ impl Key {
         let words = split_words(src);
         let initials: String = words.iter().filter_map(|w| w.chars().next()).collect();
         let lower = src.to_lowercase();
-        Some(Key { chars: lower.chars().count(), lower, words, initials })
+        Some(Key {
+            chars: lower.chars().count(),
+            lower,
+            words,
+            initials,
+        })
     }
 }
 
@@ -79,8 +84,11 @@ pub struct MatchKeys {
 
 impl MatchKeys {
     fn build(item: &LaunchItem) -> MatchKeys {
-        let mut aliases: Vec<Key> =
-            item.keyword.split_whitespace().filter_map(Key::new).collect();
+        let mut aliases: Vec<Key> = item
+            .keyword
+            .split_whitespace()
+            .filter_map(Key::new)
+            .collect();
         // FR-SRC-05：目标名也参与匹配——文件去扩展名的文件名、文件夹名，以及 App / Command
         // 指向的 exe 名（2026-10-23 A7：`notepad.exe` 敲 `notepad` 要能命中）。
         // 目标名的拼音首字母一起放进来：中文目录名只有一个关键词 `文档` 时，敲 `wd` 也得命中。
@@ -96,7 +104,10 @@ impl MatchKeys {
                 }
             }
         }
-        MatchKeys { name: Key::new(&item.name), aliases }
+        MatchKeys {
+            name: Key::new(&item.name),
+            aliases,
+        }
     }
     fn name_chars(&self) -> usize {
         self.name.as_ref().map_or(0, |k| k.chars)
@@ -123,7 +134,13 @@ pub fn parse(raw: &str) -> Parsed {
     };
     let words: Vec<String> = head.split_whitespace().map(str::to_lowercase).collect();
     let full = words.join(" ");
-    Parsed { keyword, rest, has_rest, full, words }
+    Parsed {
+        keyword,
+        rest,
+        has_rest,
+        full,
+        words,
+    }
 }
 
 /// 清单键表缓存（FR-QRY-06）。用内容指纹判断是否需要重算，而不是指望每个改动清单的地方
@@ -229,7 +246,11 @@ pub const HEAT_HALF_LIFE_DAYS: f32 = 7.0;
 /// 一个条目对整次查询的打分：名称与别名取优（别名是刻意设置的触发码，等同名称参与匹配）。
 fn score_item(p: &Parsed, keys: &MatchKeys) -> Option<(u8, f32)> {
     let mut best: Option<(u8, f32)> = None;
-    for k in [&keys.name].into_iter().flatten().chain(keys.aliases.iter()) {
+    for k in [&keys.name]
+        .into_iter()
+        .flatten()
+        .chain(keys.aliases.iter())
+    {
         let hit = score_key(p, k);
         if hit.1 > 0.0 && best.is_none_or(|b| hit > b) {
             best = Some(hit);
@@ -252,7 +273,11 @@ pub fn can_complete(raw: &str, item: &LaunchItem) -> bool {
     if name == q {
         return false;
     }
-    name.starts_with(q) || item.keyword.split_whitespace().any(|a| a.to_lowercase().starts_with(q))
+    name.starts_with(q)
+        || item
+            .keyword
+            .split_whitespace()
+            .any(|a| a.to_lowercase().starts_with(q))
 }
 
 /// 甲案（FR-ACT-06，2026-10-18 用户裁定）：**补全只负责消歧**。
@@ -364,7 +389,11 @@ fn score_word(q: &str, k: &Key) -> (u8, f32) {
     }
     // 子序列：长度 ≥3、首字符相同、按序不连续命中（`clcl`→calculator）。
     if ql >= 3
-        && k.lower.chars().next().zip(q.chars().next()).is_some_and(|(a, b)| a == b)
+        && k.lower
+            .chars()
+            .next()
+            .zip(q.chars().next())
+            .is_some_and(|(a, b)| a == b)
         && is_subsequence(q, &k.lower)
     {
         return (T_SUBSEQ, 30.0);
@@ -399,7 +428,14 @@ fn is_subsequence(needle: &str, hay: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn item(name: &str, keyword: &str, path: &str, pinned: bool, use_count: u32, last_used_ms: i64) -> LaunchItem {
+    fn item(
+        name: &str,
+        keyword: &str,
+        path: &str,
+        pinned: bool,
+        use_count: u32,
+        last_used_ms: i64,
+    ) -> LaunchItem {
         LaunchItem {
             name: name.to_string(),
             path: path.to_string(),
@@ -462,10 +498,17 @@ mod tests {
         let one = |name: &str| vec![item(name, "", "p", false, 0, 0)];
         assert_eq!(hit(&one("计算器"), "计算器"), (T_EXACT, 100.0));
         assert_eq!(hit(&one("计算器专业版"), "计算器"), (T_PREFIX, 90.0));
-        assert_eq!(hit(&one("Visual Studio Code"), "studio"), (T_WORD_PREFIX, 80.0));
+        assert_eq!(
+            hit(&one("Visual Studio Code"), "studio"),
+            (T_WORD_PREFIX, 80.0)
+        );
         assert_eq!(hit(&one("AutoHotkey"), "ah"), (T_INITIALS, 75.0)); // FR-QRY-04 驼峰拆分
         assert_eq!(hit(&one("my_file-name"), "mfn"), (T_INITIALS, 75.0)); // 非字母数字切词
-        assert_eq!(hit(&one("Visual Studio Code"), "vsc"), (T_INITIALS, 75.0), "FR-QRY-04 验收例");
+        assert_eq!(
+            hit(&one("Visual Studio Code"), "vsc"),
+            (T_INITIALS, 75.0),
+            "FR-QRY-04 验收例"
+        );
         // 包含档（既非前缀也非词首）："notepad" 里的 "ote" 在第 1 个字符 ⇒
         // 60 − 1×0.25 − (7−3)×0.1 = 59.35
         assert_eq!(hit(&one("Notepad"), "ote").0, T_CONTAINS);
@@ -490,7 +533,10 @@ mod tests {
         let items = vec![item(&format!("{}x", long), "", "p", false, 0, 0)];
         let (tier, s) = hit(&items, "x");
         assert_eq!(tier, T_CONTAINS);
-        assert!((s - (60.0 - 5.0 - 4.0)).abs() < 1e-5, "双封顶应 51.0，实得 {s}");
+        assert!(
+            (s - (60.0 - 5.0 - 4.0)).abs() < 1e-5,
+            "双封顶应 51.0，实得 {s}"
+        );
     }
 
     #[test]
@@ -506,9 +552,15 @@ mod tests {
     #[test]
     fn parse_splits_keyword_and_rest() {
         let p = parse("clip ");
-        assert_eq!((p.keyword.as_str(), p.rest.as_str(), p.has_rest), ("clip", "", true));
+        assert_eq!(
+            (p.keyword.as_str(), p.rest.as_str(), p.has_rest),
+            ("clip", "", true)
+        );
         let p = parse("clip");
-        assert_eq!((p.keyword.as_str(), p.rest.as_str(), p.has_rest), ("clip", "", false));
+        assert_eq!(
+            (p.keyword.as_str(), p.rest.as_str(), p.has_rest),
+            ("clip", "", false)
+        );
         let p = parse("calc /k ping");
         assert!(p.has_rest);
         assert_eq!(p.keyword, "calc");
@@ -523,7 +575,7 @@ mod tests {
     fn bucket_outranks_pinned() {
         let items = vec![
             item("我的计算器", "", "a", true, 9, 999), // 包含 → 2 档
-            item("计算器", "", "b", false, 0, 0), // 全等 → 6 档
+            item("计算器", "", "b", false, 0, 0),      // 全等 → 6 档
         ];
         assert_eq!(order(&items, "计算器"), ["计算器", "我的计算器"]);
     }
@@ -556,7 +608,11 @@ mod tests {
             item("axx", "", "a", false, 8, 1_000),
             item("bxx", "", "b", false, 1, NOW),
         ];
-        assert_eq!(order(&items, "xx"), ["axx", "bxx"], "同档位内先比次数，后比最近一次");
+        assert_eq!(
+            order(&items, "xx"),
+            ["axx", "bxx"],
+            "同档位内先比次数，后比最近一次"
+        );
         assert_eq!(order(&items, ""), ["axx", "bxx"], "空输入的浏览视图同判据");
     }
 
@@ -572,7 +628,10 @@ mod tests {
         let hb = learn_heat(&items[1], NOW);
         assert!((ha - 1.58496).abs() < 1e-4, "log2(9)×0.5 = {ha}");
         assert!((hb - 2.0).abs() < 1e-6, "log2(4)×1 = {hb}");
-        assert_eq!(order_at(&items, "xx", LearnRank::Decay, NOW), ["bxx", "axx"]);
+        assert_eq!(
+            order_at(&items, "xx", LearnRank::Decay, NOW),
+            ["bxx", "axx"]
+        );
         assert_eq!(
             order_at(&items, "xx", LearnRank::Count, NOW),
             ["axx", "bxx"],
@@ -585,9 +644,16 @@ mod tests {
         let heat = |count: u32, days: i64| {
             learn_heat(&item("x", "", "p", false, count, NOW - days * DAY), NOW)
         };
-        assert_eq!(heat(0, 0), 0.0, "0 次 ⇒ log2(1)=0，学习层闭嘴，交给档位与打分");
+        assert_eq!(
+            heat(0, 0),
+            0.0,
+            "0 次 ⇒ log2(1)=0，学习层闭嘴，交给档位与打分"
+        );
         assert!((heat(1, 0) - 1.0).abs() < 1e-6, "1 次 = log2(2)");
-        assert!((heat(3, 0) - 2.0).abs() < 1e-6, "3 次 = log2(4)：次数被压成对数量级");
+        assert!(
+            (heat(3, 0) - 2.0).abs() < 1e-6,
+            "3 次 = log2(4)：次数被压成对数量级"
+        );
         assert!((heat(1, 7) - 0.5).abs() < 1e-6, "恰好一个半衰期 ⇒ 掉一半");
         assert!((heat(1, 14) - 0.25).abs() < 1e-6, "两个半衰期 ⇒ 四分之一");
         assert!(heat(1, 70).abs() < 1e-3, "10 个半衰期后基本归零");
@@ -615,14 +681,20 @@ mod tests {
 
     #[test]
     fn same_score_prefers_shorter_name() {
-        let items = vec![item("xxxx", "", "a", false, 0, 0), item("xx", "", "b", false, 0, 0)];
+        let items = vec![
+            item("xxxx", "", "a", false, 0, 0),
+            item("xx", "", "b", false, 0, 0),
+        ];
         assert_eq!(order(&items, "x"), ["xx", "xxxx"]);
     }
 
     #[test]
     fn in_band_score_breaks_ties_when_learn_keys_are_flat() {
         // 同为包含档、学习键全平：靠位置/长度惩罚定序（越靠前、越短越前）
-        let items = vec![item("xxhello", "", "a", false, 0, 0), item("helloxx", "", "b", false, 0, 0)];
+        let items = vec![
+            item("xxhello", "", "a", false, 0, 0),
+            item("helloxx", "", "b", false, 0, 0),
+        ];
         assert_eq!(order(&items, "hello"), ["helloxx", "xxhello"]);
     }
 
@@ -646,15 +718,19 @@ mod tests {
             item("丙", "", "c", false, 0, 7),
         ];
         assert_eq!(order(&items, ""), ["乙", "丙", "甲"]);
-        assert_eq!(order_at(&items, "", LearnRank::Decay, NOW), ["乙", "丙", "甲"]);
+        assert_eq!(
+            order_at(&items, "", LearnRank::Decay, NOW),
+            ["乙", "丙", "甲"]
+        );
     }
 
     // ---- FR-QRY-07 截断与稳定性 ----
 
     #[test]
     fn results_are_truncated_to_50() {
-        let items: Vec<LaunchItem> =
-            (0..200).map(|i| item(&format!("项{i}"), "", &i.to_string(), false, 0, 0)).collect();
+        let items: Vec<LaunchItem> = (0..200)
+            .map(|i| item(&format!("项{i}"), "", &i.to_string(), false, 0, 0))
+            .collect();
         let r = MatchIndex::default().search("项", &items, LearnRank::Count, NOW);
         assert_eq!(r.len(), 50);
         let again = MatchIndex::default().search("项", &items, LearnRank::Count, NOW);
@@ -667,19 +743,32 @@ mod tests {
         let mut idx = MatchIndex::default();
         assert_eq!(idx.search("jsb", &items, LearnRank::Count, NOW).len(), 1);
         items.push(item("计算器", "jsq", "b", false, 0, 0));
-        assert_eq!(idx.search("jsq", &items, LearnRank::Count, NOW).len(), 1, "清单变化后新项的别名必须立即可搜");
+        assert_eq!(
+            idx.search("jsq", &items, LearnRank::Count, NOW).len(),
+            1,
+            "清单变化后新项的别名必须立即可搜"
+        );
         // 只改别名（条目数不变）也必须触发重算 —— 这是用内容指纹而不是长度比较的理由
         items[0].keyword = "jbb".to_string();
         assert_eq!(idx.search("jbb", &items, LearnRank::Count, NOW).len(), 1);
-        assert!(idx.search("jsb", &items, LearnRank::Count, NOW).is_empty(), "旧别名不应继续命中");
+        assert!(
+            idx.search("jsb", &items, LearnRank::Count, NOW).is_empty(),
+            "旧别名不应继续命中"
+        );
     }
 
     #[test]
     fn empty_browse_view_is_not_truncated() {
         // 截断 50 只作用于搜索结果；空输入的「浏览整张清单」必须看得到全部项。
-        let items: Vec<LaunchItem> =
-            (0..120).map(|i| item(&format!("项{i}"), "", &i.to_string(), false, 0, 0)).collect();
-        assert_eq!(MatchIndex::default().search("", &items, LearnRank::Count, NOW).len(), 120);
+        let items: Vec<LaunchItem> = (0..120)
+            .map(|i| item(&format!("项{i}"), "", &i.to_string(), false, 0, 0))
+            .collect();
+        assert_eq!(
+            MatchIndex::default()
+                .search("", &items, LearnRank::Count, NOW)
+                .len(),
+            120
+        );
     }
 
     // ---- FR-ACT-06 别名多键与 Tab 补全判据 ----
@@ -689,7 +778,11 @@ mod tests {
         // 「提交即学」会让 keyword 里出现多个空格分隔的触发词。合成一键时
         // initials 取整串词首字母 ⇒ "jsq qsj" 变成 "jq"，"jq" 这种查询会白吃 75 档噪声。
         let items = vec![item("计算器", "jsq qsj", "a", false, 0, 0)];
-        assert_eq!(hit(&items, "jsq"), (T_EXACT, 100.0), "别名整词该按整词档位命中");
+        assert_eq!(
+            hit(&items, "jsq"),
+            (T_EXACT, 100.0),
+            "别名整词该按整词档位命中"
+        );
         assert_eq!(hit(&items, "qsj"), (T_EXACT, 100.0), "第二个别名同理");
         assert_eq!(hit(&items, "jq"), (0, 0.0), "跨别名的假缩写不得命中");
     }
@@ -698,8 +791,14 @@ mod tests {
     fn can_complete_needs_name_or_alias_prefix() {
         let cn = item("计算器", "jsq", "a", false, 0, 0);
         assert!(can_complete("计", &cn), "名称前缀可补全");
-        assert!(can_complete("jsq", &cn), "别名整词也要能补全成名称——敲首字母才是常态");
-        assert!(!can_complete("计算器", &cn), "已经等于名称时无可补全 ⇒ 该走导航");
+        assert!(
+            can_complete("jsq", &cn),
+            "别名整词也要能补全成名称——敲首字母才是常态"
+        );
+        assert!(
+            !can_complete("计算器", &cn),
+            "已经等于名称时无可补全 ⇒ 该走导航"
+        );
         assert!(!can_complete("", &cn), "空输入没什么可补全");
         assert!(!can_complete("xj", &cn), "既不冠名称也不冠别名 ⇒ 走导航");
         let en = item("Notepad", "", "b", false, 0, 0);
@@ -742,7 +841,11 @@ mod tests {
             item("控制面板", "kzmb", "b", false, 0, 0),
         ];
         let results = MatchIndex::default().search("jsq", &cn, LearnRank::Count, NOW);
-        assert_eq!(unique_completion("jsq", &cn, &results), Some(0), "jsq→计算器 仍该补");
+        assert_eq!(
+            unique_completion("jsq", &cn, &results),
+            Some(0),
+            "jsq→计算器 仍该补"
+        );
 
         // 兄弟别名撞前缀时两边都不补：`js` 既冠 jsq(计算器) 又冠名称「记事本」
         let cn2 = vec![
@@ -761,10 +864,16 @@ mod tests {
         let task = item("Task Manager", "tas task ta", "b", false, 0, 0);
         assert!(query_is_full_word("jsb", &note));
         assert!(query_is_full_word("记事本", &note));
-        assert!(query_is_full_word("  JSB  ", &note), "首尾空白与大小写不参与判断");
+        assert!(
+            query_is_full_word("  JSB  ", &note),
+            "首尾空白与大小写不参与判断"
+        );
         assert!(!query_is_full_word("js", &note), "前缀不是全名");
         assert!(!query_is_full_word("jsbx", &note));
-        assert!(!query_is_full_word("", &note), "空框由 space_executes 自己判");
+        assert!(
+            !query_is_full_word("", &note),
+            "空框由 space_executes 自己判"
+        );
         assert!(query_is_full_word("task", &task));
         assert!(
             !query_is_full_word("Task Scheduler", &task),
@@ -794,14 +903,20 @@ mod tests {
         // off ＝ 批次 F 的老口径，一个字都不改
         assert!(run(SpaceRun::Off, "", &r_all));
         assert!(!run(SpaceRun::Off, "jsb", &r_one));
-        assert!(run(SpaceRun::Off, " ", &r_all), "off 档按 trim 判空框（旧行为保留）");
+        assert!(
+            run(SpaceRun::Off, " ", &r_all),
+            "off 档按 trim 判空框（旧行为保留）"
+        );
         assert!(!run(SpaceRun::Off, "", &none), "没有结果就没有可执行的东西");
 
         // word ＝ 丙案默认档：空框，或查询整串＝名称/别名
         assert!(run(SpaceRun::Word, "", &r_all));
         assert!(run(SpaceRun::Word, "jsb", &r_one), "别名整词 ⇒ 空格即执行");
         assert!(run(SpaceRun::Word, "记事本", &r_one));
-        assert!(!run(SpaceRun::Word, "js", &r_two), "前缀阶段空格仍是文本，能接着打");
+        assert!(
+            !run(SpaceRun::Word, "js", &r_two),
+            "前缀阶段空格仍是文本，能接着打"
+        );
         assert!(
             !run(SpaceRun::Word, " ", &r_all),
             "Shift+空格 插出来的真空格不算空框，否则下一按空格就误启动"
@@ -824,7 +939,16 @@ mod tests {
     #[test]
     fn thousand_items_match_within_frame_budget() {
         let items: Vec<LaunchItem> = (0..1000)
-            .map(|i| item(&format!("工具{i} Terminal"), &format!("g{i}"), &i.to_string(), false, 0, 0))
+            .map(|i| {
+                item(
+                    &format!("工具{i} Terminal"),
+                    &format!("g{i}"),
+                    &i.to_string(),
+                    false,
+                    0,
+                    0,
+                )
+            })
             .collect();
         let mut idx = MatchIndex::default();
         idx.search("", &items, LearnRank::Count, NOW); // 预热：建表

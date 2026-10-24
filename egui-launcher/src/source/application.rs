@@ -22,22 +22,22 @@ use std::thread;
 
 use super::websearch;
 use crate::source::{DataSource, SearchCtx, SourceId};
-use serde::{Deserialize, Serialize};
 use pinyin::ToPinyin;
-use windows::core::Interface;
-use windows::core::{PCWSTR, PWSTR};
+use serde::{Deserialize, Serialize};
 use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx,
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, IPersistFile, STGM_READ,
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoTaskMemFree, CoUninitialize, IBindCtx, IPersistFile, STGM_READ,
 };
 use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::UI::Shell::{
-    ApplicationActivationManager, IApplicationActivationManager, IEnumShellItems, IShellItem,
-    IShellLinkW, SHChangeNotify, SHCreateItemFromParsingName, AO_NONE, BHID_EnumItems,
-    SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_PATHW, SIGDN_DESKTOPABSOLUTEPARSING,
-    SIGDN_NORMALDISPLAY, SLGP_UNCPRIORITY,
+    AO_NONE, ApplicationActivationManager, BHID_EnumItems, IApplicationActivationManager,
+    IEnumShellItems, IShellItem, IShellLinkW, SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_PATHW,
+    SHChangeNotify, SHCreateItemFromParsingName, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
+    SLGP_UNCPRIORITY,
 };
+use windows::core::Interface;
+use windows::core::{PCWSTR, PWSTR};
 
 /// `{00021401-0000-0000-C000-000000000046}`，coclass ShellLink（见 E-03 记录）。
 const CLSID_SHELL_LINK: windows::core::GUID =
@@ -141,7 +141,10 @@ fn appdata_dir() -> PathBuf {
 /// 便携数据目录（清单 / 设置 / 日志 / 主题同处，FR-CFG-03）。
 /// 主题目录（`Themes\`，FR-UIX-01）也挂在这里——用户把程序拷到 U 盘，皮肤跟着走。
 pub fn data_dir() -> PathBuf {
-    user_list_path().parent().map(Path::to_path_buf).unwrap_or_else(appdata_dir)
+    user_list_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(appdata_dir)
 }
 
 /// 以真实写入试探目录可写性（Program Files 等受 ACL 保护的目录会失败→自动退化）。
@@ -157,7 +160,8 @@ fn dir_writable(dir: &Path) -> bool {
 
 fn resolve_list_path() -> PathBuf {
     let portable = std::env::current_exe().ok().and_then(|exe| {
-        exe.parent().map(|dir| (dir.to_path_buf(), dir.join("user_items.json")))
+        exe.parent()
+            .map(|dir| (dir.to_path_buf(), dir.join("user_items.json")))
     });
     match portable {
         Some((dir, file)) if dir_writable(&dir) => {
@@ -263,9 +267,16 @@ fn load_or_quarantine<T: serde::de::DeserializeOwned + Default>(
 /// 播种也不会覆盖证据"（`Loaded` 旧注释里的原话）——**那个前提是错的**，占满名额跟目录只读
 /// 是两回事，于是覆盖写照样发生。名额这一层修不掉判断错误，所以两处一起改。
 fn quarantine(path: &Path, bytes: &[u8]) -> Corrupted {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     for n in 0..BAD_NAME_SLOTS {
-        let suffix = if n == 0 { "bad".to_string() } else { format!("bad{n}") };
+        let suffix = if n == 0 {
+            "bad".to_string()
+        } else {
+            format!("bad{n}")
+        };
         if let Some(p) = keep_at(path, bytes, &format!("{name}.{suffix}")) {
             return Corrupted::Kept(p);
         }
@@ -305,7 +316,10 @@ fn keep_at(path: &Path, bytes: &[u8], candidate: &str) -> Option<PathBuf> {
 /// 目标要么保持原样，要么完整是新内容，不存在中间态。
 /// 临时名带 pid：单实例（FR-SRC-21）之外还有人工开第二份的场景，两个写者不能抢同一个临时名。
 fn write_atomic(path: &Path, bytes: &[u8], label: &str) {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, bytes) {
         eprintln!("source: 写 {label} 临时文件失败 {path:?}: {e}（原文件未改动）");
@@ -410,7 +424,9 @@ pub struct AppSettings {
 }
 
 fn default_terminal_shell() -> String {
-    crate::source::terminal::TermShell::default().as_str().to_string()
+    crate::source::terminal::TermShell::default()
+        .as_str()
+        .to_string()
 }
 
 fn default_theme() -> String {
@@ -575,7 +591,9 @@ impl HotkeySpec {
         // 单带 Shift（不带 Ctrl/Alt/Win）一律挡：这类组合只是打字，挂成全局键就是拦打字。
         if m == HKF_SHIFT {
             return if self.vk == VK_OEM_3 {
-                Err("单带 Shift 的 ` 就是 ~，挂成全局键会连波浪号一起吞掉；要带就带 Ctrl、Alt 或 Win")
+                Err(
+                    "单带 Shift 的 ` 就是 ~，挂成全局键会连波浪号一起吞掉；要带就带 Ctrl、Alt 或 Win",
+                )
             } else {
                 Err("只带 Shift 的键都只是打字，不能当全局热键")
             };
@@ -707,9 +725,8 @@ impl<'de> serde::Deserialize<'de> for SpaceRun {
         use serde::de::Error;
         match SpaceRunWire::deserialize(d)? {
             SpaceRunWire::Legacy(b) => Ok(if b { Self::Always } else { Self::Off }),
-            SpaceRunWire::Name(n) => {
-                Self::from_name(&n).ok_or_else(|| D::Error::custom(format!("未知的 space_to_run 档位：{n:?}")))
-            }
+            SpaceRunWire::Name(n) => Self::from_name(&n)
+                .ok_or_else(|| D::Error::custom(format!("未知的 space_to_run 档位：{n:?}"))),
         }
     }
 }
@@ -839,7 +856,8 @@ impl DataSource for AppsSource {
     }
 
     fn rows(&mut self, cx: &mut SearchCtx<'_>) -> Vec<usize> {
-        cx.index.search(cx.query, cx.items, cx.learn_rank, cx.now_ms)
+        cx.index
+            .search(cx.query, cx.items, cx.learn_rank, cx.now_ms)
     }
 }
 
@@ -870,7 +888,10 @@ pub const LOG_DATE_TAG: &str = "# log 日期: ";
 /// （为此打开 `Win32_System_SystemInformation` feature——批次 O 之后第二次动 feature 列表）。
 pub fn local_now_stamp() -> String {
     let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute
+    )
 }
 
 fn is_iso_date(s: &str) -> bool {
@@ -887,10 +908,15 @@ fn is_iso_date(s: &str) -> bool {
 fn log_content_date(path: &Path) -> Option<String> {
     use std::io::Read;
     let mut buf = [0u8; 128];
-    let n = std::fs::File::open(path).ok().and_then(|mut f| f.read(&mut buf).ok())?;
+    let n = std::fs::File::open(path)
+        .ok()
+        .and_then(|mut f| f.read(&mut buf).ok())?;
     let head = std::str::from_utf8(&buf[..n]).ok()?;
     let first_line = head.lines().next()?;
-    let date = first_line.strip_prefix(LOG_DATE_TAG)?.get(..10)?.to_string();
+    let date = first_line
+        .strip_prefix(LOG_DATE_TAG)?
+        .get(..10)?
+        .to_string();
     is_iso_date(&date).then_some(date)
 }
 
@@ -906,7 +932,9 @@ pub fn rotate_log_and_stamp() -> String {
 /// 归档判据本身：不取系统时间、不碰真实清单目录 ⇒ 能在临时目录里跑完整往返（单测走这条）。
 /// 首行没有日期锚的旧文件（批次 O 的产物）归成 `launcher-无日期.log`，这种归类每台机器只会发生一次。
 fn rotate_at(path: &Path, today: &str) {
-    let Ok(meta) = std::fs::metadata(path) else { return };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
     let dated = log_content_date(path);
     let stale = dated.as_deref() != Some(today);
     if stale || meta.len() > LOG_ROTATE_BYTES {
@@ -935,7 +963,10 @@ fn archive_log(path: &Path, date: &str) -> Option<PathBuf> {
 /// 只按 `launcher-` 前缀认会把用户放在同一目录里的 `launcher-notes.log` 之类的文件删掉——
 /// 与批次 N「宁多收一条也不误判」、批次 L「归属不明一律不认领」是同一条取向。
 fn is_our_archive(name: &str) -> bool {
-    let Some(body) = name.strip_prefix("launcher-").and_then(|b| b.strip_suffix(".log")) else {
+    let Some(body) = name
+        .strip_prefix("launcher-")
+        .and_then(|b| b.strip_suffix(".log"))
+    else {
         return false;
     };
     let mut parts = body.split('.');
@@ -945,13 +976,16 @@ fn is_our_archive(name: &str) -> bool {
     }
     // 后缀序号必须是纯数字（`launcher-2026-01-01.a.log` 不是我们写的）。
     let tail: Vec<&str> = parts.collect();
-    tail.iter().all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+    tail.iter()
+        .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
 }
 
 /// 裁归档。**只删自己写的文件**：名字必须严格是 `launcher-*.log`，`launcher.log` 本身、
 /// 批次 O 留下的 `launcher.log.old`、以及任何别人的东西一概不进这个列表。
 fn prune_archives(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut list: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
         .filter_map(|e| {
@@ -998,7 +1032,11 @@ pub(crate) fn system32(exe: &str) -> String {
     let windir = std::env::var_os("WINDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    windir.join("System32").join(exe).to_string_lossy().into_owned()
+    windir
+        .join("System32")
+        .join(exe)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// 名称拼音首字母 + 需求书点名要的关键字（空白分词，别名表本来就支持多键）。
@@ -1071,7 +1109,13 @@ pub fn builtin_seeds() -> Vec<LaunchItem> {
         command_seed("记事本", "notepad.exe", "", "notepad.exe", "np"),
         command_seed("画图", "mspaint.exe", "", "mspaint.exe", ""),
         command_seed("命令提示符", "cmd.exe", "", "cmd.exe", ""),
-        command_seed("PowerShell", "powershell.exe", "", "WindowsPowerShell/v1.0/powershell.exe", ""),
+        command_seed(
+            "PowerShell",
+            "powershell.exe",
+            "",
+            "WindowsPowerShell/v1.0/powershell.exe",
+            "",
+        ),
         command_seed("任务管理器", "taskmgr.exe", "", "Taskmgr.exe", ""),
         command_seed("控制面板", "control.exe", "", "control.exe", ""),
         folder_seed("此电脑", "shell:MyComputerFolder", ""),
@@ -1092,11 +1136,19 @@ pub fn builtin_seeds() -> Vec<LaunchItem> {
         // 空词回车先补成 `docs `，再敲子目录名；`{query}` 由 custom::build_hit 填进路径。
         folder_seed("文档", r"%USERPROFILE%\Documents\{query}", "docs"),
         // 占位符而不是绝对路径：程序搬文件夹后这条自己跟着走，不用重新播种。
-        folder_seed("启动器目录", crate::source::custom::LAUNCHER_DIR_PLACEHOLDER, ""),
+        folder_seed(
+            "启动器目录",
+            crate::source::custom::LAUNCHER_DIR_PLACEHOLDER,
+            "",
+        ),
         command_seed("IP 配置", "cmd.exe", "/k ipconfig", "cmd.exe", "ipconfig"),
         command_seed("Ping", "cmd.exe", "/k ping {query}", "cmd.exe", "ping"),
         // 网址尚未确定 ⇒ 用 RFC 2606 保留的 `.invalid` 当占位，改这一条的路径即可。
-        url_seed("项目主页（待填网址）", "https://example.invalid/altrun", "altrun"),
+        url_seed(
+            "项目主页（待填网址）",
+            "https://example.invalid/altrun",
+            "altrun",
+        ),
         url_seed(
             "谷歌地图",
             "https://www.google.com/maps/search/?api=1&query={query}",
@@ -1148,8 +1200,11 @@ pub fn drop_hidden(items: &mut Vec<LaunchItem>, hidden: &[String]) -> usize {
     if hidden.is_empty() {
         return 0;
     }
-    let set: std::collections::HashSet<&str> =
-        hidden.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let set: std::collections::HashSet<&str> = hidden
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     let before = items.len();
     items.retain(|i| !set.contains(i.uid().as_str()));
     before - items.len()
@@ -1165,9 +1220,16 @@ pub fn is_url(s: &str) -> bool {
     }
     if let Some(idx) = t.find(':') {
         let scheme = &t[..idx];
-        let head_alpha = scheme.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false);
-        if scheme.len() >= 2 && head_alpha
-            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        let head_alpha = scheme
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false);
+        if scheme.len() >= 2
+            && head_alpha
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
         {
             return true; // ms-settings:、mailto: 等
         }
@@ -1177,7 +1239,11 @@ pub fn is_url(s: &str) -> bool {
 
 /// 把任意输入判成条目类型：URL/协议→`Url`，其余（命令名 / 路径 / .lnk）→`Command`。
 pub fn infer_kind(input: &str) -> ItemKind {
-    if is_url(input) { ItemKind::Url } else { ItemKind::Command }
+    if is_url(input) {
+        ItemKind::Url
+    } else {
+        ItemKind::Command
+    }
 }
 
 /// FR-SRC-05：条目的「目标名」匹配键——文件取去扩展名的文件名、文件夹取路径末段
@@ -1200,7 +1266,9 @@ pub fn target_stem(item: &LaunchItem) -> Option<String> {
         ItemKind::Url | ItemKind::Internal => None,
         _ => Path::new(path).file_stem(),
     };
-    stem.and_then(|s| s.to_str()).map(str::to_string).filter(|s| !s.is_empty())
+    stem.and_then(|s| s.to_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
 }
 
 /// 由名称生成默认别名（FR-SRC-22「默认拼音首字母」）：每个汉字取其拼音首字母
@@ -1238,11 +1306,18 @@ pub fn learn_alias(item: &mut LaunchItem, word: &str) -> bool {
     if item.name.to_lowercase().contains(&w) {
         return false;
     }
-    if item.keyword.split_whitespace().any(|a| a.to_lowercase() == w) {
+    if item
+        .keyword
+        .split_whitespace()
+        .any(|a| a.to_lowercase() == w)
+    {
         return false;
     }
-    item.keyword =
-        if item.keyword.trim().is_empty() { w } else { format!("{} {w}", item.keyword.trim()) };
+    item.keyword = if item.keyword.trim().is_empty() {
+        w
+    } else {
+        format!("{} {w}", item.keyword.trim())
+    };
     true
 }
 
@@ -1252,7 +1327,11 @@ pub fn make_item_from_input(input: &str) -> LaunchItem {
     let trimmed = input.trim();
     let tail = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
     let name = tail.trim_end_matches(".lnk");
-    let name = if name.is_empty() { trimmed.to_string() } else { name.to_string() };
+    let name = if name.is_empty() {
+        trimmed.to_string()
+    } else {
+        name.to_string()
+    };
     let keyword = default_keyword(&name);
     LaunchItem {
         name,
@@ -1268,7 +1347,8 @@ pub fn make_item_from_input(input: &str) -> LaunchItem {
 
 /// 后台扫描开始菜单/桌面，把结果作为 `kind=App` 的条目一次性送回 `tx`（供「批量导入全部」）。
 /// 不写缓存：批量导入是显式动作，主线程收到后去重、落 user_items.json。
-pub fn spawn_batch_import(tx: mpsc::Sender<Vec<LaunchItem>>) {    thread::spawn(move || {
+pub fn spawn_batch_import(tx: mpsc::Sender<Vec<LaunchItem>>) {
+    thread::spawn(move || {
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         let mut files = Vec::new();
         for root in default_roots() {
@@ -1284,9 +1364,15 @@ pub fn spawn_batch_import(tx: mpsc::Sender<Vec<LaunchItem>>) {    thread::spawn(
         for file in &files {
             if let Some(app) = unsafe { resolve_lnk(file) } {
                 // 自排除：target 规范化后就是本 exe（含我们自己写的启动夹快捷方式）。
-                if exe_key.as_deref().is_some_and(|key| is_self_target(&app.path, key)) {
+                if exe_key
+                    .as_deref()
+                    .is_some_and(|key| is_self_target(&app.path, key))
+                {
                     skipped_self += 1;
-                    eprintln!("source: 批量导入自排除（target 即本 exe）：{}", file.display());
+                    eprintln!(
+                        "source: 批量导入自排除（target 即本 exe）：{}",
+                        file.display()
+                    );
                     continue;
                 }
                 apps.push(app);
@@ -1343,7 +1429,9 @@ fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     if depth > MAX_DEPTH {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -1371,7 +1459,14 @@ fn is_self_target(target: &str, exe_key: &str) -> bool {
 
 /// 本 exe 的规范化字符串键；取不到就视为没有自排除项（同上一条"宁多勿漏"的取向）。
 fn self_exe_key() -> Option<String> {
-    Some(std::env::current_exe().ok()?.canonicalize().ok()?.to_string_lossy().into_owned())
+    Some(
+        std::env::current_exe()
+            .ok()?
+            .canonicalize()
+            .ok()?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn from_wide(buf: &[u16]) -> String {
@@ -1413,7 +1508,11 @@ pub unsafe fn resolve_lnk(path: &Path) -> Option<LaunchItem> {
 
         let mut buf = [0u16; 260];
         let target = link
-            .GetPath(&mut buf, core::ptr::null_mut::<WIN32_FIND_DATAW>(), SLGP_UNCPRIORITY.0 as u32)
+            .GetPath(
+                &mut buf,
+                core::ptr::null_mut::<WIN32_FIND_DATAW>(),
+                SLGP_UNCPRIORITY.0 as u32,
+            )
             .map(|_| from_wide(&buf))
             .unwrap_or_default();
         if target.trim().is_empty() {
@@ -1421,12 +1520,20 @@ pub unsafe fn resolve_lnk(path: &Path) -> Option<LaunchItem> {
             // `scan_store_apps` 从 shell 命名空间补齐（批次 A9）。
             return None;
         }
-        let arguments = link.GetArguments(&mut buf).map(|_| from_wide(&buf)).unwrap_or_default();
-        let working_dir_raw =
-            link.GetWorkingDirectory(&mut buf).map(|_| from_wide(&buf)).unwrap_or_default();
+        let arguments = link
+            .GetArguments(&mut buf)
+            .map(|_| from_wide(&buf))
+            .unwrap_or_default();
+        let working_dir_raw = link
+            .GetWorkingDirectory(&mut buf)
+            .map(|_| from_wide(&buf))
+            .unwrap_or_default();
 
-        let name =
-            path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
         let source_path = path.to_string_lossy().into_owned();
         let expanded_target = expand_vars(&target);
         let keyword = default_keyword(&name);
@@ -1437,11 +1544,7 @@ pub unsafe fn resolve_lnk(path: &Path) -> Option<LaunchItem> {
             arguments,
             working_dir: {
                 let wd = expand_vars(&working_dir_raw);
-                if wd.trim().is_empty() {
-                    None
-                } else {
-                    Some(wd)
-                }
+                if wd.trim().is_empty() { None } else { Some(wd) }
             },
             // .lnk 自身作图标源（shell 解析快捷方式自定义图标），启动也走 .lnk 更保真。
             source_path: source_path.clone(),
@@ -1548,7 +1651,11 @@ unsafe fn scan_store_apps() -> Vec<LaunchItem> {
                 Ok(p) => pwstr_take(p),
                 Err(_) => String::new(),
             };
-            let name = if display.trim().is_empty() { aumid.clone() } else { display };
+            let name = if display.trim().is_empty() {
+                aumid.clone()
+            } else {
+                display
+            };
             let path = format!("shell:AppsFolder\\{aumid}");
             out.push(LaunchItem {
                 name: name.clone(),
@@ -1584,18 +1691,26 @@ const SENDTO_LINK_NAME: &str = "egui-launcher.lnk";
 
 fn sendto_link_path() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
-    Some(Path::new(&appdata).join(r"Microsoft\Windows\SendTo").join(SENDTO_LINK_NAME))
+    Some(
+        Path::new(&appdata)
+            .join(r"Microsoft\Windows\SendTo")
+            .join(SENDTO_LINK_NAME),
+    )
 }
 
 /// 设置页开关的当前态：文件存在且归属校验通过才算「已安装」。
 /// 同名文件若是别人建的（target 不是本 exe）→ 报未安装，且后续删除会拒绝碰它。
 /// 旧版本程序写的 Arguments=%1 形态也算自己的（历史版本产物），判据 target==本 exe 且 args ∈ {"", "%1"}。
 pub fn sendto_installed() -> bool {
-    let Some(link) = sendto_link_path() else { return false };
+    let Some(link) = sendto_link_path() else {
+        return false;
+    };
     if !link.exists() {
         return false;
     }
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
     let exe = exe.to_string_lossy().into_owned();
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let owned = unsafe { read_link_target(&link) }
@@ -1626,15 +1741,27 @@ pub fn uninstall_sendto() -> Result<String, String> {
         if !(target == exe && (args.trim().is_empty() || args.trim() == "%1")) {
             return Err(format!(
                 "「{}」不是本程序创建的，按安全规则不删除",
-                link.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                link.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
             ));
         }
         std::fs::remove_file(&link).map_err(|e| format!("删除失败: {e}"))?;
         let witem = wide_null(&link.to_string_lossy());
         let wdir = wide_null(&dir.to_string_lossy());
         unsafe {
-            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, Some(witem.as_ptr().cast()), None);
-            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, Some(wdir.as_ptr().cast()), None);
+            SHChangeNotify(
+                SHCNE_UPDATEITEM,
+                SHCNF_PATHW,
+                Some(witem.as_ptr().cast()),
+                None,
+            );
+            SHChangeNotify(
+                SHCNE_UPDATEDIR,
+                SHCNF_PATHW,
+                Some(wdir.as_ptr().cast()),
+                None,
+            );
         }
         Ok("SendTo 入口已删除（归属已验证）".to_string())
     })();
@@ -1673,8 +1800,18 @@ fn install_sendto_link() -> Result<String, String> {
         let witem = wide_null(&link_path.to_string_lossy());
         let wdir = wide_null(&dir.to_string_lossy());
         unsafe {
-            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, Some(witem.as_ptr().cast()), None);
-            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, Some(wdir.as_ptr().cast()), None);
+            SHChangeNotify(
+                SHCNE_UPDATEITEM,
+                SHCNF_PATHW,
+                Some(witem.as_ptr().cast()),
+                None,
+            );
+            SHChangeNotify(
+                SHCNE_UPDATEDIR,
+                SHCNF_PATHW,
+                Some(wdir.as_ptr().cast()),
+                None,
+            );
         }
     }
     if hr.is_ok() {
@@ -1708,20 +1845,32 @@ unsafe fn write_sendto_link(exe: &str, link_path: &Path) -> Result<String, Strin
         if link_path.exists() {
             if let Some((target, args)) = read_link_target(link_path) {
                 if target == exe && args.trim().is_empty() {
-                    return Ok(format!("SendTo 入口已存在且未变化，未重写: {}", link_path.display()));
+                    return Ok(format!(
+                        "SendTo 入口已存在且未变化，未重写: {}",
+                        link_path.display()
+                    ));
                 }
             }
         }
         let shell: IShellLinkW = CoCreateInstance(&CLSID_SHELL_LINK, None, CLSCTX_INPROC_SERVER)
             .map_err(|e| format!("CoCreateInstance(ShellLink) 失败: {e}"))?;
         let wexe = wide_null(exe);
-        shell.SetPath(PCWSTR(wexe.as_ptr())).map_err(|e| format!("SetPath: {e}"))?;
-        shell.SetIconLocation(PCWSTR(wexe.as_ptr()), 0).map_err(|e| format!("SetIconLocation: {e}"))?;
+        shell
+            .SetPath(PCWSTR(wexe.as_ptr()))
+            .map_err(|e| format!("SetPath: {e}"))?;
+        shell
+            .SetIconLocation(PCWSTR(wexe.as_ptr()), 0)
+            .map_err(|e| format!("SetIconLocation: {e}"))?;
         let wdesc = wide_null("添加到 egui-launcher 快捷项");
-        shell.SetDescription(PCWSTR(wdesc.as_ptr())).map_err(|e| format!("SetDescription: {e}"))?;
-        let pf: IPersistFile = shell.cast().map_err(|e| format!("cast IPersistFile: {e}"))?;
+        shell
+            .SetDescription(PCWSTR(wdesc.as_ptr()))
+            .map_err(|e| format!("SetDescription: {e}"))?;
+        let pf: IPersistFile = shell
+            .cast()
+            .map_err(|e| format!("cast IPersistFile: {e}"))?;
         let wlink = wide_null(&link_path.to_string_lossy());
-        pf.Save(PCWSTR(wlink.as_ptr()), true).map_err(|e| format!("Save: {e}"))?;
+        pf.Save(PCWSTR(wlink.as_ptr()), true)
+            .map_err(|e| format!("Save: {e}"))?;
         Ok(format!(
             "SendTo 入口已安装：右键文件 → 发送到 → 「egui-launcher」（{}）",
             link_path.display()
@@ -1739,7 +1888,11 @@ unsafe fn read_link_target(path: &Path) -> Option<(String, String)> {
         pf.Load(PCWSTR(wide.as_ptr()), STGM_READ).ok()?;
         let mut buf = [0u16; 260];
         let target = link
-            .GetPath(&mut buf, std::ptr::null_mut::<WIN32_FIND_DATAW>(), SLGP_UNCPRIORITY.0 as u32)
+            .GetPath(
+                &mut buf,
+                std::ptr::null_mut::<WIN32_FIND_DATAW>(),
+                SLGP_UNCPRIORITY.0 as u32,
+            )
             .map(|_| from_wide(&buf))
             .ok()?;
         let args = link.GetArguments(&mut buf).map(|_| from_wide(&buf)).ok()?;
@@ -1769,11 +1922,15 @@ fn is_our_startup_link(exe: &str, target: &str, args: &str) -> bool {
 }
 
 pub fn startup_installed() -> bool {
-    let Some(link) = startup_link_path() else { return false };
+    let Some(link) = startup_link_path() else {
+        return false;
+    };
     if !link.exists() {
         return false;
     }
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
     let exe = exe.to_string_lossy().into_owned();
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let owned = unsafe { read_link_target(&link) }
@@ -1803,7 +1960,9 @@ pub fn uninstall_startup() -> Result<String, String> {
         if !is_our_startup_link(&exe, &target, &args) {
             return Err(format!(
                 "「{}」（target={target} 参数={args}）不是本程序创建的开机自启项，按安全规则不删除",
-                link.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                link.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
             ));
         }
         std::fs::remove_file(&link).map_err(|e| format!("删除失败: {e}"))?;
@@ -1850,8 +2009,18 @@ fn notify_shell(item: &Path, dir: &Path) {
     let witem = wide_null(&item.to_string_lossy());
     let wdir = wide_null(&dir.to_string_lossy());
     unsafe {
-        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, Some(witem.as_ptr().cast()), None);
-        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, Some(wdir.as_ptr().cast()), None);
+        SHChangeNotify(
+            SHCNE_UPDATEITEM,
+            SHCNF_PATHW,
+            Some(witem.as_ptr().cast()),
+            None,
+        );
+        SHChangeNotify(
+            SHCNE_UPDATEDIR,
+            SHCNF_PATHW,
+            Some(wdir.as_ptr().cast()),
+            None,
+        );
     }
 }
 
@@ -1871,16 +2040,30 @@ unsafe fn write_startup_link(exe: &str, link_path: &Path) -> Result<String, Stri
         let shell: IShellLinkW = CoCreateInstance(&CLSID_SHELL_LINK, None, CLSCTX_INPROC_SERVER)
             .map_err(|e| format!("CoCreateInstance(ShellLink) 失败: {e}"))?;
         let wexe = wide_null(exe);
-        shell.SetPath(PCWSTR(wexe.as_ptr())).map_err(|e| format!("SetPath: {e}"))?;
+        shell
+            .SetPath(PCWSTR(wexe.as_ptr()))
+            .map_err(|e| format!("SetPath: {e}"))?;
         let wargs = wide_null(STARTUP_ARGS);
-        shell.SetArguments(PCWSTR(wargs.as_ptr())).map_err(|e| format!("SetArguments: {e}"))?;
-        shell.SetIconLocation(PCWSTR(wexe.as_ptr()), 0).map_err(|e| format!("SetIconLocation: {e}"))?;
+        shell
+            .SetArguments(PCWSTR(wargs.as_ptr()))
+            .map_err(|e| format!("SetArguments: {e}"))?;
+        shell
+            .SetIconLocation(PCWSTR(wexe.as_ptr()), 0)
+            .map_err(|e| format!("SetIconLocation: {e}"))?;
         let wdesc = wide_null("登录时静默启动 egui-launcher（不弹窗口）");
-        shell.SetDescription(PCWSTR(wdesc.as_ptr())).map_err(|e| format!("SetDescription: {e}"))?;
-        let pf: IPersistFile = shell.cast().map_err(|e| format!("cast IPersistFile: {e}"))?;
+        shell
+            .SetDescription(PCWSTR(wdesc.as_ptr()))
+            .map_err(|e| format!("SetDescription: {e}"))?;
+        let pf: IPersistFile = shell
+            .cast()
+            .map_err(|e| format!("cast IPersistFile: {e}"))?;
         let wlink = wide_null(&link_path.to_string_lossy());
-        pf.Save(PCWSTR(wlink.as_ptr()), true).map_err(|e| format!("Save: {e}"))?;
-        Ok(format!("开机自启项已写入：{}（参数 {STARTUP_ARGS}，登录后托盘常驻、不弹窗口）", link_path.display()))
+        pf.Save(PCWSTR(wlink.as_ptr()), true)
+            .map_err(|e| format!("Save: {e}"))?;
+        Ok(format!(
+            "开机自启项已写入：{}（参数 {STARTUP_ARGS}，登录后托盘常驻、不弹窗口）",
+            link_path.display()
+        ))
     }
 }
 
@@ -1914,9 +2097,13 @@ mod uwp_tests {
     #[test]
     fn aumid_from_parsing_name_accepts_both_shapes() {
         let want = Some("Microsoft.WindowsStore_8wekyb3d8bbwe!App");
-        assert_eq!(aumid_from_parsing_name("Microsoft.WindowsStore_8wekyb3d8bbwe!App").as_deref(), want);
         assert_eq!(
-            aumid_from_parsing_name(r"shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App").as_deref(),
+            aumid_from_parsing_name("Microsoft.WindowsStore_8wekyb3d8bbwe!App").as_deref(),
+            want
+        );
+        assert_eq!(
+            aumid_from_parsing_name(r"shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App")
+                .as_deref(),
             want
         );
         assert_eq!(aumid_from_parsing_name(r"C:\Anki\anki.exe"), None);
@@ -1940,14 +2127,20 @@ mod dedup_tests {
     /// 期望：同一 exe、不同参数的两条是不同条目，都该留下（uid 规则含 arguments）。
     #[test]
     fn same_path_different_arguments_both_survive() {
-        let v = dedup_items(vec![with_args("cmd.exe", "/k ping"), with_args("cmd.exe", "/k ipconfig")]);
+        let v = dedup_items(vec![
+            with_args("cmd.exe", "/k ping"),
+            with_args("cmd.exe", "/k ipconfig"),
+        ]);
         assert_eq!(v.len(), 2, "实际只留下 {} 条", v.len());
     }
 
     /// 同一 path + 同一参数（含大小写差）仍是同一条，必须合并。
     #[test]
     fn same_path_same_arguments_dedups_case_insensitively() {
-        let v = dedup_items(vec![with_args("CMD.exe", "/K PING"), with_args("cmd.exe", "/k ping ")]);
+        let v = dedup_items(vec![
+            with_args("CMD.exe", "/K PING"),
+            with_args("cmd.exe", "/k ping "),
+        ]);
         assert_eq!(v.len(), 1, "实际留下 {} 条", v.len());
     }
 
@@ -1957,8 +2150,14 @@ mod dedup_tests {
     #[test]
     fn builtin_seeds_cover_the_factory_set() {
         let seeds = builtin_seeds();
-        let has = |kw: &str| seeds.iter().any(|s| s.keyword.split_whitespace().any(|w| w == kw));
-        for kw in ["np", "hosts", "dl", "docs", "ipconfig", "ping", "altrun", "maps"] {
+        let has = |kw: &str| {
+            seeds
+                .iter()
+                .any(|s| s.keyword.split_whitespace().any(|w| w == kw))
+        };
+        for kw in [
+            "np", "hosts", "dl", "docs", "ipconfig", "ping", "altrun", "maps",
+        ] {
             assert!(has(kw), "出厂集里没有关键字 {kw}");
         }
         assert!(
@@ -1967,7 +2166,11 @@ mod dedup_tests {
         );
         // 这两条是本批两处机制的依赖：`{query}` 模板与「启动器目录」占位符。
         assert!(seeds.iter().any(|s| s.arguments == "/k ping {query}"));
-        assert!(seeds.iter().any(|s| s.path == crate::source::custom::LAUNCHER_DIR_PLACEHOLDER));
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.path == crate::source::custom::LAUNCHER_DIR_PLACEHOLDER)
+        );
         // 同 uid 的两条会在 dedup_items 里被悄悄吃掉一条。
         let mut uids: Vec<String> = seeds.iter().map(|s| s.uid()).collect();
         let before = uids.len();
@@ -1999,12 +2202,30 @@ mod dedup_tests {
     #[test]
     fn hidden_uids_are_dropped_and_nothing_else_is() {
         let mut items = vec![
-            LaunchItem { name: "关机".into(), path: "internal:shutdown".into(), kind: ItemKind::Internal, ..Default::default() },
-            LaunchItem { name: "记事本".into(), path: "notepad.exe".into(), kind: ItemKind::Command, ..Default::default() },
+            LaunchItem {
+                name: "关机".into(),
+                path: "internal:shutdown".into(),
+                kind: ItemKind::Internal,
+                ..Default::default()
+            },
+            LaunchItem {
+                name: "记事本".into(),
+                path: "notepad.exe".into(),
+                kind: ItemKind::Command,
+                ..Default::default()
+            },
         ];
         let uid = items[0].uid();
-        assert_eq!(drop_hidden(&mut items, &["   ".to_string()]), 0, "空白项不算隐藏");
-        assert_eq!(drop_hidden(&mut items, &[uid.clone(), uid]), 1, "重复 uid 只剔一条");
+        assert_eq!(
+            drop_hidden(&mut items, &["   ".to_string()]),
+            0,
+            "空白项不算隐藏"
+        );
+        assert_eq!(
+            drop_hidden(&mut items, &[uid.clone(), uid]),
+            1,
+            "重复 uid 只剔一条"
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "记事本");
         assert_eq!(drop_hidden(&mut items, &[]), 0);
@@ -2015,10 +2236,22 @@ mod dedup_tests {
     fn factory_seeds_include_the_system_command_groups() {
         let seeds = builtin_seeds();
         let count = |pred: fn(&LaunchItem) -> bool| seeds.iter().filter(|s| pred(s)).count();
-        assert_eq!(count(|s| s.kind == ItemKind::Internal && s.path == "internal:shutdown"), 1);
-        assert!(count(|s| s.path.starts_with("ms-settings:")) >= 30, "ms-settings 页没接进来");
-        assert!(count(|s| s.path == "devmgmt.msc") == 1, "Windows 工具没接进来");
-        assert!(count(|s| s.path == "internal:volume-mute") == 1, "音量与媒体没接进来");
+        assert_eq!(
+            count(|s| s.kind == ItemKind::Internal && s.path == "internal:shutdown"),
+            1
+        );
+        assert!(
+            count(|s| s.path.starts_with("ms-settings:")) >= 30,
+            "ms-settings 页没接进来"
+        );
+        assert!(
+            count(|s| s.path == "devmgmt.msc") == 1,
+            "Windows 工具没接进来"
+        );
+        assert!(
+            count(|s| s.path == "internal:volume-mute") == 1,
+            "音量与媒体没接进来"
+        );
     }
 
     /// 出厂条目的关键字两两不能撞：撞了设置页一开局就报一串警告，而且触发独占时
@@ -2050,7 +2283,11 @@ mod dedup_tests {
             serde_json::from_str(r#"{"space_to_run":true}"#).expect("旧偏好应可解析");
         assert_eq!(s.space_to_run, SpaceRun::Always);
         assert_eq!(s.tab_mode, TabMode::Complete);
-        assert_eq!(s.learn_rank, LearnRank::Count, "旧偏好没有 learn_rank ⇒ 默认甲");
+        assert_eq!(
+            s.learn_rank,
+            LearnRank::Count,
+            "旧偏好没有 learn_rank ⇒ 默认甲"
+        );
         let empty: AppSettings = serde_json::from_str("{}").expect("空偏好应可解析");
         assert_eq!(
             (empty.space_to_run, empty.tab_mode),
@@ -2079,7 +2316,10 @@ mod dedup_tests {
             ..Default::default()
         })
         .expect("档位应能序列化");
-        assert!(json.contains(r#""space_to_run":"unique""#), "实际写盘：{json}");
+        assert!(
+            json.contains(r#""space_to_run":"unique""#),
+            "实际写盘：{json}"
+        );
         assert!(json.contains(r#""learn_rank":"count""#), "实际写盘：{json}");
         assert!(serde_json::from_str::<AppSettings>(r#"{"space_to_run":"wod"}"#).is_err());
         assert!(serde_json::from_str::<AppSettings>(r#"{"learn_rank":"decayy"}"#).is_err());
@@ -2096,7 +2336,11 @@ mod dedup_tests {
         let known: AppSettings = serde_json::from_str(r#"{"terminal_shell":"pwsh"}"#).unwrap();
         assert_eq!(known.term_shell(), TermShell::Pwsh);
         let unknown: AppSettings = serde_json::from_str(r#"{"terminal_shell":"bash"}"#).unwrap();
-        assert_eq!(unknown.term_shell(), TermShell::Cmd, "陌生名字回落默认，不判坏配置");
+        assert_eq!(
+            unknown.term_shell(),
+            TermShell::Cmd,
+            "陌生名字回落默认，不判坏配置"
+        );
         let d = AppSettings::default();
         assert_eq!(d.terminal_shell, "cmd");
     }
@@ -2106,7 +2350,10 @@ mod dedup_tests {
         // 2026-10-23 A6：整份配置缺失/判坏时走的是 `Default`，派生实现给的是空表 ⇒
         // 首次运行与 E1 重建后的网页搜索一条引擎都没有。手写 Default 修的就是这一刻。
         let d = AppSettings::default();
-        assert_eq!(d.web_engines.len(), crate::source::websearch::builtin_engines().len());
+        assert_eq!(
+            d.web_engines.len(),
+            crate::source::websearch::builtin_engines().len()
+        );
         assert!(d.web_engines.iter().any(|e| e.keyword == "g"));
         assert!(d.sources_off.is_empty());
     }
@@ -2144,7 +2391,11 @@ mod dedup_tests {
             kind: ItemKind::Command,
             ..Default::default()
         };
-        assert_eq!(target_stem(&tmpl), None, "带 {{query}} 的路径由用户参数决定");
+        assert_eq!(
+            target_stem(&tmpl),
+            None,
+            "带 {{query}} 的路径由用户参数决定"
+        );
     }
 
     #[test]
@@ -2155,16 +2406,25 @@ mod dedup_tests {
             ..Default::default()
         };
         assert!(!learn_alias(&mut it, "jsq"), "已在别名里 ⇒ 不重复攒");
-        assert!(!learn_alias(&mut it, "j"), "单字不攒：会给所有含 j 的查询喂 30 档噪声");
+        assert!(
+            !learn_alias(&mut it, "j"),
+            "单字不攒：会给所有含 j 的查询喂 30 档噪声"
+        );
         assert!(!learn_alias(&mut it, "计算器"), "等于名称 ⇒ 没有可学的");
-        assert!(!learn_alias(&mut it, "计算"), "名称里已有的词不学：只会让重复关键字表多一行");
+        assert!(
+            !learn_alias(&mut it, "计算"),
+            "名称里已有的词不学：只会让重复关键字表多一行"
+        );
         assert!(!learn_alias(&mut it, "  "), "空白词不攒");
         assert!(learn_alias(&mut it, "CALC"), "新的两字符以上触发词应攒下");
         assert_eq!(it.keyword, "jsq calc", "空格追加，不动默认拼音首字母");
         assert!(!learn_alias(&mut it, "calc"), "大小写去重");
 
-        let mut bare =
-            LaunchItem { name: "Notepad".to_string(), keyword: String::new(), ..Default::default() };
+        let mut bare = LaunchItem {
+            name: "Notepad".to_string(),
+            keyword: String::new(),
+            ..Default::default()
+        };
         assert!(learn_alias(&mut bare, "np"));
         assert_eq!(bare.keyword, "np", "原本无别名时直接落第一个词");
     }
@@ -2173,13 +2433,24 @@ mod dedup_tests {
     /// 否则一律视为别人建的文件——既不认作"已安装"，卸载时也会拒绝碰它。
     #[test]
     fn startup_ownership_needs_both_target_and_startup_arg() {
-        assert!(is_our_startup_link("C:\\a\\egui-launcher.exe", "C:\\a\\egui-launcher.exe", "-Startup"));
+        assert!(is_our_startup_link(
+            "C:\\a\\egui-launcher.exe",
+            "C:\\a\\egui-launcher.exe",
+            "-Startup"
+        ));
         assert!(
             is_our_startup_link("C:\\a\\e.exe", "C:\\a\\e.exe", " -Startup "),
             "启动夹里的参数串可能带首尾空格，不参与判断"
         );
-        assert!(!is_our_startup_link("C:\\a\\e.exe", "C:\\a\\e.exe", ""), "无参数＝不是本项");
-        assert!(!is_our_startup_link("C:\\a\\e.exe", "C:\\a\\e.exe", "-PREFERENCES"));
+        assert!(
+            !is_our_startup_link("C:\\a\\e.exe", "C:\\a\\e.exe", ""),
+            "无参数＝不是本项"
+        );
+        assert!(!is_our_startup_link(
+            "C:\\a\\e.exe",
+            "C:\\a\\e.exe",
+            "-PREFERENCES"
+        ));
         assert!(
             !is_our_startup_link("C:\\a\\e.exe", "C:\\b\\other.exe", "-Startup"),
             "target 不是本 exe ⇒ 别人的快捷方式"
@@ -2199,7 +2470,10 @@ mod dedup_tests {
         let key = exe.canonicalize().unwrap().to_string_lossy().into_owned();
         let plain = exe.to_string_lossy().into_owned();
         assert!(is_self_target(&plain, &key), "本 exe 必须被判成自己");
-        assert!(is_self_target(&plain.to_uppercase(), &key), "快捷方式里大小写不同也要认出来");
+        assert!(
+            is_self_target(&plain.to_uppercase(), &key),
+            "快捷方式里大小写不同也要认出来"
+        );
         assert!(
             !is_self_target(r"C:\no-such-dir-here\zzz.exe", &key),
             "规范化失败 ⇒ 不跳过（宁可多收一条，不误判成自己）"
@@ -2215,15 +2489,15 @@ mod dedup_tests {
     /// "为了验证就往真启动夹写文件、还要注销登录一次"的成本，同时真验了落盘与解析。
     #[test]
     fn startup_link_round_trip_only_touches_temp_appdata() {
-        let base = std::env::temp_dir().join(format!("egui-launcher-startup-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("egui-launcher-startup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let old = std::env::var_os("APPDATA");
         // SAFETY: 本进程里只有 sendto/startup 两个前缀读 `APPDATA`，都不在这条测试之外被调用；
         // 结束即还原（含失败路径），不污染同进程其它测试线程。
         unsafe { std::env::set_var("APPDATA", &base) };
         let r = (|| -> Result<(), String> {
-            let startup_dir =
-                base.join(r"Microsoft\Windows\Start Menu\Programs\Startup");
+            let startup_dir = base.join(r"Microsoft\Windows\Start Menu\Programs\Startup");
             let link = startup_dir.join(STARTUP_LINK_NAME);
 
             let first = install_startup_link()?;
@@ -2253,7 +2527,9 @@ mod dedup_tests {
             if startup_installed() {
                 return Err("target 不是本 exe 却判已安装".to_string());
             }
-            let msg = uninstall_startup().err().ok_or("别人的快捷方式居然被删了")?;
+            let msg = uninstall_startup()
+                .err()
+                .ok_or("别人的快捷方式居然被删了")?;
             if !msg.contains("不是本程序创建") {
                 return Err(format!("拒删理由不对：{msg}"));
             }
@@ -2290,7 +2566,11 @@ mod dedup_tests {
         let log = dir.join("launcher.log");
 
         // ① 批次 O 留下的旧格式（首行没有锚）⇒ 归成「无日期」，不假装知道它是哪天。
-        std::fs::write(&log, "log: 本次启动没有控制台，stderr 已接到 X\nhotkey: ok\n").unwrap();
+        std::fs::write(
+            &log,
+            "log: 本次启动没有控制台，stderr 已接到 X\nhotkey: ok\n",
+        )
+        .unwrap();
         rotate_at(&log, "2026-10-19");
         assert!(!log.exists(), "无锚的旧文件应当被归档走");
         assert!(dir.join("launcher-无日期.log").exists());
@@ -2298,7 +2578,10 @@ mod dedup_tests {
         // ② 有锚且是昨天 ⇒ 按锚里的日期归档。
         std::fs::write(&log, format!("{LOG_DATE_TAG}2026-10-18 22:07 ｜ 昨天的\n")).unwrap();
         rotate_at(&log, "2026-10-19");
-        assert!(dir.join("launcher-2026-10-18.log").exists(), "跨天要按锚里的 2026-10-18 归档");
+        assert!(
+            dir.join("launcher-2026-10-18.log").exists(),
+            "跨天要按锚里的 2026-10-18 归档"
+        );
         assert!(!log.exists());
 
         // ③ 锚就是今天 ⇒ 一个字都不动（同日重启合进同一份）。
@@ -2311,7 +2594,10 @@ mod dedup_tests {
         std::fs::write(&log, format!("{LOG_DATE_TAG}昨天 ｜ 坏锚\n")).unwrap();
         rotate_at(&log, "2026-10-19");
         assert!(!log.exists());
-        assert!(dir.join("launcher-无日期.2.log").exists(), "同名归档该加序号，不该覆盖");
+        assert!(
+            dir.join("launcher-无日期.2.log").exists(),
+            "同名归档该加序号，不该覆盖"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2321,12 +2607,14 @@ mod dedup_tests {
     #[test]
     fn log_prune_keeps_newest_three_and_never_touches_foreign_names() {
         let dir = temp_log_dir("prune");
-        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let base =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         for i in 0..5u64 {
             let p = dir.join(format!("launcher-2026-01-0{}.log", i + 1));
             std::fs::write(&p, format!("第 {} 份", i + 1)).unwrap();
             let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
-            f.set_modified(base + std::time::Duration::from_secs(i * 86_400)).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(i * 86_400))
+                .unwrap();
         }
         // 01-01 最旧、01-05 最新 ⇒ 留 03/04/05。
         std::fs::write(dir.join("launcher.log"), "live").unwrap();
@@ -2336,10 +2624,16 @@ mod dedup_tests {
 
         prune_archives(&dir);
 
-        assert!(!dir.join("launcher-2026-01-01.log").exists(), "最旧的两份该被裁掉");
+        assert!(
+            !dir.join("launcher-2026-01-01.log").exists(),
+            "最旧的两份该被裁掉"
+        );
         assert!(!dir.join("launcher-2026-01-02.log").exists());
         for i in 3..=5 {
-            assert!(dir.join(format!("launcher-2026-01-0{i}.log")).exists(), "最近 3 份要留住");
+            assert!(
+                dir.join(format!("launcher-2026-01-0{i}.log")).exists(),
+                "最近 3 份要留住"
+            );
         }
         for (name, body) in [
             ("launcher.log", "live"),
@@ -2347,7 +2641,11 @@ mod dedup_tests {
             ("launcher-notes.log", "foreign"),
             ("launcher-2026-01-0a.log", "shaped-but-not"),
         ] {
-            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), body, "{name} 不该被动");
+            assert_eq!(
+                std::fs::read_to_string(dir.join(name)).unwrap(),
+                body,
+                "{name} 不该被动"
+            );
         }
 
         // 归属判据本体的边界：名字形状。
@@ -2367,7 +2665,10 @@ mod dedup_tests {
     #[test]
     fn local_stamp_is_iso_prefixed() {
         let s = local_now_stamp();
-        assert!(is_iso_date(&s[..10]), "前 10 字符必须是 YYYY-MM-DD，实得：{s}");
+        assert!(
+            is_iso_date(&s[..10]),
+            "前 10 字符必须是 YYYY-MM-DD，实得：{s}"
+        );
         let b = s.as_bytes();
         assert!(b[10] == b' ' && b[13] == b':' && b[11..13].iter().all(|c| c.is_ascii_digit()));
         assert_eq!(s.len(), 16, "完整横幅应为 YYYY-MM-DD HH:MM，实得：{s}");
@@ -2394,25 +2695,40 @@ mod dedup_tests {
 
         // ② 真坏了 ⇒ 改名留证，原位置腾出来。
         std::fs::write(&p, "「这不是 JSON」".as_bytes()).expect("写坏文件失败");
-        let fault = load_json::<Vec<LaunchItem>>(&p).err().expect("坏文件必须报 Err");
-        let Corrupted::Kept(kept) = fault else { panic!("第一次留证该成功，实得 {fault:?}") };
-        assert!(kept.exists() && !p.exists(), "证据该在 {kept:?}，原位置要腾出来");
+        let fault = load_json::<Vec<LaunchItem>>(&p)
+            .err()
+            .expect("坏文件必须报 Err");
+        let Corrupted::Kept(kept) = fault else {
+            panic!("第一次留证该成功，实得 {fault:?}")
+        };
+        assert!(
+            kept.exists() && !p.exists(),
+            "证据该在 {kept:?}，原位置要腾出来"
+        );
 
         // ③ `.bad` 那一族的名额被占满 ⇒ 不许就此说"没留住"，要走毫秒时间戳那一格。
         //    （真机那一次正是在这里翻车：报了"没留住"，调用方照常覆盖写。）
         for n in 0..BAD_NAME_SLOTS {
-            let suffix = if n == 0 { "bad".to_string() } else { format!("bad{n}") };
+            let suffix = if n == 0 {
+                "bad".to_string()
+            } else {
+                format!("bad{n}")
+            };
             std::fs::write(dir.join(format!("items.json.{suffix}")), b"x").expect("占名额失败");
         }
         std::fs::write(&p, "「还是不是 JSON」".as_bytes()).expect("第二次写坏文件失败");
-        let again = load_json::<Vec<LaunchItem>>(&p).err().expect("第二次坏文件必须报 Err");
+        let again = load_json::<Vec<LaunchItem>>(&p)
+            .err()
+            .expect("第二次坏文件必须报 Err");
         match again {
             // 时间戳那份与原文件都留着 ⇒ 这一格是"另存副本"还是"改名"都能接受，
             // 只要求：证据在、`Lost` 没出现。
             Corrupted::Kept(q) => {
                 assert!(q.exists(), "时间戳留证该落下文件，实得 {q:?}");
                 assert!(
-                    q.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("items.json.bad")),
+                    q.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("items.json.bad")),
                     "留证名要挂在原名后面，实得 {q:?}"
                 );
             }
@@ -2425,7 +2741,10 @@ mod dedup_tests {
         //    这次失败照样会走留证、把 `p` 改名出去，不许它影响上面三格。）
         std::fs::write(&p, &json).expect("重写真形状失败");
         let as_tuple = load_json::<(Vec<LaunchItem>, Option<u32>)>(&p);
-        assert!(as_tuple.is_err(), "按元组要求真清单必须失败，实得 Ok ⇒ 这条替身没照住旧形状");
+        assert!(
+            as_tuple.is_err(),
+            "按元组要求真清单必须失败，实得 Ok ⇒ 这条替身没照住旧形状"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2440,10 +2759,15 @@ mod dedup_tests {
     #[test]
     fn load_user_items_reads_back_a_file_it_just_wrote() {
         let list = user_list_path();
-        let here = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+        let here = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|p| p.to_path_buf()));
         let Some(exe_dir) = here else { return };
         if list.parent() != Some(exe_dir.as_path()) {
-            eprintln!("跳过：清单落盘位置 {} 不在测试 exe 同级 ⇒ 不往里写", list.display());
+            eprintln!(
+                "跳过：清单落盘位置 {} 不在测试 exe 同级 ⇒ 不往里写",
+                list.display()
+            );
             return;
         }
         let settings = settings_path();
@@ -2475,7 +2799,10 @@ mod dedup_tests {
         match load_user_items() {
             (empty, Some(Corrupted::Kept(kept))) => {
                 assert!(empty.is_empty(), "坏文件读回来必须是空");
-                assert!(kept.exists() && !list.exists(), "证据该在 {kept:?}，原位置该腾出来");
+                assert!(
+                    kept.exists() && !list.exists(),
+                    "证据该在 {kept:?}，原位置该腾出来"
+                );
                 let _ = std::fs::remove_file(&kept);
             }
             (_, other) => panic!("坏清单该走 Kept，实得 {other:?}"),
@@ -2488,7 +2815,9 @@ mod dedup_tests {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".test-backup"))
-            else { continue };
+            else {
+                continue;
+            };
             if let Some(dir) = back.parent() {
                 let _ = std::fs::rename(&back, dir.join(name));
             }
@@ -2515,7 +2844,10 @@ mod hotkey_tests {
     #[test]
     fn default_is_the_hardcoded_ctrl_alt_space() {
         // 这条钉住"批次 Q 之前写死的那一组数"= 出厂值，改了它等于偷偷换了用户认识的键。
-        assert_eq!(HotkeySpec::DEFAULT.mods, HKF_CONTROL | HKF_ALT | HKF_NOREPEAT);
+        assert_eq!(
+            HotkeySpec::DEFAULT.mods,
+            HKF_CONTROL | HKF_ALT | HKF_NOREPEAT
+        );
         assert_eq!(HotkeySpec::DEFAULT.vk, VK_SPACE);
         assert_eq!(HotkeySpec::default(), HotkeySpec::DEFAULT);
         assert!(HotkeySpec::DEFAULT.check().is_ok());
@@ -2571,22 +2903,44 @@ mod hotkey_tests {
         let ok = |mods, code| HotkeySpec { mods, vk: code }.check().is_ok();
         // 裸 `` ` ``：本批唯一的新例外，必须放行。
         assert!(ok(0, VK_OEM_3), "裸 ` 是批次 R 用户点名要的单键触发");
-        assert!(ok(HKF_NOREPEAT, VK_OEM_3), "NOREPEAT 是行为位，不该影响判据");
-        assert!(HotkeySpec { mods: HKF_NOREPEAT, vk: VK_OEM_3 }.backtick_bare());
+        assert!(
+            ok(HKF_NOREPEAT, VK_OEM_3),
+            "NOREPEAT 是行为位，不该影响判据"
+        );
+        assert!(
+            HotkeySpec {
+                mods: HKF_NOREPEAT,
+                vk: VK_OEM_3
+            }
+            .backtick_bare()
+        );
         // 带 Ctrl / Alt / Win 的 `` ` `` 照旧收（补字符热键就走 Win+`` ` ``这条路）。
         assert!(ok(HKF_CONTROL, VK_OEM_3));
         assert!(ok(HKF_ALT, VK_OEM_3));
         assert!(ok(HKF_WIN, VK_OEM_3));
         assert!(ok(HKF_CONTROL | HKF_ALT, VK_OEM_3));
         // 单带 Shift 的 `` ` `` 必须挡，而且挡的是"只有 Shift"这一种。
-        assert!(!ok(HKF_SHIFT, VK_OEM_3), "Shift+` 就是 ~，不能为了换 ` 把 ~ 也吞掉");
+        assert!(
+            !ok(HKF_SHIFT, VK_OEM_3),
+            "Shift+` 就是 ~，不能为了换 ` 把 ~ 也吞掉"
+        );
         assert!(!ok(HKF_SHIFT | HKF_NOREPEAT, VK_OEM_3));
-        assert!(ok(HKF_SHIFT | HKF_CONTROL, VK_OEM_3), "Ctrl+Shift+` 不是打字键，照收");
+        assert!(
+            ok(HKF_SHIFT | HKF_CONTROL, VK_OEM_3),
+            "Ctrl+Shift+` 不是打字键，照收"
+        );
         // 其它键的裸键照旧全部拒绝：例外只有 `` ` `` 一个。
         for code in [VK_A, VK_SPACE, VK_RETURN, vk('7'), VK_OEM_3 + 1, 0x2C] {
             assert!(!ok(0, code), "裸 0x{code:02X} 不在例外里");
         }
-        assert!(!HotkeySpec { mods: 0, vk: VK_SPACE }.backtick_bare(), "裸 Space 不许被认成例外");
+        assert!(
+            !HotkeySpec {
+                mods: 0,
+                vk: VK_SPACE
+            }
+            .backtick_bare(),
+            "裸 Space 不许被认成例外"
+        );
     }
 
     /// 补字符热键比呼出热键多两条规矩：必须带修饰键，且不能和呼出热键撞成同一组。
@@ -2594,7 +2948,12 @@ mod hotkey_tests {
     fn typeback_needs_a_modifier_and_must_differ_from_toggle() {
         let bt = |mods, code| HotkeySpec { mods, vk: code };
         let toggle = bt(HKF_NOREPEAT, VK_OEM_3); // 裸 `（用户设的那一种）
-        assert!(bt(HKF_WIN | HKF_NOREPEAT, VK_OEM_3).check_typeback(&toggle).is_ok(), "Win+` 是标准答案");
+        assert!(
+            bt(HKF_WIN | HKF_NOREPEAT, VK_OEM_3)
+                .check_typeback(&toggle)
+                .is_ok(),
+            "Win+` 是标准答案"
+        );
         assert!(bt(HKF_CONTROL, VK_OEM_3).check_typeback(&toggle).is_ok());
         assert!(bt(HKF_ALT, vk('L')).check_typeback(&toggle).is_ok());
         // 裸键当补字符键 = 把"吞字符"这件事换个地方再做一遍。
@@ -2603,10 +2962,14 @@ mod hotkey_tests {
         // 和呼出键同一组：系统只会把它当呼出键，补字符永远不会发生。
         // 用出厂键当呼出侧，顺带钉住"比对不看 NOREPEAT"（一个带、一个不带，仍算同一组）。
         let strong = bt(HKF_CONTROL | HKF_ALT | HKF_NOREPEAT, VK_SPACE);
-        let same = bt(HKF_CONTROL | HKF_ALT, VK_SPACE).check_typeback(&strong).unwrap_err();
+        let same = bt(HKF_CONTROL | HKF_ALT, VK_SPACE)
+            .check_typeback(&strong)
+            .unwrap_err();
         assert!(same.contains("同一组"), "实得：{same}");
         // 先过通用判据：不在可录集合里的码，理由要来自 check()。
-        let bad = bt(HKF_CONTROL, VK_BACK).check_typeback(&toggle).unwrap_err();
+        let bad = bt(HKF_CONTROL, VK_BACK)
+            .check_typeback(&toggle)
+            .unwrap_err();
         assert!(bad.contains("只收"), "实得：{bad}");
     }
 
@@ -2617,14 +2980,42 @@ mod hotkey_tests {
             (HKF_CONTROL | HKF_NOREPEAT, vk('I')),
             (HKF_CONTROL | HKF_SHIFT, vk('D')),
         ];
-        assert!(HotkeySpec { mods: HKF_CONTROL, vk: vk('I') }.conflicts_local(&table));
         assert!(
-            HotkeySpec { mods: HKF_CONTROL | HKF_NOREPEAT, vk: vk('I') }.conflicts_local(&table)
+            HotkeySpec {
+                mods: HKF_CONTROL,
+                vk: vk('I')
+            }
+            .conflicts_local(&table)
         );
-        assert!(HotkeySpec { mods: HKF_CONTROL | HKF_SHIFT, vk: vk('D') }.conflicts_local(&table));
+        assert!(
+            HotkeySpec {
+                mods: HKF_CONTROL | HKF_NOREPEAT,
+                vk: vk('I')
+            }
+            .conflicts_local(&table)
+        );
+        assert!(
+            HotkeySpec {
+                mods: HKF_CONTROL | HKF_SHIFT,
+                vk: vk('D')
+            }
+            .conflicts_local(&table)
+        );
         // Shift 是实义修饰键，不能和 Ctrl+D 混为一谈。
-        assert!(!HotkeySpec { mods: HKF_CONTROL, vk: vk('D') }.conflicts_local(&table));
-        assert!(!HotkeySpec { mods: HKF_CONTROL, vk: vk('J') }.conflicts_local(&table));
+        assert!(
+            !HotkeySpec {
+                mods: HKF_CONTROL,
+                vk: vk('D')
+            }
+            .conflicts_local(&table)
+        );
+        assert!(
+            !HotkeySpec {
+                mods: HKF_CONTROL,
+                vk: vk('J')
+            }
+            .conflicts_local(&table)
+        );
     }
 
     #[test]
@@ -2634,16 +3025,28 @@ mod hotkey_tests {
         let s: AppSettings = serde_json::from_slice(old).expect("旧文件应能解析");
         assert_eq!(s.toggle_hotkey, HotkeySpec::DEFAULT);
         // 批次 R 新字段：老文件里连 `typeback_hotkey` 这个键都没有 ⇒ 必须是"不启用"，不是崩。
-        assert_eq!(s.typeback_hotkey, None, "没有补字符热键字段的老文件应读成 None");
+        assert_eq!(
+            s.typeback_hotkey, None,
+            "没有补字符热键字段的老文件应读成 None"
+        );
 
         let custom = AppSettings {
-            toggle_hotkey: HotkeySpec { mods: HKF_ALT | HKF_NOREPEAT, vk: vk_f(6) },
-            typeback_hotkey: Some(HotkeySpec { mods: HKF_WIN | HKF_NOREPEAT, vk: VK_OEM_3 }),
+            toggle_hotkey: HotkeySpec {
+                mods: HKF_ALT | HKF_NOREPEAT,
+                vk: vk_f(6),
+            },
+            typeback_hotkey: Some(HotkeySpec {
+                mods: HKF_WIN | HKF_NOREPEAT,
+                vk: VK_OEM_3,
+            }),
             ..AppSettings::default()
         };
         let json = serde_json::to_string(&custom).unwrap();
         // 存的是裸数（十进制），不引入枚举/字符串编码。
-        assert!(json.contains("\"toggle_hotkey\":{\"mods\":"), "应为数值对，实得：{json}");
+        assert!(
+            json.contains("\"toggle_hotkey\":{\"mods\":"),
+            "应为数值对，实得：{json}"
+        );
         assert!(
             json.contains("\"typeback_hotkey\":{\"mods\":16392,\"vk\":192}"),
             "补字符热键要写成同样的数值对（Win+` = HKF_WIN 8 | HKF_NOREPEAT 16384 = 16392，vk 192），实得：{json}"
@@ -2663,9 +3066,15 @@ mod hotkey_tests {
     #[test]
     fn list_rows_defaults_to_all_and_round_trips_both_names() {
         let s: AppSettings = serde_json::from_str("{}").expect("空偏好应可解析");
-        assert_eq!(s.list_rows, ListRows::All, "缺字段 / 整份缺失都按 Delphi 口径");
+        assert_eq!(
+            s.list_rows,
+            ListRows::All,
+            "缺字段 / 整份缺失都按 Delphi 口径"
+        );
         assert!(
-            serde_json::to_string(&s).unwrap().contains(r#""list_rows":"all""#),
+            serde_json::to_string(&s)
+                .unwrap()
+                .contains(r#""list_rows":"all""#),
             "落盘用稳定名 all"
         );
 
@@ -2686,7 +3095,9 @@ mod hotkey_tests {
         let s: AppSettings = serde_json::from_str("{}").expect("空偏好应可解析");
         assert_eq!(s.row_density, RowDensity::Snug, "缺字段 / 整份缺失都按甲档");
         assert!(
-            serde_json::to_string(&s).unwrap().contains(r#""row_density":"snug""#),
+            serde_json::to_string(&s)
+                .unwrap()
+                .contains(r#""row_density":"snug""#),
             "落盘用稳定名 snug"
         );
 
@@ -2700,7 +3111,11 @@ mod hotkey_tests {
             let json = format!(r#"{{"row_density":"{name}"}}"#);
             let got: AppSettings = serde_json::from_str(&json).expect("四个档位名都应可解析");
             assert_eq!(got.row_density, want, "稳定名 {name} 读错了档");
-            assert_eq!(want.as_str(), name, "as_str 与 serde 名不一致：日志会说出另一个档");
+            assert_eq!(
+                want.as_str(),
+                name,
+                "as_str 与 serde 名不一致：日志会说出另一个档"
+            );
         }
 
         // 与 list_rows 同口径：不认识的档位名报错，不静默回落。
@@ -2713,15 +3128,24 @@ mod hotkey_tests {
     fn source_switches_round_trip_and_ignore_unknown_ids() {
         let s: AppSettings = serde_json::from_slice(br#"{"space_to_run":"word"}"#)
             .expect("没有 sources_off 字段的老文件应能解析");
-        assert!(SourceId::ALL.iter().all(|id| s.source_on(*id)), "字段缺省 ⇒ 全部启用");
+        assert!(
+            SourceId::ALL.iter().all(|id| s.source_on(*id)),
+            "字段缺省 ⇒ 全部启用"
+        );
 
         let mut s = s;
         assert!(s.set_source(SourceId::Files, false), "第一次关应有变化");
-        assert!(!s.set_source(SourceId::Files, false), "重复关同一个源不算变化（调用方据此决定写不写盘）");
+        assert!(
+            !s.set_source(SourceId::Files, false),
+            "重复关同一个源不算变化（调用方据此决定写不写盘）"
+        );
         assert!(!s.source_on(SourceId::Files));
         assert!(s.source_on(SourceId::Apps), "只关一个源，别的不受影响");
         let json = serde_json::to_string(&s).expect("应能序列化");
-        assert!(json.contains(r#""sources_off":["files"]"#), "实际写盘：{json}");
+        assert!(
+            json.contains(r#""sources_off":["files"]"#),
+            "实际写盘：{json}"
+        );
 
         let mut back: AppSettings = serde_json::from_str(&json).expect("应能读回");
         assert!(!back.source_on(SourceId::Files), "关掉的源跨启动保持关闭");
@@ -2740,7 +3164,11 @@ mod hotkey_tests {
         // 来源一：windows-0.62.2 绑定源 `Foundation/mod.rs:2677`。
         assert_eq!(ERROR_HOTKEY_ALREADY_REGISTERED, 1409);
         // 来源二：需求书附录 E E-01 在真机实测到的 `RegisterHotKey` 失败 HRESULT。
-        assert_eq!(ERROR_HOTKEY_ALREADY_REGISTERED, 0x8007_0581 & 0xFFFF, "低字就是 Win32 码");
+        assert_eq!(
+            ERROR_HOTKEY_ALREADY_REGISTERED,
+            0x8007_0581 & 0xFFFF,
+            "低字就是 Win32 码"
+        );
         // 1410 是 ERROR_CLASS_ALREADY_EXISTS：写错的后果不是崩，而是"已被系统或其它程序占用"
         // 那句提示永远不显示，退化成裸错误码——静默的错，所以这条断言留着。
         assert_ne!(ERROR_HOTKEY_ALREADY_REGISTERED, 1410);

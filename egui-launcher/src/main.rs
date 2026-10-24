@@ -15,20 +15,20 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuEvent, MenuItem},
 };
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, CloseHandle, GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM,
     LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
+use windows::core::PCWSTR;
 // FR-SRC-10：计算器结果行 Enter ＝「把纯数字写进剪贴板」。三件套在 DataExchange，
 // GlobalAlloc/GlobalLock 在 Memory（该模块没有 feature 门，已随 Win32_Foundation 白送）。
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 // 批次 A2（FR-SRC-17）「锁定屏幕」。走 API 而不是 `rundll32 user32.dll,LockWorkStation`：
 // 少起一个进程，也就没有控制台窗口闪烁那一档事。
 use windows::Win32::System::Shutdown::LockWorkStation;
@@ -36,26 +36,26 @@ use windows::Win32::System::Threading::{
     CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
     WaitForSingleObject,
 };
+use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MapVirtualKeyW, RegisterHotKey, SendInput,
-    UnregisterHotKey, VIRTUAL_KEY, MAPVK_VK_TO_CHAR, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR, MapVirtualKeyW, RegisterHotKey,
+    SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE,
     VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
-use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Shell::{
-    SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW, SEE_MASK_FLAG_NO_UI,
-    ShellExecuteExW, SHELLEXECUTEINFOW,
+    SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI,
+    SHERB_NOSOUND, SHEmptyRecycleBinW, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
-    GetWindowThreadProcessId, HWND_BROADCAST, IsIconic, KillTimer, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SC_MONITORPOWER, SendMessageTimeoutW, SetTimer, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HWND_MESSAGE, MSG, MSGFLT_ALLOW,
-    SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WM_APP,
-    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW, WINDOW_EX_STYLE,
-    WINDOW_STYLE,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ChangeWindowMessageFilterEx, CreateWindowExW,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowThreadProcessId, HWND_BROADCAST,
+    HWND_MESSAGE, IsIconic, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetTimer, SetWindowPos, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COPYDATA, WM_DESTROY, WM_HOTKEY,
+    WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW,
 };
 
 /// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
@@ -69,19 +69,19 @@ mod matching;
 mod source;
 mod theme;
 use source::application::{
-    default_keyword, dedup_items, is_url, learn_alias, make_item_from_input, Corrupted, ItemKind,
-    LaunchItem, LearnRank, ListRows, RowDensity, SpaceRun, TabMode,
+    Corrupted, ItemKind, LaunchItem, LearnRank, ListRows, RowDensity, SpaceRun, TabMode,
+    dedup_items, default_keyword, is_url, learn_alias, make_item_from_input,
 };
 // FR-WIN-02（批次 Q）：热键的位值与 VK 码用 application 侧的那套常量，判据与展示名才能
 // 在纯函数里单测；调 RegisterHotKey 时再包成 HOT_KEY_MODIFIERS。
 // 批次 R 起 `HKF_WIN` 运行期也要用了：补字符键的四个复选框（照 Delphi 版 frmConfig 的形态）
 // 是这台机器上唯一能把 Win 位设进去的入口——录制路径产不出它，见 `spec_from_press` 的注释。
 use source::application::{
-    ERROR_HOTKEY_ALREADY_REGISTERED, HotkeySpec, HKF_ALT, HKF_CONTROL, HKF_NOREPEAT, HKF_SHIFT,
-    HKF_WIN, VK_0, VK_9, VK_A, VK_F1, VK_F24, VK_OEM_3, VK_RETURN, VK_SPACE, VK_Z,
+    ERROR_HOTKEY_ALREADY_REGISTERED, HKF_ALT, HKF_CONTROL, HKF_NOREPEAT, HKF_SHIFT, HKF_WIN,
+    HotkeySpec, VK_0, VK_9, VK_A, VK_F1, VK_F24, VK_OEM_3, VK_RETURN, VK_SPACE, VK_Z,
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // 批次 A10：行模型与列表计划搬进了数据源层；这里保留旧名，五千行 UI 代码一个字不用改。
@@ -162,7 +162,10 @@ fn dialog_for_sent_path(p: &str) -> DialogState {
 
 /// 抢命名互斥体：Some=本进程是主实例（句柄需活到进程退出）；None=已有实例。
 fn acquire_single_instance() -> Option<HANDLE> {
-    let name: Vec<u16> = SINGLE_INSTANCE_MUTEX.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = SINGLE_INSTANCE_MUTEX
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         match CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
             Ok(h) => {
@@ -221,7 +224,10 @@ unsafe fn copy_data_payload(cds: &CopyDataStruct) -> Option<String> {
 /// 向运行中实例发一条 WM_COPYDATA；2s 超时（SMTO_ABORTIFHUNG）。
 /// NoWindow=消息窗还没出现（旧实例可能在启动中）；Timeout=窗口在但没应答（按卡死处理）。
 fn send_ipc_op(opcode: usize, payload: &str) -> IpcSendStatus {
-    let class: Vec<u16> = IPC_WINDOW_CLASS.encode_utf16().chain(std::iter::once(0)).collect();
+    let class: Vec<u16> = IPC_WINDOW_CLASS
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }) else {
         return IpcSendStatus::NoWindow;
     };
@@ -242,16 +248,22 @@ fn send_ipc_op(opcode: usize, payload: &str) -> IpcSendStatus {
             2000,
             None,
         )
-        .0
-            != 0
+        .0 != 0
     };
-    if acked { IpcSendStatus::Ack } else { IpcSendStatus::Timeout }
+    if acked {
+        IpcSendStatus::Ack
+    } else {
+        IpcSendStatus::Timeout
+    }
 }
 
 /// FR-WIN-07：旧实例对 IPC 无应答 ⇒ 按卡死处理，结束它，供本进程接管。
 /// 只认本程序的消息窗类名，避免误杀其它进程。
 fn kill_hung_instance() -> bool {
-    let class: Vec<u16> = IPC_WINDOW_CLASS.encode_utf16().chain(std::iter::once(0)).collect();
+    let class: Vec<u16> = IPC_WINDOW_CLASS
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }) else {
         eprintln!("single instance: 找不到旧实例的消息窗，无法结束它");
         return false;
@@ -456,7 +468,11 @@ impl DialogState {
             path: hit.path.clone(),
             arguments: String::new(),
             working_dir: String::new(),
-            kind: if hit.is_dir { ItemKind::Folder } else { ItemKind::File },
+            kind: if hit.is_dir {
+                ItemKind::Folder
+            } else {
+                ItemKind::File
+            },
             source_path: hit.path.clone(),
         }
     }
@@ -477,8 +493,7 @@ impl DialogState {
     fn to_item(&self) -> LaunchItem {
         let name = self.name.trim().to_string();
         let name = if name.is_empty() {
-            self
-                .path
+            self.path
                 .rsplit(['\\', '/'])
                 .next()
                 .unwrap_or(&self.path)
@@ -490,8 +505,11 @@ impl DialogState {
         let wd = self.working_dir.trim();
         let path = self.path.trim().to_string();
         // 用户在对话框里把命令行改成 `www.…`/`…://…`/协议形态时，类型自动跟到 Url（预填推断可能判成 Command）。
-        let kind =
-            if self.kind == ItemKind::Command && is_url(&path) { ItemKind::Url } else { self.kind };
+        let kind = if self.kind == ItemKind::Command && is_url(&path) {
+            ItemKind::Url
+        } else {
+            self.kind
+        };
         // 别名留空时按名称自动生成拼音首字母（FR-SRC-22）；用户填了则尊重用户输入。
         let kw = {
             let k = self.keyword.trim();
@@ -504,9 +522,17 @@ impl DialogState {
         LaunchItem {
             name,
             path,
-            source_path: if self.source_path.trim().is_empty() { self.path.trim().to_string() } else { self.source_path.trim().to_string() },
+            source_path: if self.source_path.trim().is_empty() {
+                self.path.trim().to_string()
+            } else {
+                self.source_path.trim().to_string()
+            },
             arguments: self.arguments.clone(),
-            working_dir: if wd.is_empty() { None } else { Some(wd.to_string()) },
+            working_dir: if wd.is_empty() {
+                None
+            } else {
+                Some(wd.to_string())
+            },
             kind,
             keyword: kw,
             // 新建默认未置顶、零统计；编辑既有项的置顶/使用统计在 DlgResult::Confirm 提交时旧值携带回填。
@@ -580,7 +606,9 @@ fn win_cursor() -> Option<(i32, i32)> {
 
 fn win_origin(hwnd: HWND) -> Option<(i32, i32)> {
     let mut r = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut r) }.ok().map(|_| (r.left, r.top))
+    unsafe { GetWindowRect(hwnd, &mut r) }
+        .ok()
+        .map(|_| (r.left, r.top))
 }
 
 fn win_size(hwnd: HWND) -> Option<(i32, i32)> {
@@ -592,24 +620,24 @@ fn win_size(hwnd: HWND) -> Option<(i32, i32)> {
 
 struct LauncherApp {
     query: String,
-    items: Vec<LaunchItem>,           // 当前显示项 = 内置种子 + 用户清单（去重后）
-    index: matching::MatchIndex,      // FR-QRY-06 匹配键缓存（名称/别名的 lower/words/initials）
+    items: Vec<LaunchItem>,      // 当前显示项 = 内置种子 + 用户清单（去重后）
+    index: matching::MatchIndex, // FR-QRY-06 匹配键缓存（名称/别名的 lower/words/initials）
     apps_tx: mpsc::Sender<Vec<LaunchItem>>, // 「批量导入」触发端（可 clone）
     apps_rx: mpsc::Receiver<Vec<LaunchItem>>, // 「批量导入」后台扫描结果通道
     clear_query_next_frame: bool,
-    selected: usize,              // FR-QRY/基线：当前键盘选中的结果行
-    scroll_followed: usize,       // FR-ACT-10：列表上次已跟随到位的选中行（与 selected 不等即本帧要滚动）
-    focus_query: bool,            // 呼出后请求把键盘焦点给搜索框
-    dialog: Option<DialogState>,  // FR-SRC-20 添加/编辑对话框（Some=打开）
+    selected: usize,                           // FR-QRY/基线：当前键盘选中的结果行
+    scroll_followed: usize, // FR-ACT-10：列表上次已跟随到位的选中行（与 selected 不等即本帧要滚动）
+    focus_query: bool,      // 呼出后请求把键盘焦点给搜索框
+    dialog: Option<DialogState>, // FR-SRC-20 添加/编辑对话框（Some=打开）
     confirm: Option<ConfirmRequest>, // 删除确认弹窗（Some=打开；2026-10-18 用户要求，删除不再一键生效）
     internal_confirm: Option<InternalConfirm>, // 批次 A2：关机/重启/注销/清空回收站的执行确认
-    about_open: bool,             // 批次 A2：「关于本程序」弹窗（Some 的等价物，用 bool 更直白）
+    about_open: bool,                // 批次 A2：「关于本程序」弹窗（Some 的等价物，用 bool 更直白）
     help_entry: Option<source::cheatsheet::CheatHit>, // 批次 A8：速查表条目的帮助页（Some=打开）
     /// 批次 F6：顶栏 ☰ 主菜单是否开着（2026-10-24 用户点名「换成一个三条杠的菜单，点击显示
     /// 新建按钮和其他设置按钮」）。用裸 bool 而不是 egui 的 memory：快捷键 Ctrl+M 也要能开它，
     /// `egui::Popup::open_bool` 正好吃这一个所有权，关闭（点击/Esc）由 Popup 写回 `false`。
     menu_open: bool,
-    win_drag: Option<DragAnchor>,    // 左键拖空白移动窗口的进行中锚点（None=没在拖）
+    win_drag: Option<DragAnchor>, // 左键拖空白移动窗口的进行中锚点（None=没在拖）
     dialog_enter_armed: bool,     // 弹窗当帧吞掉 Enter，防"打开框的那次回车"当帧又触发对话框的确定
     settings_open: bool,          // 设置页（整页模式，替代搜索页；2026-10-17 用户要求）
     settings_tab: SettingsTab,    // 设置页当前分类
@@ -655,8 +683,8 @@ struct LauncherApp {
     ime_before: Option<ImeState>, // E-05 呼出前的输入法状态
     self_hwnd: Option<HWND>,      // E-05 本机顶层窗口，切英文模式时对它发 WM_IME_CONTROL
     // FR-WIN-04 失焦关闭到托盘
-    hide_at: Option<Instant>,     // 到点复查仍失焦则关闭到托盘
-    had_focus_since_show: bool,   // 呼出后是否真正拿到过焦点（守卫：防异步 Focus 未生效那一帧误关闭）
+    hide_at: Option<Instant>,   // 到点复查仍失焦则关闭到托盘
+    had_focus_since_show: bool, // 呼出后是否真正拿到过焦点（守卫：防异步 Focus 未生效那一帧误关闭）
     // 底部居中悬浮 Toast（FR-ACT-02 启动失败 + 各操作回执；deadline 到点自动消失）
     toast: Option<(String, Instant, egui::Color32)>,
     // ---- FR-WIN-02 热键可配置（批次 Q）----
@@ -696,7 +724,10 @@ fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths
                     let nonzero = rgba.iter().filter(|&&v| v != 0).count();
                     eprintln!(
                         "icon probe: 首个成功 {}x{}，非零字节 {}/{}  ← {}",
-                        w, h, nonzero, rgba.len(),
+                        w,
+                        h,
+                        nonzero,
+                        rgba.len(),
                         source_path.rsplit('\\').next().unwrap_or("?")
                     );
                     first_logged = true;
@@ -713,7 +744,10 @@ fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths
 
 /// FR-SRC-19 学习排序的时间戳源：UNIX 毫秒，落盘后可跨进程比较。
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // Ctrl+D 打开文件所在目录的选路判据：path 展开 %VAR% 后是绝对存在的文件用 path，
@@ -874,7 +908,9 @@ const ROW_STEP_EXTRA: f32 = 4.0;
 /// 一页可见行数，至少 1（窗口拉到只装得下一行时翻页仍要能动）。
 /// `row_height` 是 [`row_geometry`] 给的实际步进（行高 + 行距）；`chrome` 见 [`list_chrome_h`]。
 fn page_rows(available_height: f32, row_height: f32, chrome: f32) -> usize {
-    ((available_height - chrome) / row_height.max(1.0)).floor().max(1.0) as usize
+    ((available_height - chrome) / row_height.max(1.0))
+        .floor()
+        .max(1.0) as usize
 }
 
 /// 翻页落点：向下夹到最后一行，向上夹到第一行。
@@ -908,7 +944,9 @@ fn commit_word(query: &str, via_digit: bool) -> String {
 /// 第 1..9 行显示 `1..9`、第 10 行显示 `0`，与 `digit_index` 同一套映射；
 /// 第 11 行起不显示——那里没有按键，标了号反而误导。
 fn row_num_label(idx: usize) -> Option<&'static str> {
-    ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"].get(idx).copied()
+    ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
+        .get(idx)
+        .copied()
 }
 
 /// 行号徽标 + 悬停说明，计算器行与条目行共用这一个画法（两行的左缘才可能对得齐）。
@@ -1001,8 +1039,10 @@ fn pressed_digit(ui: &egui::Ui, mods: egui::Modifiers) -> Option<u8> {
         (egui::Key::Num9, 9),
         (egui::Key::Num0, 0),
     ];
-    KEYS.iter()
-        .find_map(|(key, digit)| ui.input_mut(|i| i.consume_key(mods, *key)).then_some(*digit))
+    KEYS.iter().find_map(|(key, digit)| {
+        ui.input_mut(|i| i.consume_key(mods, *key))
+            .then_some(*digit)
+    })
 }
 
 /// 裸数字（不带修饰）在空输入时能否快捷执行第 N 行。
@@ -1050,9 +1090,15 @@ fn set_ime_state(ime_wnd: HWND, open: bool, conv: usize) {
 /// 获取当前前台窗口的 IME 窗口句柄
 fn foreground_ime_wnd() -> Option<HWND> {
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0.is_null() { return None; }
+    if hwnd.0.is_null() {
+        return None;
+    }
     let ime_wnd = unsafe { ImmGetDefaultIMEWnd(hwnd) };
-    if ime_wnd.0.is_null() { None } else { Some(ime_wnd) }
+    if ime_wnd.0.is_null() {
+        None
+    } else {
+        Some(ime_wnd)
+    }
 }
 
 /// E-05 第 2 档：切当前 IME 到英文模式（去掉 IME_CMODE_NATIVE 位 + 关闭 IME）
@@ -1146,13 +1192,22 @@ fn press_vk(vk: u16) {
             ki: KEYBDINPUT {
                 wVk: VIRTUAL_KEY(vk),
                 wScan: 0,
-                dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
                 time: 0,
                 dwExtraInfo: 0,
             },
         },
     };
-    let sent = unsafe { SendInput(&[key(false), key(true)], std::mem::size_of::<INPUT>() as i32) };
+    let sent = unsafe {
+        SendInput(
+            &[key(false), key(true)],
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
     if sent != 2 {
         eprintln!("internal: vk 0x{vk:02X} 只注入 {sent}/2（目标程序可能忽略了它）");
     }
@@ -1251,11 +1306,20 @@ enum HotkeyOutcome {
     Applied { slot: HotkeySlot, on: HotkeySpec },
     /// 新组合注册失败（`err` = `GetLastError`）。`now_active` = 尝试之后系统里真正装着的：
     /// `Some(旧值)` 表示回滚成功，`None` 表示连旧组合也没能装回去 ⇒ 全局呼出不可用，只能走托盘。
-    Rejected { slot: HotkeySlot, tried: HotkeySpec, err: u32, now_active: Option<HotkeySpec> },
+    Rejected {
+        slot: HotkeySlot,
+        tried: HotkeySpec,
+        err: u32,
+        now_active: Option<HotkeySpec>,
+    },
     /// 启动时读的 `tried` 被占用，退回出厂值 `fell_back_to`（这条不改 settings.json：
     /// 冲突多半是"那会儿别的程序正开着"，不该把用户的选择冲掉）。只有主热键有出厂值可退，
     /// 补字符键失败就是失败（退回一个用户没要的键更糟），所以这条不带槽位。
-    StartupFallback { tried: HotkeySpec, fell_back_to: HotkeySpec, err: u32 },
+    StartupFallback {
+        tried: HotkeySpec,
+        fell_back_to: HotkeySpec,
+        err: u32,
+    },
 }
 
 fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1280,14 +1344,14 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// 没有一处是 `consume_key`。】
 /// 表里的修饰键一律不带 `HKF_NOREPEAT`（比对时两边都剥）。
 const LOCAL_TAKEN: &[(u32, u32)] = &[
-    (HKF_CONTROL, 0x44), // Ctrl+D 打开所在目录
-    (HKF_CONTROL, 0x45), // Ctrl+E 编辑选中项
-    (HKF_CONTROL, 0x49), // Ctrl+I 批量导入全部
-    (HKF_CONTROL, 0x4A), // Ctrl+J 循环下一项
-    (HKF_CONTROL, 0x4B), // Ctrl+K 循环上一项
-    (HKF_CONTROL, 0x4D), // Ctrl+M ☰ 主菜单（批次 F6：新建按钮换成菜单后给它配的键）
-    (HKF_CONTROL, 0x4E), // Ctrl+N 循环下一项（2026-10-22 从「新建」改为导航）
-    (HKF_CONTROL, 0x50), // Ctrl+P 循环上一项（2026-10-22 从「置顶」改为导航）
+    (HKF_CONTROL, 0x44),             // Ctrl+D 打开所在目录
+    (HKF_CONTROL, 0x45),             // Ctrl+E 编辑选中项
+    (HKF_CONTROL, 0x49),             // Ctrl+I 批量导入全部
+    (HKF_CONTROL, 0x4A),             // Ctrl+J 循环下一项
+    (HKF_CONTROL, 0x4B),             // Ctrl+K 循环上一项
+    (HKF_CONTROL, 0x4D),             // Ctrl+M ☰ 主菜单（批次 F6：新建按钮换成菜单后给它配的键）
+    (HKF_CONTROL, 0x4E),             // Ctrl+N 循环下一项（2026-10-22 从「新建」改为导航）
+    (HKF_CONTROL, 0x50),             // Ctrl+P 循环上一项（2026-10-22 从「置顶」改为导航）
     (HKF_CONTROL | HKF_SHIFT, 0x44), // Ctrl+Shift+D 删除选中项
     (HKF_CONTROL | HKF_SHIFT, 0x4E), // Ctrl+Shift+N 新建快捷项
     (HKF_CONTROL | HKF_SHIFT, 0x50), // Ctrl+Shift+P 置顶 / 取消置顶
@@ -1415,7 +1479,14 @@ fn take_record_press(ui: &mut egui::Ui) -> Option<(egui::Key, egui::Modifiers)> 
     let mut hit = None;
     ui.input_mut(|i| {
         for ev in &i.events {
-            if let egui::Event::Key { pressed: true, repeat: false, key, modifiers, .. } = *ev {
+            if let egui::Event::Key {
+                pressed: true,
+                repeat: false,
+                key,
+                modifiers,
+                ..
+            } = *ev
+            {
                 if hit.is_none() {
                     hit = Some((key, modifiers));
                 }
@@ -1463,8 +1534,14 @@ fn post_hotkey_request(slot: HotkeySlot, spec: HotkeySpec) -> bool {
         return false;
     }
     *hotkey_lock(&HOTKEY_REQUEST) = Some((slot, spec));
-    match unsafe { PostMessageW(Some(HWND(raw as *mut _)), WM_APP_RELOAD_HOTKEY, WPARAM(0), LPARAM(0)) }
-    {
+    match unsafe {
+        PostMessageW(
+            Some(HWND(raw as *mut _)),
+            WM_APP_RELOAD_HOTKEY,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    } {
         Ok(()) => true,
         Err(e) => {
             *hotkey_lock(&HOTKEY_REQUEST) = None;
@@ -1520,7 +1597,12 @@ fn suspend_hotkey(hwnd: HWND) {
             }
         }
         // 每次都重起表：连着两次取键（录完主热键又去点补字符的框）不该让第二次的窗口期变短。
-        SetTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER, HOTKEY_SUSPEND_TIMEOUT, None);
+        SetTimer(
+            Some(hwnd),
+            HOTKEY_SUSPEND_TIMER,
+            HOTKEY_SUSPEND_TIMEOUT,
+            None,
+        );
     }
 }
 
@@ -1603,14 +1685,22 @@ fn inject_typeback_char() {
             ki: KEYBDINPUT {
                 wVk: VIRTUAL_KEY(0),
                 wScan: ch as u16,
-                dwFlags: if up { KEYEVENTF_UNICODE | KEYEVENTF_KEYUP } else { KEYEVENTF_UNICODE },
+                dwFlags: if up {
+                    KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                } else {
+                    KEYEVENTF_UNICODE
+                },
                 time: 0,
                 dwExtraInfo: 0,
             },
         },
     };
-    let sent =
-        unsafe { SendInput(&[key(false), key(true)], std::mem::size_of::<INPUT>() as i32) };
+    let sent = unsafe {
+        SendInput(
+            &[key(false), key(true)],
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
     // 日志记 vk 码而不记字符本身：批次 P 那条"不记用户敲的原文"的口径延伸——补进去的字符
     // 由配置决定、本来不是用户输入，但记成 0xC0 一样够定位问题。前台窗口只记 hwnd + 类名，
     // 不记标题：标题里经常带着用户正在编辑的正文（隐私口径同上）。
@@ -1623,10 +1713,17 @@ fn inject_typeback_char() {
         let cls = String::from_utf16_lossy(&buf[..n as usize]);
         format!("前台=0x{:x}({})", fg.0 as usize, cls)
     };
-    eprintln!("typeback: 已向焦点窗口补入 vk 0x{vk:02X} 对应的字符（SendInput {sent}/2，{fg_info}）");
+    eprintln!(
+        "typeback: 已向焦点窗口补入 vk 0x{vk:02X} 对应的字符（SendInput {sent}/2，{fg_info}）"
+    );
 }
 
-unsafe extern "system" fn hotkey_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn hotkey_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     unsafe {
         if msg == WM_HOTKEY {
             // 批次 R 起系统里最多装着两个键，`wparam` 就是注册时那个 id ⇒ 必须按 id 分派，
@@ -1681,7 +1778,11 @@ unsafe extern "system" fn hotkey_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             let outcome = match apply_hotkey(hwnd, slot, tried) {
                 Ok(()) => {
                     *hotkey_lock(slot.active()) = Some(tried);
-                    eprintln!("hotkey: {} 换键成功 → {}（原组合已注销）", slot.label(), tried.display());
+                    eprintln!(
+                        "hotkey: {} 换键成功 → {}（原组合已注销）",
+                        slot.label(),
+                        tried.display()
+                    );
                     HotkeyOutcome::Applied { slot, on: tried }
                 }
                 Err(err) => {
@@ -1698,7 +1799,11 @@ unsafe extern "system" fn hotkey_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                             "hotkey: {} {} 注册失败（{err}={}），已回到 {}",
                             slot.label(),
                             tried.display(),
-                            if err == ERROR_HOTKEY_ALREADY_REGISTERED { "已被占用" } else { "其它原因" },
+                            if err == ERROR_HOTKEY_ALREADY_REGISTERED {
+                                "已被占用"
+                            } else {
+                                "其它原因"
+                            },
                             k.display()
                         ),
                         None => eprintln!(
@@ -1707,7 +1812,12 @@ unsafe extern "system" fn hotkey_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                             tried.display()
                         ),
                     }
-                    HotkeyOutcome::Rejected { slot, tried, err, now_active }
+                    HotkeyOutcome::Rejected {
+                        slot,
+                        tried,
+                        err,
+                        now_active,
+                    }
                 }
             };
             hotkey_lock(&HOTKEY_RESULT).push(outcome);
@@ -1756,11 +1866,7 @@ unsafe extern "system" fn hotkey_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
     }
 }
 
-fn spawn_hotkey_thread(
-    tx: mpsc::Sender<()>,
-    configured: HotkeySpec,
-    typeback: Option<HotkeySpec>,
-) {
+fn spawn_hotkey_thread(tx: mpsc::Sender<()>, configured: HotkeySpec, typeback: Option<HotkeySpec>) {
     HOTKEY_TX.set(tx).ok();
     thread::spawn(move || unsafe {
         let module = GetModuleHandleW(None).expect("GetModuleHandleW");
@@ -1783,14 +1889,20 @@ fn spawn_hotkey_thread(
             PCWSTR(class_name.as_ptr()),
             PCWSTR(win_name.as_ptr()),
             WINDOW_STYLE(0),
-            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
             Some(HWND_MESSAGE),
             None,
             Some(module.into()),
             None,
         ) {
             Ok(h) => h,
-            Err(e) => { eprintln!("hotkey: CreateWindowExW failed: {e}"); return; }
+            Err(e) => {
+                eprintln!("hotkey: CreateWindowExW failed: {e}");
+                return;
+            }
         };
         // 换键要靠这条消息找到本窗，所以句柄在注册之前就公布（UI 第一帧可能已经想改键）。
         HOTKEY_HWND.store(hwnd.0 as usize, Ordering::Relaxed);
@@ -1807,12 +1919,19 @@ fn spawn_hotkey_thread(
                 match apply_hotkey(hwnd, HotkeySlot::Toggle, fallback) {
                     Ok(()) => {
                         *hotkey_lock(&HOTKEY_ACTIVE) = Some(fallback);
-                        hotkey_lock(&HOTKEY_RESULT)
-                            .push(HotkeyOutcome::StartupFallback { tried: configured, fell_back_to: fallback, err });
+                        hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::StartupFallback {
+                            tried: configured,
+                            fell_back_to: fallback,
+                            err,
+                        });
                         eprintln!(
                             "hotkey: {} 注册失败（{err}={}），本次退回 {}；settings.json 不改动",
                             configured.display(),
-                            if err == ERROR_HOTKEY_ALREADY_REGISTERED { "已被占用" } else { "其它原因" },
+                            if err == ERROR_HOTKEY_ALREADY_REGISTERED {
+                                "已被占用"
+                            } else {
+                                "其它原因"
+                            },
                             fallback.display()
                         );
                     }
@@ -1839,7 +1958,10 @@ fn spawn_hotkey_thread(
             match apply_hotkey(hwnd, HotkeySlot::Typeback, tb) {
                 Ok(()) => {
                     *hotkey_lock(&TYPEBACK_ACTIVE) = Some(tb);
-                    eprintln!("typeback: {} registered（按下补入呼出键那个字符）", tb.display());
+                    eprintln!(
+                        "typeback: {} registered（按下补入呼出键那个字符）",
+                        tb.display()
+                    );
                 }
                 Err(err) => {
                     hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
@@ -1851,7 +1973,11 @@ fn spawn_hotkey_thread(
                     eprintln!(
                         "typeback: {} 注册失败（{err}={}）⇒ 本次不启用补字符，字符仍然打不出来",
                         tb.display(),
-                        if err == ERROR_HOTKEY_ALREADY_REGISTERED { "已被占用" } else { "其它原因" }
+                        if err == ERROR_HOTKEY_ALREADY_REGISTERED {
+                            "已被占用"
+                        } else {
+                            "其它原因"
+                        }
                     );
                 }
             }
@@ -1860,7 +1986,9 @@ fn spawn_hotkey_thread(
         // 发来的 WM_COPYDATA 会被 UIPI 静默丢弃 ⇒ 只对该消息窗放行 WM_COPYDATA 这一条，
         // 不放开其它消息、不改完整性级别（放行范围＝这个 hwnd 的消息队列）。
         match ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, None) {
-            Ok(()) => eprintln!("ipc: 已对本消息窗放行 WM_COPYDATA（管理员实例可收普通权限次进程）"),
+            Ok(()) => {
+                eprintln!("ipc: 已对本消息窗放行 WM_COPYDATA（管理员实例可收普通权限次进程）")
+            }
             Err(e) => eprintln!("ipc: WM_COPYDATA 放行失败（不影响同级实例间转发）: {e}"),
         }
         let mut msg = MSG::default();
@@ -1991,7 +2119,9 @@ impl LauncherApp {
             if evidence_lost {
                 // 连记账那一格也不写：settings.json 可能正是没留住证据的那一份。
                 // 代价是下一次启动会再补一轮种子（只加不删，幂等），比覆盖掉现场轻。
-                eprintln!("source: 留证没成功 ⇒ 本轮不写 settings.json（seed_round 只在内存里推进）");
+                eprintln!(
+                    "source: 留证没成功 ⇒ 本轮不写 settings.json（seed_round 只在内存里推进）"
+                );
             } else {
                 source::application::save_settings(&prefs);
             }
@@ -2015,7 +2145,9 @@ impl LauncherApp {
             .iter()
             .filter(|i| {
                 i.kind == ItemKind::App
-                    && i.path.to_ascii_lowercase().contains("windows.immersivecontrolpanel")
+                    && i.path
+                        .to_ascii_lowercase()
+                        .contains("windows.immersivecontrolpanel")
                     && !prefs.hidden.iter().any(|h| h == &i.uid())
             })
             .map(|i| i.uid())
@@ -2023,7 +2155,9 @@ impl LauncherApp {
         if !dup_settings.is_empty() {
             prefs.hidden.extend(dup_settings.iter().cloned());
             if evidence_lost {
-                eprintln!("source: 隐藏重复的 Store 版「设置」（坏文件留证没成功 ⇒ 这次不写 settings.json）");
+                eprintln!(
+                    "source: 隐藏重复的 Store 版「设置」（坏文件留证没成功 ⇒ 这次不写 settings.json）"
+                );
             } else {
                 source::application::save_settings(&prefs);
                 eprintln!("source: 隐藏重复的 Store 版「设置」（已写 hidden[]）");
@@ -2041,24 +2175,32 @@ impl LauncherApp {
             }
         }
         let settings_open = intent.settings_page.is_some();
-        let settings_tab =
-            intent.settings_page.and_then(SettingsTab::from_page).unwrap_or(SettingsTab::General);
+        let settings_tab = intent
+            .settings_page
+            .and_then(SettingsTab::from_page)
+            .unwrap_or(SettingsTab::General);
         // 批次 T：`AppSettings` 不再是 `Copy`（多了一张引擎表），下面 `prefs` 要按值进结构体，
         // 所以这三样初值先取出来，不做整串 clone。
         let hotkey_active = prefs.toggle_hotkey;
         let typeback_active = prefs.typeback_hotkey;
-        let typeback_draft = prefs
-            .typeback_hotkey
-            .map(|s| HotkeySpec { mods: s.mods_named(), vk: s.vk });
+        let typeback_draft = prefs.typeback_hotkey.map(|s| HotkeySpec {
+            mods: s.mods_named(),
+            vk: s.vk,
+        });
         // 批次 F1：主题在 `main` 里就解析好了（窗口初始高度要按主题行高算），
         // 首帧的窗口底色 / 字号 / 行高直接读它，不留一帧"默认外观"。
         // 真正装进 `ctx` 在 `new` 末尾（那时 `CTX` 已 set）。
         let mut seed = Self {
-            query: String::new(), clear_query_next_frame: false, items,
+            query: String::new(),
+            clear_query_next_frame: false,
+            items,
             index: matching::MatchIndex::default(),
-            apps_tx, apps_rx, icon_tx: icon_tx.clone(),
+            apps_tx,
+            apps_rx,
+            icon_tx: icon_tx.clone(),
             icons: std::collections::HashMap::new(),
-            path_tx, path_rx,
+            path_tx,
+            path_rx,
             path_states: std::collections::HashMap::new(),
             path_in_flight: false,
             path_scanned_at: Instant::now(),
@@ -2067,23 +2209,35 @@ impl LauncherApp {
             selected: 0,
             scroll_followed: 0,
             focus_query: intent.visible && intent.dialog.is_none() && !settings_open,
-            dialog: intent.dialog, dialog_enter_armed: false,
+            dialog: intent.dialog,
+            dialog_enter_armed: false,
             confirm: None,
             internal_confirm: None,
             about_open: false,
             help_entry: None,
             menu_open: false,
             win_drag: None,
-            settings_open, settings_tab,
+            settings_open,
+            settings_tab,
             prefs,
-            theme, theme_applied: None, theme_font: None, theme_choices,
-            icon_rx, tray_rx, hotkey_rx,
-            ipc_rx, ipc_pending: Vec::new(),
+            theme,
+            theme_applied: None,
+            theme_font: None,
+            theme_choices,
+            icon_rx,
+            tray_rx,
+            hotkey_rx,
+            ipc_rx,
+            ipc_pending: Vec::new(),
             pending_batch: intent.batch,
             hide_pending: !intent.visible,
-            notify_tx, notify_rx,
-            visible: intent.visible, ime_before: None, self_hwnd,
-            hide_at: None, had_focus_since_show: false,
+            notify_tx,
+            notify_rx,
+            visible: intent.visible,
+            ime_before: None,
+            self_hwnd,
+            hide_at: None,
+            had_focus_since_show: false,
             toast: None,
             hotkey_recording: false,
             // 先按配置值显示；第一帧再从 HOTKEY_ACTIVE 校正（启动可能退回过出厂值）。
@@ -2099,8 +2253,12 @@ impl LauncherApp {
             keypick_suspended: false,
         };
         // 立即为已有项起图标加载器（source_path 为空的种子会被 extract 自然跳过）。
-        let source_paths: Vec<String> =
-            seed.items.iter().map(|i| i.source_path.clone()).filter(|p| !p.is_empty()).collect();
+        let source_paths: Vec<String> = seed
+            .items
+            .iter()
+            .map(|i| i.source_path.clone())
+            .filter(|p| !p.is_empty())
+            .collect();
         spawn_icon_loader(icon_tx, source_paths);
         // FR-SRC-06：启动就先在后台算一轮四态，首屏列表（很快会呼出）拿到的是缓存而不是
         // 现场 I/O；之后呼出与每 3 秒各刷新一次（`refresh_path_states`）。
@@ -2224,7 +2382,8 @@ impl LauncherApp {
         self.selected = 0;
         self.focus_query = true;
         // 光标位置存在 TextEditState 里，程序化换掉整个字符串不会带着它走（与 Tab 补全同一个坑）。
-        if let Some(mut st) = egui::widgets::text_edit::TextEditState::load(ctx, search_field_id()) {
+        if let Some(mut st) = egui::widgets::text_edit::TextEditState::load(ctx, search_field_id())
+        {
             st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
                 egui::text::CCursor::new(chars),
             )));
@@ -2236,7 +2395,11 @@ impl LauncherApp {
 
     /// 补全：查询换成清单里那条命令的关键字 + 空格。
     fn complete_query(&mut self, ctx: &egui::Context, text: &str) {
-        self.set_query(ctx, text.to_string(), &format!("自定义命令：查询补全为「{text}」"));
+        self.set_query(
+            ctx,
+            text.to_string(),
+            &format!("自定义命令：查询补全为「{text}」"),
+        );
     }
 
     /// 提示行被 Enter / 数字键 / 点击激活。查询已经补好（`"ping "`）就只提示"等参数"，
@@ -2249,7 +2412,10 @@ impl LauncherApp {
                 TOAST_OK,
             ));
             ctx.request_repaint_after(TOAST_TTL);
-            eprintln!("自定义命令：查询已在「{}」，等待用户输入参数", hint.completion);
+            eprintln!(
+                "自定义命令：查询已在「{}」，等待用户输入参数",
+                hint.completion
+            );
         } else {
             self.complete_query(ctx, &hint.completion);
         }
@@ -2261,7 +2427,9 @@ impl LauncherApp {
     /// 而 `SetForegroundWindow` 不会把最小化的窗口拉起来），热键那一按更被当成"再隐藏一次"。
     /// 判据要问 OS，不能问自己的旗标。
     fn is_iconic(&self) -> bool {
-        self.self_hwnd.map(|h| unsafe { IsIconic(h).as_bool() }).unwrap_or(false)
+        self.self_hwnd
+            .map(|h| unsafe { IsIconic(h).as_bool() })
+            .unwrap_or(false)
     }
 
     /// FR-SRC-21：IPC 触发的呼出（已显示则只重抢焦点，不再走 on_show 重复切输入法）。
@@ -2279,7 +2447,9 @@ impl LauncherApp {
             // winit 的可见标志会与实际窗口脱节（被系统/全屏程序最小化后，标志仍是「可见」，
             // Visible(true) 便不发 ShowWindow）；SW_RESTORE 不看标志，直接还原并显示。
             if let Some(hwnd) = self.self_hwnd {
-                unsafe { let _ = ShowWindow(hwnd, SW_RESTORE); };
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                };
             }
             self.on_show();
         }
@@ -2308,8 +2478,10 @@ impl LauncherApp {
         }
         let old = self.items.clone();
         let before = self.items.len();
-        let incoming: Vec<LaunchItem> =
-            paths.iter().map(|p| dialog_for_sent_path(p).to_item()).collect();
+        let incoming: Vec<LaunchItem> = paths
+            .iter()
+            .map(|p| dialog_for_sent_path(p).to_item())
+            .collect();
         let mut missing: Vec<String> = incoming
             .iter()
             .map(|i| i.source_path.clone())
@@ -2325,8 +2497,11 @@ impl LauncherApp {
             spawn_icon_loader(self.icon_tx.clone(), missing);
         }
         self.save_items();
-        let skipped_text =
-            if skipped > 0 { format!("，{skipped} 条重复已跳过") } else { String::new() };
+        let skipped_text = if skipped > 0 {
+            format!("，{skipped} 条重复已跳过")
+        } else {
+            String::new()
+        };
         self.toast = Some((
             format!("✓ 已添加 {added} 条{skipped_text}"),
             Instant::now() + TOAST_TTL,
@@ -2485,9 +2660,19 @@ impl LauncherApp {
         let pressed = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
         eprintln!(
             "左键拖{}（{tag}）：hwnd={hwnd:?} 按下={pressed} 起点={origin:?} 尺寸={size:?}",
-            if edge == EDGE_MOVE { "空白移动" } else { "边缘缩放" }
+            if edge == EDGE_MOVE {
+                "空白移动"
+            } else {
+                "边缘缩放"
+            }
         );
-        self.win_drag = Some(DragAnchor { hwnd, cursor, origin, size, edge });
+        self.win_drag = Some(DragAnchor {
+            hwnd,
+            cursor,
+            origin,
+            size,
+            edge,
+        });
     }
 
     /// FR-WIN-02（批次 Q）+ 批次 R 的每帧处理：① 取热键线程的回执（两个槽共用一条队列）；
@@ -2516,8 +2701,10 @@ impl LauncherApp {
                         self.typeback_awaiting = None;
                         // 草稿跟着注册成功的那一份走：复选框显示的永远是"系统里真装着的"，
                         // 不是"用户刚才点过但没装上的"。
-                        self.typeback_draft =
-                            Some(HotkeySpec { mods: on.mods_named(), vk: on.vk });
+                        self.typeback_draft = Some(HotkeySpec {
+                            mods: on.mods_named(),
+                            vk: on.vk,
+                        });
                         if self.prefs.typeback_hotkey != Some(on) {
                             self.prefs.typeback_hotkey = Some(on);
                             source::application::save_settings(&self.prefs);
@@ -2525,7 +2712,12 @@ impl LauncherApp {
                         self.hotkey_note(&format!("✓ 补字符热键已设为 {}", on.display()), true);
                     }
                 },
-                HotkeyOutcome::Rejected { slot, tried, err, now_active } => {
+                HotkeyOutcome::Rejected {
+                    slot,
+                    tried,
+                    err,
+                    now_active,
+                } => {
                     let why = if err == ERROR_HOTKEY_ALREADY_REGISTERED {
                         "已被系统或其它程序占用".to_string()
                     } else {
@@ -2541,9 +2733,7 @@ impl LauncherApp {
                             };
                             let tail = match now_active {
                                 Some(k) => format!("，当前仍是 {}", k.display()),
-                                None => {
-                                    "，且原来的键也没能装回去 ⇒ 暂时只能用托盘呼出".to_string()
-                                }
+                                None => "，且原来的键也没能装回去 ⇒ 暂时只能用托盘呼出".to_string(),
                             };
                             self.hotkey_note(&format!("⚠ {} {why}{tail}", tried.display()), false);
                         }
@@ -2561,7 +2751,11 @@ impl LauncherApp {
                         }
                     }
                 }
-                HotkeyOutcome::StartupFallback { tried, fell_back_to, err } => {
+                HotkeyOutcome::StartupFallback {
+                    tried,
+                    fell_back_to,
+                    err,
+                } => {
                     self.hotkey_active = fell_back_to;
                     let why = if err == ERROR_HOTKEY_ALREADY_REGISTERED {
                         "本次被占用".to_string()
@@ -2569,7 +2763,11 @@ impl LauncherApp {
                         format!("本次注册失败（{err}）")
                     };
                     self.hotkey_note(
-                        &format!("⚠ 你设的 {} {why}，这次先用 {}", tried.display(), fell_back_to.display()),
+                        &format!(
+                            "⚠ 你设的 {} {why}，这次先用 {}",
+                            tried.display(),
+                            fell_back_to.display()
+                        ),
                         false,
                     );
                 }
@@ -2636,7 +2834,11 @@ impl LauncherApp {
                 self.hotkey_recording = false;
                 eprintln!(
                     "设置页：热键录制取消（按 {}），当前仍是 {}",
-                    if key == egui::Key::Escape { "Esc" } else { "Tab" },
+                    if key == egui::Key::Escape {
+                        "Esc"
+                    } else {
+                        "Tab"
+                    },
                     self.hotkey_active.display()
                 );
             }
@@ -2673,8 +2875,16 @@ impl LauncherApp {
         }
         self.keypick_suspended = picking;
         post_hotkey_signal(
-            if picking { WM_APP_SUSPEND_HOTKEY } else { WM_APP_RESUME_HOTKEY },
-            if picking { "取键期注销" } else { "取键后恢复" },
+            if picking {
+                WM_APP_SUSPEND_HOTKEY
+            } else {
+                WM_APP_RESUME_HOTKEY
+            },
+            if picking {
+                "取键期注销"
+            } else {
+                "取键后恢复"
+            },
         );
     }
 
@@ -2687,7 +2897,10 @@ impl LauncherApp {
         let show = spec.display();
         if let Err(msg) = spec.check() {
             self.hotkey_note(&format!("⚠ {show}：{msg}"), false);
-            eprintln!("设置页：热键 {show} 未采纳（{msg}），当前仍是 {}", self.hotkey_active.display());
+            eprintln!(
+                "设置页：热键 {show} 未采纳（{msg}），当前仍是 {}",
+                self.hotkey_active.display()
+            );
             return false;
         }
         if spec.conflicts_local(LOCAL_TAKEN) {
@@ -3567,7 +3780,9 @@ impl LauncherApp {
         self.refresh_path_states(true);
         let Some(hwnd) = self.self_hwnd else { return };
         let ime_wnd = unsafe { ImmGetDefaultIMEWnd(hwnd) };
-        if ime_wnd.0.is_null() { return; }
+        if ime_wnd.0.is_null() {
+            return;
+        }
         let before = get_ime_state(ime_wnd);
         if self.ime_before.is_none() {
             self.ime_before = Some(before);
@@ -3598,7 +3813,9 @@ impl LauncherApp {
             eprintln!("设置页：窗口隐藏 ⇒ 退出取键（录制/选键状态不跨隐藏保留）");
             self.sync_keypick_suspend();
         }
-        let Some(before) = self.ime_before.take() else { return };
+        let Some(before) = self.ime_before.take() else {
+            return;
+        };
         if let Some(ime_wnd) = foreground_ime_wnd() {
             restore_ime(ime_wnd, before);
             let after = get_ime_state(ime_wnd);
@@ -3782,12 +3999,8 @@ impl LauncherApp {
                 &["powrprof.dll,SetSuspendState", "0,1,0"],
             ),
             A::Hibernate => self.run_console_action(ctx, "休眠", "shutdown.exe", &["/h"]),
-            A::Shutdown => {
-                self.run_console_action(ctx, "关机", "shutdown.exe", &["/s", "/t", "0"])
-            }
-            A::Restart => {
-                self.run_console_action(ctx, "重启", "shutdown.exe", &["/r", "/t", "0"])
-            }
+            A::Shutdown => self.run_console_action(ctx, "关机", "shutdown.exe", &["/s", "/t", "0"]),
+            A::Restart => self.run_console_action(ctx, "重启", "shutdown.exe", &["/r", "/t", "0"]),
             A::Logoff => self.run_console_action(ctx, "注销", "shutdown.exe", &["/l"]),
             A::EmptyRecycleBin => {
                 let flags = SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND;
@@ -3817,7 +4030,10 @@ impl LauncherApp {
                         None,
                     )
                 };
-                eprintln!("internal: 已请求关闭显示器（SendMessageTimeout 返回 {}）", r.0);
+                eprintln!(
+                    "internal: 已请求关闭显示器（SendMessageTimeout 返回 {}）",
+                    r.0
+                );
                 self.collapse_after_run(ctx);
                 true
             }
@@ -3894,7 +4110,11 @@ impl LauncherApp {
                 note.push("呼出热键已按配置重装".to_string());
             }
             // 之前关着、现在打开的源要补一次初始化（文件源要重建索引，参照设置页开关）。
-            for id in off_before.iter().copied().filter(|id| self.prefs.source_on(*id)) {
+            for id in off_before
+                .iter()
+                .copied()
+                .filter(|id| self.prefs.source_on(*id))
+            {
                 if let Some(s) = self.sources.iter_mut().find(|s| s.id() == id) {
                     s.init();
                     note.push(format!("数据源 {} 已重新初始化", id.as_str()));
@@ -4051,7 +4271,10 @@ impl LauncherApp {
     /// 把当前整张清单写盘（种子播种一次后即普通用户项，不再剔除）。
     fn save_items(&self) {
         source::application::save_user_items(&self.items);
-        eprintln!("source: 已写清单 user_items.json（{} 条）", self.items.len());
+        eprintln!(
+            "source: 已写清单 user_items.json（{} 条）",
+            self.items.len()
+        );
     }
 
     /// FR-SRC-19 学习位序数据源：启动成功后累计次数 +1、刷新最近使用时间并落盘。
@@ -4059,7 +4282,9 @@ impl LauncherApp {
     /// 临时条目（如 Ctrl+D 的 explorer /select）不在清单里，自然匹配不到、跳过。
     /// `alias_word` 非空时顺带「提交即学别名」，与统计合并成同一次写盘。
     fn mark_used(&mut self, uid: &str, alias_word: &str) {
-        let Some(pos) = self.items.iter().position(|i| i.uid() == uid) else { return };
+        let Some(pos) = self.items.iter().position(|i| i.uid() == uid) else {
+            return;
+        };
         self.items[pos].use_count = self.items[pos].use_count.saturating_add(1);
         self.items[pos].last_used_ms = now_ms();
         if !alias_word.is_empty() && learn_alias(&mut self.items[pos], alias_word) {
@@ -4106,7 +4331,10 @@ impl Default for LauncherApp {
             t4,
             r5,
             None,
-            StartupIntent { visible: true, ..Default::default() },
+            StartupIntent {
+                visible: true,
+                ..Default::default()
+            },
             // 测试/兜底用的 `Default` 不读 `Themes\`：给基准 Light 就够了，
             // 真启动路径由 `main` 解析主题再传进来。
             theme::Theme::light(),
@@ -4166,7 +4394,8 @@ impl eframe::App for LauncherApp {
         if self.hide_pending {
             self.hide_pending = false;
             if !self.visible {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
 
@@ -4230,7 +4459,8 @@ impl eframe::App for LauncherApp {
                 eprintln!("FR-WIN-05: 热键切换 → 隐藏");
                 self.visible = false;
                 self.on_hide();
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else {
                 eprintln!("FR-WIN-05: 热键切换 → 呼出");
                 self.show_now(ui.ctx());
@@ -4316,10 +4546,14 @@ impl eframe::App for LauncherApp {
                     Some(deadline) => {
                         let now = Instant::now();
                         if now >= deadline {
-                            eprintln!("FR-WIN-04: 失焦 {}ms 复查仍失焦 → 关闭到托盘", HIDE_DELAY.as_millis());
+                            eprintln!(
+                                "FR-WIN-04: 失焦 {}ms 复查仍失焦 → 关闭到托盘",
+                                HIDE_DELAY.as_millis()
+                            );
                             self.visible = false;
                             self.on_hide();
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
                         } else {
                             ui.ctx().request_repaint_after(deadline - now);
                         }
@@ -4359,7 +4593,8 @@ impl eframe::App for LauncherApp {
             // dedup 保留的先出现项仍持旧对象（学习统计天然在）；若重复项出现在后位被剔前，
             // 统一回填一次兜底。
             self.carry_stats(&old);
-            let missing: Vec<String> = self.items
+            let missing: Vec<String> = self
+                .items
                 .iter()
                 .map(|i| i.source_path.clone())
                 .filter(|p| !p.is_empty() && !self.icons.contains_key(p.as_str()))
@@ -4436,13 +4671,18 @@ impl eframe::App for LauncherApp {
                 (hot(egui::Key::Equals), hot(egui::Key::Minus))
             };
             if hit_zoom_in || hit_zoom_out {
-                let (dw, dh) = if hit_zoom_in { (60.0, 40.0) } else { (-60.0, -40.0) };
+                let (dw, dh) = if hit_zoom_in {
+                    (60.0, 40.0)
+                } else {
+                    (-60.0, -40.0)
+                };
                 let cur = ui.ctx().viewport_rect().size();
                 let next = egui::vec2(
                     (cur.x + dw).clamp(MIN_W as f32, 1200.0),
                     (cur.y + dh).clamp(MIN_H as f32, 900.0),
                 );
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(next));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(next));
                 eprintln!(
                     "快捷键 Ctrl+{}：窗口 {}×{} → {}×{}",
                     if hit_zoom_in { "=" } else { "-" },
@@ -4455,14 +4695,22 @@ impl eframe::App for LauncherApp {
             // 「打开日志」**不配快捷键**（用户 2026-10-19 裁定「不必要弄一个快捷键，将来有其他需求
             // 替换掉就可以」）⇒ 只走托盘菜单那一条路，Ctrl+Shift+L 已释放。这条也是「每个功能必须
             // 配快捷键」那条立规的第二例外（第一例外是批次 K 的"设置页开关类不另配键"）。
-            let hit_comma = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma));
+            let hit_comma =
+                ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma));
             if hit_comma {
                 self.settings_open = !self.settings_open;
                 self.focus_query = true;
                 // 批次 F6：☰ 只在搜索页渲染 ⇒ 进设置页必须先把旗标落下，
                 // 否则回到搜索页的第一帧会带着一个"没人负责关闭"的菜单。
                 self.menu_open = false;
-                eprintln!("快捷键 Ctrl+,：设置页 {}", if self.settings_open { "打开" } else { "返回搜索" });
+                eprintln!(
+                    "快捷键 Ctrl+,：设置页 {}",
+                    if self.settings_open {
+                        "打开"
+                    } else {
+                        "返回搜索"
+                    }
+                );
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
                 // Ctrl+Shift+N 新建、Ctrl+Shift+P 置顶、Ctrl+Shift+D 删除（2026-10-22 用户改键：
@@ -4481,7 +4729,9 @@ impl eframe::App for LauncherApp {
                     (hot(egui::Key::N), hot(egui::Key::D), hot(egui::Key::P))
                 };
                 let (hit_n, hit_p, hit_i, hit_e, hit_cd, hit_cf, hit_cm) = {
-                    let hot = |mods: egui::Modifiers, k: egui::Key| ui.input_mut(|i| i.consume_key(mods, k));
+                    let hot = |mods: egui::Modifiers, k: egui::Key| {
+                        ui.input_mut(|i| i.consume_key(mods, k))
+                    };
                     (
                         hot(egui::Modifiers::COMMAND, egui::Key::N),
                         hot(egui::Modifiers::COMMAND, egui::Key::P),
@@ -4500,7 +4750,9 @@ impl eframe::App for LauncherApp {
                 // Shift+Tab 必须先 consume：egui 的 consume_key 走 Modifiers::matches_logically，
                 // 它对 shift 只查"模式要 shift 而实际没有"，所以 NONE 模式会把 Shift+Tab 一起吃掉。
                 let (hit_pgup, hit_pgdn, hit_shift_tab, hit_tab) = {
-                    let hot = |mods: egui::Modifiers, k: egui::Key| ui.input_mut(|i| i.consume_key(mods, k));
+                    let hot = |mods: egui::Modifiers, k: egui::Key| {
+                        ui.input_mut(|i| i.consume_key(mods, k))
+                    };
                     (
                         hot(egui::Modifiers::NONE, egui::Key::PageUp),
                         hot(egui::Modifiers::NONE, egui::Key::PageDown),
@@ -4512,7 +4764,9 @@ impl eframe::App for LauncherApp {
                 // 当时 Ctrl+N/Ctrl+P 被「新建」「置顶」占着，2026-10-22 那两项挪到 Shift 层后
                 // N/P 也接上了同一个动作，这两键作为老习惯保留）。
                 let (hit_ctrl_j, hit_ctrl_k) = {
-                    let hot = |mods: egui::Modifiers, k: egui::Key| ui.input_mut(|i| i.consume_key(mods, k));
+                    let hot = |mods: egui::Modifiers, k: egui::Key| {
+                        ui.input_mut(|i| i.consume_key(mods, k))
+                    };
                     (
                         hot(egui::Modifiers::COMMAND, egui::Key::J),
                         hot(egui::Modifiers::COMMAND, egui::Key::K),
@@ -4537,8 +4791,8 @@ impl eframe::App for LauncherApp {
                 // 因为 consume_key(NONE, ·) 对 shift 只查"模式要而实际没有"，会把 Shift 组合一起吃掉
                 // （同一坑见批次 F 的 Shift+Tab）。键事件被吃不影响字符事件，空格照样进 TextEdit。
                 let space_down = ui.input(|i| i.key_pressed(egui::Key::Space));
-                let hit_shift_space =
-                    space_down && ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space));
+                let hit_shift_space = space_down
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space));
                 if hit_shift_space {
                     eprintln!(
                         "快捷键 Shift+空格：按档位 {:?} 本会执行，改判为插入真空格",
@@ -4600,7 +4854,11 @@ impl eframe::App for LauncherApp {
                     let p = source::filesearch::route(&self.query);
                     let already = self.query.starts_with('\'')
                         || self.query.starts_with(' ')
-                        || matches!(p, source::filesearch::Route::Search { .. } | source::filesearch::Route::Browse { .. });
+                        || matches!(
+                            p,
+                            source::filesearch::Route::Search { .. }
+                                | source::filesearch::Route::Browse { .. }
+                        );
                     if already {
                         self.toast = Some((
                             "已在文件模式（Esc 清空回到清单；直接打路径也能浏览）".to_string(),
@@ -4626,11 +4884,19 @@ impl eframe::App for LauncherApp {
                     let (hit, head_len) = {
                         let plan = self.plan();
                         let head_len = plan.head.len();
-                        (plan.head.get(self.selected).and_then(|r| r.file_hit()).cloned(), head_len)
+                        (
+                            plan.head
+                                .get(self.selected)
+                                .and_then(|r| r.file_hit())
+                                .cloned(),
+                            head_len,
+                        )
                     };
                     self.dialog = Some(match hit {
                         Some(hit) => {
-                            eprintln!("快捷键 Ctrl+Shift+N：用选中的文件行预填添加框（路径不落日志）");
+                            eprintln!(
+                                "快捷键 Ctrl+Shift+N：用选中的文件行预填添加框（路径不落日志）"
+                            );
                             DialogState::from_file_hit(&hit)
                         }
                         None => {
@@ -4660,11 +4926,17 @@ impl eframe::App for LauncherApp {
                     // 批次 X：文件行不在清单里、没有条目身份 ⇒ 编辑/删除/置顶对它无意义，
                     // 但 Ctrl+D 有真实含义（在资源管理器里定位这个文件）。下面那套按 uid 回查
                     // 的逻辑对文件行天然拿不到 `sel`，所以只需在这里单独取走 Ctrl+D 这一档。
-                    let on_file_row = plan.head.get(self.selected).and_then(|r| r.file_hit()).cloned();
+                    let on_file_row = plan
+                        .head
+                        .get(self.selected)
+                        .and_then(|r| r.file_hit())
+                        .cloned();
                     let handled_file_cd = hit_cd && on_file_row.is_some();
                     if let Some(hit) = on_file_row.filter(|_| hit_cd) {
                         select_path = Some(hit.path.clone());
-                        eprintln!("快捷键 Ctrl+D：在资源管理器中定位文件行（路径由查询现出，不落日志）");
+                        eprintln!(
+                            "快捷键 Ctrl+D：在资源管理器中定位文件行（路径由查询现出，不落日志）"
+                        );
                     }
                     let item_row = item_rank(self.selected, plan.head.len());
                     let results = plan.results;
@@ -4838,7 +5110,11 @@ impl eframe::App for LauncherApp {
                                 .map(|h| format!("{}\\", h.path))
                         };
                         if let Some(dir) = into_dir {
-                            self.set_query(ui.ctx(), dir, "快捷键 Tab：进入选中的目录（浏览模式，路径不写日志）");
+                            self.set_query(
+                                ui.ctx(),
+                                dir,
+                                "快捷键 Tab：进入选中的目录（浏览模式，路径不写日志）",
+                            );
                         } else if let Some(name) = complete_to {
                             let chars = name.chars().count();
                             self.query = name.clone();
@@ -4877,7 +5153,9 @@ impl eframe::App for LauncherApp {
                                 HeadRow::Calc(hit) => {
                                     // FR-SRC-10：数字键指到计算器行 ⇒ 与 Enter 同一语义（复制）。
                                     copy_text = Some(hit.copy.clone());
-                                    eprintln!("快捷键 数字键 {digit}：复制计算器结果（表达式原文不落日志）");
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：复制计算器结果（表达式原文不落日志）"
+                                    );
                                 }
                                 HeadRow::Search(hit) => {
                                     // FR-SRC-11：与 Enter 同一语义（用默认浏览器打开）。
@@ -4938,11 +5216,10 @@ impl eframe::App for LauncherApp {
                                     self.help_entry = Some(*hit);
                                 }
                                 HeadRow::CheatHint(_) => {
-                                    eprintln!("快捷键 数字键 {digit}：选中速查表的无匹配提示行，不执行");
-                                    self.hint_toast(
-                                        ui.ctx(),
-                                        source::cheatsheet::NO_MATCH_TOAST,
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：选中速查表的无匹配提示行，不执行"
                                     );
+                                    self.hint_toast(ui.ctx(), source::cheatsheet::NO_MATCH_TOAST);
                                 }
                             },
                             Some(Row::Item(rank)) => {
@@ -4969,11 +5246,17 @@ impl eframe::App for LauncherApp {
                     let results = plan.results;
                     let len = row_count(results.len(), head_len);
                     // 选中头段行时 `space_takes` 已为假 ⇒ 这里只可能拿到条目行；None 分支不用管。
-                    if let Some(Row::Item(rank)) =
-                        row_at(self.selected.min(len.saturating_sub(1)), results.len(), head_len)
-                    {
+                    if let Some(Row::Item(rank)) = row_at(
+                        self.selected.min(len.saturating_sub(1)),
+                        results.len(),
+                        head_len,
+                    ) {
                         let item = self.items[results[rank]].clone();
-                        eprintln!("快捷键 空格：执行第 {} 行「{}」", rank + 1 + head_len, item.name);
+                        eprintln!(
+                            "快捷键 空格：执行第 {} 行「{}」",
+                            rank + 1 + head_len,
+                            item.name
+                        );
                         launch = Some(item);
                         launch_from_list = true;
                     }
@@ -5720,7 +6003,12 @@ impl eframe::App for LauncherApp {
                 1.0
             };
             let fade = |c: egui::Color32| {
-                egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * alpha) as u8)
+                egui::Color32::from_rgba_unmultiplied(
+                    c.r(),
+                    c.g(),
+                    c.b(),
+                    (c.a() as f32 * alpha) as u8,
+                )
             };
             // 底色/描边从文字色派生：描边=文字色，底=文字色的 ~22%（红/绿两种 Toast 共用一套画法）。
             let fill = egui::Color32::from_rgb(text_c.r() / 5, text_c.g() / 5, text_c.b() / 5);
@@ -5734,11 +6022,7 @@ impl eframe::App for LauncherApp {
                         .corner_radius(10.0)
                         .inner_margin(egui::Margin::symmetric(14, 8))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(msg)
-                                    .size(13.0)
-                                    .color(fade(*text_c)),
-                            );
+                            ui.label(egui::RichText::new(msg).size(13.0).color(fade(*text_c)));
                         });
                 });
             ui.ctx().request_repaint_after(remaining.min(TOAST_FADE));
@@ -5770,7 +6054,11 @@ impl eframe::App for LauncherApp {
         // ---- FR-SRC-20 添加/编辑对话框（模态，对标 Delphi frmShortCut）----
         if self.dialog.is_some() {
             let editing = self.dialog.as_ref().unwrap().edit_uid.is_some();
-            let title = if editing { "编辑快捷项" } else { "添加快捷项" };
+            let title = if editing {
+                "编辑快捷项"
+            } else {
+                "添加快捷项"
+            };
 
             enum DlgResult {
                 Keep,
@@ -5778,9 +6066,8 @@ impl eframe::App for LauncherApp {
                 Cancel,
             }
 
-            let modal_resp = egui::Modal::new(egui::Id::new("shortcut_dialog")).show(
-                ui.ctx(),
-                |ui| {
+            let modal_resp =
+                egui::Modal::new(egui::Id::new("shortcut_dialog")).show(ui.ctx(), |ui| {
                     // 尺寸（2026-10-22 用户要求）：原来内容只有 ~300 宽、且不可拉伸。
                     // `Resize` 给一块能拖右下角的区域，egui 按 id 记住用户拉到的尺寸（本次运行内）。
                     // 上限随主窗口走：主窗口本身最小 360×240，固定 640 宽会溢出到窗外。
@@ -5807,16 +6094,17 @@ impl eframe::App for LauncherApp {
                             ui.separator();
                             // 每行＝「标签 + 占满剩余宽度的输入框」，输入框跟着窗口一起变宽。
                             let label_w = 72.0;
-                            let row = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
-                                ui.horizontal(|ui| {
-                                    ui.add_sized([label_w, 20.0], egui::Label::new(label));
-                                    let w = ui.available_width().max(160.0);
-                                    ui.add_sized(
-                                        [w, 22.0],
-                                        egui::TextEdit::singleline(value).hint_text(hint),
-                                    );
-                                });
-                            };
+                            let row =
+                                |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized([label_w, 20.0], egui::Label::new(label));
+                                        let w = ui.available_width().max(160.0);
+                                        ui.add_sized(
+                                            [w, 22.0],
+                                            egui::TextEdit::singleline(value).hint_text(hint),
+                                        );
+                                    });
+                                };
                             {
                                 let dg = self.dialog.as_mut().unwrap();
                                 row(ui, "别名", &mut dg.keyword, "触发码，如 calc");
@@ -5871,8 +6159,7 @@ impl eframe::App for LauncherApp {
                             });
                             result
                         })
-                },
-            );
+                });
 
             match modal_resp.inner {
                 DlgResult::Confirm => {
@@ -5909,7 +6196,10 @@ impl eframe::App for LauncherApp {
                             if !item.source_path.is_empty()
                                 && !self.icons.contains_key(item.source_path.as_str())
                             {
-                                spawn_icon_loader(self.icon_tx.clone(), vec![item.source_path.clone()]);
+                                spawn_icon_loader(
+                                    self.icon_tx.clone(),
+                                    vec![item.source_path.clone()],
+                                );
                             }
                             self.save_items();
                             // 入库/保存后清空搜索框，呼出即见全清单（FR-SRC-20 添加流一致）。
@@ -6229,7 +6519,8 @@ impl eframe::App for LauncherApp {
                     self.selected = 0;
                     self.visible = false;
                     self.on_hide();
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     ui.ctx().request_repaint_after(TOAST_TTL);
                 }
                 Err(e) => {
@@ -6287,7 +6578,8 @@ impl eframe::App for LauncherApp {
             } else {
                 self.visible = false;
                 self.on_hide();
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
 
@@ -6380,7 +6672,11 @@ fn redirect_stderr_if_orphan() {
     }
     let stamp = source::application::rotate_log_and_stamp();
     let path = source::application::log_path();
-    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
         return; // 日志文件打不开也要照常启动，不因记不了日志而退出
     };
     let file = LOG_FILE.get_or_init(|| file);
@@ -6468,7 +6764,11 @@ fn main() -> eframe::Result {
             None
         },
         settings_page: cli.preferences,
-        batch: if cli.send_to.len() > 1 { cli.send_to.clone() } else { Vec::new() },
+        batch: if cli.send_to.len() > 1 {
+            cli.send_to.clone()
+        } else {
+            Vec::new()
+        },
     };
     let start_visible = intent.visible;
 
@@ -6489,11 +6789,17 @@ fn main() -> eframe::Result {
         // 这一次读只喂热键线程、不写盘，所以 `Lost` 在这里不需要停手；`LauncherApp::new`
         // 里那次读才挂着"留证没成功就不写"的门禁。
         Some(Corrupted::Lost) => {
-            eprintln!("配置损坏：settings.json 解析失败且留证没成功 ⇒ 热键线程按出厂热键注册（这一次只读不写）")
+            eprintln!(
+                "配置损坏：settings.json 解析失败且留证没成功 ⇒ 热键线程按出厂热键注册（这一次只读不写）"
+            )
         }
         None => {}
     }
-    spawn_hotkey_thread(hotkey_tx, configured.toggle_hotkey, configured.typeback_hotkey);
+    spawn_hotkey_thread(
+        hotkey_tx,
+        configured.toggle_hotkey,
+        configured.typeback_hotkey,
+    );
 
     // 批次 F1 的主题在这里解析一次：默认窗口高度要按主题行高算（一屏正好 10 行），
     // 同一份再传进 `LauncherApp`——`Themes\` 只读一遍，坏主题文件在日志里也只记一次。
@@ -6564,8 +6870,14 @@ mod nav_tests {
     #[test]
     fn bare_digit_yields_to_calculator_when_calc_source_is_on() {
         assert!(bare_digit_allowed("", false));
-        assert!(!bare_digit_allowed("", true), "计算器开着时第一个数字要进表达式");
-        assert!(!bare_digit_allowed("1+2", false), "有输入时数字本来就是查询文本");
+        assert!(
+            !bare_digit_allowed("", true),
+            "计算器开着时第一个数字要进表达式"
+        );
+        assert!(
+            !bare_digit_allowed("1+2", false),
+            "有输入时数字本来就是查询文本"
+        );
         assert!(!bare_digit_allowed("   ", true));
     }
 
@@ -6586,19 +6898,43 @@ mod nav_tests {
     #[test]
     fn commit_word_takes_first_word_and_strips_row_digit() {
         assert_eq!(commit_word("jsq", false), "jsq");
-        assert_eq!(commit_word("  JSQ ", false), "jsq", "首尾空白与大小写不进别名");
-        assert_eq!(commit_word("jsq5", true), "jsq", "数字键执行时行号不是触发词");
-        assert_eq!(commit_word("jsq5", false), "jsq5", "非数字键执行不剥——那可能就是用户要的词");
-        assert_eq!(commit_word("visual studio", false), "visual", "参数词不进别名");
+        assert_eq!(
+            commit_word("  JSQ ", false),
+            "jsq",
+            "首尾空白与大小写不进别名"
+        );
+        assert_eq!(
+            commit_word("jsq5", true),
+            "jsq",
+            "数字键执行时行号不是触发词"
+        );
+        assert_eq!(
+            commit_word("jsq5", false),
+            "jsq5",
+            "非数字键执行不剥——那可能就是用户要的词"
+        );
+        assert_eq!(
+            commit_word("visual studio", false),
+            "visual",
+            "参数词不进别名"
+        );
         assert_eq!(commit_word("", false), "");
     }
 
     #[test]
     fn page_target_clamps_at_both_ends() {
         assert_eq!(page_target(0, 9, 100, true), 9);
-        assert_eq!(page_target(95, 9, 100, true), 99, "向下夹到最后一行，不越过");
+        assert_eq!(
+            page_target(95, 9, 100, true),
+            99,
+            "向下夹到最后一行，不越过"
+        );
         assert_eq!(page_target(3, 9, 100, false), 0, "向上夹到第一行");
-        assert_eq!(page_target(0, 9, 0, true), 0, "空结果不塌陷（len-1 的减法不许下溢）");
+        assert_eq!(
+            page_target(0, 9, 0, true),
+            0,
+            "空结果不塌陷（len-1 的减法不许下溢）"
+        );
     }
 
     // ---- 头段（计算器/搜索/提示）并入列表后的行模型（批次 S / T）----
@@ -6607,7 +6943,11 @@ mod nav_tests {
     fn row_count_adds_the_head_rows_only_when_present() {
         assert_eq!(row_count(0, 0), 0, "空清单空查询：一行都没有");
         assert_eq!(row_count(3, 0), 3);
-        assert_eq!(row_count(0, 1), 1, "算式没有条目命中时，列表里就只剩计算器那一行");
+        assert_eq!(
+            row_count(0, 1),
+            1,
+            "算式没有条目命中时，列表里就只剩计算器那一行"
+        );
         assert_eq!(row_count(3, 1), 4);
         assert_eq!(row_count(0, 2), 2, "头段可以不止一行（未来多源并列）");
         assert_eq!(row_count(3, 2), 5);
@@ -6618,14 +6958,26 @@ mod nav_tests {
         // 下标表照 MatchIndex::search 的真实产出构造（名次 → self.items 下标）。
         let results = [7, 2, 9];
         assert_eq!(row_at(0, results.len(), 1), Some(Row::Head(0)));
-        assert_eq!(row_at(1, results.len(), 1), Some(Row::Item(0)), "第 1 行是第 0 名");
+        assert_eq!(
+            row_at(1, results.len(), 1),
+            Some(Row::Item(0)),
+            "第 1 行是第 0 名"
+        );
         assert_eq!(row_at(3, results.len(), 1), Some(Row::Item(2)));
-        assert_eq!(row_at(4, results.len(), 1), None, "越界不给行，调用方什么都不做");
+        assert_eq!(
+            row_at(4, results.len(), 1),
+            None,
+            "越界不给行，调用方什么都不做"
+        );
         // 头段不在场时，合并行号就是名次——这条是"批次 S 之前的行为一个字没变"的证据。
         assert_eq!(row_at(0, results.len(), 0), Some(Row::Item(0)));
         assert_eq!(row_at(2, results.len(), 0), Some(Row::Item(2)));
         assert_eq!(row_at(3, results.len(), 0), None);
-        assert_eq!(row_at(0, 0, 1), Some(Row::Head(0)), "只有计算器一行时第 0 行仍在");
+        assert_eq!(
+            row_at(0, 0, 1),
+            Some(Row::Head(0)),
+            "只有计算器一行时第 0 行仍在"
+        );
         // 头段两行（假想的多源并列）：第 0/1 行归头段，应用从第 2 行起。
         assert_eq!(row_at(1, results.len(), 2), Some(Row::Head(1)));
         assert_eq!(row_at(2, results.len(), 2), Some(Row::Item(0)));
@@ -6667,7 +7019,11 @@ mod nav_tests {
         assert_eq!(HeadRow::CustomHint(hint).custom_uid(), Some(uid.as_str()));
         assert_eq!(HeadRow::Custom(hit).custom_uid(), Some(uid.as_str()));
         // 没有条目身份的头段不许被编辑/删除接管——旧口径，漂了就等于给计算器行挂上删除键。
-        let calc = CalcHit { title: s.clone(), subtitle: s.clone(), copy: s.clone() };
+        let calc = CalcHit {
+            title: s.clone(),
+            subtitle: s.clone(),
+            copy: s.clone(),
+        };
         assert_eq!(HeadRow::Calc(calc).custom_uid(), None);
         let eng = EngineHint {
             engine_id: s.clone(),
@@ -6718,7 +7074,10 @@ mod nav_tests {
         assert_eq!(exclusive_for(&engines, "G"), Exclusive::NotOurs);
         // 首词 + 空格 = 独占：没词只剩补全提示，有词就是可执行行。
         assert!(matches!(exclusive_for(&engines, "g "), Exclusive::Hints(_)));
-        assert!(matches!(exclusive_for(&engines, "G foo"), Exclusive::Rows(_)));
+        assert!(matches!(
+            exclusive_for(&engines, "G foo"),
+            Exclusive::Rows(_)
+        ));
         // 前缀/别的词不是引擎关键字。
         assert_eq!(exclusive_for(&engines, "goo x"), Exclusive::NotOurs);
         assert_eq!(exclusive_for(&engines, "zzz "), Exclusive::NotOurs);
@@ -6730,9 +7089,18 @@ mod nav_tests {
         let results = [7, 2];
         let head_len = 1;
         let len = row_count(results.len(), head_len);
-        assert_eq!(row_at(digit_index(1, len).unwrap(), results.len(), head_len), Some(Row::Head(0)));
-        assert_eq!(row_at(digit_index(2, len).unwrap(), results.len(), head_len), Some(Row::Item(0)));
-        assert_eq!(row_at(digit_index(3, len).unwrap(), results.len(), head_len), Some(Row::Item(1)));
+        assert_eq!(
+            row_at(digit_index(1, len).unwrap(), results.len(), head_len),
+            Some(Row::Head(0))
+        );
+        assert_eq!(
+            row_at(digit_index(2, len).unwrap(), results.len(), head_len),
+            Some(Row::Item(0))
+        );
+        assert_eq!(
+            row_at(digit_index(3, len).unwrap(), results.len(), head_len),
+            Some(Row::Item(1))
+        );
         assert_eq!(digit_index(4, len), None, "共三行时按 4 不该指到任何行");
     }
 
@@ -6743,9 +7111,21 @@ mod nav_tests {
         assert_eq!(chrome, 78.0, "Light 的列表外框占用：顶 63 + 底 15");
         // 甲档（默认）步进 34 + 2 = 36：438 高的窗口正好十行，手动缩到 400 就只剩八行。
         assert_eq!(page_rows(438.0, 36.0, chrome), 10);
-        assert_eq!(page_rows(400.0, 36.0, chrome), 8, "窗口比默认矮时按实际高度给行数");
-        assert_eq!(page_rows(20.0, 36.0, chrome), 1, "拉到比列表还矮时仍要能动一行");
-        assert_eq!(page_rows(400.0, 0.0, chrome), 322, "行距为 0 时按 1px 兜底，不许除零");
+        assert_eq!(
+            page_rows(400.0, 36.0, chrome),
+            8,
+            "窗口比默认矮时按实际高度给行数"
+        );
+        assert_eq!(
+            page_rows(20.0, 36.0, chrome),
+            1,
+            "拉到比列表还矮时仍要能动一行"
+        );
+        assert_eq!(
+            page_rows(400.0, 0.0, chrome),
+            322,
+            "行距为 0 时按 1px 兜底，不许除零"
+        );
     }
 
     /// 批次 F6 真机抓到的缺陷钉住：输入框改成定宽铺满之后，顶栏那条缝只剩 `item_spacing.x`，
@@ -6754,8 +7134,16 @@ mod nav_tests {
     #[test]
     fn top_drag_strip_stays_wide_enough_to_hit() {
         // egui 默认行间距 8；主题把 spacing 调紧到 4 时也要还剩 12px 可命中。
-        assert!(top_drag_strip_w(8.0) >= 8.0, "默认行间距下顶栏手柄只有 {} px", top_drag_strip_w(8.0));
-        assert!(top_drag_strip_w(4.0) >= 8.0, "紧行间距下顶栏手柄只有 {} px", top_drag_strip_w(4.0));
+        assert!(
+            top_drag_strip_w(8.0) >= 8.0,
+            "默认行间距下顶栏手柄只有 {} px",
+            top_drag_strip_w(8.0)
+        );
+        assert!(
+            top_drag_strip_w(4.0) >= 8.0,
+            "紧行间距下顶栏手柄只有 {} px",
+            top_drag_strip_w(4.0)
+        );
         // 反证：没有预留间隙时，8px 的行间距被两侧内缩吃到只剩 4px——就是本次修掉的形状。
         assert!(
             8.0 - 2.0 * TOP_DRAG_INSET < 8.0,
@@ -6769,10 +7157,18 @@ mod nav_tests {
         let mut plan = Plan::default();
         plan.results = (0..30).collect();
         cap_plan_rows(&mut plan, LIST_ROWS);
-        assert_eq!(plan.results, (0..10).collect::<Vec<_>>(), "没有头段时列前 10 条");
+        assert_eq!(
+            plan.results,
+            (0..10).collect::<Vec<_>>(),
+            "没有头段时列前 10 条"
+        );
         // 头段行与普通结果共用这 10 行名额。
         assert_eq!(result_room(2, LIST_ROWS), 8);
-        assert_eq!(result_room(LIST_ROWS, LIST_ROWS), 0, "头段自己占满就不再放结果");
+        assert_eq!(
+            result_room(LIST_ROWS, LIST_ROWS),
+            0,
+            "头段自己占满就不再放结果"
+        );
         assert_eq!(result_room(LIST_ROWS + 2, LIST_ROWS), 0, "头段超了也不下溢");
     }
 
@@ -6795,12 +7191,18 @@ mod nav_tests {
                 "{} 档默认高度 {h} 要正好装下 {LIST_ROWS} 行（步进 {step}）",
                 density.as_str()
             );
-            assert!(h >= MIN_H as f32 && h <= 900.0, "夹在缩放下限与上限之间：{h}");
+            assert!(
+                h >= MIN_H as f32 && h <= 900.0,
+                "夹在缩放下限与上限之间：{h}"
+            );
         }
         // 行高被主题写成 0（只有「跟随主题」档会读它）时按最小窗口兜底，不许算出比 MIN_H 还矮的窗口。
         let mut flat = theme::Theme::light();
         flat.row_height = 0.0;
-        assert_eq!(default_window_height(&flat, RowDensity::Theme), MIN_H as f32);
+        assert_eq!(
+            default_window_height(&flat, RowDensity::Theme),
+            MIN_H as f32
+        );
         // 换主题仍要重算：主题供 `padding`（内边距）与「跟随主题」档的行高。
         // 走纯解析那条路（`resolve_with` + 空表），单测不碰磁盘与注册表。
         let none = std::collections::HashMap::new();
@@ -6819,7 +7221,11 @@ mod nav_tests {
         for idx in 0..10 {
             let label = row_num_label(idx).unwrap_or_else(|| panic!("第 {} 行该有号", idx + 1));
             let digit: u8 = label.parse().unwrap();
-            assert_eq!(digit_index(digit, 10), Some(idx), "徽标 {label} 与数字键落点不一致");
+            assert_eq!(
+                digit_index(digit, 10),
+                Some(idx),
+                "徽标 {label} 与数字键落点不一致"
+            );
         }
         assert_eq!(row_num_label(10), None, "第 11 行没有对应按键，不该标号");
     }
@@ -6844,21 +7250,8 @@ mod nav_tests {
         assert_eq!(vk_from_egui_key(F24), Some(0x87));
         // 范围外一律 None：录制端把这种按键当"还没按到有效键"继续等。
         for k in [
-            Escape,
-            Tab,
-            Backspace,
-            Delete,
-            ArrowUp,
-            ArrowDown,
-            ArrowLeft,
-            ArrowRight,
-            PageUp,
-            PageDown,
-            Home,
-            End,
-            Insert,
-            SuperLeft,
-            SuperRight,
+            Escape, Tab, Backspace, Delete, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, PageUp,
+            PageDown, Home, End, Insert, SuperLeft, SuperRight,
         ] {
             assert_eq!(vk_from_egui_key(k), None, "{k:?} 不在可录集合");
         }
@@ -6881,11 +7274,20 @@ mod nav_tests {
             mac_cmd: false,
         };
         let plain = spec_from_press(egui::Key::A, m(false, false, false)).unwrap();
-        assert_eq!(plain.mods, HKF_NOREPEAT, "无修饰键时只剩 NOREPEAT ⇒ check() 会拒");
-        let all = spec_from_press(egui::Key::I, m(true, true, true)).unwrap();
-        assert_eq!(all.mods, HKF_NOREPEAT | HKF_CONTROL | HKF_ALT | HKF_SHIFT, "Ctrl+Alt+Shift+I 不许再多 Win");
         assert_eq!(
-            spec_from_press(egui::Key::I, m(true, false, false)).unwrap().mods,
+            plain.mods, HKF_NOREPEAT,
+            "无修饰键时只剩 NOREPEAT ⇒ check() 会拒"
+        );
+        let all = spec_from_press(egui::Key::I, m(true, true, true)).unwrap();
+        assert_eq!(
+            all.mods,
+            HKF_NOREPEAT | HKF_CONTROL | HKF_ALT | HKF_SHIFT,
+            "Ctrl+Alt+Shift+I 不许再多 Win"
+        );
+        assert_eq!(
+            spec_from_press(egui::Key::I, m(true, false, false))
+                .unwrap()
+                .mods,
             HKF_NOREPEAT | HKF_CONTROL,
             "用户实测点名的就是这一条：录 Ctrl+I 得 Ctrl+I"
         );
@@ -6902,7 +7304,13 @@ mod nav_tests {
                 for shift in [false, true] {
                     for command in [false, true] {
                         for mac_cmd in [false, true] {
-                            let m = egui::Modifiers { ctrl, alt, shift, command, mac_cmd };
+                            let m = egui::Modifiers {
+                                ctrl,
+                                alt,
+                                shift,
+                                command,
+                                mac_cmd,
+                            };
                             let s = spec_from_press(egui::Key::A, m).unwrap();
                             assert_eq!(
                                 s.mods & HKF_WIN,
@@ -6927,27 +7335,58 @@ mod nav_tests {
     #[test]
     fn local_table_holds_only_recordable_combos_and_not_the_default() {
         for (mods, vk) in LOCAL_TAKEN {
-            let spec = HotkeySpec { mods: *mods | HKF_NOREPEAT, vk: *vk };
-            assert!(spec.check().is_ok(), "表里 {}/0x{vk:02X} 根本不是可录组合", spec.display());
-            assert!(!spec.conflicts_local(&[(HotkeySpec::DEFAULT.mods, HotkeySpec::DEFAULT.vk)]),
-                "出厂组合不许出现在自己的冲突表里");
+            let spec = HotkeySpec {
+                mods: *mods | HKF_NOREPEAT,
+                vk: *vk,
+            };
+            assert!(
+                spec.check().is_ok(),
+                "表里 {}/0x{vk:02X} 根本不是可录组合",
+                spec.display()
+            );
+            assert!(
+                !spec.conflicts_local(&[(HotkeySpec::DEFAULT.mods, HotkeySpec::DEFAULT.vk)]),
+                "出厂组合不许出现在自己的冲突表里"
+            );
         }
         // 抽查几条必须挡得住的（这些功能都有 Ctrl 版本，热键不能同名）。
         for vk in [0x4E, 0x45, 0x49, 0x44, 0x50, 0x4A, 0x4B] {
             assert!(
-                HotkeySpec { mods: HKF_CONTROL | HKF_NOREPEAT, vk }.conflicts_local(LOCAL_TAKEN),
+                HotkeySpec {
+                    mods: HKF_CONTROL | HKF_NOREPEAT,
+                    vk
+                }
+                .conflicts_local(LOCAL_TAKEN),
                 "Ctrl+{} 应当被本地表挡住",
                 char::from_u32(vk).unwrap()
             );
         }
-        assert!(HotkeySpec { mods: HKF_ALT | HKF_NOREPEAT, vk: 0x35 }.conflicts_local(LOCAL_TAKEN), "Alt+5 执行第 5 行");
-        assert!(!HotkeySpec { mods: HKF_ALT | HKF_NOREPEAT, vk: 0x49 }.conflicts_local(LOCAL_TAKEN), "Alt+I 本程序没用");
+        assert!(
+            HotkeySpec {
+                mods: HKF_ALT | HKF_NOREPEAT,
+                vk: 0x35
+            }
+            .conflicts_local(LOCAL_TAKEN),
+            "Alt+5 执行第 5 行"
+        );
+        assert!(
+            !HotkeySpec {
+                mods: HKF_ALT | HKF_NOREPEAT,
+                vk: 0x49
+            }
+            .conflicts_local(LOCAL_TAKEN),
+            "Alt+I 本程序没用"
+        );
         assert!(!HotkeySpec::DEFAULT.conflicts_local(LOCAL_TAKEN));
         // 反向也要钉住：这张表只挡"本程序真绑了的键"，不挡一切眼熟的编辑键。
         // Ctrl+A/Ctrl+Z 之类在本程序里没绑（表里当初多写过四条，全是凭印象），系统空着就该让人用。
         for vk in [0x41u32, 0x42, 0x48, 0x5A] {
             assert!(
-                !HotkeySpec { mods: HKF_CONTROL | HKF_NOREPEAT, vk }.conflicts_local(LOCAL_TAKEN),
+                !HotkeySpec {
+                    mods: HKF_CONTROL | HKF_NOREPEAT,
+                    vk
+                }
+                .conflicts_local(LOCAL_TAKEN),
                 "Ctrl+{} 本程序没绑，不该出现在表里",
                 char::from_u32(vk).unwrap()
             );
@@ -6956,7 +7395,11 @@ mod nav_tests {
         // 没绑"。批次 F6 把顶栏「＋ 新建」换成 ☰ 菜单并给菜单配了 Ctrl+M，那句从此不成立 ⇒
         // 0x4D 从"没绑"名单挪到这里，改成钉住"绑了就必须进表"（表与 `consume_key` 一一对应）。
         assert!(
-            HotkeySpec { mods: HKF_CONTROL | HKF_NOREPEAT, vk: 0x4D }.conflicts_local(LOCAL_TAKEN),
+            HotkeySpec {
+                mods: HKF_CONTROL | HKF_NOREPEAT,
+                vk: 0x4D
+            }
+            .conflicts_local(LOCAL_TAKEN),
             "Ctrl+M 开 ☰ 主菜单，必须被本地表挡住"
         );
     }

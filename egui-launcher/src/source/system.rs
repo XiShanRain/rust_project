@@ -12,9 +12,7 @@
 //! Windows 工具与 ms-settings 页仍然是普通 `Command` / `Url` 条目——它们本来就该由
 //! ShellExecute 打开。
 
-use crate::source::application::{
-    command_seed, seed_keyword, url_seed, ItemKind, LaunchItem,
-};
+use crate::source::application::{ItemKind, LaunchItem, command_seed, seed_keyword, url_seed};
 
 /// 内置动作的路径前缀。改它等于把所有已播种条目的路径换掉（`uid` 也一起变），只能增不能改。
 pub const SCHEME: &str = "internal:";
@@ -118,9 +116,11 @@ impl InternalAction {
     /// 不可撤销的那四条：默认（`confirm_actions = true`）执行前必须弹一次确认。
     /// 只说"会不会丢工作"：锁屏、关显示器、调音量都能随手撤回或重来，不在此列。
     pub fn needs_confirm(self) -> bool {
-        matches!(self, Self::Shutdown | Self::Restart | Self::Logoff | Self::EmptyRecycleBin)
+        matches!(
+            self,
+            Self::Shutdown | Self::Restart | Self::Logoff | Self::EmptyRecycleBin
+        )
     }
-
 }
 
 fn action_seed(name: &str, action: InternalAction, explicit: &str) -> LaunchItem {
@@ -153,26 +153,54 @@ const SETTINGS_PAGES: [(&str, &str, &str); 36] = [
     ("Win·电源与睡眠", "ms-settings:powersleep", "powersleep"),
     ("Win·电池", "ms-settings:battery", "battery"),
     ("Win·存储感知", "ms-settings:storagesense", "storage"),
-    ("Win·应用与功能", "ms-settings:appsfeatures", "appsfeatures uninstall"),
-    ("Win·可选功能", "ms-settings:optionalfeatures", "optionalfeatures"),
+    (
+        "Win·应用与功能",
+        "ms-settings:appsfeatures",
+        "appsfeatures uninstall",
+    ),
+    (
+        "Win·可选功能",
+        "ms-settings:optionalfeatures",
+        "optionalfeatures",
+    ),
     ("Win·默认应用", "ms-settings:defaultapps", "defaultapps"),
     ("Win·启动应用", "ms-settings:startupapps", "startupapps"),
     ("Win·打印机", "ms-settings:printers", "printers print"),
     ("Win·蓝牙", "ms-settings:bluetooth", "bluetooth"),
-    ("Win·已连接设备", "ms-settings:connecteddevices", "connecteddevices"),
+    (
+        "Win·已连接设备",
+        "ms-settings:connecteddevices",
+        "connecteddevices",
+    ),
     ("Win·WLAN", "ms-settings:network-wifi", "winwlan wifi wlan"),
     ("Win·网络状态", "ms-settings:network", "networkstatus"),
     ("Win·VPN", "ms-settings:network-vpn", "winvpn vpn"),
-    ("Win·飞行模式", "ms-settings:network-airplanemode", "airplanemode"),
-    ("Win·移动热点", "ms-settings:network-mobilehotspot", "mobilehotspot"),
+    (
+        "Win·飞行模式",
+        "ms-settings:network-airplanemode",
+        "airplanemode",
+    ),
+    (
+        "Win·移动热点",
+        "ms-settings:network-mobilehotspot",
+        "mobilehotspot",
+    ),
     ("Win·鼠标", "ms-settings:mousetouchpad", "mouse"),
     ("Win·键盘", "ms-settings:keyboard", "keyboard"),
     ("Win·输入", "ms-settings:typing", "typing"),
-    ("Win·区域与语言", "ms-settings:regionlanguage", "regionlanguage language"),
+    (
+        "Win·区域与语言",
+        "ms-settings:regionlanguage",
+        "regionlanguage language",
+    ),
     ("Win·日期与时间", "ms-settings:dateandtime", "dateandtime"),
     ("Win·颜色", "ms-settings:colors", "colors"),
     ("Win·主题", "ms-settings:themes", "themes"),
-    ("Win·个性化", "ms-settings:personalization", "personalization"),
+    (
+        "Win·个性化",
+        "ms-settings:personalization",
+        "personalization",
+    ),
     ("Win·任务栏", "ms-settings:taskbar", "taskbar"),
     // 不能叫「Win·隐私」：与「Win·颜色」的拼音首字母同为 `winys`，出厂关键字会撞车。
     // 也不能叫「Win·隐私总览」：`winyszl` 跨词恰好拼出 `sz`，裸 `sz` 会把它带出来
@@ -180,7 +208,11 @@ const SETTINGS_PAGES: [(&str, &str, &str); 36] = [
     ("Win·隐私概览", "ms-settings:privacy", "privacy"),
     ("Win·隐私·位置", "ms-settings:privacy-location", "location"),
     ("Win·隐私·相机", "ms-settings:privacy-camera", "camera"),
-    ("Win·隐私·麦克风", "ms-settings:privacy-microphone", "microphone"),
+    (
+        "Win·隐私·麦克风",
+        "ms-settings:privacy-microphone",
+        "microphone",
+    ),
     ("Win·恢复", "ms-settings:recovery", "recovery reset"),
     ("Win·激活", "ms-settings:activation", "activation"),
     ("Win·关于本机", "ms-settings:about", "aboutpc sysinfo"),
@@ -226,8 +258,16 @@ pub fn system_seeds() -> Vec<LaunchItem> {
         action_seed("启动器·热键", InternalAction::Settings(3), "hotkeys"),
         action_seed("启动器·数据源", InternalAction::Settings(4), "sources"),
         action_seed("重新加载配置", InternalAction::Reload, "reload"),
-        action_seed("重建应用索引", InternalAction::RebuildAppIndex, "rebuildapp reindexapp"),
-        action_seed("重建文件索引", InternalAction::RebuildFileIndex, "rebuildfile reindexfile"),
+        action_seed(
+            "重建应用索引",
+            InternalAction::RebuildAppIndex,
+            "rebuildapp reindexapp",
+        ),
+        action_seed(
+            "重建文件索引",
+            InternalAction::RebuildFileIndex,
+            "rebuildfile reindexfile",
+        ),
         action_seed("关于本程序", InternalAction::About, "about"),
         action_seed("打开日志", InternalAction::OpenLog, "log"),
         action_seed("退出启动器", InternalAction::Quit, "quit exit"),
@@ -247,7 +287,13 @@ pub fn system_seeds() -> Vec<LaunchItem> {
     }
     // 附录 C 点名的三条带参数项。运行对话框走 shell 命令 CLSID 而不是 Win+R ——
     // 本项目不注入 Win 键；`{2559…}` 不是 `{query}` 占位符，参数原样交给 explorer。
-    seeds.push(command_seed("资源管理器", "explorer.exe", "", "explorer.exe", "explorer files"));
+    seeds.push(command_seed(
+        "资源管理器",
+        "explorer.exe",
+        "",
+        "explorer.exe",
+        "explorer files",
+    ));
     seeds.push(command_seed(
         "运行对话框",
         "explorer.exe",
@@ -255,7 +301,13 @@ pub fn system_seeds() -> Vec<LaunchItem> {
         "explorer.exe",
         "runbox",
     ));
-    seeds.push(command_seed("进程列表", "cmd.exe", "/k tasklist", "cmd.exe", "tasklist processlist"));
+    seeds.push(command_seed(
+        "进程列表",
+        "cmd.exe",
+        "/k tasklist",
+        "cmd.exe",
+        "tasklist processlist",
+    ));
 
     for (name, uri, explicit) in SETTINGS_PAGES {
         seeds.push(url_seed(name, uri, explicit));
@@ -266,7 +318,11 @@ pub fn system_seeds() -> Vec<LaunchItem> {
         action_seed("静音", InternalAction::VolumeMute, "mute"),
         action_seed("增加音量", InternalAction::VolumeUp, "volup"),
         action_seed("降低音量", InternalAction::VolumeDown, "voldown"),
-        action_seed("播放/暂停", InternalAction::MediaPlayPause, "playpause media"),
+        action_seed(
+            "播放/暂停",
+            InternalAction::MediaPlayPause,
+            "playpause media",
+        ),
         action_seed("下一曲", InternalAction::MediaNext, "next"),
         action_seed("上一曲", InternalAction::MediaPrev, "prev previous"),
         action_seed("停止播放", InternalAction::MediaStop, "stop"),
@@ -285,8 +341,12 @@ pub fn system_seeds() -> Vec<LaunchItem> {
 pub fn rename_legacy_settings(items: &mut [LaunchItem]) -> usize {
     let mut changed = 0;
     for seed in crate::source::application::builtin_seeds() {
-        let Some(old) = legacy_name(&seed.path, &seed.name) else { continue };
-        let Some(item) = items.iter_mut().find(|i| i.uid() == seed.uid()) else { continue };
+        let Some(old) = legacy_name(&seed.path, &seed.name) else {
+            continue;
+        };
+        let Some(item) = items.iter_mut().find(|i| i.uid() == seed.uid()) else {
+            continue;
+        };
         if item.name.trim() == old {
             item.name = seed.name;
             item.keyword = seed.keyword;
@@ -307,7 +367,9 @@ fn legacy_name(path: &str, new_name: &str) -> Option<String> {
         "internal:settings:4" => Some("设置·数据源".to_string()),
         // 这一条不只换前缀还换了词（「总览」→「概览」，避 `sz` 跨词命中），旧名单独列出。
         "ms-settings:privacy" => Some("设置·隐私总览".to_string()),
-        _ => new_name.strip_prefix("Win·").map(|tail| format!("设置·{tail}")),
+        _ => new_name
+            .strip_prefix("Win·")
+            .map(|tail| format!("设置·{tail}")),
     }
 }
 
@@ -343,9 +405,18 @@ mod tests {
         ];
         for a in all {
             assert_eq!(InternalAction::from_id(&a.id()), Some(a), "{}", a.id());
-            assert_eq!(InternalAction::from_path(&a.path()), Some(a), "{}", a.path());
+            assert_eq!(
+                InternalAction::from_path(&a.path()),
+                Some(a),
+                "{}",
+                a.path()
+            );
         }
-        assert_eq!(InternalAction::from_id("settings:0"), None, "页码只有 1..=4");
+        assert_eq!(
+            InternalAction::from_id("settings:0"),
+            None,
+            "页码只有 1..=4"
+        );
         assert_eq!(InternalAction::from_id("settings:5"), None);
         assert_eq!(InternalAction::from_id("nope"), None);
         assert_eq!(InternalAction::from_path("internal:nope"), None);
@@ -360,8 +431,9 @@ mod tests {
             .filter(|a| a.needs_confirm())
             .map(|a| a.id())
             .collect();
-        let want: HashSet<String> =
-            ["shutdown", "restart", "logoff", "empty-recycle-bin"].map(str::to_string).into();
+        let want: HashSet<String> = ["shutdown", "restart", "logoff", "empty-recycle-bin"]
+            .map(str::to_string)
+            .into();
         assert_eq!(gated, want);
     }
 
@@ -369,19 +441,40 @@ mod tests {
     fn every_group_is_actually_present() {
         let seeds = system_seeds();
         let count = |f: &dyn Fn(&LaunchItem) -> bool| seeds.iter().filter(|i| f(i)).count();
-        assert_eq!(count(&|i| i.kind == ItemKind::Internal && i.path.contains("settings:")), 4, "四条设置页直命令");
-        assert!(count(&|i| i.kind == ItemKind::Internal) >= 20, "内置动作要覆盖自身/电源/媒体三组");
+        assert_eq!(
+            count(&|i| i.kind == ItemKind::Internal && i.path.contains("settings:")),
+            4,
+            "四条设置页直命令"
+        );
+        assert!(
+            count(&|i| i.kind == ItemKind::Internal) >= 20,
+            "内置动作要覆盖自身/电源/媒体三组"
+        );
         // 表里的 20 条 + 附录 C 点名的三条带参数项（资源管理器 / 运行对话框 / 进程列表）。
         assert_eq!(
-            count(&|i| i.path.ends_with(".msc") || i.path.ends_with(".cpl") || i.path.ends_with(".exe")),
+            count(&|i| i.path.ends_with(".msc")
+                || i.path.ends_with(".cpl")
+                || i.path.ends_with(".exe")),
             TOOLS.len() + 3,
             "Windows 工具一条不少"
         );
-        for id in ["internal:lock", "internal:sleep", "internal:hibernate", "internal:monitor-off"] {
+        for id in [
+            "internal:lock",
+            "internal:sleep",
+            "internal:hibernate",
+            "internal:monitor-off",
+        ] {
             assert!(count(&|i| i.path == id) == 1, "电源与会话组缺 {id}");
         }
-        assert_eq!(count(&|i| i.path.starts_with("ms-settings:")), SETTINGS_PAGES.len(), "ms-settings 页一条不少");
-        assert!(count(&|i| i.path.starts_with("ms-settings:")) >= 30, "需求书要求至少 40 页里的稳定子集");
+        assert_eq!(
+            count(&|i| i.path.starts_with("ms-settings:")),
+            SETTINGS_PAGES.len(),
+            "ms-settings 页一条不少"
+        );
+        assert!(
+            count(&|i| i.path.starts_with("ms-settings:")) >= 30,
+            "需求书要求至少 40 页里的稳定子集"
+        );
         assert!(count(&|i| i.keyword.contains("mute")) == 1, "音量组在");
     }
 
@@ -401,8 +494,14 @@ mod tests {
         };
         for q in ["设置", "sz"] {
             let got = names(q);
-            assert!(got.contains(&"Windows 设置".to_string()), "{q} 该出 Windows 设置：{got:?}");
-            assert!(got.contains(&"启动器设置".to_string()), "{q} 该出启动器设置：{got:?}");
+            assert!(
+                got.contains(&"Windows 设置".to_string()),
+                "{q} 该出 Windows 设置：{got:?}"
+            );
+            assert!(
+                got.contains(&"启动器设置".to_string()),
+                "{q} 该出启动器设置：{got:?}"
+            );
             assert!(
                 !got.iter().any(|n| n.starts_with("Win·")),
                 "{q} 不该把 36 条设置页铺出来：{got:?}"
@@ -413,7 +512,10 @@ mod tests {
         assert!(names("声音").contains(&"Win·声音".to_string()));
         // `win` 是这批页面的集合词，36 条要一次列全（WLAN/VPN 靠显式别名补上 win 前缀）。
         assert_eq!(
-            names("win").iter().filter(|n| n.starts_with("Win·")).count(),
+            names("win")
+                .iter()
+                .filter(|n| n.starts_with("Win·"))
+                .count(),
             SETTINGS_PAGES.len(),
             "敲 win 该列全部设置页"
         );
@@ -443,7 +545,11 @@ mod tests {
         let find = |p: &str| items.iter().find(|i| i.path == p).unwrap();
         assert_eq!(find("ms-settings:").name, "Windows 设置");
         assert_eq!(find("ms-settings:sound").name, "Win·声音");
-        assert_eq!(find("ms-settings:sound").keyword, "winsy sound audio", "旧关键字要按出厂值重算");
+        assert_eq!(
+            find("ms-settings:sound").keyword,
+            "winsy sound audio",
+            "旧关键字要按出厂值重算"
+        );
         assert_eq!(find("internal:settings:3").name, "启动器·热键");
 
         assert_eq!(rename_legacy_settings(&mut items), 0, "改名必须幂等");
@@ -457,7 +563,11 @@ mod tests {
         for s in &seeds {
             assert!(uids.insert(s.uid()), "uid 重复：{}", s.uid());
             assert!(names.insert(s.name.clone()), "名称重复：{}", s.name);
-            assert!(!s.keyword.trim().is_empty(), "每条都该有可敲的别名：{}", s.name);
+            assert!(
+                !s.keyword.trim().is_empty(),
+                "每条都该有可敲的别名：{}",
+                s.name
+            );
         }
     }
 

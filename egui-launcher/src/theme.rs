@@ -215,7 +215,11 @@ impl Theme {
     /// egui 控件的全局配色。两侧样式表都写同一份（见 [`Theme::apply`]），
     /// 这样系统明暗切换不会把已经选好的主题顶掉。
     pub fn visuals(&self) -> egui::Visuals {
-        let mut v = if self.is_dark() { egui::Visuals::dark() } else { egui::Visuals::light() };
+        let mut v = if self.is_dark() {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        };
         v.dark_mode = self.is_dark();
         v.panel_fill = self.background;
         v.window_fill = self.background;
@@ -272,10 +276,22 @@ impl Theme {
     /// 需求书 6.2 的 `input_font_size` 不在这里——它只给搜索框（TextEdit 自己带字体）。
     pub fn text_styles(&self) -> BTreeMap<egui::TextStyle, egui::FontId> {
         let mut m = BTreeMap::new();
-        m.insert(egui::TextStyle::Small, egui::FontId::proportional(self.subtitle_font_size));
-        m.insert(egui::TextStyle::Body, egui::FontId::proportional(self.title_font_size));
-        m.insert(egui::TextStyle::Button, egui::FontId::proportional(self.title_font_size));
-        m.insert(egui::TextStyle::Monospace, egui::FontId::monospace(self.shortcut_font_size));
+        m.insert(
+            egui::TextStyle::Small,
+            egui::FontId::proportional(self.subtitle_font_size),
+        );
+        m.insert(
+            egui::TextStyle::Body,
+            egui::FontId::proportional(self.title_font_size),
+        );
+        m.insert(
+            egui::TextStyle::Button,
+            egui::FontId::proportional(self.title_font_size),
+        );
+        m.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(self.shortcut_font_size),
+        );
         m.insert(
             egui::TextStyle::Heading,
             egui::FontId::proportional(self.title_font_size + 4.0),
@@ -289,12 +305,18 @@ impl Theme {
             .fill(self.window_fill())
             .stroke(egui::Stroke::new(1.0, self.border))
             .corner_radius(egui::CornerRadius::same(WINDOW_RADIUS))
-            .inner_margin(egui::Margin::same(self.padding.round().clamp(0.0, 127.0) as i8))
+            .inner_margin(egui::Margin::same(
+                self.padding.round().clamp(0.0, 127.0) as i8
+            ))
     }
 
     /// 装进 egui：两套主题样式都写同一份，避免系统明暗切换时观感跳变。
     pub fn apply(&self, ctx: &egui::Context) {
-        let theme = if self.is_dark() { egui::Theme::Dark } else { egui::Theme::Light };
+        let theme = if self.is_dark() {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
         ctx.set_theme(theme);
         let visuals = self.visuals();
         let text_styles = self.text_styles();
@@ -316,7 +338,11 @@ pub fn parse_hex(s: &str) -> Option<egui::Color32> {
         return None;
     }
     let v = u32::from_str_radix(s, 16).ok()?;
-    Some(egui::Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
+    Some(egui::Color32::from_rgb(
+        (v >> 16) as u8,
+        (v >> 8) as u8,
+        v as u8,
+    ))
 }
 
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
@@ -336,9 +362,21 @@ struct Pal([&'static str; 13]);
 
 impl Pal {
     fn file(self, base: Option<&str>) -> ThemeFile {
-        let [background, border, input_text, separator, title, subtitle, shortcut, selected_background,
-            selected_title, selected_subtitle, selected_shortcut, highlight, selected_highlight] =
-            self.0;
+        let [
+            background,
+            border,
+            input_text,
+            separator,
+            title,
+            subtitle,
+            shortcut,
+            selected_background,
+            selected_title,
+            selected_subtitle,
+            selected_shortcut,
+            highlight,
+            selected_highlight,
+        ] = self.0;
         ThemeFile {
             base: base.map(str::to_string),
             background: hex(background),
@@ -485,14 +523,21 @@ pub fn user_dir() -> PathBuf {
 /// 读用户主题目录。坏文件只记日志跳过——主题问题不许挡住启动。
 pub fn load_user_files(dir: &std::path::Path) -> HashMap<String, ThemeFile> {
     let mut out = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()).is_none_or(|e| !e.eq_ignore_ascii_case("json"))
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_none_or(|e| !e.eq_ignore_ascii_case("json"))
         {
             continue;
         }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
@@ -514,10 +559,13 @@ pub fn load_user_files(dir: &std::path::Path) -> HashMap<String, ThemeFile> {
 /// 读不到（旧系统、权限）按浅色处理——与 `Light` 基准一致。
 pub fn system_is_dark() -> bool {
     use windows::Win32::Foundation::ERROR_SUCCESS;
-    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
     let subkey = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
     let subkey: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-    let value: Vec<u16> = "AppsUseLightTheme".encode_utf16().chain(std::iter::once(0)).collect();
+    let value: Vec<u16> = "AppsUseLightTheme"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut data = 1u32;
     let mut size = std::mem::size_of::<u32>() as u32;
     let rc = unsafe {
@@ -538,7 +586,10 @@ pub fn system_is_dark() -> bool {
 /// 两者原先各读一次 `Themes\`——坏文件会在日志里出现两遍，改为共用同一份。
 pub fn load(selection: &str) -> (Theme, Vec<String>) {
     let files = load_user_files(&user_dir());
-    (resolve_with(selection, &files, system_is_dark()), all_names(&files))
+    (
+        resolve_with(selection, &files, system_is_dark()),
+        all_names(&files),
+    )
 }
 
 /// 纯解析（单测走这条，不碰磁盘与注册表）。
@@ -553,7 +604,11 @@ pub fn resolve_with(
         selection
     };
     let mut t = resolve_name(name, files, 0, &mut Vec::new());
-    t.name = if selection == SYSTEM_THEME { SYSTEM_THEME.to_string() } else { t.name };
+    t.name = if selection == SYSTEM_THEME {
+        SYSTEM_THEME.to_string()
+    } else {
+        t.name
+    };
     t
 }
 
@@ -572,7 +627,9 @@ fn resolve_name(
         return theme;
     };
     if depth >= MAX_DEPTH || stack.iter().any(|s| s == name) {
-        eprintln!("theme: 继承链在「{name}」这里断开（深度 {depth} / 成环），按 {FALLBACK_THEME} 处理");
+        eprintln!(
+            "theme: 继承链在「{name}」这里断开（深度 {depth} / 成环），按 {FALLBACK_THEME} 处理"
+        );
         return theme;
     }
     stack.push(name.to_string());
@@ -581,7 +638,10 @@ fn resolve_name(
     // 而不是落回 Light（否则「Dark.json 写 base:Dark + 一个背景色」会丢掉整套 Dark 配色）。
     if file.base.as_deref() == Some(name) {
         let builtin = builtin_file(name).unwrap_or_default();
-        let builtin_base = builtin.base.clone().unwrap_or_else(|| FALLBACK_THEME.to_string());
+        let builtin_base = builtin
+            .base
+            .clone()
+            .unwrap_or_else(|| FALLBACK_THEME.to_string());
         if name != FALLBACK_THEME {
             theme = resolve_name(&builtin_base, files, depth + 1, stack);
         }
@@ -591,7 +651,10 @@ fn resolve_name(
         stack.pop();
         return theme;
     }
-    let base_name = file.base.clone().unwrap_or_else(|| FALLBACK_THEME.to_string());
+    let base_name = file
+        .base
+        .clone()
+        .unwrap_or_else(|| FALLBACK_THEME.to_string());
     if name != FALLBACK_THEME {
         theme = resolve_name(&base_name, files, depth + 1, stack);
     }
@@ -629,20 +692,34 @@ pub fn install_fonts(ctx: &egui::Context, font_name: &str) {
     if let Some((label, bytes, index)) = preferred {
         let mut data = egui::FontData::from_owned(bytes);
         data.index = index;
-        fonts.font_data.insert("theme".to_owned(), std::sync::Arc::new(data));
-        fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "theme".to_owned());
+        fonts
+            .font_data
+            .insert("theme".to_owned(), std::sync::Arc::new(data));
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "theme".to_owned());
         eprintln!("theme: 字体改用 {label}");
     }
     for (file, index) in [("msyh.ttc", 0u32), ("simhei.ttf", 0), ("STXIHEI.TTF", 0)] {
-        let Ok(bytes) = std::fs::read(format!(r"C:\Windows\Fonts\{file}")) else { continue };
+        let Ok(bytes) = std::fs::read(format!(r"C:\Windows\Fonts\{file}")) else {
+            continue;
+        };
         if skrifa::FontRef::from_index(&bytes, index).is_err() {
             continue;
         }
         let mut data = egui::FontData::from_owned(bytes);
         data.index = index;
-        fonts.font_data.insert("cjk".to_owned(), std::sync::Arc::new(data));
+        fonts
+            .font_data
+            .insert("cjk".to_owned(), std::sync::Arc::new(data));
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("cjk".to_owned());
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("cjk".to_owned());
         }
         break;
     }
@@ -656,11 +733,17 @@ fn find_font(name: &str) -> Option<(String, Vec<u8>, u32)> {
         candidates.push(dir.join(format!("{name}.{ext}")));
     }
     for path in candidates {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         if skrifa::FontRef::from_index(&bytes, 0).is_err() {
             continue;
         }
-        let label = path.file_name().and_then(|s| s.to_str()).unwrap_or(name).to_string();
+        let label = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name)
+            .to_string();
         return Some((label, bytes, 0));
     }
     None
@@ -671,7 +754,10 @@ mod tests {
     use super::*;
 
     fn files(entries: &[(&str, ThemeFile)]) -> HashMap<String, ThemeFile> {
-        entries.iter().map(|(n, f)| (n.to_string(), f.clone())).collect()
+        entries
+            .iter()
+            .map(|(n, f)| (n.to_string(), f.clone()))
+            .collect()
     }
 
     #[test]
@@ -688,7 +774,10 @@ mod tests {
         assert_eq!(t.selected_radius, 0.0);
         assert_eq!(t.opacity, 255);
         assert_eq!(t.background, egui::Color32::from_rgb(0xFA, 0xFA, 0xFA));
-        assert_eq!(t.selected_highlight, egui::Color32::from_rgb(0x00, 0x47, 0xB8));
+        assert_eq!(
+            t.selected_highlight,
+            egui::Color32::from_rgb(0x00, 0x47, 0xB8)
+        );
         assert!(!t.is_dark());
     }
 
@@ -701,13 +790,26 @@ mod tests {
             assert_eq!(t.name, name);
             // Compact 与 Light 同色系（它的特色是尺寸），其余主题都必须有自己的底色。
             if name != "Light" && name != "Compact" {
-                assert_ne!(t.background, Theme::light().background, "「{name}」没有自己的底色");
+                assert_ne!(
+                    t.background,
+                    Theme::light().background,
+                    "「{name}」没有自己的底色"
+                );
             }
         }
         let compact = resolve_with("Compact", &none, false);
-        assert!(compact.row_height < Theme::light().row_height, "Compact 的行高要更小");
-        assert!(compact.icon_size < Theme::light().icon_size, "Compact 的图标要更小");
-        assert!(compact.padding < Theme::light().padding, "Compact 的内边距要更小");
+        assert!(
+            compact.row_height < Theme::light().row_height,
+            "Compact 的行高要更小"
+        );
+        assert!(
+            compact.icon_size < Theme::light().icon_size,
+            "Compact 的图标要更小"
+        );
+        assert!(
+            compact.padding < Theme::light().padding,
+            "Compact 的内边距要更小"
+        );
     }
 
     #[test]
@@ -720,7 +822,10 @@ mod tests {
         let dark = resolve_with("Dark", &HashMap::new(), false);
         assert_eq!(t.background, dark.background, "没写的颜色必须跟 base 走");
         assert_eq!(t.title, dark.title);
-        assert_eq!(t.selected_background, egui::Color32::from_rgb(0x1D, 0x4E, 0xD8));
+        assert_eq!(
+            t.selected_background,
+            egui::Color32::from_rgb(0x1D, 0x4E, 0xD8)
+        );
         assert_eq!(t.selected_radius, 8.0);
         assert_eq!(t.opacity, 240);
         assert_eq!(t.name, "Mine");
@@ -728,7 +833,10 @@ mod tests {
 
     #[test]
     fn self_base_edits_the_builtin_instead_of_looping() {
-        let mut f = ThemeFile { base: Some("Dark".into()), ..Default::default() };
+        let mut f = ThemeFile {
+            base: Some("Dark".into()),
+            ..Default::default()
+        };
         f.background = Some("101010".into());
         let t = resolve_with("Dark", &files(&[("Dark", f)]), false);
         let builtin = resolve_with("Dark", &HashMap::new(), false);
@@ -738,8 +846,14 @@ mod tests {
 
     #[test]
     fn a_cycle_falls_back_to_light_without_recursing_forever() {
-        let a = ThemeFile { base: Some("B".into()), ..Default::default() };
-        let b = ThemeFile { base: Some("A".into()), ..Default::default() };
+        let a = ThemeFile {
+            base: Some("B".into()),
+            ..Default::default()
+        };
+        let b = ThemeFile {
+            base: Some("A".into()),
+            ..Default::default()
+        };
         let t = resolve_with("A", &files(&[("A", a), ("B", b)]), false);
         assert_eq!(t.background, Theme::light().background);
     }
@@ -751,7 +865,10 @@ mod tests {
         for i in 0..10 {
             list.push((
                 format!("X{i}"),
-                ThemeFile { base: Some(format!("X{}", i + 1)), ..Default::default() },
+                ThemeFile {
+                    base: Some(format!("X{}", i + 1)),
+                    ..Default::default()
+                },
             ));
         }
         let borrowed: Vec<(&str, ThemeFile)> =
@@ -770,8 +887,14 @@ mod tests {
 
     #[test]
     fn hex_accepts_both_spellings_and_rejects_bad_widths() {
-        assert_eq!(parse_hex("005FE0"), Some(egui::Color32::from_rgb(0x00, 0x5F, 0xE0)));
-        assert_eq!(parse_hex("#005FE0"), Some(egui::Color32::from_rgb(0x00, 0x5F, 0xE0)));
+        assert_eq!(
+            parse_hex("005FE0"),
+            Some(egui::Color32::from_rgb(0x00, 0x5F, 0xE0))
+        );
+        assert_eq!(
+            parse_hex("#005FE0"),
+            Some(egui::Color32::from_rgb(0x00, 0x5F, 0xE0))
+        );
         assert_eq!(parse_hex("005FE"), None);
         assert_eq!(parse_hex("005FE00"), None);
         assert_eq!(parse_hex("005FEG"), None);
@@ -780,8 +903,14 @@ mod tests {
     #[test]
     fn system_picks_dark_or_light_from_the_os_flag() {
         let none = HashMap::new();
-        assert_eq!(resolve_with(SYSTEM_THEME, &none, true).background, resolve_with("Dark", &none, false).background);
-        assert_eq!(resolve_with(SYSTEM_THEME, &none, false).background, resolve_with("Light", &none, false).background);
+        assert_eq!(
+            resolve_with(SYSTEM_THEME, &none, true).background,
+            resolve_with("Dark", &none, false).background
+        );
+        assert_eq!(
+            resolve_with(SYSTEM_THEME, &none, false).background,
+            resolve_with("Light", &none, false).background
+        );
     }
 
     #[test]
@@ -802,11 +931,23 @@ mod tests {
 
     #[test]
     fn dark_theme_is_recognised_by_luminance() {
-        for name in ["Dark", "Nord", "GitHub Dark", "Catppuccin Mocha", "Tokyo Night"] {
-            assert!(resolve_with(name, &HashMap::new(), false).is_dark(), "「{name}」应判为深色");
+        for name in [
+            "Dark",
+            "Nord",
+            "GitHub Dark",
+            "Catppuccin Mocha",
+            "Tokyo Night",
+        ] {
+            assert!(
+                resolve_with(name, &HashMap::new(), false).is_dark(),
+                "「{name}」应判为深色"
+            );
         }
         for name in ["Light", "Solarized Light", "GitHub Light", "Sepia"] {
-            assert!(!resolve_with(name, &HashMap::new(), false).is_dark(), "「{name}」应判为浅色");
+            assert!(
+                !resolve_with(name, &HashMap::new(), false).is_dark(),
+                "「{name}」应判为浅色"
+            );
         }
     }
 }

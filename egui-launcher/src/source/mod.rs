@@ -238,7 +238,10 @@ pub fn dispatch(
             continue;
         }
         if let Some(rows) = guarded(id, || s.take_over(&mut *cx)).flatten() {
-            return SearchPlan { head: rows, results: Vec::new() };
+            return SearchPlan {
+                head: rows,
+                results: Vec::new(),
+            };
         }
     }
 
@@ -329,7 +332,11 @@ mod registry_tests {
         true
     }
 
-    fn ctx_with<'a>(query: &'a str, items: &'a [LaunchItem], index: &'a mut MatchIndex) -> SearchCtx<'a> {
+    fn ctx_with<'a>(
+        query: &'a str,
+        items: &'a [LaunchItem],
+        index: &'a mut MatchIndex,
+    ) -> SearchCtx<'a> {
         SearchCtx {
             query,
             items,
@@ -387,7 +394,10 @@ mod registry_tests {
     #[test]
     fn a_custom_hint_absorbs_the_same_item_from_results() {
         let hinted = LaunchItem::default();
-        let other = LaunchItem { path: "mspaint.exe".into(), ..Default::default() };
+        let other = LaunchItem {
+            path: "mspaint.exe".into(),
+            ..Default::default()
+        };
         let items = vec![hinted, other];
         let uid = items[0].uid();
         let mut sources: Vec<Box<dyn DataSource>> = vec![
@@ -398,20 +408,31 @@ mod registry_tests {
         let mut cx = ctx_with("ping", &items, &mut index);
         let plan = dispatch(&mut sources, &mut cx, |_| true);
         assert_eq!(plan.head.len(), 1, "提示行留在头段");
-        assert_eq!(plan.results, vec![1], "同一 uid 从下方结果里摘掉，别的条目不误伤");
+        assert_eq!(
+            plan.results,
+            vec![1],
+            "同一 uid 从下方结果里摘掉，别的条目不误伤"
+        );
     }
 
     /// FR-SRC-16：`>` 是显式语法 ⇒ 独占整张列表；裸 `>` 只给用法行；源关掉后同一条查询
     /// 回到普通搜索（设置页那行开关的判据）。
     #[test]
     fn a_terminal_prefix_takes_over_and_bare_prefix_gives_usage() {
-        let items = vec![LaunchItem { name: "计算器".into(), path: "calc.exe".into(), ..Default::default() }];
+        let items = vec![LaunchItem {
+            name: "计算器".into(),
+            path: "calc.exe".into(),
+            ..Default::default()
+        }];
         let mut index = MatchIndex::default();
         {
             let mut sources = default_sources();
             let mut cx = ctx_with(">ipconfig /all", &items, &mut index);
             let plan = dispatch(&mut sources, &mut cx, |_| true);
-            assert!(plan.results.is_empty(), "`>` 独占：下面的清单一条都不许露出");
+            assert!(
+                plan.results.is_empty(),
+                "`>` 独占：下面的清单一条都不许露出"
+            );
             match plan.head.as_slice() {
                 [SourceRow::Terminal(h)] => {
                     assert_eq!(h.command, "ipconfig /all");
@@ -425,7 +446,10 @@ mod registry_tests {
             let mut cx = ctx_with(">", &items, &mut index);
             let plan = dispatch(&mut sources, &mut cx, |_| true);
             assert!(plan.results.is_empty());
-            assert!(matches!(plan.head.as_slice(), [SourceRow::TermHint(_)]), "裸 `>` 只给用法行");
+            assert!(
+                matches!(plan.head.as_slice(), [SourceRow::TermHint(_)]),
+                "裸 `>` 只给用法行"
+            );
         }
         {
             let mut sources = default_sources();
@@ -439,7 +463,11 @@ mod registry_tests {
     fn default_registry_has_each_source_once_in_paper_order() {
         let sources = default_sources();
         let ids: Vec<SourceId> = sources.iter().map(|s| s.id()).collect();
-        assert_eq!(ids, SourceId::ALL.to_vec(), "注册顺序必须与 SourceId::ALL 一致");
+        assert_eq!(
+            ids,
+            SourceId::ALL.to_vec(),
+            "注册顺序必须与 SourceId::ALL 一致"
+        );
         let mut labels: Vec<&str> = sources.iter().map(|s| s.label()).collect();
         let n = labels.len();
         labels.sort_unstable();
@@ -451,9 +479,24 @@ mod registry_tests {
     fn take_over_order_follows_registration_and_stops_at_first_hit() {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let mut sources: Vec<Box<dyn DataSource>> = vec![
-            Box::new(Probe { id: SourceId::Apps, seen: seen.clone(), take: None, boom: false }),
-            Box::new(Probe { id: SourceId::Custom, seen: seen.clone(), take: Some(0), boom: false }),
-            Box::new(Probe { id: SourceId::Web, seen: seen.clone(), take: Some(0), boom: false }),
+            Box::new(Probe {
+                id: SourceId::Apps,
+                seen: seen.clone(),
+                take: None,
+                boom: false,
+            }),
+            Box::new(Probe {
+                id: SourceId::Custom,
+                seen: seen.clone(),
+                take: Some(0),
+                boom: false,
+            }),
+            Box::new(Probe {
+                id: SourceId::Web,
+                seen: seen.clone(),
+                take: Some(0),
+                boom: false,
+            }),
         ];
         let items: Vec<LaunchItem> = Vec::new();
         let mut index = MatchIndex::default();
@@ -467,8 +510,18 @@ mod registry_tests {
     fn a_disabled_source_is_not_asked_at_all() {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let mut sources: Vec<Box<dyn DataSource>> = vec![
-            Box::new(Probe { id: SourceId::Apps, seen: seen.clone(), take: None, boom: true }),
-            Box::new(Probe { id: SourceId::Custom, seen: seen.clone(), take: None, boom: false }),
+            Box::new(Probe {
+                id: SourceId::Apps,
+                seen: seen.clone(),
+                take: None,
+                boom: true,
+            }),
+            Box::new(Probe {
+                id: SourceId::Custom,
+                seen: seen.clone(),
+                take: None,
+                boom: false,
+            }),
         ];
         let items: Vec<LaunchItem> = Vec::new();
         let mut index = MatchIndex::default();
@@ -483,8 +536,18 @@ mod registry_tests {
     fn one_source_panicking_does_not_take_down_the_rest() {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let mut sources: Vec<Box<dyn DataSource>> = vec![
-            Box::new(Probe { id: SourceId::Custom, seen: seen.clone(), take: None, boom: true }),
-            Box::new(Probe { id: SourceId::Web, seen: seen.clone(), take: None, boom: false }),
+            Box::new(Probe {
+                id: SourceId::Custom,
+                seen: seen.clone(),
+                take: None,
+                boom: true,
+            }),
+            Box::new(Probe {
+                id: SourceId::Web,
+                seen: seen.clone(),
+                take: None,
+                boom: false,
+            }),
         ];
         let items: Vec<LaunchItem> = Vec::new();
         let mut index = MatchIndex::default();
@@ -492,6 +555,10 @@ mod registry_tests {
         let _ = dispatch(&mut sources, &mut cx, |_| true);
         // 探针只在 `take_over` 里记账 ⇒ 这一段看到的是独占段的问询次序：
         // 崩掉的那个问过一次就被跳过，后面的源照常被问到（`dispatch` 没有 unwinding 出去）。
-        assert_eq!(&*seen.borrow(), &[SourceId::Custom, SourceId::Web], "崩掉一个源不该带走下一个");
+        assert_eq!(
+            &*seen.borrow(),
+            &[SourceId::Custom, SourceId::Web],
+            "崩掉一个源不该带走下一个"
+        );
     }
 }

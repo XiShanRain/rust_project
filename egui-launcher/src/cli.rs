@@ -92,19 +92,30 @@ mod tests {
     #[test]
     fn preferences_reads_next_number() {
         assert_eq!(parse_strs(&["-Preferences", "2"]).preferences, Some(2));
-        assert_eq!(parse_strs(&["-Preferences", "8"]).preferences, Some(8), "越界页码由调用方落回");
+        assert_eq!(
+            parse_strs(&["-Preferences", "8"]).preferences,
+            Some(8),
+            "越界页码由调用方落回"
+        );
     }
 
     #[test]
     fn preferences_without_number_defaults_to_first_page() {
         assert_eq!(parse_strs(&["-Preferences"]).preferences, Some(1));
-        assert_eq!(parse_strs(&["-Preferences", "-Startup"]).preferences, Some(1));
+        assert_eq!(
+            parse_strs(&["-Preferences", "-Startup"]).preferences,
+            Some(1)
+        );
         assert!(parse_strs(&["-Preferences", "-Startup"]).startup);
     }
 
     #[test]
     fn unknown_flag_is_ignored_but_does_not_eat_paths() {
         let c = parse_strs(&["-Update", r"C:\a.txt"]);
-        assert_eq!(c.send_to, vec![r"C:\a.txt"], "裸路径在未知开关之后仍应被识别为 SendTo");
+        assert_eq!(
+            c.send_to,
+            vec![r"C:\a.txt"],
+            "裸路径在未知开关之后仍应被识别为 SendTo"
+        );
     }
 }

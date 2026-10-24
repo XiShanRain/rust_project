@@ -517,9 +517,15 @@ pub fn matches(entry: &CheatEntry, needle: &str) -> bool {
         return true;
     }
     let needle = needle.to_lowercase();
-    [entry.key, entry.title, entry.summary, entry.tags, entry.group.aliases()]
-        .iter()
-        .any(|s| s.to_lowercase().contains(&needle))
+    [
+        entry.key,
+        entry.title,
+        entry.summary,
+        entry.tags,
+        entry.group.aliases(),
+    ]
+    .iter()
+    .any(|s| s.to_lowercase().contains(&needle))
 }
 
 /// 本帧该列哪些条目：所属源关掉的不列，过滤词不命中的不列。顺序照表。
@@ -576,7 +582,11 @@ impl DataSource for CheatSource {
         if hits.is_empty() {
             return Some(vec![SourceRow::CheatHint(CheatHint::empty(needle))]);
         }
-        Some(hits.into_iter().map(|entry| SourceRow::Cheat(CheatHit { entry })).collect())
+        Some(
+            hits.into_iter()
+                .map(|entry| SourceRow::Cheat(CheatHit { entry }))
+                .collect(),
+        )
     }
 }
 
@@ -608,15 +618,27 @@ mod tests {
         assert_eq!(keys.len(), n, "示例写法重样了，用户分不清是哪一条");
         for e in ENTRIES {
             assert!(!e.title.is_empty() && !e.summary.is_empty() && !e.detail.is_empty());
-            assert!(!e.tags.is_empty(), "「{}」没有过滤词，`? 关键词` 搜不到它", e.title);
+            assert!(
+                !e.tags.is_empty(),
+                "「{}」没有过滤词，`? 关键词` 搜不到它",
+                e.title
+            );
             if let Some(page) = e.settings_page {
                 // 批次 F1 加了第 5 页「外观」，上界跟着走（现量：SettingsTab::from_page 认 1..=5）。
-                assert!((1..=5).contains(&page), "「{}」指向不存在的设置页 {page}", e.title);
+                assert!(
+                    (1..=5).contains(&page),
+                    "「{}」指向不存在的设置页 {page}",
+                    e.title
+                );
             }
             // 列表与帮助页都是纯 `ui.label`，不解析 Markdown：`**粗体**` 会原样带着星号出场
             //（2026-10-23 真机截图里就是这么露的）。
             for text in [e.key, e.title, e.summary, e.detail, e.tags] {
-                assert!(!text.contains("**"), "「{}」的文案里有 Markdown 粗体标记：{text}", e.title);
+                assert!(
+                    !text.contains("**"),
+                    "「{}」的文案里有 Markdown 粗体标记：{text}",
+                    e.title
+                );
             }
         }
     }
@@ -625,11 +647,20 @@ mod tests {
     fn filters_hit_what_the_acceptance_criteria_name() {
         // 需求书验收原话：「敲 `?` 能看到"空格=文件模式、`>`=终端"等条目」。
         let all = entries("", &all_on);
-        assert!(all.iter().any(|e| e.key.contains('>')), "`?` 里看不到终端条目");
-        assert!(all.iter().any(|e| e.key.contains("空格")), "`?` 里看不到空格开头的文件模式");
+        assert!(
+            all.iter().any(|e| e.key.contains('>')),
+            "`?` 里看不到终端条目"
+        );
+        assert!(
+            all.iter().any(|e| e.key.contains("空格")),
+            "`?` 里看不到空格开头的文件模式"
+        );
         for needle in ["file", "文件", "快捷键", "终端", "计算器"] {
             assert!(entries(needle, &all_on).iter().all(|e| matches(e, needle)));
-            assert!(!entries(needle, &all_on).is_empty(), "过滤词「{needle}」一条也命不中");
+            assert!(
+                !entries(needle, &all_on).is_empty(),
+                "过滤词「{needle}」一条也命不中"
+            );
         }
         assert!(entries("file", &all_on).len() < all.len());
     }
@@ -667,13 +698,21 @@ mod tests {
 
         // 不认识的过滤词 → 一行提示（不可执行）。
         let mut index2 = crate::matching::MatchIndex::default();
-        let mut cx2 = SearchCtx { query: "?没有这种条目", index: &mut index2, ..cx };
+        let mut cx2 = SearchCtx {
+            query: "?没有这种条目",
+            index: &mut index2,
+            ..cx
+        };
         let rows = src.take_over(&mut cx2).expect("过滤词为空也不是普通搜索");
         assert!(matches!(rows.as_slice(), [SourceRow::CheatHint(_)]));
 
         // 不是第 0 个字符 → 不参与（`x?` 归普通搜索）。
         let mut index3 = crate::matching::MatchIndex::default();
-        let mut cx3 = SearchCtx { query: "x?", index: &mut index3, ..cx2 };
+        let mut cx3 = SearchCtx {
+            query: "x?",
+            index: &mut index3,
+            ..cx2
+        };
         assert!(src.take_over(&mut cx3).is_none());
     }
 }

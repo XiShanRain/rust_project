@@ -63,7 +63,11 @@ impl TermShell {
         match self {
             Self::Cmd => vec!["/k".to_string(), command.to_string()],
             Self::PowerShell | Self::Pwsh => {
-                vec!["-NoExit".to_string(), "-Command".to_string(), command.to_string()]
+                vec![
+                    "-NoExit".to_string(),
+                    "-Command".to_string(),
+                    command.to_string(),
+                ]
             }
             Self::Wt => vec!["cmd.exe".to_string(), "/k".to_string(), command.to_string()],
         }
@@ -100,7 +104,11 @@ pub enum TermRoute<'a> {
 pub fn route(raw: &str) -> Option<TermRoute<'_>> {
     let body = raw.strip_prefix('>')?;
     let body = body.trim();
-    Some(if body.is_empty() { TermRoute::Usage } else { TermRoute::Command(body) })
+    Some(if body.is_empty() {
+        TermRoute::Usage
+    } else {
+        TermRoute::Command(body)
+    })
 }
 
 /// 独占行：前缀后面那条命令。
@@ -160,10 +168,13 @@ impl super::DataSource for TerminalSource {
 
     fn take_over(&mut self, cx: &mut super::SearchCtx<'_>) -> Option<Vec<super::SourceRow>> {
         match route(cx.query)? {
-            TermRoute::Usage => Some(vec![super::SourceRow::TermHint(TermHint::usage(cx.term_shell))]),
-            TermRoute::Command(body) => {
-                Some(vec![super::SourceRow::Terminal(TermHit::new(cx.term_shell, body))])
-            }
+            TermRoute::Usage => Some(vec![super::SourceRow::TermHint(TermHint::usage(
+                cx.term_shell,
+            ))]),
+            TermRoute::Command(body) => Some(vec![super::SourceRow::Terminal(TermHit::new(
+                cx.term_shell,
+                body,
+            ))]),
         }
     }
 }
@@ -174,9 +185,19 @@ mod tests {
 
     #[test]
     fn prefix_routes_only_at_position_zero() {
-        assert_eq!(route(">ipconfig /all"), Some(TermRoute::Command("ipconfig /all")));
-        assert_eq!(route("> ipconfig  "), Some(TermRoute::Command("ipconfig")), "前缀后可带空格");
-        assert_eq!(route(">ping 127.0.0.1"), Some(TermRoute::Command("ping 127.0.0.1")));
+        assert_eq!(
+            route(">ipconfig /all"),
+            Some(TermRoute::Command("ipconfig /all"))
+        );
+        assert_eq!(
+            route("> ipconfig  "),
+            Some(TermRoute::Command("ipconfig")),
+            "前缀后可带空格"
+        );
+        assert_eq!(
+            route(">ping 127.0.0.1"),
+            Some(TermRoute::Command("ping 127.0.0.1"))
+        );
         assert_eq!(route(">"), Some(TermRoute::Usage));
         assert_eq!(route(">   "), Some(TermRoute::Usage));
         assert_eq!(route(" >dir"), None, "前导空格归文件模式，不许抢");
@@ -188,11 +209,19 @@ mod tests {
     fn shell_names_are_stable_and_unknown_is_rejected() {
         assert_eq!(TermShell::default(), TermShell::Cmd);
         for s in TermShell::ALL {
-            assert_eq!(TermShell::from_name(s.as_str()), Some(s), "稳定名必须能原地往返");
+            assert_eq!(
+                TermShell::from_name(s.as_str()),
+                Some(s),
+                "稳定名必须能原地往返"
+            );
             assert!(!s.args("dir").is_empty());
         }
         assert_eq!(TermShell::from_name(" CMD "), Some(TermShell::Cmd));
-        assert_eq!(TermShell::from_name("bash"), None, "不认识的名字交给调用方回落默认");
+        assert_eq!(
+            TermShell::from_name("bash"),
+            None,
+            "不认识的名字交给调用方回落默认"
+        );
         assert_eq!(TermShell::from_name(""), None);
     }
 
@@ -206,7 +235,11 @@ mod tests {
                 "{} 不能执行完就关窗，否则用户看不到输出：{joined}",
                 s.as_str()
             );
-            assert!(joined.ends_with("ipconfig /all"), "{} 丢掉了命令原文：{joined}", s.as_str());
+            assert!(
+                joined.ends_with("ipconfig /all"),
+                "{} 丢掉了命令原文：{joined}",
+                s.as_str()
+            );
         }
     }
 }
