@@ -198,7 +198,7 @@ pub fn user_list_exists() -> bool {
 /// （`Corrupted`）：`Kept` 给调用方一句话提示，`Lost` 还要求调用方**这一轮别写盘**。
 /// 文件本来就在 ⇒ 两格都是干净的默认值。
 pub fn load_user_items() -> (Vec<LaunchItem>, Option<Corrupted>) {
-    load_or_quarantine(&user_list_path())
+    load_user_items_at(&user_list_path())
 }
 
 /// 覆盖写用户清单（调用方负责先剔除内置种子、只持久化用户新增项）。
@@ -338,6 +338,313 @@ fn write_atomic(path: &Path, bytes: &[u8], label: &str) {
     }
 }
 
+// ---- FR-CFG-01 批次 E2：配置版本、逐版迁移、字段级容错 ----
+
+/// `settings.json` 的字段形态版本。**只有"已有字段的类型或含义变了"才 +1**；
+/// 纯新增字段不加号——`#[serde(default)]` 本来就读得动老文件，加号反而让每次改动都得写一条
+/// 空迁移。加了号就必须同时在 [`migrate_settings`] 里补一条臂，否则那个版本的文件会被停在
+/// "不认识的版本差"那一步（只按已知字段读，不猜）。
+pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+
+/// 迁移前备份的名额。写不进备份就不迁移，所以这个数字的实际含义是
+/// "同一个版本最多留下几份现场"；5 份用满还在原地打转，说明这份目录本身就写不进去。
+const MIGRATE_BACKUP_SLOTS: usize = 5;
+
+/// JSON 值的形态名，只用来写日志。**只取形态、不取值**：`theme`、`terminal_shell`、条目的
+/// `name` 这些格子里装的都是用户写的内容，而 serde 的错误原文会把值一起打出来
+/// （`invalid type: string "…"`）⇒ 直接打印 `e` 等于把用户数据写进日志，FR-SYS-03 那条线不能破。
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "空值",
+        serde_json::Value::Bool(_) => "布尔",
+        serde_json::Value::Number(_) => "数字",
+        serde_json::Value::String(_) => "字符串",
+        serde_json::Value::Array(_) => "数组",
+        serde_json::Value::Object(_) => "对象",
+    }
+}
+
+/// 逐字段取一格：缺键 ⇒ 保持 `Default` 里那个值（＝需求书「缺失项补默认」）；
+/// 类型不符 ⇒ **只兜这一格**并记一条脱敏日志（＝「类型不符取默认并记日志」）。
+///
+/// 为什么是宏而不是函数：这 17 格类型各不相同，`from_value::<T>` 的 `T` 没法在运行时给。
+/// 展开出来的表就是「字段名 → 类型」的清单，而 **字段名即 JSON 键名**（`AppSettings` 与
+/// `LaunchItem` 都没有 `rename_all`；容器级 `rename_all` 一旦加上去，这张表会整体读不进来，
+/// 症状是"配置全部回默认"——加字段忘写一行也是同一个症状，由
+/// `every_settings_field_is_read_from_a_full_file` 那条单测兜住）。
+/// `$tag` 是给清单用的前缀（「清单第 3 条：」），偏好那边传空串。
+macro_rules! take_field {
+    ($map:expr, $out:expr, $tag:expr, $field:ident, $ty:ty) => {
+        if let Some(raw) = $map.get(stringify!($field)) {
+            match serde_json::from_value::<$ty>(raw.clone()) {
+                Ok(x) => $out.$field = x,
+                Err(_) => eprintln!(
+                    "config: {}字段 `{}` 类型不符（实为{}）⇒ 取默认值",
+                    $tag,
+                    stringify!($field),
+                    json_kind(raw)
+                ),
+            }
+        }
+    };
+}
+
+/// 版本戳单独判：缺键＝v0（这一格批次 E2 才有），类型不对＝按 v0 处理并记一条。
+fn read_version(map: &serde_json::Map<String, serde_json::Value>) -> u32 {
+    match map.get("schema_version") {
+        None => 0,
+        Some(raw) => match serde_json::from_value::<u32>(raw.clone()) {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!(
+                    "config: 字段 `schema_version` 类型不符（实为{}）⇒ 按 v0 处理",
+                    json_kind(raw)
+                );
+                0
+            }
+        },
+    }
+}
+
+/// 对象树 → `AppSettings`。`version` 由调用方给（已经判完、可能已经迁过），
+/// 不再从树里取第二次。
+fn settings_from_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+    version: u32,
+) -> AppSettings {
+    let mut s = AppSettings::default();
+    s.schema_version = version;
+    take_field!(map, s, "", space_to_run, SpaceRun);
+    take_field!(map, s, "", tab_mode, TabMode);
+    take_field!(map, s, "", learn_rank, LearnRank);
+    take_field!(map, s, "", toggle_hotkey, HotkeySpec);
+    take_field!(map, s, "", typeback_hotkey, Option<HotkeySpec>);
+    take_field!(
+        map,
+        s,
+        "",
+        web_engines,
+        Vec<crate::source::websearch::WebEngine>
+    );
+    take_field!(map, s, "", seed_round, u32);
+    take_field!(map, s, "", sources_off, Vec<String>);
+    take_field!(map, s, "", hidden, Vec<String>);
+    take_field!(map, s, "", hidden_stash, Vec<LaunchItem>);
+    take_field!(map, s, "", confirm_actions, bool);
+    take_field!(map, s, "", terminal_shell, String);
+    take_field!(map, s, "", theme, String);
+    take_field!(map, s, "", list_rows, ListRows);
+    take_field!(map, s, "", row_density, RowDensity);
+    take_field!(map, s, "", default_scope, Scope);
+    take_field!(map, s, "", appearance, Appearance);
+    s
+}
+
+/// 一份清单元素 → `LaunchItem`。**不是对象就不认它是条目**（调用方丢它并记下标）：
+/// 硬造一条 `name`/`path` 全空的条目会带着空 uid 进清单、和 `dedup_items` 与 `uid()` 的规则打架，
+/// 后果比"少一条"更难查。
+fn item_from_value(map: &serde_json::Map<String, serde_json::Value>, tag: &str) -> LaunchItem {
+    let mut it = LaunchItem::default();
+    take_field!(map, it, tag, name, String);
+    take_field!(map, it, tag, path, String);
+    take_field!(map, it, tag, arguments, String);
+    take_field!(map, it, tag, working_dir, Option<String>);
+    take_field!(map, it, tag, source_path, String);
+    take_field!(map, it, tag, kind, ItemKind);
+    take_field!(map, it, tag, keyword, String);
+    take_field!(map, it, tag, pinned, bool);
+    take_field!(map, it, tag, use_count, u32);
+    take_field!(map, it, tag, last_used_ms, i64);
+    take_field!(map, it, tag, tags, Vec<String>);
+    it
+}
+
+/// 数组 → 清单。逐条容错：某一条的某一格类型不对，只兜那一格，**其余 292 条一字不动**。
+/// 这是本批对用户数据最实在的一条改动：以前同一种错会把整份清单送进 `.bad`。
+///
+/// 「成不构成一条」的门槛沿用 E2 之前 serde 的那道：`name`/`path` 在结构体上**没有**
+/// `#[serde(default)]`（上面其余格子都有），旧写法少任一键就整份解析失败。逐字段容错把
+/// 那个失败点拆掉之后，必须在这一层把门槛补回来，否则 `{"path":"C:\\x.exe"}`（没有名字）
+/// 会带着空 `name` 进清单——行上什么都没有、`uid()` 派生成 `custom:||`，与去重规则打架，
+/// 后果比少一条更难查（[`item_from_value`] 同一条理由）。出厂种子的构造器
+/// （[`command_seed`] 等）每条两个字段都非空 ⇒ 这道门槛不会误剔除正常条目。
+fn items_from_tree(list: &[serde_json::Value]) -> Vec<LaunchItem> {
+    let mut out = Vec::with_capacity(list.len());
+    for (i, raw) in list.iter().enumerate() {
+        let tag = format!("清单第 {} 条：", i + 1);
+        match raw.as_object() {
+            Some(map) => {
+                let it = item_from_value(map, &tag);
+                if it.name.is_empty() || it.path.is_empty() {
+                    eprintln!("config: {tag}缺 `name` 或 `path` ⇒ 这一条不认作条目，其余照常");
+                } else {
+                    out.push(it);
+                }
+            }
+            None => eprintln!(
+                "config: {}不是对象（实为{}）⇒ 这一条不认作条目，其余照常",
+                tag,
+                json_kind(raw)
+            ),
+        }
+    }
+    out
+}
+
+/// **一次升一版、不许跳版**：循环里每一步只认识 `v → v+1`，碰到不认识的版本差就停手，
+/// 返回实际到达的版本号。停在半路不是错误——那份配置照样按已知字段读得出来（NFR-04）。
+///
+/// v0 → v1 看着是空步子（只打版本戳、数据一字不动），但它是让后面每一步都有号可对的前置：
+/// 批次 J 那次 `space_to_run` 由布尔扩成四档是在自定义 `Deserialize` 里兜的（[`SpaceRun`]），
+/// 那种写法只能处理"一种形态改成另一种"，处理不了"改了语义、要换算"，所以从此改走版本号。
+fn migrate_settings(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    from: u32,
+) -> u32 {
+    let mut v = from;
+    while v < SETTINGS_SCHEMA_VERSION {
+        match v {
+            0 => {}
+            other => {
+                eprintln!("config: 没有从 v{other} 往上一版的迁移步子 ⇒ 停在这里，不猜");
+                return other;
+            }
+        }
+        v += 1;
+        map.insert("schema_version".to_string(), serde_json::Value::from(v as u64));
+    }
+    v
+}
+
+/// 迁移前的**原始字节**备份：`settings.v0.backup.json`，名字被占就 `-1`、`-2`……最多
+/// [`MIGRATE_BACKUP_SLOTS`] 份，**绝不覆盖已有同名文件**（那份可能是更早一次的现场）。
+/// 落不成就返回 `None` ⇒ 调用方不迁移：宁可不迁移，不能无证据迁移。
+fn backup_before_migrate(path: &Path, version: u32) -> Option<PathBuf> {
+    let bytes = std::fs::read(path).ok()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (name.clone(), String::new()),
+    };
+    for n in 0..MIGRATE_BACKUP_SLOTS {
+        let candidate = if n == 0 {
+            format!("{stem}.v{version}.backup{ext}")
+        } else {
+            format!("{stem}.v{version}.backup-{n}{ext}")
+        };
+        let target = path.with_file_name(candidate);
+        if target.exists() {
+            continue;
+        }
+        write_atomic(&target, &bytes, "迁移前备份");
+        if target.exists() {
+            return Some(target);
+        }
+    }
+    None
+}
+
+/// 合法 JSON、但顶层形状不是这个消费者要的形态（偏好是数组、清单是对象之类）。
+/// 按 FR-CFG-02 走与"语法坏"完全同一条留证路径，不新造第二种下场。
+/// 这里要再读一次文件只为拿字节：`load_json` 交回来的是解析后的树，而改名留证要的是原字节。
+fn shape_fault(path: &Path, got: &serde_json::Value) -> Option<Corrupted> {
+    eprintln!(
+        "config: {path:?} 顶层形状不对（实为{}）⇒ 与语法坏同路，先留证再按默认值启动",
+        json_kind(got)
+    );
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| quarantine(path, &bytes))
+}
+
+/// 读一份偏好文件（路径参数化，单测才打得到临时目录而不碰用户数据）。
+///
+/// 三条下场分开走，一条都不许合并：
+/// - 文件不在 ⇒ `AppSettings::default()`（v1），不写盘；
+/// - 语法坏 / 顶层不是对象 ⇒ 留证（`Corrupted`）+ 默认值，**不写盘**（写盘会覆盖唯一证据）；
+/// - 读得动 ⇒ 需要迁移就先备份再逐步迁，**只有真的动了这份树才回写一次**；
+///   纯读永远不改盘（保住"未知键"与更高版本戳，也避免每次启动都产生一次写）。
+fn load_settings_at(path: &Path) -> (AppSettings, Option<Corrupted>) {
+    let (tree, fault) = load_or_quarantine::<serde_json::Value>(path);
+    if let Some(e) = fault {
+        return (AppSettings::default(), Some(e));
+    }
+    match tree {
+        serde_json::Value::Null => (AppSettings::default(), None),
+        serde_json::Value::Object(mut map) => {
+            let claimed = read_version(&map);
+            if claimed > SETTINGS_SCHEMA_VERSION {
+                eprintln!(
+                    "config: {path:?} 标的是 v{claimed}，本程序只认到 v{SETTINGS_SCHEMA_VERSION} ⇒ 按认识的字段读，不改它的版本戳、不回写"
+                );
+                return (settings_from_map(&map, claimed), None);
+            }
+            if claimed < SETTINGS_SCHEMA_VERSION {
+                let Some(kept) = backup_before_migrate(path, claimed) else {
+                    eprintln!(
+                        "config: 迁移前留证写不进去 ⇒ 本次不迁移（宁可不迁移，不能无证据迁移），照常按 v{claimed} 读"
+                    );
+                    return (settings_from_map(&map, claimed), None);
+                };
+                eprintln!("config: 迁移前已留证 {kept:?}");
+                let reached = migrate_settings(&mut map, claimed);
+                let s = settings_from_map(&map, reached);
+                if reached > claimed {
+                    save_settings_at(path, &s);
+                    eprintln!("config: {path:?} 已从 v{claimed} 迁到 v{reached}");
+                }
+                return (s, None);
+            }
+            (settings_from_map(&map, claimed), None)
+        }
+        other => (AppSettings::default(), shape_fault(path, &other)),
+    }
+}
+
+/// 数组非空却一条都不成形 ⇒ **整份清单不认**，走与语法坏同一条留证路径。
+///
+/// 这条判据不能被逐条容错吃掉：逐条容错的前提是"还有别的条读得出来"。全丢光又不留证，
+/// 调用方拿到的就是"空清单 + 没有故障"，与"用户把清单删空了"一模一样（`[]`），于是照常
+/// 播种写回 ⇒ 唯一那份现场被覆盖——2026-10-22 真机⑫的教训换了实现也不能破。
+/// 反过来说，`[1, 2]` 这种一个字节都不值得留的写法本来就该进 `.bad`，批次 X 那条
+/// 「真的坏才报坏，且要留证在原位置之外」的断言到此仍然成立。
+fn quarantine_total_loss(path: &Path, count: usize) -> Option<Corrupted> {
+    eprintln!(
+        "config: {path:?} 里 {count} 个元素没一个够作条目 ⇒ 整份清单不认，先留证再按空清单启动"
+    );
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| quarantine(path, &bytes))
+}
+
+/// 读一份用户清单（路径参数化，同上）。顶层必须是数组；数组里逐条逐字段容错。
+/// 与偏好同一处分流：语法坏 / 顶层不是数组 / 非空数组但一条都不成形 ⇒ 留证且不回写；
+/// `[]` ⇒ 干净的空清单（用户真的把条目删光了，与"坏"是两回事）。
+fn load_user_items_at(path: &Path) -> (Vec<LaunchItem>, Option<Corrupted>) {
+    let (tree, fault) = load_or_quarantine::<serde_json::Value>(path);
+    if let Some(e) = fault {
+        return (Vec::new(), Some(e));
+    }
+    match tree {
+        serde_json::Value::Null => (Vec::new(), None),
+        serde_json::Value::Array(list) => {
+            let items = items_from_tree(&list);
+            if items.is_empty() && !list.is_empty() {
+                return (Vec::new(), quarantine_total_loss(path, list.len()));
+            }
+            (items, None)
+        }
+        other => (Vec::new(), shape_fault(path, &other)),
+    }
+}
+
+fn save_settings_at(path: &Path, s: &AppSettings) {
+    match serde_json::to_vec_pretty(s) {
+        Ok(json) => write_atomic(path, &json, "settings.json"),
+        Err(e) => eprintln!("source: 序列化偏好失败: {e}"),
+    }
+}
+
 /// 用户偏好（`settings.json`，与清单同目录、同样便携优先）。
 /// 只放真实生效的开关——不设无功能的占位项（设置页立规同口径）。
 ///
@@ -346,6 +653,12 @@ fn write_atomic(path: &Path, bytes: &[u8], label: &str) {
 /// 不再是 `Copy` 就编译不过 ⇒ 那三个初值改成先取出来（`src/main.rs:1608` 起）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    /// 字段形态版本（FR-CFG-01）。**缺键就是 v0**——这一格是批次 E2 才加的，老文件里没有。
+    /// 读盘时它决定走不走迁移链，所以由 [`load_settings_at`] 单独判过再灌进来，
+    /// 不由下面的字段表兜（"读到的版本"和"实际用的版本"不能两解）。
+    #[serde(default)]
+    pub schema_version: u32,
+
     /// 空格执行选中项（FR-ACT-01 的 `space_to_run`，Delphi 版 ALTRun 同名字段）。
     /// 批次 J（2026-10-18 用户裁定）由 bool 扩成四档，见 [`SpaceRun`]。
     #[serde(default)]
@@ -469,6 +782,9 @@ fn default_true() -> bool {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            // 一份"程序自己造出来的"配置当然是当前版本。首启写盘带的就是这个号，
+            // 于是老文件（缺键 ⇒ v0）与新文件（v1）在日志里一眼分得开。
+            schema_version: SETTINGS_SCHEMA_VERSION,
             space_to_run: SpaceRun::default(),
             tab_mode: TabMode::default(),
             learn_rank: LearnRank::default(),
@@ -1123,18 +1439,16 @@ fn prune_archives(dir: &Path) {
     }
 }
 
-/// 读取偏好（E1，批次 X，与清单同一条判据）；文件缺失回默认值，文件坏了先留证再回默认值。
+/// 读取偏好（E1，批次 X 立的"缺失回默认、坏了先留证再回默认"；E2，批次 E2 在其上加了
+/// 版本戳、逐版迁移与字段级容错，三条下场的分流见 [`load_settings_at`]）。
 /// 第二格是坏文件的下场（`Corrupted`），调用方拿它给用户提示，并且在 `Lost` 时停手不写。
 /// NFR-04：坏配置不得影响启动。
 pub fn load_settings() -> (AppSettings, Option<Corrupted>) {
-    load_or_quarantine(&settings_path())
+    load_settings_at(&settings_path())
 }
 
 pub fn save_settings(s: &AppSettings) {
-    match serde_json::to_vec_pretty(s) {
-        Ok(json) => write_atomic(&settings_path(), &json, "settings.json"),
-        Err(e) => eprintln!("source: 序列化偏好失败: {e}"),
-    }
+    save_settings_at(&settings_path(), s);
 }
 
 /// 出厂命令集的轮次（§4.2.1 + 批次 A2）。每次往 [`builtin_seeds`] 里加条目就 +1：
@@ -4151,3 +4465,393 @@ mod hotkey_tests {
         assert_ne!(ERROR_HOTKEY_ALREADY_REGISTERED, 1410);
     }
 }
+
+/// 批次 E2（FR-CFG-01 剩下的那一半：版本戳、逐版迁移、字段级容错）的判据测试。
+/// 全走 [`load_settings_at`] / [`load_user_items_at`] 的路径参数化版本 ⇒ 一条都不碰用户真实
+/// 数据目录（便携判定会把 `settings_path()` 指到 exe 旁边，测试不许写那儿）。
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("egui-launcher-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(p: &Path, text: &str) {
+        std::fs::write(p, text.as_bytes()).expect("临时目录写不了");
+    }
+
+    /// 证伪实验①：某一格类型写错 ⇒ **只兜那一格**，同文件其余字段照读，且不产生 `.bad`。
+    /// 判据故意选 `confirm_actions`（出厂默认 `true`）：如果我实际上还在走整份 `from_slice`，
+    /// 那一格会读成 `true`（＝整份回默认），这条当场红——"整份兜默认"与"单格兜默认"分得开。
+    #[test]
+    fn a_wrong_typed_field_costs_only_that_field_not_the_whole_file() {
+        let dir = temp_dir("e2-one-field");
+        let p = dir.join("settings.json");
+        write(
+            &p,
+            r#"{
+              "schema_version": 1,
+              "theme": [1, 2],
+              "confirm_actions": false,
+              "terminal_shell": "powershell",
+              "sources_off": ["files"]
+            }"#,
+        );
+        let (s, fault) = load_settings_at(&p);
+        assert!(fault.is_none(), "单格类型不符不该把整份文件判坏：{fault:?}");
+        assert_eq!(s.theme, default_theme(), "类型不符那一格该回默认");
+        assert!(!s.confirm_actions, "同文件的布尔必须照读（读到 true 就是整份回默认了）");
+        assert_eq!(s.terminal_shell, "powershell");
+        assert_eq!(s.sources_off, vec!["files".to_string()]);
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".bad")),
+            "能读出来的配置不该被留证成 .bad"
+        );
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("[1, 2]"),
+            "纯读不许回写：文件原样留着，用户看得见自己写错的那一格"
+        );
+    }
+
+    /// 逐格点名断言，而不是 `assert_eq!(got, x)`：漏写一行 `take_field!` 时，
+    /// 报错必须说得出是哪一格漏了（整结构体比较只给一句"不相等"）。
+    /// 这一条同时兜住两个漂移：加字段忘了进表、以及给容器加 `rename_all` 让表里的键名整体失效。
+    #[test]
+    fn every_settings_field_is_read_from_a_full_file() {
+        let mut x = AppSettings::default();
+        x.space_to_run = SpaceRun::Unique;
+        x.tab_mode = TabMode::Navigate;
+        x.learn_rank = LearnRank::Decay;
+        x.toggle_hotkey = HotkeySpec {
+            mods: HKF_ALT | HKF_WIN,
+            vk: VK_SPACE,
+        };
+        x.typeback_hotkey = Some(HotkeySpec::DEFAULT);
+        x.web_engines.truncate(2);
+        x.seed_round = 7;
+        x.sources_off = vec!["files".to_string(), "system".to_string()];
+        x.hidden = vec!["custom:command|a.exe|".to_string()];
+        x.hidden_stash = vec![LaunchItem {
+            name: "藏起来的".to_string(),
+            path: "C:\\x.exe".to_string(),
+            ..Default::default()
+        }];
+        x.confirm_actions = false;
+        x.terminal_shell = "pwsh".to_string();
+        x.theme = "Dark".to_string();
+        x.list_rows = ListRows::Ten;
+        x.row_density = RowDensity::Roomy;
+        x.default_scope = Scope::Basic;
+        x.appearance = Appearance {
+            width: 720.0,
+            status_bar: false,
+            fade: true,
+            ..Default::default()
+        };
+
+        let dir = temp_dir("e2-full-file");
+        let p = dir.join("settings.json");
+        std::fs::write(&p, &serde_json::to_vec_pretty(&x).unwrap()).unwrap();
+        let (got, fault) = load_settings_at(&p);
+        assert!(fault.is_none());
+        assert_eq!(got.schema_version, SETTINGS_SCHEMA_VERSION, "schema_version");
+        assert_eq!(got.space_to_run, SpaceRun::Unique, "space_to_run");
+        assert_eq!(got.tab_mode, TabMode::Navigate, "tab_mode");
+        assert_eq!(got.learn_rank, LearnRank::Decay, "learn_rank");
+        assert_eq!(got.toggle_hotkey, HotkeySpec { mods: HKF_ALT | HKF_WIN, vk: VK_SPACE }, "toggle_hotkey");
+        assert_eq!(got.typeback_hotkey, Some(HotkeySpec::DEFAULT), "typeback_hotkey");
+        assert_eq!(got.web_engines.len(), 2, "web_engines");
+        assert_eq!(got.seed_round, 7, "seed_round");
+        assert_eq!(got.sources_off.len(), 2, "sources_off");
+        assert_eq!(got.hidden.len(), 1, "hidden");
+        assert_eq!(got.hidden_stash.len(), 1, "hidden_stash");
+        assert_eq!(got.hidden_stash[0].name, "藏起来的", "hidden_stash 里的 name");
+        assert!(!got.confirm_actions, "confirm_actions");
+        assert_eq!(got.terminal_shell, "pwsh", "terminal_shell");
+        assert_eq!(got.theme, "Dark", "theme");
+        assert_eq!(got.list_rows, ListRows::Ten, "list_rows");
+        assert_eq!(got.row_density, RowDensity::Roomy, "row_density");
+        assert_eq!(got.default_scope, Scope::Basic, "default_scope");
+        assert_eq!(got.appearance.width, 720.0, "appearance 递归合并：width");
+        assert_eq!(got.appearance.status_bar, false, "appearance.status_bar");
+        assert_eq!(got.appearance.fade, true, "appearance.fade");
+    }
+
+    /// 「缺失项补默认」＋批次 J 那次的老写法：`space_to_run` 曾是布尔。
+    /// 缺版本戳的文件按 v0 读 ⇒ 这里用 `schema_version: 1` 把迁移那条路隔开，两条判据别混。
+    #[test]
+    fn absent_fields_fall_back_and_the_legacy_bool_still_reads() {
+        let dir = temp_dir("e2-absent");
+        let p = dir.join("settings.json");
+        write(&p, r#"{"schema_version": 1, "space_to_run": true}"#);
+        let (s, fault) = load_settings_at(&p);
+        assert!(fault.is_none());
+        assert_eq!(s.space_to_run, SpaceRun::Always, "老文件 true＝始终执行（批次 J 的兼容口径）");
+        assert_eq!(s.theme, default_theme());
+        assert_eq!(
+            s.web_engines.len(),
+            crate::source::websearch::builtin_engines().len(),
+            "缺 web_engines 要回内置那几条，不是空表（批次 X 真机 A6 的根因）"
+        );
+    }
+
+    /// 「数组整体替换、不做元素级合并」：文件里写两条引擎就是两条，
+    /// 不许跟内置那几条并起来；这一格默认是 9 条，所以"少了几条"看得见。
+    #[test]
+    fn arrays_replace_wholesale_instead_of_merging() {
+        let dir = temp_dir("e2-array-replace");
+        let p = dir.join("settings.json");
+        let full = crate::source::websearch::builtin_engines().len();
+        let mut x = AppSettings::default();
+        x.web_engines.truncate(2);
+        std::fs::write(&p, &serde_json::to_vec_pretty(&x).unwrap()).unwrap();
+        let (got, _) = load_settings_at(&p);
+        assert_eq!(got.web_engines.len(), 2, "该是文件里的两条");
+        assert_ne!(got.web_engines.len(), full, "不许与内置并成 {full} 条");
+    }
+
+    /// 未知键读时忽略（不判坏）。代价明写并要求测试证实：任何一次真实写盘都会把它丢掉
+    /// ⇒ "用旧版本程序打开新版本写出的文件"会丢新键。当前只有一个版本，触发不了。
+    #[test]
+    fn unknown_keys_are_ignored_on_read_and_dropped_on_write() {
+        let dir = temp_dir("e2-unknown");
+        let p = dir.join("settings.json");
+        write(&p, r#"{"schema_version": 1, "theme": "Dark", "future_switch": {"a": 1}}"#);
+        let (got, fault) = load_settings_at(&p);
+        assert!(fault.is_none(), "多一个不认识的键不该判坏");
+        assert_eq!(got.theme, "Dark");
+        save_settings_at(&p, &got);
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(!after.contains("future_switch"), "这一条把'未知键会被写盘丢掉'钉成明写的事实");
+    }
+
+    /// v0 → v1：迁移前留的是**原始字节**，迁完才打戳；第二次启动不再产生第二份备份。
+    #[test]
+    fn a_v0_file_is_backed_up_then_stamped_once() {
+        let dir = temp_dir("e2-migrate");
+        let p = dir.join("settings.json");
+        let raw = r#"{"theme": "Dark", "terminal_shell": "pwsh"}"#;
+        write(&p, raw);
+        let (s, fault) = load_settings_at(&p);
+        assert!(fault.is_none());
+        assert_eq!(s.schema_version, SETTINGS_SCHEMA_VERSION, "迁完该是当前版本");
+        assert_eq!(s.theme, "Dark", "迁移不许丢用户已写下的值");
+        let bak = dir.join("settings.v0.backup.json");
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            raw.as_bytes(),
+            "备份必须是原始字节，不是重新序列化的一份"
+        );
+        let on_disk = std::fs::read_to_string(&p).unwrap();
+        assert!(on_disk.contains("\"schema_version\": 1"), "版本戳要落盘");
+        let (again, _) = load_settings_at(&p);
+        assert_eq!(again.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert!(!dir.join("settings.v0.backup-1.json").exists(), "已经 v1 就不该再迁一次");
+    }
+
+    /// 证伪实验②：备份名额全被占 ⇒ **留不到证就不迁移、也不写盘**，但内容照样读得出来。
+    /// 占名用目录：`exists()` 为真就跳过，写同名的文件也必然失败——两条都踩到。
+    #[test]
+    fn no_backup_means_no_migration() {
+        let dir = temp_dir("e2-no-backup");
+        for n in 0..MIGRATE_BACKUP_SLOTS {
+            let candidate = if n == 0 {
+                "settings.v0.backup.json".to_string()
+            } else {
+                format!("settings.v0.backup-{n}.json")
+            };
+            std::fs::create_dir(dir.join(candidate)).expect("占名额失败");
+        }
+        let p = dir.join("settings.json");
+        let raw = r#"{"theme": "Dark"}"#;
+        write(&p, raw);
+        let (s, fault) = load_settings_at(&p);
+        assert!(fault.is_none(), "不迁移不等于配置坏了");
+        assert_eq!(s.schema_version, 0, "没迁移成功就不能自称已经迁过");
+        assert_eq!(s.theme, "Dark", "不迁移也要按已知字段读出内容");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), raw, "原文件一字不许动");
+    }
+
+    /// 版本比本程序新 ⇒ 按认识的字段读、不改它的版本戳、不回写。
+    /// 反例是本程序把 v9 盖成 v1：那等于把"这份文件已经迁过"的谎写进磁盘。
+    #[test]
+    fn a_newer_version_is_read_but_never_rewritten() {
+        let dir = temp_dir("e2-newer");
+        let p = dir.join("settings.json");
+        let raw = r#"{"schema_version": 9, "theme": "Dark", "only_future_knows": true}"#;
+        write(&p, raw);
+        let (s, fault) = load_settings_at(&p);
+        assert!(fault.is_none());
+        assert_eq!(s.schema_version, 9, "读到几就是几，不许降回本程序的版本");
+        assert_eq!(s.theme, "Dark");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), raw, "比本程序新的文件一字不改");
+    }
+
+    /// 清单侧最实在的一条：某一条的某一格类型不对 ⇒ 只兜那一格，其余条目一字不动。
+    /// 输入照上游真实形态构造（`builtin_seeds()` 序列化后改一格），不手写条目形状。
+    #[test]
+    fn one_bad_field_in_one_item_does_not_take_the_whole_list_down() {
+        let dir = temp_dir("e2-item-field");
+        let p = dir.join("user_items.json");
+        let mut tree: Vec<serde_json::Value> = builtin_seeds()
+            .into_iter()
+            .take(3)
+            .map(|it| serde_json::to_value(&it).unwrap())
+            .collect();
+        tree[0]["use_count"] = serde_json::json!(5);
+        tree[1]["use_count"] = serde_json::json!("abc");
+        std::fs::write(&p, &serde_json::to_vec_pretty(&tree).unwrap()).unwrap();
+        let (got, fault) = load_user_items_at(&p);
+        assert!(fault.is_none(), "一条里的一格不该把整份清单送进 .bad");
+        assert_eq!(got.len(), 3, "三条都要留住");
+        assert_eq!(got[0].use_count, 5, "好读的那条照读");
+        assert_eq!(got[1].use_count, 0, "类型不符那一格回默认");
+        assert_eq!(got[1].name, builtin_seeds()[1].name, "同一条的其余字段不许被牵连");
+        assert_eq!(got[2].use_count, 0);
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".bad")),
+            "读得出来的清单不该留证"
+        );
+    }
+
+    /// 不是对象的元素不认作条目（丢掉 + 记下标），**不造一条空 name 空 path 的假条目**：
+    /// 那种条目会带空 uid 进清单、与 `dedup_items` 和 `uid()` 的规则打架，比少一条更难查。
+    #[test]
+    fn a_non_object_element_is_dropped_rather_than_turned_into_a_blank_item() {
+        let dir = temp_dir("e2-item-shape");
+        let p = dir.join("user_items.json");
+        let seeds = builtin_seeds();
+        let mut tree: Vec<serde_json::Value> = vec![
+            serde_json::to_value(&seeds[0]).unwrap(),
+            serde_json::Value::String("我不是条目".to_string()),
+            serde_json::to_value(&seeds[1]).unwrap(),
+        ];
+        tree[2]["name"] = serde_json::json!("改过名的");
+        std::fs::write(&p, &serde_json::to_vec_pretty(&tree).unwrap()).unwrap();
+        let (got, fault) = load_user_items_at(&p);
+        assert!(fault.is_none());
+        assert_eq!(got.len(), 2, "非对象那一格不算条目");
+        assert_eq!(got[1].name, "改过名的", "被丢的是中间那条，前后两条该照位留下");
+        assert!(got.iter().all(|i| !i.name.is_empty()), "不许出现空名假条目");
+    }
+
+    /// `name`/`path` 是条目唯一的必需格（E2 之前 serde 就要求这两个键存在）。逐字段容错把
+    /// "缺键"从整份解析失败降成"这一条不认" ⇒ 少了名字的条目不许带空 uid 混进清单，
+    /// 而**同文件其余条目照读、且不留证**（这半边是逐条容错的本职）。
+    #[test]
+    fn an_item_missing_a_name_or_a_path_is_not_an_item() {
+        let dir = temp_dir("e2-item-required");
+        let p = dir.join("user_items.json");
+        let seeds = builtin_seeds();
+        let mut no_name = serde_json::to_value(&seeds[0]).unwrap();
+        no_name.as_object_mut().unwrap().remove("name");
+        let mut no_path = serde_json::to_value(&seeds[1]).unwrap();
+        no_path.as_object_mut().unwrap().remove("path");
+        let tree = vec![
+            no_name,
+            no_path,
+            serde_json::to_value(&seeds[2]).unwrap(),
+        ];
+        std::fs::write(&p, &serde_json::to_vec_pretty(&tree).unwrap()).unwrap();
+        let (got, fault) = load_user_items_at(&p);
+        assert!(fault.is_none(), "还有条目读得出来就不该把整份判坏");
+        assert_eq!(got.len(), 1, "缺必需格的两条不认作条目");
+        assert_eq!(got[0].name, seeds[2].name, "第三条该照位留下");
+        assert!(
+            got.iter().all(|i| !i.name.is_empty() && !i.path.is_empty()),
+            "不许出现空名或空路径的条目（uid 会派生成 `custom:||`）"
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".bad")),
+            "读得出来的清单不该留证"
+        );
+    }
+
+    /// 判据①的边界：数组非空却**一条都不成形** ⇒ 逐条容错会把它读成"空清单"，而调用方
+    /// 紧接着按空清单播种写回 ⇒ 唯一现场被覆盖（批次 X 真机⑫同一形状的事故，换了实现不许破）。
+    /// 所以这一格整体不认、走留证；对照格是 `[]`——那是用户真删光了，干净、不留证、不动盘。
+    #[test]
+    fn a_list_where_nothing_survives_is_quarantined_not_seeded_over() {
+        let dir = temp_dir("e2-total-loss");
+        let p = dir.join("user_items.json");
+        write(&p, "[1, 2]");
+        let (got, fault) = load_user_items_at(&p);
+        assert!(got.is_empty());
+        let fault = fault.expect("一条都不成形必须报下场，不许静默成空清单");
+        let Corrupted::Kept(kept) = &fault else {
+            panic!("第一次留证该成功，实得 {fault:?}")
+        };
+        assert!(kept.exists() && !p.exists(), "证据在 {kept:?}，原位置要腾出来");
+
+        let ok = dir.join("clean.json");
+        write(&ok, "[]");
+        let (none, fault) = load_user_items_at(&ok);
+        assert!(none.is_empty());
+        assert!(fault.is_none(), "空数组＝用户删光了，不是坏");
+        assert!(ok.exists(), "干净的空清单不许被改名");
+    }
+
+    /// FR-CFG-02 没退化：顶层形状不对（偏好成了数组 / 清单成了对象）与语法坏同一条路——
+    /// 改名留证、按默认值启动、**不写盘**（写盘会覆盖唯一证据）。
+    #[test]
+    fn a_wrong_top_level_shape_still_quarantines() {
+        let dir = temp_dir("e2-shape-fault");
+        let s = dir.join("settings.json");
+        write(&s, r#"[1, 2, 3]"#);
+        let (prefs, fault) = load_settings_at(&s);
+        let kept_fault = fault.expect("形状不对必须报下场");
+        let Corrupted::Kept(kept) = &kept_fault else {
+            panic!("第一次留证该成功，实得 {kept_fault:?}")
+        };
+        assert!(kept.exists() && !s.exists(), "证据在 {kept:?}，原位置要腾出来");
+        assert_eq!(prefs.theme, default_theme(), "留证之后按默认值启动");
+        assert_eq!(prefs.schema_version, SETTINGS_SCHEMA_VERSION, "默认值就是当前版本");
+
+        let l = dir.join("user_items.json");
+        write(&l, r#"{"not": "an array"}"#);
+        let (items, fault2) = load_user_items_at(&l);
+        assert!(matches!(fault2, Some(Corrupted::Kept(_))), "实得 {fault2:?}");
+        assert!(items.is_empty());
+        assert!(!l.exists(), "清单也该被改名留证");
+    }
+
+    /// 真·语法坏仍是老那条路（这一条是回归守卫：新增的 `Value` 中间层不许把语法错吞掉）。
+    #[test]
+    fn invalid_json_still_quarantines_through_the_value_layer() {
+        let dir = temp_dir("e2-syntax");
+        let p = dir.join("settings.json");
+        write(&p, "{ 坏 JSON");
+        let (prefs, fault) = load_settings_at(&p);
+        assert!(matches!(fault, Some(Corrupted::Kept(_))), "实得 {fault:?}");
+        assert_eq!(prefs.confirm_actions, true, "默认值启动");
+    }
+
+    /// 「无 BOM」是需求书明写的：写盘首三字节不许是 EF BB BF。
+    #[test]
+    fn settings_json_is_written_without_a_bom() {
+        let dir = temp_dir("e2-bom");
+        let p = dir.join("settings.json");
+        save_settings_at(&p, &AppSettings::default());
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(!bytes.starts_with(&[0xEF, 0xBB, 0xBF]), "首三字节不该是 UTF-8 BOM");
+        let (got, fault) = load_settings_at(&p);
+        assert!(fault.is_none());
+        assert_eq!(got.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+}
+
