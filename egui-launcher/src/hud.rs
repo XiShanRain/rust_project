@@ -203,7 +203,7 @@ fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             return;
         };
         if !sh.styled {
-            sh.styled = patch_window_style(&sh.title);
+            sh.styled = patch_window_style(&sh.title, true);
         }
 
         let held = sh.hold.as_secs_f32();
@@ -247,32 +247,40 @@ fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     ui.ctx().request_repaint();
 }
 
-/// 首帧把窗口从「普通置顶窗」改成「工具窗」：不进 Alt+Tab / 任务栏，也不会被激活。
-fn patch_window_style(title: &str) -> bool {
+/// 首帧把窗口从「普通置顶窗」改成「工具窗」：不进 Alt+Tab / 任务栏。
+/// `no_activate = true` 是 HUD 的口径（也不激活、不抢焦点）；大字显示传 `false`——
+/// 它必须能拿到键盘焦点，`Esc` 才收得到。
+pub(crate) fn patch_window_style(title: &str, no_activate: bool) -> bool {
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())) }) else {
         return false;
     };
     let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-    let want = (ex | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
+    let mut want = (ex | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
+    if no_activate {
+        want |= WS_EX_NOACTIVATE.0;
+    } else {
+        want &= !WS_EX_NOACTIVATE.0;
+    }
     if want != ex {
         unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want as isize) };
     }
     true
 }
 
-fn with_alpha(color: egui::Color32, factor: f32) -> egui::Color32 {
+pub(crate) fn with_alpha(color: egui::Color32, factor: f32) -> egui::Color32 {
     let a = (color.a() as f32 * factor).round().clamp(0.0, 255.0) as u8;
     egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
 }
 
-fn win_cursor() -> Option<(i32, i32)> {
+/// 当前鼠标位置（物理像素）。
+pub(crate) fn win_cursor() -> Option<(i32, i32)> {
     let mut p = POINT::default();
     unsafe { GetCursorPos(&mut p) }.ok().map(|_| (p.x, p.y))
 }
 
 /// 某个屏幕坐标所在显示器的工作区（物理像素，已排除任务栏）。
-fn monitor_work_at(pt: (i32, i32)) -> Option<egui::Rect> {
+pub(crate) fn monitor_work_at(pt: (i32, i32)) -> Option<egui::Rect> {
     let hmon = unsafe {
         MonitorFromPoint(
             POINT { x: pt.0, y: pt.1 },

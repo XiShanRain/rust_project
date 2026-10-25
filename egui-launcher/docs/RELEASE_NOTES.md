@@ -874,6 +874,28 @@ F7 把「隐藏只对出厂条目开放」写成了明示偏差①：扫描导�
 | 未做 / 偏差（明写） | ① `show_on`（FR-WIN-09）未实现 ⇒「按落点屏」退化为「主窗屏 → 3s 内上次用过的屏 → 鼠标屏」，3s 复用靠 `last_work` 缓存；② 后台事件 5000ms 停留没有接线点——目前只有前台复制这一条 1500ms 路径，常量已备；③ 不透明度 240 在浅色主题上肉眼几乎与不透明无差别（截图上分不出），240 是按原文写的值，没有另做视觉调优；④ 工作区物理像素 → 逻辑点用主窗 `pixels_per_point`，跨不同 DPI 显示器时位置可能有偏差，未实测；⑤ 样式补齐前约 270ms 的窗口带 APPWINDOW；⑥ Alt+Tab 没有逐帧枚举，证据是扩展样式位（TOOLWINDOW 置位、APPWINDOW 清零） |
 | 提交 | **未提交**。commit / push 需用户正文原话；本批与需求书、开发计划的改动一起等授权 |
 
+### 四十三、FR-UIX-10 大字显示：`Ctrl+L` 把当前内容铺满屏幕中央（2026-10-24，用户正文「1. 已提交并推送 2. 开始下一个任务,任务完成说明本次任务内容,我需要用它做message提交」）
+
+AHK 版的 `Ctrl+L` 是「看不清就把这串字放大」，Delphi 版没有。本批补齐这条：新文件 `src/large_type.rs`，一个独立、无边框、置顶、**要抢焦点**的子视口，`Esc` / 点击 / 失焦关闭。**触发入口沿用 `Ctrl+L`，不新增键**；面板动作没做（本程序尚无行动作面板）。
+
+| 项 | 现量 |
+| --- | --- |
+| 形态 | `ctx.show_viewport_deferred` 独立子视口，`ViewportId::from_hash_of("alt-run-large-type")`、标题 `ALTRun Large Type <pid>`（供 Win32 按标题回查句柄）；`with_decorations(false) + with_always_on_top() + with_transparent(true) + with_taskbar(false) + with_active(true) + with_resizable(false)` |
+| 与 HUD 的差别 | **不做点击穿透、不设 `WS_EX_NOACTIVATE`**——它必须拿到焦点才收得到 `Esc`；首帧只补 `WS_EX_TOOLWINDOW`、清 `WS_EX_APPWINDOW`（**更正**：旧记录误把主窗的 `0x40118` 当成大字窗的落地值；按位推应是 `0x801B8`，本轮未重新取样） |
+| 配色与尺寸 | 底 `141414`、白字、不透明度 **235/255**（AHK `WinSetTransparent(235)`）、圆角 12、内边距 40，全部硬编码不读主题；文本宽上限 = 工作区宽 × 0.85 − 2×40，窗口尺寸最后再夹进工作区（留边 8） |
+| 字号阶梯 | 按字符数：≤12→96、≤30→64、≤80→40、≤300→28、其余 18（需求书原文逐档一致）；阶梯档竖着放不下时继续降 24 / 14 / 10 / 8——这一档兜底是为「不溢出屏幕」服务的，低于 18 是**有意扩充** |
+| 内容口径 | 对齐 AHK `ResultItem.DisplayText()`：有选中行用它的展示文本，没有就用查询框原文（`trim`）；所以网页搜索行显示的是 **URL 而不是标题**（AHK 同样如此）。原文不落日志，只记字符数与字号 |
+| 位置 | 鼠标所在显示器的工作区居中（AHK `WorkAreaAtMouse` 同口径）；工作区由 `MonitorFromPoint` + `GetMonitorInfoW().rcWork` 取 |
+| 关闭与焦点 | `Esc` / 鼠标点击 / 失焦三条路；前两条在发 `Visible(false)` **之前**调 Win32 `SetForegroundWindow(主窗 HWND)`——藏窗那一瞬系统会自己挑「下一个活动窗」，由本进程先把主窗激活才可控。「失焦」这一档不抢回焦点 |
+| 抓到的缺陷 | **FR-WIN-04 会把主窗藏掉**：大字窗一抢焦点，主窗 50ms 后自动隐藏，关闭时 `SetForegroundWindow` 只能激活一个隐藏窗 ⇒ 焦点落到外部程序、后续按键全漏。修复两处：① `LargeType::showing()` 加入 FR-WIN-04 的 `keep_open` 豁免；② 主窗 HWND 从 E-05 那条路传进 `LargeType::new(root)`，关闭前归还焦点。**没有照抄 AHK 的「弹大字前 Hide 搜索窗」**——Hide 之后一关大字，焦点落到本进程隐藏的事件窗，按键全丢（同日两次实测） |
+| 接线 | `src/main.rs`：`hit_cl = hot(COMMAND, Key::L)`、`LOCAL_TAKEN` 登记 0x4C、分支里取 `large_text_of(...)` 再 `large_type.show(ctx, text)`；`ui()` 末尾每帧 `large_type.render(ctx)` |
+| 单测 | 8 条纯函数：阶梯五档 / 降档严格变小且能落到 8 / 换行上限 85% / 短文本不换行 / 超宽换行 / 超高降档到 18 / 极端文本夹紧 / 居中且不出工作区；另在 `main.rs` 补「Ctrl+L 必须被本地表挡住」与 `large_text_of` 的选中行优先/原文回落两条 |
+| 真机自查（隔离沙箱 `target\large-type-test\`，由我注入操作） | ① 12 字符 ⇒ `字号 96，窗口 596×190`（`verify3.log` 转存的 launcher.log）；② 13 字符输入命中的头行是 49 字符 Google URL ⇒ `字号 40`、窗口约 1122×126，主窗仍留在下方可见（截图 `shot-short.png`）；③ 165 字符 ⇒ `字号 28，窗口 1630×208`（`launcher.log`）；④ `Esc` 收起、点击收起都在日志里留痕；⑤ 大字窗 `fg=large`（抢到焦点，`verify3.log`）；⑥ `shot-short.png` 里大字窗完整落在工作区内（12 / 49 字符两例），165 字符的 1630×208 也在 1920 宽之内 |
+| 验证 | `cargo test --bin egui-launcher` **224/224**；`cargo check --all-targets` 零警告；`cargo build` 通过（未跑 `cargo fmt`） |
+| 未结清 / 偏差（明写） | ① **面板动作没做**——没有行动作面板，触发只有 `Ctrl+L`；② **`>300` 字符落到 18 号这一档**只有单测，真机取样没拿到（上一轮长文注入被前台游戏抢走）；③ **「焦点还回主窗」的干净真机取证没拿到**，最后一轮五个检查点全部失真；④ AHK 是 Hide 搜索窗、本实现让主窗留在原位（有意偏离，理由见上）；⑤ 透明度 235 在深色桌面上的观感未做视觉调优；⑥ 跨不同 DPI 显示器时「物理像素 → 逻辑点」沿用主窗 `pixels_per_point`，未实测 |
+| 测试过程的越界（如实记） | 测试机前台被 Minecraft（pid 36688）占着，脚本的 `SendInput` 在焦点漂移后把 `Ctrl+L`、`Esc`、一串 `M`、空格和两次鼠标点击送进了游戏；其中一次真实点击把刚弹出的大字窗关掉。后续测试已停在「注入前确认前台是本程序窗口」这一条上，没有再在游戏前台时注入 |
+| 提交 | **未提交**。commit / push 需用户正文原话；本批与需求书、开发计划的改动一起等授权 |
+
 ---
 
 ## v0.1.0-dev · 2026-10-17

@@ -67,6 +67,7 @@ const HOTKEY_TYPEBACK: i32 = 2;
 
 mod cli;
 mod hud;
+mod large_type;
 mod matching;
 mod source;
 mod theme;
@@ -733,6 +734,8 @@ struct LauncherApp {
     toast: Option<(String, Instant, egui::Color32)>,
     // ---- FR-UIX-09：独立提示层（HUD，`src/hud.rs`）----
     hud: hud::Hud,
+    // ---- FR-UIX-10：大字显示（`src/large_type.rs`）----
+    large_type: large_type::LargeType,
     // ---- FR-WIN-02 热键可配置（批次 Q）----
     /// 设置页正在录制新组合：为真时本帧按键由录制端独占，快捷键分支与 Esc 链整体跳过。
     hotkey_recording: bool,
@@ -1112,6 +1115,43 @@ fn status_left_text(
     text
 }
 
+/// FR-UIX-10 大字显示的文本。口径对齐 AHK 版 `ResultItem.DisplayText()`：
+/// 「选中行的展示文本」优先，没有选中行时退回输入框原文（AHK `_ShowLargeType` 是
+/// `item.DisplayText()` 否则 `Input.Value`）。条目层与 AHK `CopyText()` 同一条分派：
+/// 文件 / 目录 / URL 取 `path`，其余取名称。
+///
+/// 头段行的「展示文本」没有 AHK 对应物（那些行在 AHK 里各自是独立控件），按各自最像
+/// 「这段文字本身」的字段取：计算器取结果、网页搜索取 URL、提示行取标题、终端取命令。
+fn large_text_of(
+    row: Option<&HeadRow>,
+    item: Option<&LaunchItem>,
+    query: &str,
+) -> Option<String> {
+    let text = match (item, row) {
+        (Some(item), _) => match item.kind {
+            ItemKind::Url | ItemKind::File | ItemKind::Folder => item.path.clone(),
+            _ => item.name.clone(),
+        },
+        (None, Some(row)) => match row {
+            HeadRow::Calc(hit) => hit.copy.clone(),
+            HeadRow::Search(hit) => hit.url.clone(),
+            HeadRow::Hint(hit) => hit.title.clone(),
+            HeadRow::Custom(hit) => hit.name.clone(),
+            // 提示行的标题是「某命令（需要参数）」这种说明文，命令原文才是可展示的内容。
+            HeadRow::CustomHint(hit) => hit.command.clone(),
+            HeadRow::File(hit) => hit.path.clone(),
+            HeadRow::Terminal(hit) => hit.command.clone(),
+            HeadRow::TermHint(hit) => hit.title.clone(),
+            HeadRow::Cheat(hit) => hit.entry.title.to_string(),
+            HeadRow::CheatHint(hit) => hit.title.clone(),
+            HeadRow::ScopeTags(hit) => hit.title.clone(),
+        },
+        (None, None) => query.to_string(),
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// 状态栏右侧 `Enter` 键帽后面的动作词（FR-UIX-08「右 = Enter 行为标签」）。
 ///
 /// 与行首徽标同口径，但这里要能直接接在键帽后面读（「Enter 打开」），所以用动词短语。
@@ -1479,7 +1519,7 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// 本程序自己占用的组合（录制端落定前的预检表）。**表里的每一条都对着 `ui()` 里一次真实的
 /// `consume_key`**（Ctrl+Shift+N 新建、Ctrl+E 编辑、Ctrl+I 批量导入、Ctrl+D 打开目录、
 /// Ctrl+Shift+D 删除、Ctrl+Shift+P 置顶、Ctrl+N/P 与 Ctrl+J/K 循环导航、Ctrl+M 开 ☰ 主菜单、
-/// Ctrl+数字 与 Alt+数字 执行第 N 行），
+/// Ctrl+L 大字显示、Ctrl+数字 与 Alt+数字 执行第 N 行），
 /// 不多写一条：表是"避让本程序的功能键"，不是"避开所有看着眼熟的键"，多出来的条目会白白
 /// 挡掉系统里其实空着的组合（Ctrl+A 这种本程序压根没绑）。
 ///
@@ -1500,6 +1540,7 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_CONTROL, 0x49),             // Ctrl+I 批量导入全部
     (HKF_CONTROL, 0x4A),             // Ctrl+J 循环下一项
     (HKF_CONTROL, 0x4B),             // Ctrl+K 循环上一项
+    (HKF_CONTROL, 0x4C),             // Ctrl+L 大字显示（FR-UIX-10）
     (HKF_CONTROL, 0x4D),             // Ctrl+M ☰ 主菜单（批次 F6：新建按钮换成菜单后给它配的键）
     (HKF_CONTROL, 0x4E),             // Ctrl+N 循环下一项（2026-10-22 从「新建」改为导航）
     (HKF_CONTROL, 0x50),             // Ctrl+P 循环上一项（2026-10-22 从「置顶」改为导航）
@@ -2406,6 +2447,7 @@ impl LauncherApp {
             had_focus_since_show: false,
             toast: None,
             hud: hud::Hud::new(),
+            large_type: large_type::LargeType::new(self_hwnd),
             hotkey_recording: false,
             // 先按配置值显示；第一帧再从 HOTKEY_ACTIVE 校正（启动可能退回过出厂值）。
             hotkey_active,
@@ -5022,6 +5064,11 @@ impl eframe::App for LauncherApp {
                 || self.about_open
                 || self.help_entry.is_some()
                 || self.settings_open
+                // FR-UIX-10：大字窗要抢焦点才收得到 Esc，主窗必然"失焦"。
+                // 这一档不藏：主窗留着，关闭大字时才有一个可激活的窗口把焦点还回来
+                // （真机 2026-10-24：藏掉之后 SetForegroundWindow 激活的是隐藏窗，
+                // 焦点落到外部程序，后续按键全漏）。
+                || self.large_type.showing()
             {
                 self.hide_at = None;
             } else if ui.input(|i| i.focused) {
@@ -5227,7 +5274,7 @@ impl eframe::App for LauncherApp {
                     };
                     (hot(egui::Key::N), hot(egui::Key::D), hot(egui::Key::P))
                 };
-                let (hit_n, hit_p, hit_i, hit_e, hit_cd, hit_cf, hit_cm) = {
+                let (hit_n, hit_p, hit_i, hit_e, hit_cd, hit_cf, hit_cm, hit_cl) = {
                     let hot = |mods: egui::Modifiers, k: egui::Key| {
                         ui.input_mut(|i| i.consume_key(mods, k))
                     };
@@ -5239,6 +5286,7 @@ impl eframe::App for LauncherApp {
                         hot(egui::Modifiers::COMMAND, egui::Key::D),
                         hot(egui::Modifiers::COMMAND, egui::Key::F),
                         hot(egui::Modifiers::COMMAND, egui::Key::M),
+                        hot(egui::Modifiers::COMMAND, egui::Key::L),
                     )
                 };
                 // 裸 Delete 只在搜索框为空时接管：有输入时它是文本编辑键，不能抢。
@@ -5385,6 +5433,30 @@ impl eframe::App for LauncherApp {
                             text,
                             "快捷键 Ctrl+F：进入文件模式（补 ' 前缀，原输入保留为过滤词、不写日志）",
                         );
+                    }
+                } else if hit_cl {
+                    // FR-UIX-10（2026-10-24）：大字显示。内容口径对齐 AHK 版
+                    // `_ShowLargeType`——有选中行就用它的展示文本，没有就用输入框原文。
+                    // 原文不落日志，只记字符数与字号（FR-SYS-03）。
+                    //
+                    // 与 AHK 版有一处**有意偏离**：AHK 在弹大字前把搜索窗 Hide 掉，这里让主窗
+                    // 留在原位。真机实测（2026-10-24）Hide 之后大字一关，焦点会落到本进程那个
+                    // 隐藏的事件窗上（按键全部丢失），不如让主窗留在下面接回焦点。
+                    // 配套改动：FR-WIN-04 在大字窗开着期间不自动隐藏主窗（见下方 keep_open
+                    // 里的 `large_type.showing()`），否则焦点一被大字窗拿走，主窗 50ms 就没了。
+                    let text = {
+                        let plan = self.plan();
+                        let item = item_rank(self.selected, plan.head.len())
+                            .and_then(|r| plan.results.get(r))
+                            .map(|i| self.items[*i].clone());
+                        large_text_of(plan.head.get(self.selected), item.as_ref(), &self.query)
+                    };
+                    match text {
+                        Some(text) => {
+                            self.toast = None;
+                            self.large_type.show(ui.ctx(), text);
+                        }
+                        None => eprintln!("快捷键 Ctrl+L：没有可显示的文字（空输入且没有选中行）"),
                     }
                 } else if hit_csn {
                     // 批次 X：选中的是文件行时把这一行预填进添加对话框（"从眼前这一行建快捷项"），
@@ -7416,6 +7488,9 @@ impl eframe::App for LauncherApp {
         // FR-UIX-09：本帧仍在显示期的 HUD 子视口。主窗隐藏后这里不再跑，但已声明的视口
         // 由 HUD 自己的回调续命（E-08 实测）。
         self.hud.render(ui.ctx());
+        // FR-UIX-10：大字显示同理——声明在、回调活着；主窗即使被热键藏起来，
+        // 已声明的大字视口也由它自己的回调续命。
+        self.large_type.render(ui.ctx());
     }
 }
 
@@ -8444,6 +8519,95 @@ mod nav_tests {
             }
             .conflicts_local(LOCAL_TAKEN),
             "Ctrl+M 开 ☰ 主菜单，必须被本地表挡住"
+        );
+        // FR-UIX-10：Ctrl+L 现在绑了大字显示，与 Ctrl+M 同一口径进表。
+        assert!(
+            HotkeySpec {
+                mods: HKF_CONTROL | HKF_NOREPEAT,
+                vk: 0x4C
+            }
+            .conflicts_local(LOCAL_TAKEN),
+            "Ctrl+L 大字显示，必须被本地表挡住"
+        );
+    }
+
+    #[test]
+    fn large_text_prefers_the_selected_row_then_the_query() {
+        use crate::source::calc::CalcHit;
+        use crate::source::custom::CustomHint;
+        use crate::source::filesearch::FileHit;
+        use crate::source::websearch::SearchHit;
+
+        // AHK `_ShowLargeType`：没有选中行就用输入框原文（且两侧空白不进大字窗）。
+        assert_eq!(
+            large_text_of(None, None, "  138 0013 8000 "),
+            Some("138 0013 8000".to_string())
+        );
+        assert_eq!(large_text_of(None, None, "   "), None, "全空白不弹窗");
+
+        // 条目层照 AHK `CopyText()`：URL / 文件 / 目录取 path，其余取名称。
+        let url = LaunchItem {
+            name: "示例".into(),
+            kind: ItemKind::Url,
+            path: "https://example.com/?q=1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            large_text_of(None, Some(&url), "被忽略"),
+            Some("https://example.com/?q=1".to_string())
+        );
+        let app = LaunchItem {
+            name: "记事本".into(),
+            kind: ItemKind::App,
+            path: "notepad.exe".into(),
+            ..Default::default()
+        };
+        assert_eq!(large_text_of(None, Some(&app), ""), Some("记事本".to_string()));
+
+        // 头段行：计算器取结果、网页搜索取 URL、文件取路径、参数提示取命令原文。
+        let calc = HeadRow::Calc(CalcHit {
+            title: "7+7".into(),
+            subtitle: String::new(),
+            copy: "14".into(),
+        });
+        assert_eq!(large_text_of(Some(&calc), None, ""), Some("14".to_string()));
+        let search = HeadRow::Search(SearchHit {
+            engine_id: "g".into(),
+            title: "g 词".into(),
+            subtitle: String::new(),
+            url: "https://example.com/search?q=词".into(),
+        });
+        assert_eq!(
+            large_text_of(Some(&search), None, ""),
+            Some("https://example.com/search?q=词".to_string())
+        );
+        let file = HeadRow::File(FileHit {
+            title: "a.txt".into(),
+            path: "C:\\x\\a.txt".into(),
+            is_dir: false,
+            subtitle: String::new(),
+        });
+        assert_eq!(
+            large_text_of(Some(&file), None, ""),
+            Some("C:\\x\\a.txt".to_string())
+        );
+        let hint = HeadRow::CustomHint(CustomHint {
+            uid: "u".into(),
+            title: "ping（需要参数）".into(),
+            subtitle: String::new(),
+            completion: "ping ".into(),
+            command: "cmd.exe /k ping {query}".into(),
+        });
+        assert_eq!(
+            large_text_of(Some(&hint), None, ""),
+            Some("cmd.exe /k ping {query}".to_string()),
+            "提示行的标题是说明文，命令原文才是可展示内容"
+        );
+
+        // 有选中条目时条目优先（真实调用里两者互斥，这里钉住优先级）。
+        assert_eq!(
+            large_text_of(Some(&calc), Some(&url), ""),
+            Some("https://example.com/?q=1".to_string())
         );
     }
 }

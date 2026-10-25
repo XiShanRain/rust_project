@@ -482,6 +482,20 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: Some(6),
     },
     CheatEntry {
+        key: "Ctrl+L",
+        title: "大字显示",
+        summary: "把选中行放大到屏幕中央；没有选中行就显示输入原文",
+        detail: "无边框置顶、`141414` 黑底白字（不跟随主题），窗口在工作区居中。\n\
+                 字号按字符数分档：≤12 → 96、≤30 → 64、≤80 → 40、≤300 → 28、其余 18；\n\
+                 放不进屏幕会继续降档，窗口尺寸始终不超过工作区。\n\
+                 主窗留在原位，大字在它上面；关掉大字后焦点回到主窗，可以接着改查询。\n\
+                 关闭方式：Esc / 点一下 / 切到别的窗口。显示内容不写日志。",
+        tags: "key 大字 放大 展示 large type",
+        group: Group::Keys,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
         key: "Ctrl+,",
         title: "打开 / 返回设置页",
         summary: "六页：通用 / 功能 / 热键 / 数据源 / 外观 / 高级",
