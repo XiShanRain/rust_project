@@ -108,6 +108,11 @@ pub enum SourceRow {
     CheatHint(cheatsheet::CheatHint),
     /// 裸 `@` 的分类提示行（批次 G1）：不可执行，点/按只给一句用法 Toast。
     ScopeTags(application::ScopeTagHint),
+    /// 操作面板的一行（批次 P1，FR-ACT-03）。**不是数据源的产物**：面板开着时
+    /// `main.rs::plan()` 整段不跑注册表，头段就是这一种行、结果段为空。
+    /// 借道头段而不是另起一套列表，是因为 ↑↓ / PgUp/PgDn / Ctrl+N/P/J/K / Tab / 数字键 /
+    /// 点击 / 滚动跟随 / 状态栏这些机制全都按「合并行号」算 —— 另写一遍必漂。
+    Action(crate::actions::Action),
 }
 
 impl SourceRow {

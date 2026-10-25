@@ -59,7 +59,17 @@ impl TermShell {
 
     /// 一律"执行完停在窗口里"（`/k` / `-NoExit`）：否则 `>ipconfig` 一闪就关，
     /// 用户连输出都没看清。`wt` 那一档把同样的东西交给 Windows Terminal 的新标签去跑。
+    ///
+    /// 空命令（「在终端打开」只要一个停在原地的窗口）不带上 `/k`/`-Command` 那一段：
+    /// `cmd /k ""` 先回声一次空命令，`powershell -Command ""` 直接报参数绑定错误，
+    /// 而这两个程序裸跑本来就是"交互式、不退出"。
     fn args(self, command: &str) -> Vec<String> {
+        if command.is_empty() {
+            return match self {
+                Self::Cmd | Self::Wt => Vec::new(),
+                Self::PowerShell | Self::Pwsh => vec!["-NoExit".to_string()],
+            };
+        }
         match self {
             Self::Cmd => vec!["/k".to_string(), command.to_string()],
             Self::PowerShell | Self::Pwsh => {
@@ -79,11 +89,33 @@ impl TermShell {
     /// 子进程会**继承**那个终端，`/k` 会把命令塞进用户自己的控制台里，不是新窗口。
     /// `wt.exe` 是 GUI 程序，给它加这个标志反而会凭空多开一个控制台窗口。
     pub fn spawn(self, command: &str) -> std::io::Result<()> {
+        self.spawn_inner(command, None)
+    }
+
+    /// 批次 P1（FR-ACT-04「在终端打开」）：只给工作目录、不带命令。
+    /// 空命令在 [`args`] 里就是"开一个停得住的交互窗口"，于是这一档不需要另拼一条
+    /// `cd /d` 命令（那条在 pwsh 里写法不同，四选一就要分四支）。
+    pub fn spawn_at(self, dir: &str) -> std::io::Result<()> {
+        self.spawn_inner("", Some(dir))
+    }
+
+    fn spawn_inner(self, command: &str, dir: Option<&str>) -> std::io::Result<()> {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
         let mut cmd = Command::new(self.program());
-        cmd.args(self.args(command));
+        let mut args = self.args(command);
+        if let Some(d) = dir {
+            // 三个控制台程序吃 `current_dir`；`wt` 是 GUI 程序，它给新标签选的是自己
+            // 配置里的 `startingDirectory`（出厂是 `%USERPROFILE%`），继承来的 cwd 会被
+            // 覆盖 ⇒ 只有它必须用 `-d` 显式说。
+            if self == Self::Wt {
+                args.splice(0..0, ["-d".to_string(), d.to_string()]);
+            } else {
+                cmd.current_dir(d);
+            }
+        }
+        cmd.args(args);
         if self != Self::Wt {
             cmd.creation_flags(CREATE_NEW_CONSOLE);
         }

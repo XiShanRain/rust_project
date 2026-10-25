@@ -45,8 +45,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI,
-    SHERB_NOSOUND, SHEmptyRecycleBinW, ShellExecuteExW,
+    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE,
+    SEE_MASK_FLAG_NO_UI, SHFILEOPSTRUCTW, SHFileOperationW, SHObjectProperties, SHOP_FILEPATH,
+    SHELLEXECUTEINFOW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
+    SHEmptyRecycleBinW, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ChangeWindowMessageFilterEx, CreateWindowExW,
@@ -65,6 +67,7 @@ const HOTKEY_TOGGLE: i32 = 1;
 /// 补字符热键（批次 R，2026-10-20 用户追加需求）：按下它把被裸键吞掉的那个字符投给焦点窗口。
 const HOTKEY_TYPEBACK: i32 = 2;
 
+mod actions;
 mod cli;
 mod hud;
 mod large_type;
@@ -736,6 +739,10 @@ struct LauncherApp {
     hud: hud::Hud,
     // ---- FR-UIX-10：大字显示（`src/large_type.rs`）----
     large_type: large_type::LargeType,
+    // ---- 批次 P1：操作面板（FR-ACT-03 / FR-ACT-04，`src/actions.rs` 出表）----
+    /// 面板现场（`None` = 结果模式）。面板开着时查询框里那几个字是**过滤词**，
+    /// 用户原来的查询原文存在 `saved_query` 里，退出时原样放回去。
+    panel: Option<PanelState>,
     // ---- FR-WIN-02 热键可配置（批次 Q）----
     /// 设置页正在录制新组合：为真时本帧按键由录制端独占，快捷键分支与 Esc 链整体跳过。
     hotkey_recording: bool,
@@ -1079,18 +1086,25 @@ fn hint_message(hint: &source::websearch::EngineHint) -> &'static str {
 
 /// 状态栏左侧那一格（FR-UIX-08「左 = 面板返回 / 文件模式 / 轮换提示」）。
 ///
-/// 三档按「此刻最有用」排序，不是并列展示：目录浏览时用户下一步多半是返回，先把返回键说出来；
-/// 文件模式其次；平时才轮到 Tab 轮换。「基本」分类范围只在这一格里追加——它是清单层的筛子，
-/// 目录浏览/文件模式两档下说它会让人误以为是文件范围。
+/// 四档按「此刻最有用」排序，不是并列展示：操作面板开着先说怎么回去；目录浏览时用户下一步
+/// 多半是返回，把返回键说出来；文件模式其次；平时才轮到 Tab 轮换。「基本」分类范围只在
+/// 平时这一档追加——它是清单层的筛子，面板/目录/文件模式三档下说它会让人误以为是文件范围。
 ///
 /// 目录那一档的 Esc 文案按 [`browse_parent_of`] 的真实落点说：带过滤词时先去词（不是退目录），
 /// 盘根再按下去是清空查询——三处说成同一句话会教坏用户。
 fn status_left_text(
+    panel: bool,
     browse: Option<(&str, &str)>,
     file_mode: bool,
     tab: TabMode,
     basic_scope: bool,
 ) -> String {
+    // 批次 P1（FR-ACT-03）：面板模式下这一格改说"怎么回去"。左格排在目录 / 文件模式之前：
+    // 面板里的过滤词是随便打的字，`route()` 认不出浏览态，但**就算**认出也不该拿目录那套
+    // Esc 文案骗人——此刻 Esc 的唯一落点是退出面板。
+    if panel {
+        return "操作面板 · Esc 或 ← 返回结果".to_string();
+    }
     if let Some((dir, filter)) = browse {
         let esc = if !filter.is_empty() {
             "Esc 清除筛选"
@@ -1113,6 +1127,24 @@ fn status_left_text(
         text.push_str(" · 分类：基本");
     }
     text
+}
+
+/// 状态栏右格的圆角键帽（FR-UIX-08）。调用方在 `right_to_left` 的子 Ui 里按"先右后左"的顺序
+/// 塞：先动作词、再 `Enter`、最后才是 `→ 操作` 那一组。
+fn status_key_cap(ui: &mut egui::Ui, text: &str, theme: &theme::Theme) {
+    egui::Frame::new()
+        .fill(theme.selected_background)
+        .stroke(egui::Stroke::new(1.0, theme.border))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(7, 2))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .monospace()
+                    .size(theme.shortcut_font_size + 1.0)
+                    .color(theme.input_text),
+            );
+        });
 }
 
 /// FR-UIX-10 大字显示的文本。口径对齐 AHK 版 `ResultItem.DisplayText()`：
@@ -1145,6 +1177,8 @@ fn large_text_of(
             HeadRow::Cheat(hit) => hit.entry.title.to_string(),
             HeadRow::CheatHint(hit) => hit.title.clone(),
             HeadRow::ScopeTags(hit) => hit.title.clone(),
+            // 批次 P1：面板行的"这段文字本身"就是动作名——大字要的是"我现在选的是哪一条"。
+            HeadRow::Action(hit) => hit.label.clone(),
         },
         (None, None) => query.to_string(),
     };
@@ -1170,6 +1204,9 @@ fn enter_action_label(row: Option<&HeadRow>) -> &'static str {
         Some(HeadRow::File(_)) => "打开",
         Some(HeadRow::Terminal(_)) => "执行命令",
         Some(HeadRow::Cheat(_)) => "查看",
+        // 批次 P1（FR-ACT-03）：面板行的 Enter 落点＝执行高亮的那一条动作，词跟着行首徽标走
+        // （「Enter 复制」「Enter 删除」——与结果模式同一套"徽标即动作类别"的口径）。
+        Some(HeadRow::Action(hit)) => hit.id.badge(),
     }
 }
 
@@ -1210,6 +1247,223 @@ fn row_at(selected: usize, results_len: usize, head_len: usize) -> Option<Row> {
 /// 选中头段（计算器/搜索/提示）时返回 `None`——那些行不是条目，空格不替它们执行任何程序。
 fn item_rank(selected: usize, head_len: usize) -> Option<usize> {
     (selected >= head_len).then(|| selected - head_len)
+}
+
+// ---- 批次 P1：操作面板（FR-ACT-03 进出 + FR-ACT-04 动作表）----
+
+/// 批次 P1（FR-ACT-03）：操作面板的现场。`None` = 结果模式（平常那一屏）。
+///
+/// **面板不另开输入框**：过滤词就住在 [`LauncherApp::query`] 里——AHK 版同口径
+/// （`_SetInput("")` 清空 + `Win.SetCueBanner` 把「关于〈项标题〉的操作」做到占位符上）。
+/// 于是"恢复原输入文字"＝把进来时那一串原样写回，焦点、光标、TextEdit 的绑定一个都不碰。
+struct PanelState {
+    /// 进来时的查询原文。退出时一字不改写回（验收：进出面板后 `chr` 与选中的 Chrome 行都不丢）。
+    saved_query: String,
+    /// 进来时的高亮行（合并行号），退出时原样放回。
+    saved_selected: usize,
+    /// 动作表的输入：标题 / 种类 / 路径 / 能不能编辑。进面板时算一次，之后不再随帧变。
+    target: actions::PanelTarget,
+    /// 完整动作表（未按过滤词裁剪）。面板行序就是这里的序，`filter_actions` 只删不改序。
+    actions: Vec<actions::Action>,
+    /// 「打开」那一条具体怎么打开。**必须在进面板这一刻就定下来**：面板开着时查询框是过滤词，
+    /// `{query}` 型自定义命令再按 `self.query` 去填就填错了东西。
+    open: PanelOpen,
+}
+
+/// [`PanelState::open`] 的两种形态，差别只有一件事：**有没有清单身份**
+/// （学习统计与脱敏日志都挂在身份上）。
+enum PanelOpen {
+    /// 清单里的条目：交给与 Enter 完全同一条 [`LauncherApp::launch_with_log`]
+    /// （内置动作 `internal:` 的分派、自定义命令的脱敏日志都在里面），只是学习用的词换成进来时那串。
+    Entry {
+        /// 真正交给 `ShellExecuteExW` 的那份（自定义命令是已填好 `{query}` 的副本）。
+        entry: LaunchItem,
+        /// 清单侧身份。副本的派生 uid 与它不同，所以单列一份，不能用 `entry.uid()`。
+        uid: String,
+        /// 自定义命令：path/arguments 里带着用户敲的词 ⇒ 日志走脱敏那一条。
+        masked: bool,
+    },
+    /// 只有路径 / URL（文件行、网页搜索行）：直接 `ShellExecuteExW`。
+    /// 不进清单、不记学习——FR-SYS-03：这些串都是从查询框现搜出来的。
+    Path,
+}
+
+/// 面板里执行完一条动作之后的现场处置。四条出路语义上互斥，所以做成枚举而不是两个 bool。
+enum PanelOutcome {
+    /// 原样保留（复制 / 属性 / 打开方式 / 回收站 / 大字——用户下一步还在面板里）。
+    Stay,
+    /// 保留现场但换一份 target（置顶切换后「置顶 / 取消置顶」那条文案要跟着改，动作表要重建）。
+    Reland(actions::PanelTarget),
+    /// 关面板回结果模式（编辑 / 删除确认 / 添加为命令——现场交给了我们自己的弹窗）。
+    Close,
+    /// 窗口已经收到托盘（打开 / 提权 / 终端 / 所在位置），面板没资格留下：
+    /// 下次呼出必须从结果模式重新开始。
+    Gone,
+}
+
+/// FR-ACT-03 那句「仅"新按"，须过滤键盘自重复」。
+///
+/// egui 的 `key_pressed` / `num_presses` 把操作系统的自重复也算成"本帧按下了"，按住 `→`
+/// 就会连跳进面板、再连执行动作——验收点名的正是这条，只能读原始事件里的 `repeat: false`。
+/// 命中后还要把这些键事件**收走**：`→`/`←` 在这里做的是模式切换，同一帧不能再让 TextEdit
+/// 拿去移光标（退出时 `set_query` 把光标放到末尾，TextEdit 若又吃到一条 `←` 就差一个字符，
+/// 下一次 `→` 白按）。只 `retain` 掉目标键那一格，手法与 [`take_record_press`] 一致——
+/// 清空整帧事件会让同一帧里的 Esc 和所有快捷键一起变聋（批次 R 踩过）。
+fn take_fresh_key(ctx: &egui::Context, wanted: egui::Key) -> bool {
+    let ours = |ev: &egui::Event| {
+        matches!(ev,
+            egui::Event::Key { key, modifiers, .. }
+            if *key == wanted && *modifiers == egui::Modifiers::NONE
+        )
+    };
+    let mut fresh = false;
+    ctx.input_mut(|i| {
+        fresh = i.events.iter().any(|ev| {
+            ours(ev)
+                && matches!(ev, egui::Event::Key { pressed: true, repeat: false, .. })
+        });
+        if fresh {
+            i.events.retain(|ev| !ours(ev));
+        }
+    });
+    fresh
+}
+
+/// FR-ACT-03 那句「且光标在末尾」：插入点不在查询末尾时 `→` 是 TextEdit 的"右移光标"，
+/// 抢走它用户就没法从词中间往右翻。`CCursor::index` 是**字符**下标（与 [`set_query`] 里
+/// `CCursor::new(chars)` 同一口径），所以跟 `chars().count()` 比，不跟字节长度比。
+/// 读不到 `TextEditState`（输入框还没渲染过）按"不在末尾"处理——那种情况本来也不该进面板。
+fn caret_at_end(ctx: &egui::Context, query: &str) -> bool {
+    let Some(st) = egui::widgets::text_edit::TextEditState::load(ctx, search_field_id()) else {
+        return false;
+    };
+    // 0.36 把插入点收在 `TextCursorState::char_range()` 里（返回 `Option`：从未点过输入框
+    // 就没有 range），不是更早版本那个直接摆在外面的 `CCursorRange` 字段。
+    let Some(range) = st.cursor.char_range() else {
+        return false;
+    };
+    // `index` 是 `CharIndex`（0.36 的字符下标新类型，`.0` 才是那个 `usize`），
+    // 所以右边也得按"字符数"给，按字节比会在中文查询上判错。
+    range.primary.index.0 >= query.chars().count()
+}
+
+/// 「这一串此刻在不在盘上」——只有对该形态是路径的串才去 `stat`，
+/// URL / `shell:` / `internal:` 一律 false（`actions_for` 里那几格本来就不看 `exists`）。
+/// 清单条目不走这里，走 FR-SRC-06 那份后台缓存：离线 UNC 在主线程 `stat` 会把整帧挂住。
+fn fs_exists(path: &str) -> bool {
+    actions::is_fs_path(path) && std::path::Path::new(path).exists()
+}
+
+/// 「所在位置」的落点。先按 Ctrl+D 那套找**文件**（[`resolve_file_for_select`] 的判据是
+/// `is_file()`），落空了再认**目录**——FR-ACT-04 的验收点名的正是文件夹那一格
+/// （「对文件夹『所在位置』打开父目录并选中」），只复用文件判据的话文件夹行永远定不了位，
+/// 而 `explorer /select,` 对目录本来就是有效的。
+fn reveal_target(path: &str, source_path: &str) -> Option<String> {
+    let pick = |p: &str| -> Option<String> {
+        let t = p.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let expanded = source::application::expand_vars(t);
+        let pb = std::path::PathBuf::from(&expanded);
+        (pb.is_absolute() && pb.is_dir()).then_some(expanded)
+    };
+    resolve_file_for_select(path, source_path).or_else(|| pick(path).or_else(|| pick(source_path)))
+}
+
+/// 「用户在系统那句警告里点了否」：`ERROR_CANCELLED(1223)` 经 `HRESULT_FROM_WIN32` 变成
+/// `0x800704C7`。UAC 拒绝提权、`FOF_WANTNUKEWARNING` 那句"永久删除"被驳回，都是这一个码。
+/// 它不是故障 ⇒ Toast 要说「已取消」，不能写「失败：…」。
+/// （`recycle_path` 那边拿到的是裸 Win32 码 1223，`SHFileOperationW` 不返回 HRESULT。）
+fn user_cancelled(e: &windows::core::Error) -> bool {
+    e.code() == windows::core::HRESULT::from_win32(1223)
+}
+
+/// 把「当前高亮行」翻译成面板需要的两份数据（动作表输入 + 「打开」的可执行形态）。
+/// 返回 `None` = 这一行没有可处置的对象 ⇒ `→` 保持 TextEdit 的原义，不抢键。
+///
+/// 「哪些行有面板」与「Enter 按下去干什么」是两件事，判据**刻意不同源**：计算器那一串数字
+/// 没有路径可复制、终端行是一条命令而不是一个东西、`valid=false` 的提示行压根不该被执行——
+/// 硬给它们一张动作表只会供出一排按了报错的按钮。
+///
+/// 参数拆成 `head` / `results` 两片而不是 `&Plan`：渲染那一帧把 `plan.results` 搬出来当局部量
+/// 用了（条目循环要按下标取），整块 `&plan` 在那里是"部分移动后再借用"，编译不过。
+fn panel_for_row(
+    row: Row,
+    head: &[HeadRow],
+    results: &[usize],
+    items: &[LaunchItem],
+    path_states: &std::collections::HashMap<String, source::pathcheck::PathState>,
+) -> Option<(actions::PanelTarget, PanelOpen)> {
+    // 清单那一格：uid / 可编辑 / exists（四态缓存）都跟着身份走。
+    // `is_dir` 用**声明的 kind**，不新起一次 `stat`：目录型条目入库时就是 Folder。
+    let target_of = |it: &LaunchItem| -> actions::PanelTarget {
+        let exists = match path_states.get(&it.uid()) {
+            // 缓存里没这一条（刚入库 / 还没轮到扫它）⇒ 当作在：四态只在"确认不在"时才说不在。
+            Some(s) => !s.is_problem(),
+            None => true,
+        };
+        actions::PanelTarget {
+            title: it.name.clone(),
+            subject: actions::subject_for(it.kind, &it.path, it.kind == ItemKind::Folder),
+            path: it.path.clone(),
+            arguments: it.arguments.clone(),
+            exists,
+            editable: true,
+            uid: Some(it.uid()),
+            pinned: it.pinned,
+        }
+    };
+    match row {
+        Row::Item(rank) => {
+            let it = items.get(*results.get(rank)?)?;
+            let uid = it.uid();
+            Some((target_of(it), PanelOpen::Entry { entry: it.clone(), uid, masked: false }))
+        }
+        Row::Head(h) => match head.get(h)? {
+            // 自定义命令的独占行：`hit.entry` 是已把 `{query}` 填好的副本，uid 仍是清单里那一条。
+            HeadRow::Custom(hit) => {
+                let it = items.iter().find(|i| i.uid() == hit.uid)?;
+                Some((
+                    target_of(it),
+                    PanelOpen::Entry {
+                        entry: hit.entry.clone(),
+                        uid: hit.uid.clone(),
+                        masked: true,
+                    },
+                ))
+            }
+            HeadRow::File(hit) => Some((
+                actions::PanelTarget {
+                    title: hit.title.clone(),
+                    subject: actions::subject_for(ItemKind::File, &hit.path, hit.is_dir),
+                    path: hit.path.clone(),
+                    arguments: String::new(),
+                    // 这一行是刚列出来 / 查出来的，不存在就不会出现在这里。
+                    exists: true,
+                    editable: false,
+                    uid: None,
+                    pinned: false,
+                },
+                PanelOpen::Path,
+            )),
+            HeadRow::Search(hit) => Some((
+                actions::PanelTarget {
+                    title: hit.title.clone(),
+                    subject: actions::subject_for(ItemKind::Url, &hit.url, false),
+                    path: hit.url.clone(),
+                    arguments: String::new(),
+                    exists: fs_exists(&hit.url),
+                    editable: false,
+                    uid: None,
+                    pinned: false,
+                },
+                PanelOpen::Path,
+            )),
+            // 计算器 / 终端 / 各类提示行（`valid=false`）/ 分类行：没有可处置的对象。
+            _ => None,
+        },
+    }
 }
 
 /// 取回被按下的数字键（小键盘也算：winit 把 `Numpad*` 映射到同一批 `Num*`）。
@@ -1312,27 +1566,118 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// 批次 A9：Store/MSIX 条目（路径形如 `shell:AppsFolder\<AUMID>`）是唯一的例外——
 /// 它改走 `IApplicationActivationManager`，理由见 `application::activate_uwp`。
 fn shell_execute(file: &str, params: &str, dir: Option<&str>) -> windows::core::Result<()> {
+    shell_execute_verb(file, None, params, dir)
+}
+
+/// [`shell_execute`] 的带动词版本（批次 P1，FR-ACT-04）。动词有两处用到：
+/// `runas`（以管理员运行）与 `properties`（属性框的兜底，见 [`show_properties`]）。
+///
+/// 两点与默认动词不同：① Store 的 AUMID 串**不走** `activate_uwp`——那个入口只认"打开"，
+/// 提权/属性对它没有意义（面板里那两档本来就不给 Store 应用）；② `SEE_MASK_FLAG_NO_UI`
+/// 挡的是"没有关联程序"那类系统错误框，**不挡 UAC**：`runas` 照样弹提权，用户拒绝后
+/// 返回 `ERROR_CANCELLED(1223)`，调用方据此说"已取消"而不是"失败"。
+fn shell_execute_verb(
+    file: &str,
+    verb: Option<&str>,
+    params: &str,
+    dir: Option<&str>,
+) -> windows::core::Result<()> {
     // 清单里的路径可能是 `%VAR%` 形态（出厂「启动器目录」用的是 `%LAUNCHER_DIR%`，
     // 要跟着 exe 搬家）——ShellExecuteExW 不替我们展开，所以在这里统一走一次。
     // `expand_env` 对未定义的 `%…%` 原样保留，用户写错的变量不会被悄悄吃掉。
     let file = source::custom::expand_env(file);
-    if let Some(aumid) = source::application::uwp_aumid(&file) {
-        return source::application::activate_uwp(aumid);
+    if verb.is_none() {
+        if let Some(aumid) = source::application::uwp_aumid(&file) {
+            return source::application::activate_uwp(aumid);
+        }
     }
     let params = source::custom::expand_env(params);
-    let dir = dir.map(source::custom::expand_env);
+    let dir = dir.as_ref().map(|d| source::custom::expand_env(d));
     let wfile = wide_z(&file);
+    let wverb = verb.map(wide_z);
     let wparams = wide_z(&params);
     let wdir = dir.as_ref().map(|d| wide_z(d));
     let mut sei: SHELLEXECUTEINFOW = unsafe { core::mem::zeroed() };
     sei.cbSize = core::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
     sei.fMask = SEE_MASK_FLAG_NO_UI;
-    sei.lpVerb = PCWSTR::null(); // 默认动词 open
+    sei.lpVerb = wverb.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
     sei.lpFile = PCWSTR(wfile.as_ptr());
     sei.lpParameters = PCWSTR(wparams.as_ptr());
     sei.lpDirectory = PCWSTR(wdir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()));
     sei.nShow = SW_SHOWNORMAL.0;
     unsafe { ShellExecuteExW(&mut sei) }
+}
+
+/// FR-ACT-04「以管理员运行」。参数与「打开」同一条通道，只多一个 `runas` 动词。
+/// 工作目录跟着条目的 `working_dir` 走（与不提权那一档对齐，不额外加限制）。
+fn shell_execute_runas(file: &str, params: &str, dir: Option<&str>) -> windows::core::Result<()> {
+    shell_execute_verb(file, Some("runas"), params, dir)
+}
+
+/// FR-ACT-04「打开方式…」。走系统自己的 `OpenAs_RunDLL`，不自己列候选程序。
+///
+/// 路径**不加引号**（与 AHK `ActionCatalog.OpenWith` 同一口径）：`OpenAs_RunDLL` 把剩下的
+/// 整条命令行当作目标名，加了引号反而把引号算进文件名。
+fn open_with_dialog(path: &str) -> windows::core::Result<()> {
+    shell_execute(
+        "rundll32.exe",
+        &format!("shell32.dll,OpenAs_RunDLL {path}"),
+        None,
+    )
+}
+
+/// FR-ACT-04「属性」。`SHObjectProperties(0, SHOP_FILEPATH, path, 0)` 与资源管理器里
+/// 右键→属性是同一条调用；它对某些形态（网络盘上的文件夹一类）返回 FALSE，
+/// 这时回落到 `properties` 动词——需求书那条验收「对网络盘文件夹『属性』不报错」靠的就是
+/// 这一对兜底，只留第一道会静默什么都不发生。兜底的返回码不当成功判据：能起起来就算成功。
+fn show_properties(path: &str) -> bool {
+    let by_api = unsafe {
+        // 主线程此前不常驻 COM 公寓（只有后台扫描线程和 UWP 启动那一下会初始化）。
+        // 这里补一次 STA：已初始化返回 S_FALSE、被别的组件设成别的公寓返回 RPC_E_CHANGED_MODE，
+        // 两种都不影响这次调用，所以**不配对 CoUninitialize**（计数里可能有别人的那一份）。
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let w = wide_z(path);
+        SHObjectProperties(None, SHOP_FILEPATH, PCWSTR(w.as_ptr()), PCWSTR::null()).as_bool()
+    };
+    if by_api {
+        return true;
+    }
+    shell_execute_verb(path, Some("properties"), "", None).is_ok()
+}
+
+/// FR-ACT-04「移入回收站」。用 Windows 自己的删除（`SHFileOperationW` + `FOF_ALLOWUNDO`），
+/// 于是进度框、重名询问、回收站还原这些系统行为全都免费。
+///
+/// 标志里刻意带上 `FOF_WANTNUKEWARNING`：`ALLOWUNDO` 只保证"能进回收站的时候"进回收站，
+/// 网络盘、超大文件、被策略禁止的卷上它会**永久删除**——那一句警告必须由系统问，不能替用户跳过。
+/// `pFrom` 要求「双 NUL 结尾」：`wide_z` 补的是数组末尾那一个，所以字符串本身也得带一个 `\0`。
+fn recycle_path(path: &str) -> Result<(), u16> {
+    let from = wide_z(&format!("{path}\0"));
+    let mut op = SHFILEOPSTRUCTW::default();
+    op.wFunc = FO_DELETE;
+    op.pFrom = PCWSTR(from.as_ptr());
+    op.fFlags = (FOF_ALLOWUNDO | FOF_WANTNUKEWARNING | FOF_NOCONFIRMATION | FOF_SILENT).0 as u16;
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code == 0 {
+        Ok(())
+    } else {
+        // 用户在那句"永久删除"警告里点了否，系统返回 1223（ERROR_CANCELLED）——
+        // 这不是故障，调用方要按"取消"说。
+        Err(code as u16)
+    }
+}
+
+/// 把搜索框的插入点放到末尾。程序化换掉 `self.query` 不会带着 `TextEditState` 里的光标走
+/// ⇒ 接着打字会插进词中间（批次 F 的 Tab 补全踩过，[`LauncherApp::set_query`] 里内联做了同一件事）。
+/// 这个函数只给"拿不到 `ctx` 的那条改写路径"用：`on_hide` 是被隐藏流程调起来的，
+/// 只能取 `CTX` 那个静态句柄。
+fn caret_to_end(ctx: &egui::Context, chars: usize) {
+    if let Some(mut st) = egui::widgets::text_edit::TextEditState::load(ctx, search_field_id()) {
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(chars),
+        )));
+        st.store(ctx, search_field_id());
+    }
 }
 
 /// 批次 P（FR-SYS-03）「打开日志」的落点：用系统关联程序打开 `launcher.log`。
@@ -2448,6 +2793,8 @@ impl LauncherApp {
             toast: None,
             hud: hud::Hud::new(),
             large_type: large_type::LargeType::new(self_hwnd),
+            // 批次 P1：面板不是启动态能带进来的东西（呼出永远从结果模式开始）。
+            panel: None,
             hotkey_recording: false,
             // 先按配置值显示；第一帧再从 HOTKEY_ACTIVE 校正（启动可能退回过出厂值）。
             hotkey_active,
@@ -4299,6 +4646,22 @@ impl LauncherApp {
         // 批次 F6：☰ 菜单不跨隐藏保留。失焦自动隐藏时 Popup 那一帧不再运行，也就没人把
         // `menu_open` 写回 false——不在这里清掉，下次呼出会带着一个悬着的菜单出现。
         self.menu_open = false;
+        // 批次 P1（FR-ACT-03）：面板同样不跨隐藏保留。失焦自动隐藏时不会有第二帧来退出它——
+        // 留着的话下次呼出直接落在"框里是过滤词、列表只有动作"那一屏（与 ☰ 菜单同一条处理）。
+        // 原查询与高亮行在这里放回：不放回就是把用户没打过的过滤词当成他打的词。
+        // 光标也要一起放到末尾（`query` 是程序化改写的，见 [`caret_to_end`]）。
+        if let Some(p) = self.panel.take() {
+            let chars = p.saved_query.chars().count();
+            eprintln!(
+                "操作面板：窗口隐藏 ⇒ 退出面板，原查询（{chars} 个字符，不落原文）与第 {} 行已放回",
+                p.saved_selected + 1
+            );
+            self.query = p.saved_query;
+            self.selected = p.saved_selected;
+            if let Some(ctx) = CTX.get() {
+                caret_to_end(ctx, chars);
+            }
+        }
         // 批次 R：窗口一隐藏，eframe 就不再跑 `ui()` ⇒ `hotkey_frame` 末尾那条边沿检测等不到
         // 下一帧。取键态若还开着，全局呼出会一直停在"临时注销"状态（按了没反应），所以在这里
         // 就地退出取键并把键装回。放在这个函数最前面是因为它下面有一条 `return`。
@@ -4763,6 +5126,442 @@ impl LauncherApp {
         self.launch_and_hide_masked(ctx, &entry, "FR-SRC-14 文件行");
     }
 
+    /// 批次 P1（FR-ACT-03）：`→` / 右键「操作…」进入操作面板。
+    /// 返回 `false` = 这一行没有可处置的对象（计算器 / 终端 / 各类 `valid=false` 提示行）⇒ 现场一字不动。
+    ///
+    /// 过滤词就住在 `query` 里，所以"进入"＝存现场 + 清空。**清空必须走 [`Self::set_query`]**：
+    /// 它同时把光标放到末尾并要回焦点——少了这两样，进面板打的第一个字会插到词中间或落空
+    /// （批次 F 补全后光标插错位是同一个坑）。
+    fn open_panel(&mut self, ctx: &egui::Context, row: Row) -> bool {
+        let plan = self.plan();
+        let Some((target, open)) =
+            panel_for_row(row, &plan.head, &plan.results, &self.items, &self.path_states)
+        else {
+            eprintln!("操作面板：这一行没有可处置的对象（计算器 / 终端 / 提示 / 分类行），不进面板");
+            return false;
+        };
+        // 「恢复选中行」按**这一行本身**记，不按此刻的选中记：键盘（`→`）进来时两者相等——
+        // 行本来就是从 `self.selected` 取的；右键进来时用户点的是哪一行，退出就该落回哪一行。
+        let merged = match row {
+            Row::Head(h) => h,
+            Row::Item(rank) => plan.head.len() + rank,
+        };
+        let panel_actions = actions::actions_for(&target);
+        // FR-SYS-03：只有清单里真实存在的条目才报名字——文件行 / 搜索行的标题是从查询现出来的。
+        if target.editable {
+            eprintln!(
+                "操作面板：进入（{:?}，关于「{}」，动作 {} 条）",
+                target.subject,
+                target.title,
+                panel_actions.len()
+            );
+        } else {
+            eprintln!(
+                "操作面板：进入（{:?}，动作 {} 条；对象来自查询 ⇒ 标题不落日志）",
+                target.subject,
+                panel_actions.len()
+            );
+        }
+        self.panel = Some(PanelState {
+            saved_query: self.query.clone(),
+            saved_selected: merged,
+            target,
+            actions: panel_actions,
+            open,
+        });
+        self.set_query(ctx, String::new(), "操作面板：查询框改作过滤词（原查询已存，原文不落日志）");
+        true
+    }
+
+    /// 批次 P1（FR-ACT-03）：退出面板回结果模式（`Esc` / `←` / 空输入 `Backspace` / 执行完一条换屏动作）。
+    /// 恢复**原输入文字与选中行**是写进验收的两句，顺序有讲究：`set_query` 内部带着
+    /// `selected = 0`，所以放回行号必须排在它**之后**。
+    fn close_panel(&mut self, ctx: &egui::Context, by: &str, focus_search: bool) {
+        let Some(p) = self.panel.take() else { return };
+        let chars = p.saved_query.chars().count();
+        let row = p.saved_selected + 1;
+        let saved = p.saved_query;
+        self.set_query(
+            ctx,
+            saved,
+            &format!(
+                "操作面板：由{by}退出，原查询（{chars} 个字符，不落原文）与第 {row} 行已恢复"
+            ),
+        );
+        self.selected = p.saved_selected;
+        if !focus_search {
+            // 现场交给了自己的弹窗（编辑 / 删除确认）⇒ 焦点不许被抢回搜索框。
+            self.focus_query = false;
+        }
+        ctx.request_repaint();
+    }
+
+    /// 批次 P1（FR-ACT-03 / FR-ACT-04）：执行面板里选中的那条动作。
+    ///
+    /// **学习统计以原查询记**，这是 FR-ACT-03 定这条流程的理由：用户打的是 `chr`，学会的就该是
+    /// `chr`→Chrome；把动作名「打开」喂进别名表，下次打 `open` 就能唤出 Chrome。所以 `alias_word`
+    /// 取 `saved_query`，而且只有真的启动了程序的两档（打开 / 提权）才记。
+    ///
+    /// 每条动作的现场处置见 [`PanelOutcome`]：复制 / 属性 / 打开方式 / 回收站 / 大字**不关窗**
+    /// （用户下一步还在面板里，或要去别处粘贴）；打开 / 提权 / 终端 / 所在位置交给系统后收进托盘。
+    fn run_panel_action(&mut self, ctx: &egui::Context, id: actions::ActionId) {
+        let Some(state) = self.panel.take() else { return };
+        let alias_word = commit_word(&state.saved_query, false);
+        let PanelState {
+            saved_query,
+            saved_selected,
+            target,
+            actions: panel_actions,
+            open,
+        } = state;
+        let label = id.label();
+        let outcome: PanelOutcome = match id {
+            // ---- 三类"启动" ----
+            actions::ActionId::Open => match &open {
+                PanelOpen::Entry {
+                    entry,
+                    uid,
+                    masked,
+                } => {
+                    let started = if *masked {
+                        self.launch_and_hide_masked(ctx, entry, uid)
+                    } else {
+                        self.launch_and_hide(ctx, entry)
+                    };
+                    if started {
+                        self.mark_used(uid, &alias_word);
+                        PanelOutcome::Gone
+                    } else {
+                        // 启动失败：`launch_with_log` 已经把窗口留在原地给了原因。
+                        // 面板不撤——撤了查询框里剩的就是过滤词，那一屏结果会被过滤词误导。
+                        PanelOutcome::Stay
+                    }
+                }
+                PanelOpen::Path => {
+                    // 文件行 / 搜索行：串从查询现出 ⇒ 与 `open_file_hit` 同一口径，路径不落日志。
+                    match shell_execute(&target.path, &target.arguments, None) {
+                        Ok(()) => {
+                            eprintln!(
+                                "操作面板：打开（{:?}，路径不落日志）→ 关闭到托盘",
+                                target.subject
+                            );
+                            self.collapse_after_run(ctx);
+                            PanelOutcome::Gone
+                        }
+                        Err(e) => {
+                            eprintln!("操作面板：打开失败（{:?}）：{e}", target.subject);
+                            self.toast = Some((
+                                format!("⚠ 打开失败：{e}"),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_ERR,
+                            ));
+                            ctx.request_repaint_after(TOAST_TTL);
+                            PanelOutcome::Stay
+                        }
+                    }
+                }
+            },
+            actions::ActionId::RunAs => {
+                let dir = match &open {
+                    PanelOpen::Entry { entry, .. } => entry.working_dir.as_deref(),
+                    PanelOpen::Path => None,
+                };
+                match shell_execute_runas(&target.path, &target.arguments, dir) {
+                    Ok(()) => {
+                        if let PanelOpen::Entry { uid, .. } = &open {
+                            self.mark_used(uid, &alias_word);
+                        }
+                        eprintln!(
+                            "操作面板：以管理员运行（{:?}）已交给 UAC → 关闭到托盘",
+                            target.subject
+                        );
+                        self.collapse_after_run(ctx);
+                        PanelOutcome::Gone
+                    }
+                    Err(e) if user_cancelled(&e) => {
+                        eprintln!("操作面板：提权被用户取消（1223），未运行");
+                        self.toast = Some((
+                            "已取消提权，未运行".to_string(),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                        ctx.request_repaint_after(TOAST_TTL);
+                        PanelOutcome::Stay
+                    }
+                    Err(e) => {
+                        eprintln!("操作面板：以管理员运行失败（{:?}）：{e}", target.subject);
+                        self.toast = Some((
+                            format!("⚠ 提权启动失败：{e}"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_ERR,
+                        ));
+                        ctx.request_repaint_after(TOAST_TTL);
+                        PanelOutcome::Stay
+                    }
+                }
+            }
+            actions::ActionId::OpenTerminal => {
+                // 目录进本目录、文件进所在目录（AHK `_ParentDir` 同口径）。用 `spawn_at` 而不是
+                // 拼一条 `cd /d` 命令：那玩意在 pwsh 里写法不同，四档 shell 就要分四支。
+                let dir = if matches!(target.subject, actions::Subject::Folder) {
+                    target.path.clone()
+                } else {
+                    actions::parent_dir(&target.path)
+                };
+                let shell = self.prefs.term_shell();
+                match shell.spawn_at(&dir) {
+                    Ok(()) => {
+                        eprintln!(
+                            "操作面板：在终端打开（shell {}，目录不落日志）→ 关闭到托盘",
+                            shell.as_str()
+                        );
+                        self.collapse_after_run(ctx);
+                        PanelOutcome::Gone
+                    }
+                    Err(e) => {
+                        eprintln!("操作面板：终端启动失败（shell {}）：{e}", shell.as_str());
+                        self.toast = Some((
+                            format!("⚠ 启动失败：{e}"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_ERR,
+                        ));
+                        ctx.request_repaint_after(TOAST_TTL);
+                        PanelOutcome::Stay
+                    }
+                }
+            }
+            // ---- 交给系统的对话框 ----
+            actions::ActionId::OpenWith => match open_with_dialog(&target.path) {
+                Ok(()) => {
+                    eprintln!("操作面板：已交给系统「打开方式」（对象来自查询 ⇒ 路径不落日志）");
+                    PanelOutcome::Stay
+                }
+                Err(e) => {
+                    eprintln!("操作面板：「打开方式」调用失败：{e}");
+                    self.toast = Some((
+                        format!("⚠ 打开方式失败：{e}"),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_ERR,
+                    ));
+                    ctx.request_repaint_after(TOAST_TTL);
+                    PanelOutcome::Stay
+                }
+            },
+            actions::ActionId::Properties => {
+                if show_properties(&target.path) {
+                    eprintln!("操作面板：属性框已交给系统（{:?}，路径不落日志）", target.subject);
+                } else {
+                    // `SHObjectProperties` 与 `properties` 动词两道都落空——网络盘上的某些形态会这样。
+                    eprintln!("操作面板：属性框起不来（{:?}）", target.subject);
+                    self.toast = Some((
+                        "⚠ 这个对象没有属性框".to_string(),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_ERR,
+                    ));
+                    ctx.request_repaint_after(TOAST_TTL);
+                }
+                PanelOutcome::Stay
+            }
+            actions::ActionId::Reveal => {
+                let source_path = match &open {
+                    PanelOpen::Entry { entry, .. } => entry.source_path.as_str(),
+                    PanelOpen::Path => "",
+                };
+                match reveal_target(&target.path, source_path) {
+                    Some(p) => {
+                        eprintln!(
+                            "操作面板：所在位置（{} 个字符的路径不落日志）→ 关闭到托盘",
+                            p.chars().count()
+                        );
+                        self.select_in_explorer(ctx, &p);
+                        PanelOutcome::Gone
+                    }
+                    None => {
+                        eprintln!("操作面板：所在位置落空（{:?}：没有可定位的本地路径）", target.subject);
+                        self.toast = Some((
+                            "⚠ 这一条没有能在资源管理器里定位的本地路径".to_string(),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_ERR,
+                        ));
+                        ctx.request_repaint_after(TOAST_TTL);
+                        PanelOutcome::Stay
+                    }
+                }
+            }
+            // ---- 剪贴板三格：都不关窗（下一步是去别处粘贴，不是收工）----
+            actions::ActionId::CopyPath
+            | actions::ActionId::CopyUrl
+            | actions::ActionId::CopyName => {
+                let text = match id {
+                    actions::ActionId::CopyName => target.name_to_copy(),
+                    actions::ActionId::CopyUrl => target.path.clone(),
+                    _ => target.path_to_copy(),
+                };
+                let verb = match id {
+                    actions::ActionId::CopyName => "名称",
+                    actions::ActionId::CopyUrl => "网址",
+                    _ => "路径",
+                };
+                match copy_to_clipboard(&text) {
+                    Ok(()) => {
+                        // 内容多半来自查询 ⇒ 日志只记长度与是哪一格（FR-SYS-03）。
+                        eprintln!(
+                            "操作面板：已复制{verb}（{} 个字符，内容不落日志）",
+                            text.chars().count()
+                        );
+                        self.toast = Some((
+                            format!("✓ 已复制{verb}：{text}"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("操作面板：复制{verb}失败：{e}");
+                        self.toast = Some((
+                            format!("⚠ 复制失败：{e}"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_ERR,
+                        ));
+                    }
+                }
+                ctx.request_repaint_after(TOAST_TTL);
+                PanelOutcome::Stay
+            }
+            actions::ActionId::Recycle => {
+                // `recycle_path` 给的是裸 Win32 码（`SHFileOperationW` 不按 HRESULT 说话）：
+                // 1223 = 用户在那句「永久删除？」警告里点了"否"，其余非零才是真失败。
+                match recycle_path(&target.path) {
+                    Ok(()) => {
+                        self.refresh_path_states(true);
+                        eprintln!(
+                            "操作面板：已移入回收站（{} 个字符的路径不落日志）",
+                            target.path.chars().count()
+                        );
+                        self.toast = Some((
+                            "✓ 已移入回收站（可从回收站还原）".to_string(),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                        ctx.request_repaint_after(TOAST_TTL);
+                        // 对象已经不在了 ⇒ 面板里没有第二条动作还值得对它做，退回结果模式。
+                        // 清单条目**不跟着删**（进回收站 ≠ 从清单消失），路径四态会把它标成失效。
+                        PanelOutcome::Close
+                    }
+                    Err(1223) => {
+                        eprintln!("操作面板：那句「永久删除」警告被用户驳回，未删除");
+                        self.toast = Some((
+                            "已取消，未删除".to_string(),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                        ctx.request_repaint_after(TOAST_TTL);
+                        PanelOutcome::Stay
+                    }
+                    Err(c) => {
+                        eprintln!("操作面板：移入回收站失败（系统返回 {c}）");
+                        self.toast = Some((
+                            format!("⚠ 移入回收站失败（系统返回 {c}）"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_ERR,
+                        ));
+                        ctx.request_repaint_after(TOAST_TTL);
+                        PanelOutcome::Stay
+                    }
+                }
+            }
+            // ---- 交给我们自己的弹窗与确认框 ----
+            actions::ActionId::Edit => {
+                if let Some(uid) = &target.uid {
+                    if let Some(it) = self.items.iter().find(|i| i.uid() == *uid).cloned() {
+                        self.dialog = Some(DialogState::from_item(&it));
+                        // 打开面板这一下是 Enter 按的：同一帧不能让刚出生的对话框把它当成「确定」。
+                        self.dialog_enter_armed = true;
+                    }
+                }
+                PanelOutcome::Close
+            }
+            actions::ActionId::AddCommand => {
+                self.dialog = Some(DialogState::from_input(&target.path));
+                self.dialog_enter_armed = true;
+                PanelOutcome::Close
+            }
+            actions::ActionId::Delete => {
+                if let Some(uid) = &target.uid {
+                    if let Some(it) = self.items.iter().find(|i| i.uid() == *uid).cloned() {
+                        self.confirm = Some(ConfirmRequest {
+                            uid: it.uid(),
+                            name: it.name.clone(),
+                            path: it.path.clone(),
+                        });
+                        eprintln!("操作面板：删除 {uid} 前先弹确认（未删除）");
+                    }
+                }
+                PanelOutcome::Close
+            }
+            actions::ActionId::TogglePin => {
+                // 只改这一份快照里的 `pinned`，让面板原地换行文案（「置顶」⇄「取消置顶」）。
+                // 不能搬走 `target`：`PanelOutcome::Stay`/`Close` 那条路还要用它把现场放回。
+                let mut new_target = target.clone();
+                if let Some(uid) = &new_target.uid {
+                    if let Some(pos) = self.items.iter().position(|i| i.uid() == *uid) {
+                        self.items[pos].pinned = !self.items[pos].pinned;
+                        let on = self.items[pos].pinned;
+                        let name = self.items[pos].name.clone();
+                        self.save_items();
+                        new_target.pinned = on;
+                        self.toast = Some((
+                            format!("✓ 已{}", if on { "置顶" } else { "取消置顶" }),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                        eprintln!("操作面板：置顶切换 {uid} → {on}（「{name}」）");
+                    }
+                }
+                PanelOutcome::Reland(new_target)
+            }
+            actions::ActionId::LargeType => {
+                // 复用 FR-UIX-10 的大字视口：铺的就是这一项的名字（`target.title`）。
+                self.large_type.show(ctx, target.title.clone());
+                PanelOutcome::Stay
+            }
+        };
+        // 现场怎么处置见 [`PanelOutcome`]。`Gone` 是唯一不回去的：那条路上窗口已经收到托盘，
+        // 下次呼出必须从结果模式重新开始（`on_hide` 里也兜了一遍，两处口径一致）。
+        match outcome {
+            PanelOutcome::Stay => {
+                self.panel = Some(PanelState {
+                    saved_query,
+                    saved_selected,
+                    target,
+                    actions: panel_actions,
+                    open,
+                });
+            }
+            PanelOutcome::Reland(new_target) => {
+                let rebuilt = actions::actions_for(&new_target);
+                self.panel = Some(PanelState {
+                    saved_query,
+                    saved_selected,
+                    target: new_target,
+                    actions: rebuilt,
+                    open,
+                });
+                ctx.request_repaint();
+            }
+            PanelOutcome::Close => {
+                self.panel = Some(PanelState {
+                    saved_query,
+                    saved_selected,
+                    target,
+                    actions: panel_actions,
+                    open,
+                });
+                self.close_panel(ctx, label, self.dialog.is_none() && self.confirm.is_none());
+            }
+            PanelOutcome::Gone => {}
+        }
+    }
+
     /// 把当前整张清单写盘（种子播种一次后即普通用户项，不再剔除）。
     fn save_items(&self) {
         source::application::save_user_items(&self.items);
@@ -4783,11 +5582,12 @@ impl LauncherApp {
         self.items[pos].use_count = self.items[pos].use_count.saturating_add(1);
         self.items[pos].last_used_ms = now_ms();
         if !alias_word.is_empty() && learn_alias(&mut self.items[pos], alias_word) {
-            // FR-SYS-03 隐私口径：`alias_word` 是查询框里敲的原文，绝不落日志。批次 P 之后
-            // 这个文件能存好几天、还能托盘一键打开，最容易被随手发给别人看问题 ⇒ 只记清单侧的落点。
+            // FR-SYS-03 隐私口径：别名字段本身就是"用户敲过的词的集合"——把 `keyword` 打进日志，
+            // 等于把刚学到的那个词（以及历史上所有被学进去的查询原文）原样抄进一份能存好几天、
+            // 还能托盘一键打开的文件里。所以只记"写过了"，字段内容一个字都不出。
             eprintln!(
-                "提交即学别名：已写入「{}」的别名字段 ⇒ {}（不记用户敲的词）",
-                self.items[pos].name, self.items[pos].keyword
+                "提交即学别名：已写入「{}」的别名字段（学到的词与既有别名都不落日志）",
+                self.items[pos].name
             );
         }
         self.save_items();
@@ -4871,6 +5671,21 @@ impl LauncherApp {
     ///
     /// 关掉的源在 [`source::dispatch`] 里**连被问到的机会都没有**，不会出结果、也不会出提示行。
     fn plan(&mut self) -> Plan {
+        // 批次 P1（FR-ACT-03）：面板开着时整张列表就是那张动作表，此刻查询框里那几个字是**过滤词**。
+        // 走头段通道（`SourceRow::Action`）而不是 `results`：动作行没有"名次"可言，而 ↑↓／PgUp／
+        // Ctrl+J/K／Tab／数字键／点击／徽标／状态栏全都读同一份 `plan`，借道头段就等于一次到位。
+        // 早退必须在 `cap_plan_rows` 之前——那一刀是给「10 条」档的结果列表用的，动作表只有十几行，
+        // 被截掉后半张就成了「进面板看不见「删除」」。
+        if let Some(p) = &self.panel {
+            let hits = actions::filter_actions(&self.query, &p.actions);
+            return Plan {
+                head: hits
+                    .iter()
+                    .map(|&i| source::SourceRow::Action(p.actions[i].clone()))
+                    .collect(),
+                results: Vec::new(),
+            };
+        }
         let now = now_ms();
         // 先取值再借 `prefs.engines`：配置里存的是稳定名，认识的才留下，不认识回落 cmd。
         let term_shell = self.prefs.term_shell();
@@ -5183,6 +5998,14 @@ impl eframe::App for LauncherApp {
         let mut copy_path: Option<String> = None;
         let mut row_actions: Vec<String> = Vec::new();
         let mut pin_toggles: Vec<String> = Vec::new();
+        // 批次 P1（FR-ACT-03）：面板里被选中的动作（Enter / 点击 / 数字键三条入口汇成这一个槽）。
+        // 和其它槽一样"当帧只记、帧末才做"：动作会弹系统对话框、会改清单、甚至会把窗口收进托盘，
+        // 在渲染列表的借用里做这些事，下一行就要读到改过的 `self.panel`。
+        let mut panel_action: Option<actions::ActionId> = None;
+        // FR-ACT-03 的右键入口「操作…」。同样必须帧末才做：`open_panel` 要 `&mut self`，
+        // 而右键闭包里正握着 `&self.items[..]` 借出来的那一行（2021 的按字段捕获让它过了编译，
+        // 换成整块 `&mut self` 就冲突了）。
+        let mut panel_request: Option<Row> = None;
 
         // 快捷键补键（2026-10-17 立规「每个功能必须配快捷键」）：窗口可见且无弹窗时生效。
         // 键位口径（用户 2026-10-17 指定）：Delete=删除选中项（仅空输入时；有输入时归 TextEdit 前向删除）、
@@ -5198,6 +6021,12 @@ impl eframe::App for LauncherApp {
         // 判据与各自代价见设置页「空格执行选中项」）。Shift+空格 恒为插入真空格，不受档位影响。
         // FR-SRC-10（批次 S）：查询能算出一个数时列表第 0 行是计算器行。它的「执行」＝复制纯数字
         // 再关到托盘，走 Enter / 点击 / 数字键这三条；空格与 Tab 补全在选中它时整体不接管。
+        // 批次 P1（FR-ACT-03）：`→` 进操作面板（只认"新按"那一下 + 光标必须在末尾，所以按住不放
+        // 不会连跳），`←` / `Esc` / 输入为空时的 `Backspace` 退出并把原查询与选中行放回去。
+        // 判据与落点见下面的 `panel_exit` / `panel_enter`：这两个旗标是那条长派发链的第一档，
+        // 排在 Ctrl+M / Ctrl+F / 数字键 / Tab 之前；但上面那批 `consume_key` 已经先一步把
+        // Ctrl 组合的事件吃掉了——箭头键与它们不同键，所以先后顺序不影响结果。
+        // Esc 那一档不在这里，在下方 Esc 阶梯里（面板先于"清空输入"和"关闭到托盘"）。
         // 鼠标中键不再执行任何条目（2026-10-18 用户裁定废弃），移动窗口改由「左键拖空白」承担，见下方同名注释块。
         // consume_key 精确匹配修饰键并吃掉事件，防与 TextEdit/其他控件的键位打架。
         if self.visible
@@ -5397,7 +6226,39 @@ impl eframe::App for LauncherApp {
                     );
                 }
 
-                if hit_cm {
+                // ---- 批次 P1（FR-ACT-03）：`→` 进面板 / `←`・空输入 `Backspace` 出面板 ----
+                // 判据放在这里（渲染列表之前）而不是列表那一坨里：退出要恢复查询，
+                // 同帧的 TextEdit 若已经按"过滤词"渲染过一遍，恢复就得等下一帧、光标还会差一格。
+                // 两个旗标都只在**搜索页**成立：设置页整页替换了搜索页（`settings_ui` 里 `return`），
+                // 那一屏没有列表可切。
+                // `take_fresh_key` 排最后：只有真的要进出才把键收走，不命中就原样留给输入框。
+                let panel_exit: Option<&'static str> = if self.panel.is_none()
+                    || self.settings_open
+                {
+                    None
+                } else if take_fresh_key(ui.ctx(), egui::Key::ArrowLeft) {
+                    Some("←")
+                } else if self.query.is_empty()
+                    && ui.input(|i| i.key_pressed(egui::Key::Backspace))
+                {
+                    Some("空输入的 Backspace")
+                } else {
+                    None
+                };
+                let panel_enter = !self.settings_open
+                    && self.panel.is_none()
+                    && caret_at_end(ui.ctx(), &self.query)
+                    && take_fresh_key(ui.ctx(), egui::Key::ArrowRight);
+
+                if let Some(by) = panel_exit {
+                    self.close_panel(ui.ctx(), by, true);
+                } else if panel_enter {
+                    let plan = self.plan();
+                    let row = row_at(self.selected, plan.results.len(), plan.head.len());
+                    if let Some(row) = row {
+                        self.open_panel(ui.ctx(), row);
+                    }
+                } else if hit_cm {
                     // 批次 F6：☰ 主菜单的键盘入口（用户裁定「三条杠菜单 + 快捷键都留」）。
                     // 这里只翻旗标——菜单项本身在顶栏那帧由 `main_menu_content` 渲染并返回动作。
                     self.menu_open = !self.menu_open;
@@ -5840,6 +6701,14 @@ impl eframe::App for LauncherApp {
                                     eprintln!("快捷键 数字键 {digit}：选中的是分类提示行，不执行");
                                     self.hint_toast(ui.ctx(), hint.subtitle.as_str());
                                 }
+                                HeadRow::Action(hit) => {
+                                    // 批次 P1：面板那十几行也占前 10 个数字键位（口径与 Enter 一致）。
+                                    eprintln!(
+                                        "快捷键 数字键 {digit}：执行操作面板动作「{}」",
+                                        hit.id.label()
+                                    );
+                                    panel_action = Some(hit.id);
+                                }
                             },
                             Some(Row::Item(rank)) => {
                                 let item = self.items[results[rank]].clone();
@@ -5989,10 +6858,15 @@ impl eframe::App for LauncherApp {
                 // 高度钳到 [`INPUT_MIN_H`] 并让文字垂直居中——原先 TextEdit 只按字体高长到 ~29px。
                 // 批次 F8（FR-UIX-08）：状态栏开着时键位说明在栏里，输入框只留一句；
                 // 关掉状态栏则回落到那一整句长提示（两者的耦合口径就这一处）。
-                let hint = if self.prefs.appearance.status_bar {
-                    SEARCH_HINT_SHORT
-                } else {
-                    SEARCH_HINT
+                // 批次 P1（FR-ACT-03）：面板借用的是同一个输入框（`query` 当过滤词），
+                // 于是那句「关于〈项标题〉的操作」就落在占位符上——与 AHK 的 `SetCueBanner` 同形态，
+                // 而且只在过滤词为空（刚进面板）时露出来，正是需要它的那一刻。
+                let hint = match &self.panel {
+                    Some(p) => egui::RichText::new(p.target.banner()),
+                    None if self.prefs.appearance.status_bar => {
+                        egui::RichText::new(SEARCH_HINT_SHORT)
+                    }
+                    None => egui::RichText::new(SEARCH_HINT),
                 };
                 let resp = ui.add_sized(
                     [edit_w, INPUT_MIN_H],
@@ -6134,11 +7008,17 @@ impl eframe::App for LauncherApp {
             }
 
             if total == 0 {
+                // FR-ACT-03：面板模式的过滤词没命中任何动作。必须排在最前——此刻查询框里是
+                // 过滤词，`in_file_mode` / `q.is_empty()` 那两格说的是"搜索/清单"，全是错的话；
+                // 更要短路 FR-SRC-23 的「Enter 弹出新增」，否则打一个不存在的动作名按 Enter
+                // 会拿过滤词去建一条快捷项。
+                if self.panel.is_some() {
+                    ui.label("没有匹配的动作——改字再筛，或按 Esc / ← 返回结果列表。");
+                } else if q.is_empty() {
+                    ui.label("清单为空——按 Ctrl+Shift+N、或点右上 ☰ 里的「新建快捷项」，也可按 Ctrl+I 批量导入。");
                 // 批次 X：文件模式下"未找到"这三行字会说错两件事——范围（不是"清单里没有"，
                 // 是"索引范围里没有"或"这个目录空/读不到"）与预填（`'报告`、`pic 报告` 这种带
                 // 触发符的串喂给 `from_input` 会生成一条命令行是乱码的条目）。所以另起一格。
-                if q.is_empty() {
-                    ui.label("清单为空——按 Ctrl+Shift+N、或点右上 ☰ 里的「新建快捷项」，也可按 Ctrl+I 批量导入。");
                 } else if in_file_mode {
                     if self.prefs.source_on(source::SourceId::Files) {
                         ui.label(match &file_route {
@@ -6217,6 +7097,11 @@ impl eframe::App for LauncherApp {
                                 }
                                 HeadRow::ScopeTags(hint) => {
                                     self.hint_toast(ui.ctx(), hint.subtitle.as_str())
+                                }
+                                HeadRow::Action(hit) => {
+                                    // 批次 P1（FR-ACT-03）：Enter 执行选中的动作，学习统计以
+                                    // **原查询**记录（在 `run_panel_action` 里取 `saved_query`）。
+                                    panel_action = Some(hit.id);
                                 }
                             },
                             Some(Row::Item(rank)) => {
@@ -6306,6 +7191,15 @@ impl eframe::App for LauncherApp {
                                         if sel.clicked() {
                                             open_hit = Some(hit.clone());
                                         }
+                                        // FR-ACT-03 的右键入口。搜索行的对象就是那条 URL ⇒
+                                        // 面板给「打开 / 复制网址 / 复制名称 / 添加为命令 / 大字显示」五条
+                                        // （`on_disk` 对 URL 恒假，提权、打开方式、定位、终端、属性都不出现）。
+                                        sel.context_menu(|ui| {
+                                            if ui.button("操作…").clicked() {
+                                                panel_request = Some(Row::Head(h));
+                                                ui.close();
+                                            }
+                                        });
                                     });
                                 }
                                 HeadRow::Hint(hint) => {
@@ -6369,6 +7263,15 @@ impl eframe::App for LauncherApp {
                                             launch_masked = true;
                                             launch_from_list = true;
                                         }
+                                        // FR-ACT-03：独占的自定义命令行也是条目，右键给面板。
+                                        // 「打开」这一条用面板里的 `PanelOpen::Entry`（已把
+                                        // `{query}` 填好的那份），所以按面板的"打开"和按 Enter 同结果。
+                                        sel.context_menu(|ui| {
+                                            if ui.button("操作…").clicked() {
+                                                panel_request = Some(Row::Head(h));
+                                                ui.close();
+                                            }
+                                        });
                                     });
                                 }
                                 HeadRow::CustomHint(hint) => {
@@ -6456,9 +7359,15 @@ impl eframe::App for LauncherApp {
                                         if sel.clicked() {
                                             open_file = Some(hit.clone());
                                         }
-                                        // 文件行不在清单里 ⇒ 没有"编辑/删除清单条目"可言，右键给三件
-                                        // 对这个文件本身有意义的事（复制 / 定位 / 收进清单）。
+                                        // 文件行不在清单里 ⇒ 没有"编辑/删除清单条目"可言，右键给
+                                        // 「操作…」面板（FR-ACT-03/04）加三件对这个文件本身有意义的事
+                                        // （复制 / 定位 / 收进清单）。后三条是面板的子集，留着是因为
+                                        // 它们各自一键直达、不必进面板再挑。
                                         sel.context_menu(|ui| {
+                                            if ui.button("操作…").clicked() {
+                                                panel_request = Some(Row::Head(h));
+                                                ui.close();
+                                            }
                                             if ui.button("复制路径").clicked() {
                                                 copy_path = Some(hit.path.clone());
                                                 ui.close();
@@ -6615,6 +7524,43 @@ impl eframe::App for LauncherApp {
                                         }
                                     });
                                 }
+                                HeadRow::Action(hit) => {
+                                    // 批次 P1（FR-ACT-04）：标题 + 键位 + 一句"这一条会碰什么"。
+                                    // 副标题在 `actions_for` 里就是照这个目的填的（复制动作给要复制的
+                                    // 那串、定位动作给路径、终端动作给目录），所以原样显示、不再加工。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, hit.id.badge());
+                                        ui.add_sized(
+                                            [icon, icon],
+                                            egui::Label::new(
+                                                egui::RichText::new("\u{2699}")
+                                                    .size(glyph)
+                                                    .weak(),
+                                            ),
+                                        )
+                                        .on_hover_text("操作面板（FR-ACT-03 / FR-ACT-04）");
+                                        let sel = ui.selectable_label(is_sel, hit.label.clone());
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        if !hit.keys.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(hit.keys)
+                                                    .monospace()
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.subtitle.as_str())
+                                                .weak()
+                                                .size(sub_size),
+                                        );
+                                        if sel.clicked() {
+                                            panel_action = Some(hit.id);
+                                        }
+                                    });
+                                }
                             }
                         }
                         for (rank, &hit) in results.iter().enumerate() {
@@ -6653,6 +7599,12 @@ impl eframe::App for LauncherApp {
                                 }
                                 // FR-SRC-22：种子已并入普通清单，每项都能编辑/删除
                                 sel.context_menu(|ui| {
+                                    // FR-ACT-03：右键「操作…」进面板。放在最前——它是"这一行还能做
+                                    // 什么"的总入口，编辑/置顶/删除是其中三条的快捷版。
+                                    if ui.button("操作…").clicked() {
+                                        panel_request = Some(Row::Item(rank));
+                                        ui.close();
+                                    }
                                     if ui.button("编辑…").clicked() {
                                         let dq = DialogState::from_item(item);
                                         self.dialog = Some(dq);
@@ -6696,15 +7648,19 @@ impl eframe::App for LauncherApp {
                     _ => None,
                 };
                 let left = status_left_text(
+                    self.panel.is_some(),
                     browse,
                     in_file_mode,
                     self.prefs.tab_mode,
                     matches!(self.prefs.default_scope, Scope::Basic),
                 );
                 // 左格剪到右格之前：360 宽 + 长路径时宁可截断，也不让两段字叠在一起。
+                // 右格占位按面板开合给两档：结果模式多一组「→ 操作」（键帽 + 词），留到 232；
+                // 面板模式只有 Enter 那一枚，回到原来的 170。
+                let right_reserve = if self.panel.is_some() { 170.0 } else { 232.0 };
                 let left_rect = egui::Rect::from_min_max(
                     bar.min,
-                    egui::pos2((bar.max.x - 170.0).max(bar.min.x + 40.0), bar.max.y),
+                    egui::pos2((bar.max.x - right_reserve).max(bar.min.x + 40.0), bar.max.y),
                 );
                 ui.painter().with_clip_rect(left_rect).text(
                     egui::pos2(bar.min.x, bar.center().y),
@@ -6713,10 +7669,27 @@ impl eframe::App for LauncherApp {
                     egui::FontId::proportional(self.theme.title_font_size),
                     self.theme.subtitle,
                 );
-                let action = match row_at(self.selected, total - head_len, head_len) {
+                let selected_row = row_at(self.selected, total - head_len, head_len);
+                let action = match selected_row {
                     Some(Row::Head(h)) => enter_action_label(plan.head.get(h)),
                     _ => enter_action_label(None),
                 };
+                // FR-UIX-08 右格原文的后半句「+ `→` 动作」。批次 F8 那颗键帽没画，理由是
+                // 「还没有行动作面板，画个死键帽反而误导」；面板有了，判据也照面板的真实入口
+                // 取——只有 `panel_for_row` 认得的行（条目 / 自定义命令 / 文件 / 搜索）才亮，
+                // 计算器、终端、提示行按 `→` 是什么都不做的，就不给它们许诺。
+                let panel_ready = self.panel.is_none()
+                    && match selected_row {
+                        Some(row) => panel_for_row(
+                            row,
+                            &plan.head,
+                            &results,
+                            &self.items,
+                            &self.path_states,
+                        )
+                        .is_some(),
+                        None => false,
+                    };
                 let mut right = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(bar.shrink2(egui::vec2(0.0, 4.0)))
@@ -6727,19 +7700,15 @@ impl eframe::App for LauncherApp {
                         .size(self.theme.title_font_size)
                         .color(self.theme.title),
                 );
-                egui::Frame::new()
-                    .fill(self.theme.selected_background)
-                    .stroke(egui::Stroke::new(1.0, self.theme.border))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::symmetric(7, 2))
-                    .show(&mut right, |ui| {
-                        ui.label(
-                            egui::RichText::new("Enter")
-                                .monospace()
-                                .size(self.theme.shortcut_font_size + 1.0)
-                                .color(self.theme.input_text),
-                        );
-                    });
+                status_key_cap(&mut right, "Enter", &self.theme);
+                if panel_ready {
+                    right.label(
+                        egui::RichText::new("操作")
+                            .size(self.theme.title_font_size)
+                            .color(self.theme.title),
+                    );
+                    status_key_cap(&mut right, "→", &self.theme);
+                }
             }
         });
 
@@ -7422,9 +8391,23 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        // FR-ACT-03：右键「操作…」入口。放在面板动作之前：同一帧里两件事不会同时发生
+        // （结果模式的右键槽和面板里的动作槽互斥），这个顺序只是让"先开框、后动作"读起来顺。
+        if let Some(row) = panel_request {
+            self.open_panel(ui.ctx(), row);
+        }
+
+        // 批次 P1（FR-ACT-03 / FR-ACT-04）：执行面板里选中的那条动作。放在其它帧末槽之后：
+        // 它会改 `self.panel` / `self.query` / `self.dialog`，而这些下面 Esc 那一串都要读——
+        // 顺序颠倒的话，同帧的 Esc 会对着一个已经变化一次的现场再做一次"退出"。
+        if let Some(id) = panel_action {
+            self.run_panel_action(ui.ctx(), id);
+        }
+
         // Esc 分段（FR-ACT-10「清空后隐藏」+2026-10-17 设置页一档 +2026-10-18 删除确认一档
-        // +2026-10-24 批次 F6 菜单一档）：
-        // 菜单→只收菜单；确认框→关框；对话框→关框；设置页→回搜索；有字→清空；全空→关闭到托盘。
+        // +2026-10-24 批次 F6 菜单一档 +2026-10-25 批次 P1 操作面板一档）：
+        // 菜单→只收菜单；确认框→关框；对话框→关框；设置页→回搜索；面板→回结果并还原现场；
+        // 目录→上一级；有字→清空；全空→关闭到托盘。
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             if menu_was_open {
                 // Popup 在本帧已经把旗标写回 false，这里只补一条日志并接住剩下的分支——
@@ -7462,6 +8445,12 @@ impl eframe::App for LauncherApp {
                 self.settings_open = false;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
+            } else if self.panel.is_some() {
+                // 批次 P1（FR-ACT-03）：面板开着时 Esc 关面板并把原查询与选中行放回去。
+                // 排在「Esc 返回上级目录」与「有字→清空」**之前**是有意的：过滤词长得像路径
+                // （`D:\temp`）时那两档会抢走这一下，结果是面板还开着、查询已被换成父目录——
+                // 两个模式同时被搅，比没反应更糟。
+                self.close_panel(ui.ctx(), "Esc", true);
             } else if let Some(parent) = browse_parent_of(&self.query) {
                 // 批次 F8（FR-SRC-14 附带）：目录浏览里 Esc 逐级返回；先去过滤词再上溯。
                 // 盘根返回 None ⇒ 落到下面"清空查询"那一档，行为与以前一致。
@@ -8208,9 +9197,16 @@ mod nav_tests {
 
     #[test]
     fn status_left_text_puts_the_next_escape_first() {
+        // 批次 P1（FR-ACT-03）新加的那一档排在最前：面板开着时，就算过滤词长得像目录、
+        // 也像文件模式，这一格说的仍然是「怎么退出面板」——Esc 的真实落点只有这一个。
+        assert_eq!(
+            status_left_text(true, Some(("D:\\a\\b\\", "")), true, TabMode::Complete, true),
+            "操作面板 · Esc 或 ← 返回结果"
+        );
         // 目录浏览三档 Esc 文案各说各的真实落点：退目录 / 去过滤词 / 盘根清空。
         assert_eq!(
             status_left_text(
+                false,
                 Some(("D:\\a\\b\\", "")),
                 false,
                 TabMode::Navigate,
@@ -8219,28 +9215,28 @@ mod nav_tests {
             "目录 D:\\a\\b\\ · Esc 返回上级"
         );
         assert_eq!(
-            status_left_text(Some(("D:\\a\\b\\", "re")), false, TabMode::Complete, false),
+            status_left_text(false, Some(("D:\\a\\b\\", "re")), false, TabMode::Complete, false),
             "目录 D:\\a\\b\\ · Esc 清除筛选"
         );
         assert_eq!(
-            status_left_text(Some(("D:\\", "")), false, TabMode::Complete, false),
+            status_left_text(false, Some(("D:\\", "")), false, TabMode::Complete, false),
             "目录 D:\\ · Esc 清空"
         );
         assert_eq!(
-            status_left_text(None, true, TabMode::Complete, true),
+            status_left_text(false, None, true, TabMode::Complete, true),
             "文件模式 · Esc 清空"
         );
         // 平时两档 Tab 口径，各自原样出场；「基本」只在平时那一档追加。
         assert_eq!(
-            status_left_text(None, false, TabMode::Complete, false),
+            status_left_text(false, None, false, TabMode::Complete, false),
             "Tab 补全 / 下一项"
         );
         assert_eq!(
-            status_left_text(None, false, TabMode::Complete, true),
+            status_left_text(false, None, false, TabMode::Complete, true),
             "Tab 补全 / 下一项 · 分类：基本"
         );
         assert_eq!(
-            status_left_text(None, false, TabMode::Navigate, false),
+            status_left_text(false, None, false, TabMode::Navigate, false),
             "Tab 下一项 · Shift+Tab 上一项"
         );
     }
@@ -8316,6 +9312,73 @@ mod nav_tests {
             subtitle: String::new(),
         });
         assert_eq!(enter_action_label(Some(&scope)), "查看");
+        // 批次 P1：面板行的 Enter 词 = 那条动作的行首徽标（「Enter 复制」「Enter 回收」）。
+        let action = HeadRow::Action(actions::Action {
+            id: actions::ActionId::Recycle,
+            label: actions::ActionId::Recycle.label().to_string(),
+            subtitle: String::new(),
+            keys: "",
+        });
+        assert_eq!(enter_action_label(Some(&action)), "回收");
+    }
+
+    /// `→` 进面板、状态栏那枚 `→` 键帽、右键「操作…」三个入口共用这一条判据。
+    /// 键帽按了会没反应的话就是误导 ⇒ 「有没有面板可进」必须与 `panel_for_row` 同源，
+    /// 所以这里直接测那个函数，不再另写一份"看起来一样"的规则。
+    #[test]
+    fn only_rows_that_hold_an_object_offer_the_action_panel() {
+        let items = [LaunchItem {
+            name: "记事本".into(),
+            path: "notepad.exe".into(),
+            kind: ItemKind::Command,
+            ..Default::default()
+        }];
+        let states = std::collections::HashMap::new();
+        let no_panel = |row: Row, head: &[HeadRow]| {
+            panel_for_row(row, head, &[0], &items, &states).is_some()
+        };
+        // 条目行永远有面板（哪怕路径是裸命令名，`exists` 走的是"没扫到当作在"那一格）。
+        assert!(no_panel(Row::Item(0), &[]));
+        // 名次越界 ⇒ None，不 panic：选中行与计划不同帧时宁可什么都不做。
+        assert!(!no_panel(Row::Item(3), &[]));
+        for head in [
+            HeadRow::Calc(source::calc::CalcHit {
+                title: "= 2".into(),
+                subtitle: String::new(),
+                copy: "2".into(),
+            }),
+            HeadRow::Terminal(source::terminal::TermHit {
+                shell: source::terminal::TermShell::Cmd,
+                command: "ipconfig".into(),
+                title: "ipconfig".into(),
+                subtitle: String::new(),
+            }),
+            HeadRow::Hint(source::websearch::EngineHint {
+                engine_id: "g".into(),
+                title: "搜索「x」".into(),
+                subtitle: String::new(),
+                completion: "g x".into(),
+            }),
+            HeadRow::ScopeTags(source::application::ScopeTagHint {
+                title: "分类".into(),
+                subtitle: String::new(),
+            }),
+        ] {
+            assert!(!no_panel(Row::Head(0), &[head.clone()]), "{head:?} 这一行不该有面板");
+        }
+        // 文件行与搜索行是"查询现出来的对象"，面板给得了复制/打开，uid 为空 ⇒ 不谈编辑置顶。
+        let file = HeadRow::File(source::filesearch::FileHit {
+            title: "a.txt".into(),
+            path: "D:\\a.txt".into(),
+            is_dir: false,
+            subtitle: String::new(),
+        });
+        let (target, open) = panel_for_row(Row::Head(0), &[file], &[], &items, &states)
+            .expect("文件行应有面板");
+        assert_eq!(target.subject, actions::Subject::File);
+        assert!(!target.editable);
+        assert!(target.uid.is_none());
+        assert!(matches!(open, PanelOpen::Path));
     }
 
     #[test]
