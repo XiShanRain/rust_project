@@ -426,6 +426,9 @@ enum Destructive {
     ResetLearning,
     /// FR-CFG-08：先写 `.bak` 再把偏好恢复默认（用户资产保留）。
     RestoreDefaults,
+    /// FR-QRY-10（批次 C3）：把 search_history.json 清成空表，上限那一格不动。
+    /// 这一个**不写备份**——另两个清的是统计，这张表清的是用户敲过的原文。
+    ClearHistory,
 }
 
 // FR-SRC-23【2026-10-17 修订】：无匹配 Enter 已从「直接运行兜底」改为弹 AddDialog 预填入库，
@@ -788,6 +791,16 @@ struct LauncherApp {
     /// 「全部回收站」的执行前确认（Some=确认框开着，里面是待回收的路径）。
     /// 与删除确认同一形态：这一帧只问，按「确定」那一帧才逐个进回收站。
     batch_confirm: Option<Vec<String>>,
+    // ---- 批次 C3：FR-QRY-10 搜索历史（`search_history.json`）----
+    /// 执行过的查询原文，最新在前（与 [`source::application::push_history`] 那张表同一口径：
+    /// 只存文本、不存结果，去重不分大小写、回填按原样）。落盘在 `remember_history` 里按需做。
+    history: Vec<String>,
+    /// 翻历史的游标（`index = 0` ＝ 没在翻，框里是用户自己敲的）。框里的字被用户改动时归零，
+    /// 与 AHK `_OnInputChange` 清 `HistoryIndex` 同一口径——不清就成了"改完字再按 ↑ 跳过一条"。
+    history_browse: source::application::HistoryBrowse,
+    /// `search_history.json` 坏了且留证没成功 ⇒ 本次启动不写它（写一次就覆盖掉唯一证据）。
+    /// 只管历史这一份文件：设置与清单另有各自的门槛，见 `writes_blocked`。
+    history_blocked: bool,
 }
 
 fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths: Vec<String>) {
@@ -1078,7 +1091,8 @@ fn top_drag_strip_w(item_spacing_x: f32) -> f32 {
 /// 搜索框的占位提示。**批次 F6 起改短**：输入框放大到 22pt 之后，原先那串十来个键名的长提示
 /// 会被输入框右缘裁掉（留半句话比没有更糟）。完整键表有两处入口——☰ 菜单本身（Ctrl+M）
 /// 和查询框打 `?` 的速查表（批次 A8 起有；批次 F6 那阵注释里写的是 37 条，
-/// 2026-10-26 批次 B8 之后现量 52 条——`grep -c '^    CheatEntry {' src/source/cheatsheet.rs` 随时可复量）。
+/// 2026-10-26 批次 B8 之后 52 条、同批次 C3 加「翻搜索历史」一条后现量 53 条
+/// ——`grep -c '^    CheatEntry {' src/source/cheatsheet.rs` 随时可复量）。
 const SEARCH_HINT: &str = "搜索…（Enter 运行 · Ctrl+M 菜单 · ? 帮助 · Esc 关闭）";
 
 /// 状态栏开着时的占位提示（FR-UIX-08「两者耦合」的定义）：键位说明已经落在状态栏左/右两格，
@@ -1657,6 +1671,22 @@ fn wheel_selection_step(events: &[egui::Event]) -> i32 {
     }
 }
 
+/// 批次 C3（FR-QRY-10）：`Ctrl+↑↓` 这一刻该不该归"翻搜索历史"。判据单独成函数是为了**能测**
+/// ——`ui()` 里那份现场（egui 上下文、弹窗状态）打不开，而这三条让位本身是纯的。
+///
+/// 三条与 AHK `SearchWindow.RecallHistory` 开头那两句一一对上（`SearchWindow.ahk:1429-1431`），
+/// 少一条就是"在别的地方按 ↑↓ 会跳走搜索历史"：
+/// - **面板模式**（AHK 的 `Mode = "actions"`）：框里那几个字是过滤词，↑↓ 属于那张动作表；
+///   回填一串查询进面板的过滤框，得到的是"动作列表被过滤成空"，不是用户要的东西。
+/// - **文件模式**（AHK 的 `FileMode`）：↑↓ 属于目录浏览/文件结果，同理让位。
+/// - **弹窗类现场开着**：Enter 都归"确定"了，翻历史更靠后（[`LauncherApp::keys_live`]）。
+///
+/// 设置页与取键录制态不写在参数里：调用点外面那道总闸（`!recording` / `!settings_open`）
+/// 已经把它们挡了，这里再列一遍只会让人以为这两条是可选的。
+fn recall_history_allowed(panel_open: bool, in_file_mode: bool, keys_live: bool) -> bool {
+    !panel_open && !in_file_mode && keys_live
+}
+
 /// 「这一串此刻在不在盘上」——只有对该形态是路径的串才去 `stat`，
 /// URL / `shell:` / `internal:` 一律 false（`actions_for` 里那几格本来就不看 `exists`）。
 /// 清单条目不走这里，走 FR-SRC-06 那份后台缓存：离线 UNC 在主线程 `stat` 会把整帧挂住。
@@ -1668,7 +1698,12 @@ fn fs_exists(path: &str) -> bool {
 /// 现场（通道、egui 上下文）测不起来，而"哪份配置的留证没成功"这个决定本身是纯的。
 /// 任一份是 `Lost`（改名与另存副本都没成、坏文件还挡在原位）⇒ 本轮启动的六处补齐/去重
 /// 一律不落盘：写一次就覆盖掉唯一证据。
-fn lost_evidence_labels<'a>(faults: [(&'a str, &'a Option<Corrupted>); 2]) -> Vec<&'a str> {
+///
+/// 批次 C3 起改成切片入参：可有可无的文件再加一份（`search_history.json`）不该逼着
+/// 每条调用点和每道形参再长一格。
+fn lost_evidence_labels<'a>(
+    faults: &[(&'a str, &'a Option<Corrupted>)],
+) -> Vec<&'a str> {
     faults
         .iter()
         .filter(|(_, c)| matches!(c, Some(Corrupted::Lost)))
@@ -2352,12 +2387,18 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// 【2026-10-24 批次 F7 补一条：`Ctrl+Del`（主界面隐藏出厂条目）同样不进表——`Delete`
 /// 不在可录集合里，录制端永远产不出这个组合，也就撞不上；表只收改得出来的组合。】
 /// 【2026-10-26 批次 B8 破一处先例：上面那句"裸键录不进来"**对 F1–F4 不成立**——
-/// [`HotkeySpec::check`] 对功能键放行不带修饰（`application.rs:957` 的 `if function { return Ok(()) }`），
+/// [`HotkeySpec::check`] 对功能键放行不带修饰（`application.rs` 里 `if function { return Ok(()) }`
+/// 那一格，判据在 `check` 开头），
 /// 所以裸 `F1`…`F4` 是录得出来的组合，本程序绑了它们就必须进表。同批的 `Ctrl+C` 更硬：
 /// egui-winit 把 Ctrl+C 折成 `Event::Copy` 后**不再投递 `Event::Key`**
 /// （`egui-winit-0.36.2/src/lib.rs:1019-1027`），窗口内热键录成这一组会永远等不到自己那一帧。】
 /// 表里的修饰键一律不带 `HKF_NOREPEAT`（比对时两边都剥）。
 const LOCAL_TAKEN: &[(u32, u32)] = &[
+    // 批次 C3（FR-QRY-10）的 `Ctrl+↑` / `Ctrl+↓` **不列在这里**，是单测挡下来的（下表第一条断言
+    // 就是"表里每一格必须真录得出来"）：`HotkeySpec::check` 只收字母、数字、空格、回车、反引号
+    // 与 F1–F24，方向键 0x26/0x28 过不了它，`vk_from_egui_key` 也不认这两个变体（录制端对方向键
+    // 的口径是"继续等，不提示"）⇒ 用户把全局键和次级动作键都录不成这一颗，拦它等于白占一行。
+    // 窗口内取键不经过这张表：`ui()` 里在查询框渲染之前直接 `consume_key(COMMAND, ArrowUp/Down)`。
     (HKF_CONTROL, 0x43),             // Ctrl+C 复制这一行（批次 B8；复制的不是选中文本，见 take_copy_press）
     (HKF_CONTROL, 0x44),             // Ctrl+D 打开所在目录
     (HKF_CONTROL, 0x45),             // Ctrl+E 编辑选中项
@@ -3075,20 +3116,33 @@ impl LauncherApp {
             seeds
         };
         items = dedup_items(items);
+        // 批次 C3（FR-QRY-10）：搜索历史。**文件不在＝空表，并且不写盘**——用户还没执行过任何东西，
+        // 这时候在盘上落一个 `[]` 是程序自己造的文件，不是用户要的（与清单那条"只有真没有才播种"同一口径）。
+        let (history, broken_history) = source::application::load_history();
         // §4.2.1 出厂命令集的补齐：老清单（settings 里的轮次落后）启动时补一次缺，补完记账。
         // 只加不删、已有条目一律不动；记账之后删掉的条目不会自己回来（找回用设置页那个按钮）。
         let mut prefs = settings;
         // 两种下场分开说：`Kept` 报得出留证落点，`Lost` 只能请人工处理，并且要立刻把"本轮对它
         // 只读不写"通知到下面那条补齐路径（2026-10-22 真机⑫：留证没成功时照样播种写盘，
         // 把唯一那份坏文件覆盖了——那一次日志里就写着「覆盖写会丢掉唯一证据」）。
-        let lost = lost_evidence_labels([
+        let lost_cfg = lost_evidence_labels(&[
             ("settings.json", &broken_settings),
             ("user_items.json", &broken_list),
         ]);
-        let writes_blocked = !lost.is_empty();
+        let writes_blocked = !lost_cfg.is_empty();
+        // 历史那份是第三个文件，门禁也各管各的：它没留住证只挡它自己的写，
+        // 不连带挡设置与清单（那是另外两份文件、另外两回事）；反过来也一样。
+        let history_blocked = matches!(broken_history, Some(Corrupted::Lost));
+        // 给用户看的那一句把三份并进来：坏在哪个文件上他就得知道哪个，别说漏了让他以为没事。
+        let lost = if history_blocked {
+            lost_cfg.into_iter().chain(["search_history.json"]).collect()
+        } else {
+            lost_cfg
+        };
         for (label, c, fallback) in [
             ("settings.json", &broken_settings, "出厂默认"),
             ("user_items.json", &broken_list, "空清单"),
+            ("search_history.json", &broken_history, "空历史"),
         ] {
             match c {
                 Some(Corrupted::Kept(p)) => eprintln!(
@@ -3125,6 +3179,16 @@ impl LauncherApp {
                 "⚠ 配置文件坏了，已改名留底：{a}，本次按出厂默认启动（你的清单照常，原文件没有被覆盖）"
             )),
             (None, None) => None,
+        };
+        // 批次 C3：历史那份坏了的说法单独追加，不改上面三条臂。
+        // 理由不是省事——那三条是 E2 真机逐条对过屏幕文案的（`⚠ 两个配置文件坏了…` 那句
+        // 就是当时截屏回读定下来的），为第三个文件重写它们等于作废一次实测记录。
+        let notice = match (notice, kept(&broken_history)) {
+            (Some(s), Some(h)) => Some(format!("{s}；搜索历史也坏了，已改名留底：{h}")),
+            (None, Some(h)) => Some(format!(
+                "⚠ 搜索历史坏了，已改名留底：{h}，本次按空历史启动（原文件没有被覆盖）"
+            )),
+            (n, None) => n,
         };
         // 留证没成功那句话不许被"已改名留底"盖掉：两种下场说成一件事就是骗用户。
         // 措辞按事实收窄（2026-10-26 批次 E3）：门禁只管启动期那六处补齐/去重，
@@ -3319,6 +3383,9 @@ impl LauncherApp {
             secondary_recording: false,
             marked: Vec::new(),
             batch_confirm: None,
+            history,
+            history_browse: source::application::HistoryBrowse::default(),
+            history_blocked,
         };
         // 立即为已有项起图标加载器（source_path 为空的种子会被 extract 自然跳过）。
         let source_paths: Vec<String> = seed
@@ -4500,6 +4567,43 @@ impl LauncherApp {
                                 .weak()
                                 .small(),
                             );
+                            ui.separator();
+                            // FR-QRY-10（批次 C3）：搜索历史上限。落盘的只有文本，不存结果、不存 uid。
+                            ui.label(egui::RichText::new("搜索历史").strong());
+                            let mut limit = self.prefs.history_size as f32;
+                            let hr = ui.add(
+                                egui::Slider::new(
+                                    &mut limit,
+                                    0.0..=source::application::HISTORY_SIZE_MAX as f32,
+                                )
+                                .step_by(1.0)
+                                .fixed_decimals(0)
+                                .text("记住最近"),
+                            );
+                            if hr.changed() {
+                                // 滑块只走 `0..=HISTORY_SIZE_MAX`，`round()` 后必在区间内；
+                                // `max(0.0)` 是给手写过负数的那份 settings.json 兜底（用的时候还有一道夹）。
+                                self.prefs.history_size = limit.round().max(0.0) as usize;
+                            }
+                            // 拖动中每帧都在变 ⇒ 只有松手那一帧（或键盘/点击步进改的）才写盘，
+                            // 否则一次拖动就把 settings.json 的 mtime 刷成心跳（与外观页「窗口宽度」同一口径）。
+                            if hr.drag_stopped()
+                                || (hr.changed() && !ui.input(|i| i.pointer.primary_down()))
+                            {
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：history_size = {}（已写 settings.json）",
+                                    self.prefs.history_size
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "记住最近 {} 条：每次执行（回车启动、点开文件行、> 开头的终端命令、计算器复制、面板里选一条走掉）把输入框那串存进 search_history.json。Ctrl+↑ 往更早翻，Ctrl+↓ 翻回来；翻到最末再按一次就回到你自己敲的那串。\n只存文本、不存结果：回填进来的串不会替你启动任何东西，还是按回车才执行。重复的按小写认（C:\\Foo 与 c:\\foo 算同一条），存的时候按原样存。\n调到 0＝不再记；下一次执行会把已有的那批一起清掉并落盘。想现在就清干净、又不改上限，用「高级」页那个「清空搜索历史」。\n这张表里的原文只进 search_history.json，绝不进 launcher.log。",
+                                    self.prefs.history_size
+                                ))
+                                .weak()
+                                .small(),
+                            );
                         }
                         SettingsTab::Features => {
                             ui.label(egui::RichText::new("批量导入").strong());
@@ -4815,6 +4919,7 @@ impl LauncherApp {
                                     (secondary_key.as_str(), "次级动作：快捷键版直接做一条（文件行定位 / 网页行复制网址），面板版等于 →（上一张卡片可改）"),
                                     (typeback_key.as_str(), "补字符：把呼出键吞掉的那个字符打回焦点窗口（上一张卡片可改）"),
                                     ("↑ / ↓", "选择条目"),
+                                    ("Ctrl+↑ / Ctrl+↓", "翻搜索历史：往更早一条 / 往更新一条，翻到最末再按 Ctrl+↓ 回到你自己敲的那串（批次 C3；上限见「通用」页「搜索历史」，面板与文件模式下不接管）"),
                                     ("PgUp / PgDn", "结果列表翻页（列表滚动跟随选中项）"),
                                     ("1 … 9 / 0", "执行第 1–9 行 / 第 10 行（列表前 10 行已标号）；裸键仅输入为空时生效，Ctrl+数字 / Alt+数字 不受限制"),
                                     ("Tab", "补全 / 循环下一项（按设置页「Tab 键行为」）；补全优先模式下只有「能被这个查询补长的候选恰好一条」才补全，否则导航；选中的是文件夹行时恒为进入该目录（FR-SRC-14）"),
@@ -5102,6 +5207,23 @@ impl LauncherApp {
                                 ui.ctx().request_repaint();
                             }
                             ui.separator();
+                            // FR-QRY-10（批次 C3）：清空搜索历史。只清表，「通用」页那个上限不动。
+                            ui.label(egui::RichText::new("清空搜索历史").strong());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "现在存着 {} 条（上限 {}）。按这个把 search_history.json 清成空表，Ctrl+↑ 从空表翻起；「通用」页那个上限不受影响。\n这一条不写备份：上面两个按钮都先备份，因为它们清的是统计；这张表存的是你亲手敲过的原文，留一份副本正好是「清空」二字的反面。想让它以后一条都不记，把上限调到 0。",
+                                    self.history.len(),
+                                    self.prefs.history_size
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                            if ui.button("清空搜索历史…").clicked() {
+                                self.pending_destructive = Some(Destructive::ClearHistory);
+                                eprintln!("设置页：点了「清空搜索历史」，等确认");
+                                ui.ctx().request_repaint();
+                            }
+                            ui.separator();
                             // 批次 F7（FR-CFG-08）：恢复默认。
                             ui.label(egui::RichText::new("恢复默认").strong());
                             ui.label(
@@ -5296,6 +5418,13 @@ impl LauncherApp {
         // 「把这 N 项移到回收站？」，而用户早已忘了自己标过什么。
         if self.batch_confirm.take().is_some() {
             eprintln!("全部回收站：窗口隐藏 ⇒ 取消确认（未删除）");
+        }
+        // 批次 C3：翻历史的位置同样不跨隐藏保留。不归零的症状最扎手：执行一次之后那条被
+        // `push_history` 挪到了第 1 格，而 `index` 还停在上一轮的 3 ⇒ 下次呼出按 `Ctrl+↑`
+        // 从第 4 格起跳，前三条全被跳过。草稿也一起丢（那串属于上一轮，不是这一轮要回来的东西）。
+        if self.history_browse.index != 0 {
+            self.history_browse = Default::default();
+            eprintln!("搜索历史：窗口隐藏 ⇒ 翻页位置归零");
         }
         // 批次 R：窗口一隐藏，eframe 就不再跑 `ui()` ⇒ `hotkey_frame` 末尾那条边沿检测等不到
         // 下一帧。取键态若还开着，全局呼出会一直停在"临时注销"状态（按了没反应），所以在这里
@@ -6518,7 +6647,11 @@ impl LauncherApp {
                 });
                 self.close_panel(ctx, label, self.dialog.is_none() && self.confirm.is_none());
             }
-            PanelOutcome::Gone => {}
+            // 批次 C3：`Gone` 是唯一"这条查询已经交付出去"的下场（打开 / 提权 / 终端 /
+            // 所在位置 / 全部打开，窗口收到托盘）。历史取 `saved_query` 不取 `self.query`：
+            // 此刻框里是**过滤词**，记进历史就会在下次 `Ctrl+↑` 时回填出一个没敲过的词。
+            // `Stay` / `Close` 那两档不记：复制、属性、大字这些不关窗，用户还在这条查询里。
+            PanelOutcome::Gone => self.remember_history(saved_query),
         }
     }
 
@@ -6551,6 +6684,50 @@ impl LauncherApp {
             );
         }
         self.save_items();
+    }
+
+    /// 列表区此刻吃不吃键盘。三处共用同一个判据（列表按键与滚轮、搜索页顶栏的拖窗缝、
+    /// 列表右侧那块拖窗手柄）：弹窗/确认框/关于页/帮助页任一开着 ⇒ 让位，
+    /// Enter 归"确定"按钮、拖动手柄整块撤掉。
+    /// 批次 C3 之前这三处各抄了一遍同样的六个条件，加一档确认框就得记着改三处——
+    /// 漏一处的症状是"开着确认框还能用 ↑↓ 移动选中"。
+    fn keys_live(&self) -> bool {
+        self.dialog.is_none()
+            && self.confirm.is_none()
+            && self.batch_confirm.is_none()
+            && self.internal_confirm.is_none()
+            && !self.about_open
+            && self.help_entry.is_none()
+    }
+
+    /// FR-QRY-10（批次 C3）：一次成功执行 = 记一条搜索历史。
+    ///
+    /// 文本由调用方给，不读 `self.query`：操作面板那一路此刻框里是**过滤词**，用户真正的查询
+    /// 存在 `PanelState::saved_query` 里（`mark_used` 的 `alias_word` 同源、同一口径）。
+    /// 也不挂在 `mark_used` 上——那个函数第一件事就是"这条不在清单里就返回"，而历史上恰恰
+    /// 最该留住那种条目：`>git status`、一个敲了半天的文件路径、`g:某词`，它们都不进清单。
+    ///
+    /// 只在表真的变了的时候写盘（`source::application::AppSettings::set_source` 那条
+    /// "没变就别多一次写"的口径）。
+    /// 日志只报条数、绝不报文本：这张表存的就是用户敲过的原文，FR-SYS-03 那条口径对它同样成立
+    /// （`launcher.log` 能存好几天，托盘一键就能打开，抄进去等于把历史明文另存一份）。
+    ///
+    /// 形参收 `String` 不是 `&str`：调用点全在 `&mut self` 的界面帧里，喂 `&self.query`
+    /// 会撞上"边改边借"（`remember_history` 要动 `self.history` 与 `self.prefs`）。
+    fn remember_history(&mut self, text: String) {
+        if !source::application::push_history(&mut self.history, &text, self.prefs.history_limit())
+        {
+            return;
+        }
+        let n = self.history.len();
+        if self.history_blocked {
+            eprintln!(
+                "source: 搜索历史已在内存里更新（现 {n} 条），但留证没成功 ⇒ 本次启动不写 search_history.json"
+            );
+            return;
+        }
+        source::application::save_history(&self.history);
+        eprintln!("source: 已写搜索历史 search_history.json（{n} 条，文本不落日志）");
     }
 
     /// FR-SRC-19 编辑保统计：按派生 `uid` 把 `old` 里的 pinned/use_count/last_used_ms
@@ -7082,6 +7259,69 @@ impl eframe::App for LauncherApp {
                 let yield_copy = query_box_owns_copy(ui.ctx());
                 let hit_copy = self.panel.is_none()
                     && ui.input_mut(|i| take_copy_press(&mut i.events, yield_copy));
+                // ---- 批次 C3（FR-QRY-10）：`Ctrl+↑` 更早一条 / `Ctrl+↓` 更新一条 ----
+                // 放在查询框渲染**之前**取键是有意的：`consume_key` 会把这一格事件删掉，
+                // 后面的 TextEdit 就看不到它（否则单行框先把它当"光标到行首"动一遍，回填再盖回来）。
+                // 与裸 `↑↓`（移动选中）不需要再写一条互斥判据：事件已被删，下面列表那一段的
+                // `key_pressed(ArrowUp)` 同帧恒为 `false`——`num_presses` 读的就是同一份 `events`
+                // （`input_state/mod.rs:691-711` / `:746-764`，egui 0.36.2）。
+                // `Shift+↑` / `Alt+↑` 仍然归移动选中：`Modifiers::matches_logically` 对 ctrl 是
+                // 精确比（`:211-220`），少了 ctrl 就匹配不上 `COMMAND` 这一层——与 AHK
+                // `if ctrl → RecallHistory / else MoveSelection` 分得一样。
+                let hist_step = if recall_history_allowed(
+                    self.panel.is_some(),
+                    !matches!(
+                        source::filesearch::route(&self.query),
+                        source::filesearch::Route::NotOurs
+                    ),
+                    self.keys_live(),
+                ) {
+                    let up = ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp)
+                    });
+                    let down = ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowDown)
+                    });
+                    match (up, down) {
+                        (true, _) => Some(1),
+                        (false, true) => Some(-1),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(step) = hist_step {
+                    let key_name = if step > 0 { "↑" } else { "↓" };
+                    let next = source::application::recall_history(
+                        &self.history,
+                        &self.query,
+                        &mut self.history_browse,
+                        step,
+                    );
+                    match next {
+                        Some(text) => {
+                            // 日志里不许出现回填的那串：它就是用户敲过的原文（FR-SYS-03）。
+                            let where_ = if self.history_browse.index == 0 {
+                                "回到自己敲的那串".to_string()
+                            } else {
+                                format!("第 {} 条", self.history_browse.index)
+                            };
+                            self.set_query(
+                                ui.ctx(),
+                                text,
+                                &format!(
+                                    "搜索历史 Ctrl+{key_name}：{where_}（共 {} 条，原文不落日志）",
+                                    self.history.len()
+                                ),
+                            );
+                        }
+                        None => eprintln!(
+                            "搜索历史 Ctrl+{key_name}：{}那头已经到底（共 {} 条），输入框不动",
+                            if step > 0 { "更早" } else { "更新" },
+                            self.history.len()
+                        ),
+                    }
+                }
                 // Ctrl+Shift+N 新建、Ctrl+Shift+P 置顶、Ctrl+Shift+D 删除（2026-10-22 用户改键：
                 // Ctrl+N/Ctrl+P 让给"下一项/上一项"，与需求书 FR-ACT-10 原文的 `Ctrl+P/N` 移动对齐；
                 // 置顶挪到 Shift 层，与新建同层对称）。
@@ -8012,6 +8252,16 @@ impl eframe::App for LauncherApp {
                 ui.add_space(TOP_DRAG_GAP);
                 if resp.changed() {
                     self.selected = 0; // 输入变化时选中回到第一行
+                    // 批次 C3：框里的字被用户改动 ⇒ 翻历史的位置归零（AHK 在 `_OnInputChange`
+                    // 里清 `HistoryIndex`，同一口径）。不清的症状：翻到第 3 条、改成别的字、
+                    // 再按 `Ctrl+↑` 会跳到第 4 条——中间那条永远看不见。
+                    // 程序化回填不会走到这里：egui 的 `changed` 只由 `events()` 那一路置起
+                    // （`text_edit/builder.rs:568-602`，0.36.2），换个字符串进 `self.query`
+                    // 不算用户改动。真机第 4 条专门验这一点（连按三次应依次回填三条）。
+                    if self.history_browse.index != 0 {
+                        self.history_browse = Default::default();
+                        eprintln!("搜索历史：输入已改 ⇒ 翻页位置归零");
+                    }
                 }
                 // 批次 F6：「＋ 新建」按钮撤掉，换成 ☰ 主菜单（用户点名「换成一个三条杠的菜单，
                 // 点击显示新建按钮和其他设置按钮」）。新建那条路一条没少：菜单第一项 + Ctrl+Shift+N。
@@ -8075,13 +8325,7 @@ impl eframe::App for LauncherApp {
                     }
                 }
             });
-            if self.dialog.is_none()
-                && self.confirm.is_none()
-                && self.batch_confirm.is_none()
-                && self.internal_confirm.is_none()
-                && !self.about_open
-                && self.help_entry.is_none()
-            {
+            if self.keys_live() {
                 let r = head_row.response.rect;
                 self.drag_handle(
                     ui,
@@ -8121,13 +8365,7 @@ impl eframe::App for LauncherApp {
             // `Context::rect_contains_pointer` 认到的层就不是滚动区域那一层，滚轮整段被吞。
             // 同层注册后：滚轮照常滚，点击仍归结果行（行是 click，这里是 drag-only，且行在本行之后注册）。
             // 弹窗/确认框/帮助页打开时整块撤掉，与原来的让位规则一致。
-            if !(self.dialog.is_some()
-                || self.confirm.is_some()
-                || self.batch_confirm.is_some()
-                || self.internal_confirm.is_some()
-                || self.about_open
-                || self.help_entry.is_some())
-            {
+            if !self.keys_live() {
                 let root = ui.ctx().viewport_rect();
                 let plate = egui::Rect::from_min_max(
                     egui::pos2(root.min.x + 260.0, root.min.y + 40.0),
@@ -8193,12 +8431,7 @@ impl eframe::App for LauncherApp {
                     self.selected = 0;
                 }
                 // 键盘导航：↑↓ 移动选中，Enter 运行选中项。对话框/确认框开着时让位给它们（Enter=确定）。
-                let keys_live = self.dialog.is_none()
-                    && self.confirm.is_none()
-                    && self.batch_confirm.is_none()
-                    && self.internal_confirm.is_none()
-                    && !self.about_open
-                    && self.help_entry.is_none();
+                let keys_live = self.keys_live();
                 // 批次 B8（FR-ACT-10 附录 A「滚轮移动选中」，口径同 AHK `_OnMouseWheel`）：
                 // 一格滚轮 = 选中上/下一行，两端夹住不回绕（与 ↑↓ 同一条边界）。列表位置不另外滚，
                 // 交给下面既有的"选中跟随"（`follow_selection` → `scroll_to_me(Align::Center)`），
@@ -9335,7 +9568,12 @@ impl eframe::App for LauncherApp {
                         Destructive::RestoreDefaults => (
                             "恢复默认？",
                             "恢复 (Enter)",
-                            "重置空格执行 / Tab 语义 / 学习排序 / 数据源开关 / 危险操作确认 / 终端 shell / 主题 / 显示条数 / 行密度 / 缺省分类范围。热键、网页引擎、隐藏条目、自定义命令与置顶都会保留。落盘前先备份 settings.json。",
+                            "重置空格执行 / Tab 语义 / 学习排序 / 数据源开关 / 危险操作确认 / 终端 shell / 主题 / 显示条数 / 行密度 / 缺省分类范围 / 历史上限。热键、网页引擎、隐藏条目、自定义命令与置顶都会保留。落盘前先备份 settings.json。",
+                        ),
+                        Destructive::ClearHistory => (
+                            "清空搜索历史？",
+                            "清空 (Enter)",
+                            "把 search_history.json 清成空表：Ctrl+↑ 从空表翻起，你敲过的那些串不再能回填。历史上限那一格不动。这一条不写备份（另两个按钮先备份，是因为它们清的是统计；这张表要清的是原文）。",
                         ),
                     };
                     ui.heading(title);
@@ -9409,6 +9647,38 @@ impl eframe::App for LauncherApp {
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
                             eprintln!("高级页：恢复默认 → 偏好已重置（{bak_note}）");
+                        }
+                        Destructive::ClearHistory => {
+                            let n = self.history.len();
+                            self.history.clear();
+                            // 翻页索引必须跟着归零：表空了还留着"正在第 3 条"，
+                            // 下一次 Ctrl+↑ 就会拿越界的下标去问一张空表。
+                            self.history_browse = Default::default();
+                            if self.history_blocked {
+                                // 与 remember_history 同一道闸：那份坏文件还挡在原位，
+                                // 清空的写盘正好会把唯一证据覆盖掉——宁可只在内存里清。
+                                self.toast = Some((
+                                    format!(
+                                        "⚠ 内存里 {n} 条已清，但那份坏文件没动（留证没成功 ⇒ 本次启动不写 search_history.json）"
+                                    ),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_ERR,
+                                ));
+                                eprintln!(
+                                    "高级页：清空搜索历史 → 内存里 {n} 条已清；坏文件留证没成功 ⇒ 不写盘"
+                                );
+                            } else {
+                                source::application::save_history(&self.history);
+                                self.toast = Some((
+                                    format!("✓ 已清空搜索历史（{n} 条）"),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_OK,
+                                ));
+                                eprintln!(
+                                    "高级页：清空搜索历史 → {n} 条已清（search_history.json 写成空表，不备份）"
+                                );
+                            }
+                            ui.ctx().request_repaint_after(TOAST_TTL);
                         }
                     }
                 }
@@ -9576,6 +9846,11 @@ impl eframe::App for LauncherApp {
         // 运行选中的程序并关闭到托盘（FR-ACT + 用户要求：Enter/点击运行后窗口自动关）。
         // FR-SRC-19：清单项成功启动才累计使用统计（launch_and_hide 失败分支提前 return，走不到这里）。
         if let Some(entry) = launch {
+            // FR-QRY-10（批次 C3）：提交了就记一条，**不等启动结果**——AHK `Knowledge.Record`
+            // 也是先记账再 `_SafeRun`。理由在用户那侧：启动失败时他要的是改两个字再试一次，
+            // 框里那串正是得留着的东西；而记完不会挡任何事（不写学习统计、不改清单）。
+            // 空查询（呼出后直接点列表）由 `push_history` 自己跳过。
+            self.remember_history(self.query.clone());
             // 自定义命令的 uid 取原条目（`entry` 是填过 `{query}` 的副本，派生 uid 已变）。
             let uid = launch_uid.clone().unwrap_or_else(|| entry.uid());
             let started = if launch_masked {
@@ -9592,15 +9867,20 @@ impl eframe::App for LauncherApp {
         // FR-SRC-11：搜索行的「执行」＝用默认浏览器打开 + 关到托盘。与上两段互斥：
         // 头段一次只会产生其中一个动作（计算器复制 / 搜索打开 / 条目启动）。
         if let Some(hit) = open_hit {
+            self.remember_history(self.query.clone());
             self.open_search_hit(ui.ctx(), &hit);
         }
 
         // 批次 X：文件行的三个动作（打开 / 在资源管理器中定位 / 复制路径）。与上面三段互斥：
         // 一次按键或点击只会产出其中一个。
         if let Some(hit) = open_file {
+            // 批次 C3：这一条最该进历史——他能敲到这里，说明这串路径是现打的。
+            self.remember_history(self.query.clone());
             self.open_file_hit(ui.ctx(), &hit);
         }
         if let Some(hit) = open_term {
+            // 批次 C3：`>` 那条命令同样不进清单（没有 uid 可学），历史上却是他最想找回的一串。
+            self.remember_history(self.query.clone());
             self.run_terminal_hit(ui.ctx(), &hit);
         }
         if let Some(path) = select_path {
@@ -9638,6 +9918,8 @@ impl eframe::App for LauncherApp {
         // 不是 `run`——算式结果不该启动任何进程）。与上面那段互斥：选中计算器行时不会产生 LaunchItem。
         // 复制失败不隐藏，与 FR-ACT-02 启动失败同一口径：窗口留在原地把原因显示出来。
         if let Some(text) = copy_text {
+            // 批次 C3：算式也是"敲进去又提交出去的一串"（AHK 给 `text` 动作照样记账，同口径）。
+            self.remember_history(self.query.clone());
             match copy_to_clipboard(&text) {
                 Ok(()) => {
                     // 表达式原文不落日志（FR-SYS-03 隐私口径）⇒ 只记长度与成败。
@@ -11139,6 +11421,132 @@ mod nav_tests {
             .conflicts_local(LOCAL_TAKEN),
             "F5 本程序没绑，不该出现在表里"
         );
+        // ---- 批次 C3：`Ctrl+↑` / `Ctrl+↓` 绑了但**不进表** ----
+        // 上面那条 for 会把"表里有但录不进来"的格子判红，这两颗正是被它挡回去的：
+        // 方向键既过不了 `check`（只收字母数字空格回车反引号与 F1–F24），`vk_from_egui_key`
+        // 也不认这两个变体 ⇒ 全局键与次级动作键都录不成它，表里拦一颗录不出来的键只是白占一行。
+        // 这一句钉的是"下一个人看到窗口内绑了 ↑↓，顺手往表里补两行"——补了这里就红。
+        for vk in [0x26u32, 0x28] {
+            let arrow = HotkeySpec {
+                mods: HKF_CONTROL | HKF_NOREPEAT,
+                vk,
+            };
+            assert!(
+                arrow.check().is_err(),
+                "0x{vk:02X} 要是哪天录得进来了，这条让位规则就得重新想"
+            );
+            assert!(
+                !arrow.conflicts_local(LOCAL_TAKEN),
+                "录不进来的键不许占本地表一行"
+            );
+        }
+        // 录制端也得自己认这同一件事：`vk_from_egui_key` 不认方向键 ⇒ `spec_from_press` 直接
+        // 返回 `None`，那颗键在录制路径上连"非法组合"的提示都走不到（口径是"继续等，不提示"）。
+        // 两边判据分开钉：`check` 是"值不值得注册"，这里是"能不能被录出来"，缺一个都会骗人。
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true, // Windows 上 egui-winit 把 command 直接抄 ctrl（lib.rs:492-500）
+            ..egui::Modifiers::NONE
+        };
+        for key in [egui::Key::ArrowUp, egui::Key::ArrowDown] {
+            assert_eq!(
+                vk_from_egui_key(key),
+                None,
+                "{key:?} 要是哪天进了可录集合，上面那条让位就得重判"
+            );
+            assert!(
+                spec_from_press(key, ctrl).is_none(),
+                "{key:?} + Ctrl 录不出 spec"
+            );
+        }
+    }
+
+    /// 批次 C3：`Ctrl+↑↓` 的取键口径。**不自己复刻判据**——把上游真会投进队列的键帧
+    /// （egui-winit 0.36.2 `lib.rs:492-500`：Windows 上按住 Ctrl 时 `ctrl` 与 `command` 一起为真）
+    /// 喂给 egui 自己的 `consume_key`，让它说清"这一帧还剩什么"。
+    ///
+    /// 三条都是真机上会撞的：
+    /// ① `Ctrl+↑` 取走之后裸 `↑` 必须还在——同一帧的列表导航读的就是 `key_pressed(↑)`，
+    ///    把裸键一起吞掉等于按一次历史选下一行跟着跳；
+    /// ② `Ctrl+Shift+↑` 一起被取走（`matches_logically` 只在模式**要求** shift 时才查它）
+    ///    ⇒ 多按一个 Shift 仍翻历史，与 AHK 那句 `if ctrl` 同一口径；
+    /// ③ `Alt+↑` 不归本程序：模式要 `command`，事件里 `command` 为假 ⇒ 原样留给输入框。
+    #[test]
+    fn ctrl_arrow_take_leaves_bare_and_alt_arrows() {
+        use egui::{Event, InputState, Key, Modifiers};
+        let none = Modifiers::NONE;
+        let ctrl = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+        let ctrl_shift = Modifiers {
+            shift: true,
+            ..ctrl
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        };
+        let press = |key, m| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+        };
+
+        let mut up = InputState::default();
+        up.events = vec![press(Key::ArrowUp, ctrl), press(Key::ArrowUp, none)];
+        assert!(
+            up.consume_key(Modifiers::COMMAND, Key::ArrowUp),
+            "Ctrl+↑ 该被取走（翻历史）"
+        );
+        assert!(
+            up.key_pressed(Key::ArrowUp),
+            "裸 ↑ 必须留在同一帧里 ⇒ 列表导航照旧，不需要另写一道修饰键判据"
+        );
+        assert!(
+            !up.consume_key(Modifiers::COMMAND, Key::ArrowUp),
+            "同一帧只取一次：裸 ↑ 不许被第二下当成 Ctrl+↑"
+        );
+
+        let mut down = InputState::default();
+        down.events = vec![press(Key::ArrowDown, ctrl_shift), press(Key::ArrowDown, alt)];
+        assert!(
+            down.consume_key(Modifiers::COMMAND, Key::ArrowDown),
+            "多按一个 Shift 仍算翻历史（matches_logically 不查模式没要求的 Shift）"
+        );
+        assert_eq!(
+            down.num_presses(Key::ArrowDown),
+            1,
+            "Alt+↓ 不是本程序的键，必须整条留下"
+        );
+        // 刻意不再断言"Alt+↓ 取不走"：`consume_key(ALT, ↓)` 本身会命中那条事件
+        //（模式没要求 ctrl，`cmd_ctrl_matches` 只查"别按 ctrl/command"）——
+        // 这条键不归本程序管是靠**我们不去调它**保证的，不是靠取键函数的判据。
+    }
+
+    /// 批次 C3：`Ctrl+↑↓` 在哪些情况下让位。判据单列成 `recall_history_allowed` 就是为了这条能测——
+    /// 界面帧里那三样状态（面板 / 文件模式 / 弹窗）凑不出真实现场。
+    #[test]
+    fn history_recall_yields_to_panel_file_mode_and_modals() {
+        assert!(
+            recall_history_allowed(false, false, true),
+            "搜索页、没开面板、不在文件模式 ⇒ 才归历史"
+        );
+        assert!(
+            !recall_history_allowed(true, false, true),
+            "面板开着：↑↓ 是面板自己的导航键，翻历史会把选中项改掉"
+        );
+        assert!(
+            !recall_history_allowed(false, true, true),
+            "文件模式：AHK 的 RecallHistory 在这一档直接 return（回填进来的串会被当成路径续打）"
+        );
+        assert!(
+            !recall_history_allowed(false, false, false),
+            "弹窗 / 确认框 / 关于 / 速查表活着：按键不归搜索页（keys_live 那六条门）"
+        );
     }
 
     #[test]
@@ -11349,12 +11757,12 @@ mod nav_tests {
         )));
 
         assert!(
-            lost_evidence_labels([("settings.json", &none), ("user_items.json", &none)])
+            lost_evidence_labels(&[("settings.json", &none), ("user_items.json", &none)])
                 .is_empty(),
             "两份都没坏 ⇒ 不许挡写盘"
         );
         assert_eq!(
-            lost_evidence_labels([
+            lost_evidence_labels(&[
                 ("settings.json", &Some(Corrupted::Lost)),
                 ("user_items.json", &kept),
             ]),
@@ -11362,19 +11770,41 @@ mod nav_tests {
             "留证成功的 Kept 不该被当成事故"
         );
         assert_eq!(
-            lost_evidence_labels([
+            lost_evidence_labels(&[
                 ("settings.json", &none),
                 ("user_items.json", &Some(Corrupted::Lost)),
             ]),
             vec!["user_items.json"],
         );
         assert_eq!(
-            lost_evidence_labels([
+            lost_evidence_labels(&[
                 ("settings.json", &Some(Corrupted::Lost)),
                 ("user_items.json", &Some(Corrupted::Lost)),
             ]),
             vec!["settings.json", "user_items.json"],
             "两份都没留住 ⇒ 两份都要报出来"
+        );
+        // 批次 C3 起入参是切片：第三份文件（`search_history.json`）挂进来不必让形参再长一格。
+        // 这两条只钉函数本身——每一份 `Lost` 都照实报出、`Kept` 照旧不算事故、顺序照旧按传入。
+        // 「历史坏了只挡历史写盘、配置照写」**不是**这个函数的性质，是调用方的：
+        // `LauncherApp::new` 只把配置那两份喂进这道闸，历史那份另走 `history_blocked`。
+        assert_eq!(
+            lost_evidence_labels(&[
+                ("settings.json", &none),
+                ("user_items.json", &none),
+                ("search_history.json", &Some(Corrupted::Lost)),
+            ]),
+            vec!["search_history.json"],
+            "三份里只有历史丢证 ⇒ 只报它一个"
+        );
+        assert_eq!(
+            lost_evidence_labels(&[
+                ("settings.json", &Some(Corrupted::Lost)),
+                ("user_items.json", &none),
+                ("search_history.json", &kept),
+            ]),
+            vec!["settings.json"],
+            "三份混着传：Kept 依旧不算事故、顺序依旧按传入"
         );
     }
 

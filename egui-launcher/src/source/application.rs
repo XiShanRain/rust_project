@@ -367,7 +367,7 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// 逐字段取一格：缺键 ⇒ 保持 `Default` 里那个值（＝需求书「缺失项补默认」）；
 /// 类型不符 ⇒ **只兜这一格**并记一条脱敏日志（＝「类型不符取默认并记日志」）。
 ///
-/// 为什么是宏而不是函数：这 17 格类型各不相同，`from_value::<T>` 的 `T` 没法在运行时给。
+/// 为什么是宏而不是函数：这 18 格类型各不相同，`from_value::<T>` 的 `T` 没法在运行时给。
 /// 展开出来的表就是「字段名 → 类型」的清单，而 **字段名即 JSON 键名**（`AppSettings` 与
 /// `LaunchItem` 都没有 `rename_all`；容器级 `rename_all` 一旦加上去，这张表会整体读不进来，
 /// 症状是"配置全部回默认"——加字段忘写一行也是同一个症状，由
@@ -439,6 +439,7 @@ fn settings_from_map(
     take_field!(map, s, "", row_density, RowDensity);
     take_field!(map, s, "", default_scope, Scope);
     take_field!(map, s, "", appearance, Appearance);
+    take_field!(map, s, "", history_size, usize);
     s
 }
 
@@ -775,6 +776,14 @@ pub struct AppSettings {
     /// 窗口宽度 / 记住位置 / 状态栏 / 淡入（批次 F8）。见 [`Appearance`]。
     #[serde(default)]
     pub appearance: Appearance,
+
+    /// 搜索历史存几条（FR-QRY-10，批次 C3）。需求书 4.2 定的默认值是 30。
+    /// **`0` = 不记历史**——这一格是隐私开关，不是"存零条然后崩"：[`push_history`] 收到 0
+    /// 会把表清成空，`recall_history` 拿到空表恒返回"没变化"。
+    /// 读进来的值不直接信，用 [`AppSettings::history_limit`] 取（手改成 9999 也只是夹到上限，
+    /// 与 [`AppSettings::term_shell`] 对陌生稳定名回落 `cmd` 同一口径）。
+    #[serde(default = "default_history_size")]
+    pub history_size: usize,
 }
 
 fn default_terminal_shell() -> String {
@@ -820,8 +829,21 @@ impl Default for AppSettings {
             row_density: RowDensity::default(),
             default_scope: Scope::default(),
             appearance: Appearance::default(),
+            history_size: HISTORY_SIZE_DEFAULT,
         }
     }
+}
+
+/// 需求书 4.2 定的默认条数。
+pub const HISTORY_SIZE_DEFAULT: usize = 30;
+
+/// 这一格的上限：滑块给到 200 就到底，手改成一万也只是夹到 200。
+/// 历史是**每次都全量重写的小文件**（一条字符串数组），上限不是为了省磁盘，
+/// 是为了让"翻历史"这件事在几百次按键后仍然翻得完。
+pub const HISTORY_SIZE_MAX: usize = 200;
+
+fn default_history_size() -> usize {
+    HISTORY_SIZE_DEFAULT
 }
 
 impl AppSettings {
@@ -833,6 +855,13 @@ impl AppSettings {
     /// 终端源实际用的 shell：配置里那一格是稳定名，不认识就回落 `cmd`。
     pub fn term_shell(&self) -> crate::source::terminal::TermShell {
         crate::source::terminal::TermShell::from_name(&self.terminal_shell).unwrap_or_default()
+    }
+
+    /// 历史实际存几条：夹进 `0..=HISTORY_SIZE_MAX`。配置里那一格是用户手写得出来的，
+    /// 与 [`term_shell`](Self::term_shell) 同一口径——**不在读盘时改写它**（纯读不回写是
+    /// FR-CFG-01 那条不变量），所以每一次用到都过这道夹子。`0` 是合法的"不记历史"。
+    pub fn history_limit(&self) -> usize {
+        self.history_size.min(HISTORY_SIZE_MAX)
     }
 
     /// 开 / 关一个源；返回 `true` ＝ 状态真的有变化（调用方据此写盘）。
@@ -1552,6 +1581,137 @@ pub fn save_settings(s: &AppSettings) {
     save_settings_at(&settings_path(), s);
 }
 
+// ---- FR-QRY-10 批次 C3：搜索历史 ----
+
+/// 历史文件与清单同目录（同一个便携判定，句法照 [`settings_path`]）。
+///
+/// **为什么不塞进 `settings.json`**：这一张是"机器每次执行都重排一遍"的表，而 settings.json 是
+/// 用户会自己在编辑器里打开、手改、期望别的东西别碰的表；同一份文件里两种写入节奏互相覆盖，
+/// 用户改一次设置就把历史洗掉（或反过来）。分开还有第二条好处：`.bad` 留证名额各算各的，
+/// 历史反复写坏不会把清单的名额吃掉（[`quarantine`] 那 10 格是有原因的）。
+fn history_path() -> PathBuf {
+    user_list_path().with_file_name("search_history.json")
+}
+
+/// 读一份搜索历史：**顶层字符串数组，最新在前**。
+/// 三条下场沿用 [`load_json`] 那一条判据（本文件注释立过的规矩：清单、偏好、历史共用，
+/// 不许各写一份）：不在 ⇒ 空表；语法坏 / 顶层不是数组 / 数组里装的不是字符串 ⇒ 先留证再按空表启动，
+/// **且调用方拿到非 `None` 的下场时本轮不许回写**。
+fn load_history_at(path: &Path) -> (Vec<String>, Option<Corrupted>) {
+    load_or_quarantine(path)
+}
+
+pub fn load_history() -> (Vec<String>, Option<Corrupted>) {
+    load_history_at(&history_path())
+}
+
+pub fn save_history(entries: &[String]) {
+    save_history_at(&history_path(), entries);
+}
+
+/// 路径参数化的那一份（与 [`load_settings_at`] 同一句法）：单测才打得到临时目录，
+/// 不许把历史写进用户真实数据目录。
+fn save_history_at(path: &Path, entries: &[String]) {
+    match serde_json::to_vec_pretty(entries) {
+        Ok(json) => write_atomic(path, &json, "search_history.json"),
+        Err(e) => eprintln!("source: 序列化搜索历史失败: {e}"),
+    }
+}
+
+/// 记一条历史：去重（**不分大小写**）后放到最前，超出 `limit` 的从尾部丢掉。
+/// 返回 `true` = 这张表真的变了 ⇒ 调用方据此决定要不要写盘（与 [`AppSettings::set_source`]
+/// 同一口径：没变就别多一次写）。
+///
+/// 与 AHK 版（`Knowledge.AddHistory`）差两处，都是刻意的：
+/// - AHK 存的是 `StrLower(text)`，回填时用户敲过的 `C:\Foo` 会变成 `c:\foo`。这一格存的是
+///   **可能要再执行一次的东西**，大小写敏感的场合不该被历史改掉 ⇒ **按原样存**，只在去重时比小写。
+/// - 首尾空白剥掉（同 AHK 的 `Trim`）：尾巴带个空格的历史回填进输入框，会立刻从"匹配"换成
+///   "独占模式"那一类完全不同的口径。
+///
+/// `limit = 0`（设置页那个隐私档）不需要单独分支：插进去再按上限裁掉，表又回到原样 ⇒
+/// 下面那句"变了没有"给 `false`，一条都不记。唯一的例外是**表里原本有存货**：那一次裁剪把
+/// 存货清空、返回 `true` ⇒ 落盘一次空表。这是把"我不再记了"顺带落成"我存的那些也没了"，
+/// 想只清存货不改上限，用「高级」页那个「清空搜索历史」。
+pub fn push_history(entries: &mut Vec<String>, text: &str, limit: usize) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let before = entries.clone();
+    let key = t.to_lowercase();
+    if let Some(pos) = entries.iter().position(|e| e.to_lowercase() == key) {
+        entries.remove(pos);
+    }
+    entries.insert(0, t.to_string());
+    while entries.len() > limit {
+        entries.pop();
+    }
+    *entries != before
+}
+
+/// 翻历史的游标。AHK 用两格散字段（`HistoryIndex` 与 `_historyDraft`），这里合一：
+/// 回填一次要同时动这两格，分开传给调用方就有"记了一格漏了另一格"的可能，
+/// 症状是"再按一次跳回最早的一条"。
+///
+/// - `index = 0` ＝ 不在翻历史，输入框里是用户自己敲的内容；
+/// - `index = n`（1 起算）＝ 正在看第 n 条，[`push_history`] 那张表的第 `n-1` 格。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryBrowse {
+    pub index: usize,
+    pub draft: String,
+}
+
+/// `Ctrl+↑`（`step = +1`，往更早）/ `Ctrl+↓`（`step = -1`，往更新，回到自己敲的那串）。
+/// 返回 `Some(要填进输入框的文本)`，并把 `browse` 推到新位置；`None` = 到头了，**什么都不动**。
+///
+/// 两条从 AHK `RecallHistory` 原样转写的规矩，缺一条就别扭：
+/// - 第一次从"不在翻历史"起步时，把此刻输入框里的内容存成草稿 ⇒ 翻到底再翻回来，
+///   刚敲的两个字还在。
+/// - 候选与输入框**当前内容**相同就再往下一格（循环，不是只走一步）。历史去过重，
+///   所以能撞上的只有一种：用户新敲的词恰好等于历史里的某一条——那一格回填了等于没回填，
+///   一次按键看不出反应，会被当成"这键没生效"。
+///
+/// 比较用原文精确比（不按大小写折叠）：与 [`push_history`] 的"按原样存"是同一个取向。
+pub fn recall_history(
+    entries: &[String],
+    current: &str,
+    browse: &mut HistoryBrowse,
+    step: i32,
+) -> Option<String> {
+    if step == 0 {
+        return None;
+    }
+    let browsing = browse.index > 0;
+    let draft = if browsing {
+        browse.draft.clone()
+    } else {
+        current.to_string()
+    };
+    let len = entries.len() as i64;
+    let mut i = browse.index as i64;
+    let text;
+    loop {
+        i += step as i64;
+        if i < 0 || i > len {
+            return None; // 已经是最早一条（↑）／已经站在草稿上（↓）
+        }
+        let cand = if i == 0 {
+            draft.clone()
+        } else {
+            entries[(i - 1) as usize].clone()
+        };
+        if cand != current || i == 0 {
+            text = cand;
+            break;
+        }
+    }
+    if !browsing {
+        browse.draft = current.to_string();
+    }
+    browse.index = i as usize;
+    Some(text)
+}
+
 /// 出厂命令集的轮次（§4.2.1 + 批次 A2）。每次往 [`builtin_seeds`] 里加条目就 +1：
 /// 老用户的 `settings.json` 里记的是旧号 ⇒ 启动时自动补一次缺，补完即记账。
 /// 记账之后不再自动补 ⇒ **删掉的条目不会因为下次启动又回来**。
@@ -1979,6 +2139,9 @@ pub fn restore_defaults(s: &mut AppSettings) {
     s.default_scope = Scope::default();
     // 批次 E3-丙：次级动作回到「快捷键版」。键位属于热键三格，保留。
     s.secondary_action = SecondaryAction::default();
+    // 批次 C3：历史上限回到需求书 4.2 的 30。**只改这一格数字，不动已经存下来的历史**
+    // （清内容走高级页那个「清空搜索历史」，两件事分开）。
+    s.history_size = HISTORY_SIZE_DEFAULT;
     // 批次 F8：宽度 / 记住位置 / 状态栏 / 淡入也回厂，位置一起清掉（下次启动居中）。
     s.appearance = Appearance::default();
 }
@@ -3399,6 +3562,7 @@ mod dedup_tests {
         let mut s = AppSettings::default();
         let hot = s.toggle_hotkey;
         let typeback = s.typeback_hotkey;
+        let second = s.secondary_hotkey;
         let engines = s.web_engines.len();
         s.space_to_run = SpaceRun::Always;
         s.tab_mode = TabMode::Navigate;
@@ -3410,6 +3574,8 @@ mod dedup_tests {
         s.list_rows = ListRows::Ten;
         s.row_density = RowDensity::Dense;
         s.default_scope = Scope::Basic;
+        s.secondary_action = SecondaryAction::Panel;
+        s.history_size = 3;
         s.appearance.width = 820.0;
         s.appearance.remember_position = false;
         s.appearance.last_pos = Some([100, 200]);
@@ -3436,12 +3602,22 @@ mod dedup_tests {
         assert_eq!(s.row_density, RowDensity::default());
         assert_eq!(s.default_scope, Scope::default());
         assert_eq!(
+            s.secondary_action,
+            SecondaryAction::default(),
+            "次级动作形态回厂（批次 E3 加的，形态是口径不是资产）"
+        );
+        assert_eq!(
+            s.history_size, HISTORY_SIZE_DEFAULT,
+            "历史上限回厂：它是保留策略，跟着一起回默认"
+        );
+        assert_eq!(
             s.appearance,
             Appearance::default(),
             "外观段整段回厂（含记住位置与上次坐标）"
         );
         assert_eq!(s.toggle_hotkey, hot, "热键保留");
         assert_eq!(s.typeback_hotkey, typeback, "补字符热键保留");
+        assert_eq!(s.secondary_hotkey, second, "次级动作键位属于热键三格，同样保留");
         assert_eq!(s.web_engines.len(), engines, "网页引擎保留");
         assert_eq!(s.hidden.len(), 1, "隐藏项保留（否则删掉的条目会复活）");
         assert_eq!(s.hidden_stash.len(), 1, "隐藏快照跟着 hidden[] 一起保留");
@@ -4645,6 +4821,8 @@ mod hotkey_tests {
 /// 批次 E2（FR-CFG-01 剩下的那一半：版本戳、逐版迁移、字段级容错）的判据测试。
 /// 全走 [`load_settings_at`] / [`load_user_items_at`] 的路径参数化版本 ⇒ 一条都不碰用户真实
 /// 数据目录（便携判定会把 `settings_path()` 指到 exe 旁边，测试不许写那儿）。
+/// 【2026-10-26 批次 C3：`search_history.json` 的读写也归在这一节——同一个 `temp_dir` 夹具、
+/// 同一套"纯读不动盘 / 坏了先留证"的不变量，另起一个模块只会多造一份 helper。】
 #[cfg(test)]
 mod config_tests {
     use super::*;
@@ -4745,6 +4923,15 @@ mod config_tests {
             vk: VK_SPACE,
         };
         x.typeback_hotkey = Some(HotkeySpec::DEFAULT);
+        // 批次 E3 加的两格当时只进了 `settings_field_defaults_when_absent_and_round_trips`，
+        // 而那条走的是 serde 派生（`from_slice`），**不经过 `take_field!` 这张表**——
+        // 表里漏一行时的症状是"这两格永远回默认"，那条测试一点感觉都没有。
+        // 【2026-10-26 批次 C3 补进本条：这是真读盘路径，漏行才报得出来。】
+        x.secondary_action = SecondaryAction::Panel;
+        x.secondary_hotkey = HotkeySpec {
+            mods: HKF_CONTROL | HKF_ALT | HKF_NOREPEAT,
+            vk: 0x78, // F9：录制端不会拒的组合，免得测试值本身是个反例
+        };
         x.web_engines.truncate(2);
         x.seed_round = 7;
         x.sources_off = vec!["files".to_string(), "system".to_string()];
@@ -4760,6 +4947,7 @@ mod config_tests {
         x.list_rows = ListRows::Ten;
         x.row_density = RowDensity::Roomy;
         x.default_scope = Scope::Basic;
+        x.history_size = 7;
         x.appearance = Appearance {
             width: 720.0,
             status_bar: false,
@@ -4778,6 +4966,15 @@ mod config_tests {
         assert_eq!(got.learn_rank, LearnRank::Decay, "learn_rank");
         assert_eq!(got.toggle_hotkey, HotkeySpec { mods: HKF_ALT | HKF_WIN, vk: VK_SPACE }, "toggle_hotkey");
         assert_eq!(got.typeback_hotkey, Some(HotkeySpec::DEFAULT), "typeback_hotkey");
+        assert_eq!(got.secondary_action, SecondaryAction::Panel, "secondary_action");
+        assert_eq!(
+            got.secondary_hotkey,
+            HotkeySpec {
+                mods: HKF_CONTROL | HKF_ALT | HKF_NOREPEAT,
+                vk: 0x78
+            },
+            "secondary_hotkey"
+        );
         assert_eq!(got.web_engines.len(), 2, "web_engines");
         assert_eq!(got.seed_round, 7, "seed_round");
         assert_eq!(got.sources_off.len(), 2, "sources_off");
@@ -4793,6 +4990,8 @@ mod config_tests {
         assert_eq!(got.appearance.width, 720.0, "appearance 递归合并：width");
         assert_eq!(got.appearance.status_bar, false, "appearance.status_bar");
         assert_eq!(got.appearance.fade, true, "appearance.fade");
+        assert_eq!(got.history_size, 7, "history_size");
+        assert_eq!(got.history_limit(), 7, "history_limit：配置值小于上限时原样");
     }
 
     /// 「缺失项补默认」＋批次 J 那次的老写法：`space_to_run` 曾是布尔。
@@ -5102,6 +5301,165 @@ mod config_tests {
         let (got, fault) = load_settings_at(&p);
         assert!(fault.is_none());
         assert_eq!(got.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+
+    /// 批次 C3（FR-QRY-10）：记一条历史的四条规矩，每条都对应一次"用户看得出来的别扭"。
+    #[test]
+    fn push_history_moves_the_newest_to_the_front_and_caps_the_tail() {
+        let mut h: Vec<String> = Vec::new();
+        assert!(!push_history(&mut h, "", 30), "空查询不记（AHK 同口径）");
+        assert!(!push_history(&mut h, "   ", 30), "只有空白也不记");
+        assert!(h.is_empty());
+
+        assert!(push_history(&mut h, "cmd", 30));
+        assert!(push_history(&mut h, "notepad", 30));
+        assert_eq!(h, vec!["notepad", "cmd"], "最新在前");
+
+        assert!(push_history(&mut h, "cmd", 30));
+        assert_eq!(h, vec!["cmd", "notepad"], "再敲一次是整条挪到最前，不是后面多一条");
+
+        assert!(push_history(&mut h, " CMD ", 30));
+        assert_eq!(
+            h,
+            vec!["CMD", "notepad"],
+            "去重不分大小写，但存的是这次敲的原样（不学 AHK 一律小写）、首尾空白剥掉"
+        );
+
+        assert!(!push_history(&mut h, "CMD", 30), "位置与内容都没动 ⇒ 报没变，调用方就不写盘");
+        assert_eq!(h.len(), 2);
+
+        let mut full = vec!["3".to_string(), "2".to_string(), "1".to_string()];
+        assert!(push_history(&mut full, "4", 3));
+        assert_eq!(full, vec!["4", "3", "2"], "超上限从尾部丢，不是一律清空");
+
+        let mut off = vec!["x".to_string()];
+        assert!(push_history(&mut off, "y", 0), "0 档把已有的历史裁干净 ⇒ 算变化，要落盘");
+        assert!(off.is_empty());
+        let mut off2: Vec<String> = Vec::new();
+        assert!(
+            !push_history(&mut off2, "y", 0),
+            "本来就没东西时 0 档不许产生一次写盘（不记＝不碰盘）"
+        );
+    }
+
+    /// 批次 C3：`Ctrl+↑↓` 的走位。判据照 AHK `RecallHistory`，四条各自钉死一条边界。
+    #[test]
+    fn recall_history_walks_back_and_returns_the_draft() {
+        let h = vec!["c".to_string(), "b".to_string(), "a".to_string()];
+
+        let mut untouched = HistoryBrowse::default();
+        assert_eq!(recall_history(&[], "", &mut untouched, 1), None, "没历史时不许动");
+        assert_eq!(untouched, HistoryBrowse::default(), "不动就意味着游标一格都没改");
+
+        let mut br = HistoryBrowse::default();
+        assert_eq!(recall_history(&h, "", &mut br, 1).as_deref(), Some("c"));
+        assert_eq!(br.index, 1);
+        assert_eq!(br.draft, "", "起步那一下把输入框原文存成草稿");
+        assert_eq!(recall_history(&h, "c", &mut br, 1).as_deref(), Some("b"));
+        assert_eq!(recall_history(&h, "b", &mut br, 1).as_deref(), Some("a"));
+        assert_eq!(recall_history(&h, "a", &mut br, 1), None, "已经是最早一条");
+        assert_eq!(br.index, 3, "到头那一下不许把游标甩回 0（甩了就再也不能往回翻）");
+
+        assert_eq!(recall_history(&h, "a", &mut br, -1).as_deref(), Some("b"));
+        assert_eq!(recall_history(&h, "b", &mut br, -1).as_deref(), Some("c"));
+        assert_eq!(br.index, 1);
+
+        // 用户自己敲了字再翻：翻到底必须把那两个字还回去，否则"手敲的被历史吃了"。
+        let mut b2 = HistoryBrowse::default();
+        assert_eq!(recall_history(&h, "zz", &mut b2, 1).as_deref(), Some("c"));
+        assert_eq!(b2.draft, "zz");
+        assert_eq!(recall_history(&h, "c", &mut b2, -1).as_deref(), Some("zz"));
+        assert_eq!(b2.index, 0, "回到草稿＝退出翻历史");
+        assert_eq!(recall_history(&h, "zz", &mut b2, -1), None, "已经在草稿上，再按不动");
+    }
+
+    /// 批次 C3：一次按键必须看得见变化（AHK 那个 `while` 循环存在的唯一理由）。
+    #[test]
+    fn recall_history_skips_the_entry_that_is_already_typed() {
+        let h = vec!["notepad".to_string(), "cmd".to_string()];
+        let mut br = HistoryBrowse::default();
+        assert_eq!(
+            recall_history(&h, "notepad", &mut br, 1).as_deref(),
+            Some("cmd"),
+            "用户刚敲的正好等于最新一条 ⇒ 回填它等于没回填，要再往下一条"
+        );
+        assert_eq!(br.index, 2, "跳格也要把游标落在真正那一条上");
+
+        // 草稿那一格是例外：翻回 0 就是退出翻历史，内容与当前相同也照样回去。
+        let mut b = HistoryBrowse { index: 1, draft: "notepad".to_string() };
+        assert_eq!(recall_history(&h, "notepad", &mut b, -1).as_deref(), Some("notepad"));
+        assert_eq!(b.index, 0);
+    }
+
+    /// 批次 C3：`search_history.json` 的读写。两条 E2 不变量在这儿同样成立——
+    /// **纯读不动盘**、**坏文件先留证再按空表启动**。
+    #[test]
+    fn history_file_starts_empty_without_touching_disk_and_round_trips() {
+        let dir = temp_dir("c3-file");
+        let p = dir.join("search_history.json");
+
+        let (h, fault) = load_history_at(&p);
+        assert!(h.is_empty() && fault.is_none(), "首次运行＝空表且没有事故");
+        assert!(!p.exists(), "纯读不许造出一个空文件");
+
+        save_history_at(&p, &["cmd".to_string(), "notepad".to_string()]);
+        let (back, fault2) = load_history_at(&p);
+        assert!(fault2.is_none());
+        assert_eq!(back, vec!["cmd", "notepad"], "顺序原样回来（最新在前）");
+        assert!(
+            !std::fs::read(&p).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]),
+            "无 BOM 与偏好同口径"
+        );
+
+        save_history_at(&p, &[]);
+        let (cleared, fault3) = load_history_at(&p);
+        assert!(fault3.is_none());
+        assert!(cleared.is_empty(), "空表是合法内容，不是坏文件（与清单 `[]` 同一判据）");
+    }
+
+    #[test]
+    fn a_broken_history_file_quarantines_instead_of_being_written_over() {
+        let dir = temp_dir("c3-bad");
+        let p = dir.join("search_history.json");
+        write(&p, "[1, 2]");
+        let (h, fault) = load_history_at(&p);
+        assert!(h.is_empty());
+        let Some(Corrupted::Kept(kept)) = &fault else {
+            panic!("第一次留证该成功，实得 {fault:?}")
+        };
+        assert!(kept.exists() && !p.exists(), "证据在 {kept:?}，原位置要腾出来");
+        assert_eq!(
+            std::fs::read(kept).unwrap(),
+            b"[1, 2]",
+            "留的是原文，不是我们重排过的东西"
+        );
+
+        write(&p, r#"{"a": 1}"#);
+        assert!(
+            matches!(load_history_at(&p).1, Some(Corrupted::Kept(_))),
+            "顶层不是数组同样判坏（历史与清单、偏好共用这一条判据）"
+        );
+    }
+
+    /// 批次 C3：`history_size` 这一格自身的容错，与"读盘不改写、用的时候才夹"。
+    #[test]
+    fn history_size_absent_is_30_and_a_huge_one_is_clamped_at_use() {
+        let dir = temp_dir("c3-size");
+        let p = dir.join("settings.json");
+
+        write(&p, r#"{"schema_version": 1}"#);
+        let (s, fault) = load_settings_at(&p);
+        assert!(fault.is_none());
+        assert_eq!(s.history_size, HISTORY_SIZE_DEFAULT, "老文件没这一格 ⇒ 30");
+
+        write(&p, r#"{"schema_version": 1, "history_size": 9999}"#);
+        let (s, _) = load_settings_at(&p);
+        assert_eq!(s.history_size, 9999, "读盘不回写用户那一格（FR-CFG-01 纯读不动盘）");
+        assert_eq!(s.history_limit(), HISTORY_SIZE_MAX, "取用的时候才夹，上限 200");
+
+        write(&p, r#"{"schema_version": 1, "history_size": "很多"}"#);
+        let (s, _) = load_settings_at(&p);
+        assert_eq!(s.history_size, HISTORY_SIZE_DEFAULT, "类型不符只兜这一格");
     }
 }
 

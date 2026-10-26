@@ -607,6 +607,25 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: None,
     },
     CheatEntry {
+        key: "Ctrl+↑ / Ctrl+↓",
+        title: "翻搜索历史",
+        summary: "回填之前执行过的那串；只填文本，不替你执行",
+        detail: "批次 C3（2026-10-26，需求书 FR-QRY-10）：`Ctrl+↑` 往更早一条翻，`Ctrl+↓` 往更新一条翻。\n\
+                 翻到最早就停在那儿（输入框不动）；翻回最末再按一次 `Ctrl+↓` 回到你自己刚敲的那串。\n\
+                 存进历史的是「提交出去的那一串」：回车启动、点开文件行、`>` 终端命令、计算器复制、\n\
+                 面板里选一条走掉，都算一次执行。启动失败也照记（AHK 的 `Knowledge.Record` 就是先记账再运行，\n\
+                 你要的是改两个字再试一次，框里那串得留着）。\n\
+                 只存文本、不存结果：回填进来的串仍然要按回车才执行，也不会替你选中任何一行。\n\
+                 重复按小写认（`C:\\Foo` 与 `c:\\foo` 是同一条），存的时候按原样存，不改大小写。\n\
+                 上限与「不再记」在「通用」页「搜索历史」那一格；立刻清干净用「高级」页那个按钮。\n\
+                 操作面板开着、文件模式（' 与 > 那几式）下不接管：那两处 ↑↓ 是它们自己的导航键。\n\
+                 裸 `↑` `↓` 仍是选择条目，多按一个 Shift（`Ctrl+Shift+↑`）照旧算翻历史。",
+        tags: "key ctrl up down 箭头 历史 history 回填 搜索 查询",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(1),
+    },
+    CheatEntry {
         key: "F1",
         title: "关于本程序",
         summary: "版本、程序位置、清单条数；Esc 关闭",
