@@ -415,6 +415,25 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: None,
     },
     CheatEntry {
+        key: "Ctrl+Enter",
+        title: "次级动作",
+        summary: "默认快捷键版：文件行定位 / 网页行复制网址；可改键、可切成面板版",
+        detail: "对当前选中行做\"次级动作\"——打开是 Enter，这一颗做另一件事。\n\
+                 设置页「热键」页有两种形态（默认快捷键版，可随时切换）：\n\
+                 · 快捷键版：文件行 / 目录行「在资源管理器里定位」，网页搜索行「复制网址」；\n\
+                   应用条目、系统命令、自定义命令没有\"一眼就是它\"的次级动作 ⇒ 只提示你按 →\n\
+                   看全部，不替你猜（也刻意不含\"打开\"：Enter 已经是打开）。\n\
+                 · 面板版：等于把 → 那个入口搬到这颗键上，动作进面板再选。\n\
+                 这颗键只在搜索页、没有弹窗、没开面板时生效；它不注册给系统，所以不抢别的\n\
+                 程序的键，也不会像全局呼出键那样被系统整条吞掉。必须带 Ctrl 或 Alt（裸键与\n\
+                 单带 Shift 的键都只是打字），Win 组合设不了；键本身可在同一页录制、可恢复默认\n\
+                 （Backspace / Delete），改动立刻生效并写进 settings.json。",
+        tags: "key ctrl enter 次级 动作 secondary 定位 复制网址",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(3),
+    },
+    CheatEntry {
         key: "Ctrl+Shift+N",
         title: "新建快捷项",
         summary: "选中的是文件行时预填这一行",

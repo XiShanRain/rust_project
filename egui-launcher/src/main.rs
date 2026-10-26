@@ -84,7 +84,8 @@ use source::application::{
 // 是这台机器上唯一能把 Win 位设进去的入口——录制路径产不出它，见 `spec_from_press` 的注释。
 use source::application::{
     ERROR_HOTKEY_ALREADY_REGISTERED, HKF_ALT, HKF_CONTROL, HKF_NOREPEAT, HKF_SHIFT, HKF_WIN,
-    HotkeySpec, VK_0, VK_9, VK_A, VK_F1, VK_F24, VK_OEM_3, VK_RETURN, VK_SPACE, VK_Z,
+    HotkeySpec, SecondaryAction, VK_0, VK_9, VK_A, VK_F1, VK_F24, VK_OEM_3, VK_RETURN, VK_SPACE,
+    VK_Z,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -102,6 +103,9 @@ const HIDE_DELAY: Duration = Duration::from_millis(50);
 // FR-ACT-02 启动失败提示的停留时长（M1 验收「有提示」；到点自动消失，成功启动即清空）。
 // 2026-10-17 泛化为通用 Toast（SendTo 安装结果也走它），故改名 TOAST_*。
 const TOAST_TTL: Duration = Duration::from_secs(3);
+// 配置损坏/留证失败那句说明要长得多（含"先手动备份再删掉"这种要照着做的话），
+// 3 秒读不完两条换行的句子——批次 E3 起这类启动提示单独给 10 秒。
+const TOAST_TTL_STARTUP: Duration = Duration::from_secs(10);
 // Toast 尾段淡出时长。
 const TOAST_FADE: Duration = Duration::from_millis(400);
 const TOAST_ERR: egui::Color32 = egui::Color32::from_rgb(255, 156, 146);
@@ -767,6 +771,10 @@ struct LauncherApp {
     /// 这里只用来保证边沿检测不重复发消息——兜底定时器可能已经把真值改回 false 了，
     /// 那种情况下多发一条 resume 是无害的（`resume_hotkey` 幂等）。
     keypick_suspended: bool,
+    // ---- 批次 E3-丙：次级动作键（`Ctrl+Enter` 一类窗口内热键）----
+    /// 设置页「次级动作」卡片的键框正在等一次按键。这颗键**不注册给系统**（不占别人的键、
+    /// 也不进热键线程），所以不需要 `*_awaiting` / `*_active` 那一套回执；录制完直接落配置。
+    secondary_recording: bool,
 }
 
 fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths: Vec<String>) {
@@ -1329,6 +1337,50 @@ fn take_fresh_key(ctx: &egui::Context, wanted: egui::Key) -> bool {
     fresh
 }
 
+/// 一次按键是否命中某个**窗口内**热键（批次 E3-丙）。
+///
+/// 修饰键按"逐位相等"比：`Ctrl+Enter` 不该被 `Ctrl+Shift+Enter` 触发，也不该被裸 `Enter` 触发。
+/// egui 的 `matches_logically` 恰恰相反——它忽略多出来的 Shift/Alt，[`take_fresh_key`] 为箭头键
+/// 用的也是 `== NONE`，这里是同一条口径的显式写法。
+///
+/// `HKF_WIN` 一旦出现在配置里就直接不命中：egui 在 Windows 上根本不把 Win 当修饰键传上来
+///（`Modifiers` 只有 `command`，那是 Ctrl 的副本），所以带 Win 的组合在这个入口永远等不到自己的
+/// 那一帧。设置页的 [`HotkeySpec::check_secondary`] 已经挡住了这条路，这里只是让手改
+/// `settings.json` 的人也不会得到一个"按什么都触发"的键。
+fn local_hotkey_hits(spec: HotkeySpec, key: egui::Key, m: egui::Modifiers) -> bool {
+    let named = spec.mods_named();
+    if named & HKF_WIN != 0 || vk_from_egui_key(key) != Some(spec.vk) {
+        return false;
+    }
+    m.ctrl == (named & HKF_CONTROL != 0)
+        && m.alt == (named & HKF_ALT != 0)
+        && m.shift == (named & HKF_SHIFT != 0)
+}
+
+/// 窗口内热键的取用：命中就**只收走这一个组合**的键事件并返回 `true`。
+///
+/// 为什么必须收走：`Enter` 那一档用的是 `key_pressed`，它不看修饰键 ⇒ 不收走的话
+/// `Ctrl+Enter` 会同时跑次级动作和选中项，一次按键干两件事。为什么只 retain 掉自己那一格而不清空
+/// 整帧：清空会把同一帧的 Esc 和所有固定快捷键一起变聋（批次 R 踩过这个坑，见 [`take_record_press`]）。
+fn take_local_hotkey(ui: &mut egui::Ui, spec: HotkeySpec) -> bool {
+    let ours = |ev: &egui::Event| {
+        matches!(ev,
+            egui::Event::Key { key, modifiers, .. }
+            if local_hotkey_hits(spec, *key, *modifiers)
+        )
+    };
+    let mut fresh = false;
+    ui.input_mut(|i| {
+        fresh = i.events.iter().any(|ev| {
+            ours(ev) && matches!(ev, egui::Event::Key { pressed: true, repeat: false, .. })
+        });
+        if fresh {
+            i.events.retain(|ev| !ours(ev));
+        }
+    });
+    fresh
+}
+
 /// FR-ACT-03 那句「且光标在末尾」：插入点不在查询末尾时 `→` 是 TextEdit 的"右移光标"，
 /// 抢走它用户就没法从词中间往右翻。`CCursor::index` 是**字符**下标（与 [`set_query`] 里
 /// `CCursor::new(chars)` 同一口径），所以跟 `chars().count()` 比，不跟字节长度比。
@@ -1352,6 +1404,18 @@ fn caret_at_end(ctx: &egui::Context, query: &str) -> bool {
 /// 清单条目不走这里，走 FR-SRC-06 那份后台缓存：离线 UNC 在主线程 `stat` 会把整帧挂住。
 fn fs_exists(path: &str) -> bool {
     actions::is_fs_path(path) && std::path::Path::new(path).exists()
+}
+
+/// 批次 E3：启动期写盘门禁的判据。单独成函数是为了**能测**——`LauncherApp::new` 里那份
+/// 现场（通道、egui 上下文）测不起来，而"哪份配置的留证没成功"这个决定本身是纯的。
+/// 任一份是 `Lost`（改名与另存副本都没成、坏文件还挡在原位）⇒ 本轮启动的六处补齐/去重
+/// 一律不落盘：写一次就覆盖掉唯一证据。
+fn lost_evidence_labels<'a>(faults: [(&'a str, &'a Option<Corrupted>); 2]) -> Vec<&'a str> {
+    faults
+        .iter()
+        .filter(|(_, c)| matches!(c, Some(Corrupted::Lost)))
+        .map(|(label, _)| *label)
+        .collect()
 }
 
 /// 「所在位置」的落点。先按 Ctrl+D 那套找**文件**（[`resolve_file_for_select`] 的判据是
@@ -2594,7 +2658,11 @@ impl LauncherApp {
         // 两种下场分开说：`Kept` 报得出留证落点，`Lost` 只能请人工处理，并且要立刻把"本轮对它
         // 只读不写"通知到下面那条补齐路径（2026-10-22 真机⑫：留证没成功时照样播种写盘，
         // 把唯一那份坏文件覆盖了——那一次日志里就写着「覆盖写会丢掉唯一证据」）。
-        let mut evidence_lost = false;
+        let lost = lost_evidence_labels([
+            ("settings.json", &broken_settings),
+            ("user_items.json", &broken_list),
+        ]);
+        let writes_blocked = !lost.is_empty();
         for (label, c, fallback) in [
             ("settings.json", &broken_settings, "出厂默认"),
             ("user_items.json", &broken_list, "空清单"),
@@ -2604,12 +2672,9 @@ impl LauncherApp {
                     "配置损坏：{label} 解析失败，已隔离为 {}，本次按{fallback}启动（原文件未被覆盖）",
                     p.display()
                 ),
-                Some(Corrupted::Lost) => {
-                    evidence_lost = true;
-                    eprintln!(
-                        "配置损坏：{label} 解析失败且留证没成功 ⇒ 本轮对它只读不写（写一次就覆盖掉唯一证据），请人工备份后删掉这个文件"
-                    );
-                }
+                Some(Corrupted::Lost) => eprintln!(
+                    "配置损坏：{label} 解析失败且留证没成功 ⇒ 本次启动不写它（写一次就覆盖掉唯一证据；之后手动保存仍会覆盖），请人工备份后删掉这个文件"
+                ),
                 None => {}
             }
         }
@@ -2639,19 +2704,28 @@ impl LauncherApp {
             (None, None) => None,
         };
         // 留证没成功那句话不许被"已改名留底"盖掉：两种下场说成一件事就是骗用户。
-        let notice = if evidence_lost {
-            Some(match notice {
-                Some(s) => format!("{s}；另有一份留证没成功 ⇒ 本轮对它只读不写，请人工处理"),
-                None => "⚠ 配置文件坏了，但留证没成功（改名与另存副本都失败）⇒ 本轮对它只读不写，请人工备份后删掉"
-                    .to_string(),
-            })
-        } else {
-            notice
+        // 措辞按事实收窄（2026-10-26 批次 E3）：门禁只管启动期那六处补齐/去重，
+        // 用户之后手动增删改条目照样会写回，所以只能说"本次启动不会写它"。
+        let lost_tail = match lost.as_slice() {
+            [] => None,
+            [one] => Some(format!(
+                "{one} 坏了且留证没成功（原名与副本都写不出来）⇒ 本次启动不会写它，你之后手动保存仍会覆盖；请先手动备份再删掉"
+            )),
+            many => Some(format!(
+                "{} 都坏了且留证都没成功（原名与副本都写不出来）⇒ 本次启动不会写它们，你之后手动保存仍会覆盖；请先手动备份再删掉",
+                many.join(" 与 ")
+            )),
+        };
+        let notice = match (notice, lost_tail) {
+            (None, None) => None,
+            (Some(s), None) => Some(s),
+            (None, Some(t)) => Some(format!("⚠ {t}")),
+            (Some(s), Some(t)) => Some(format!("{s}；{t}")),
         };
         if prefs.seed_round < source::application::SEED_ROUND {
             let added = source::application::merge_missing_seeds(&mut items);
             if added > 0 {
-                if evidence_lost {
+                if writes_blocked {
                     eprintln!(
                         "source: 出厂命令集本可补 {added} 条，但坏文件留证没成功 ⇒ 这次不写清单（补齐只在内存里生效）"
                     );
@@ -2665,7 +2739,7 @@ impl LauncherApp {
                 }
             }
             prefs.seed_round = source::application::SEED_ROUND;
-            if evidence_lost {
+            if writes_blocked {
                 // 连记账那一格也不写：settings.json 可能正是没留住证据的那一份。
                 // 代价是下一次启动会再补一轮种子（只加不删，幂等），比覆盖掉现场轻。
                 eprintln!(
@@ -2678,7 +2752,7 @@ impl LauncherApp {
             // 补标签只发生在 seed_round 进位这一次——之后用户清掉标签不会再被补回。
             let tagged = source::application::apply_factory_tags(&mut items);
             if tagged > 0 {
-                if evidence_lost {
+                if writes_blocked {
                     eprintln!(
                         "source: 出厂分类回填 {tagged} 条（坏文件留证没成功 ⇒ 这次不写清单）"
                     );
@@ -2693,7 +2767,7 @@ impl LauncherApp {
         // 与 seed_round 无关——补种只加不删，改名得单独走一趟；幂等，第二轮起恒为 0。
         let renamed = source::system::rename_legacy_settings(&mut items);
         if renamed > 0 {
-            if evidence_lost {
+            if writes_blocked {
                 eprintln!("source: 设置条目改名 {renamed} 条（坏文件留证没成功 ⇒ 这次不写清单）");
             } else {
                 source::application::save_user_items(&items);
@@ -2716,7 +2790,7 @@ impl LauncherApp {
             .collect();
         if !dup_settings.is_empty() {
             prefs.hidden.extend(dup_settings.iter().cloned());
-            if evidence_lost {
+            if writes_blocked {
                 eprintln!(
                     "source: 隐藏重复的 Store 版「设置」（坏文件留证没成功 ⇒ 这次不写 settings.json）"
                 );
@@ -2729,7 +2803,7 @@ impl LauncherApp {
         // 只有真剔掉东西才写盘（平时 dropped=0，不该因为这条路径多写一次文件）。
         let dropped = source::application::drop_hidden(&mut items, &prefs.hidden);
         if dropped > 0 {
-            if evidence_lost {
+            if writes_blocked {
                 eprintln!("source: hidden[] 隐藏 {dropped} 条（坏文件留证没成功 ⇒ 这次不写清单）");
             } else {
                 source::application::save_user_items(&items);
@@ -2819,6 +2893,7 @@ impl LauncherApp {
             typeback_awaiting: None,
             typeback_armed: false,
             keypick_suspended: false,
+            secondary_recording: false,
         };
         // 立即为已有项起图标加载器（source_path 为空的种子会被 extract 自然跳过）。
         let source_paths: Vec<String> = seed
@@ -3401,7 +3476,7 @@ impl LauncherApp {
     /// 取键态下吃掉本帧按键并分派给两个入口之一。互斥是结构自带的：`take_record_press` 会把
     /// 整帧的 Key 事件清空，一帧只可能有一个框拿到键，所以先判谁在等就够了。
     fn take_keypick(&mut self, ui: &mut egui::Ui) {
-        if !self.hotkey_recording && !self.typeback_armed {
+        if !self.hotkey_recording && !self.typeback_armed && !self.secondary_recording {
             return;
         }
         // 换键请求还悬着（回执未到）时不接受第二次取键，否则会覆盖 REQUEST 槽里的组合。
@@ -3432,6 +3507,53 @@ impl LauncherApp {
                     }
                     self.typeback_armed = false;
                     eprintln!("设置页：补字符键的键框收到 {shown}（修饰键看四个复选框）");
+                }
+            }
+            return;
+        }
+        if self.secondary_recording {
+            match key {
+                egui::Key::Escape | egui::Key::Tab => {
+                    self.secondary_recording = false;
+                    eprintln!(
+                        "设置页：次级动作键录制取消（按 {}），当前仍是 {}",
+                        if key == egui::Key::Escape { "Esc" } else { "Tab" },
+                        self.prefs.secondary_hotkey.display()
+                    );
+                }
+                egui::Key::Backspace | egui::Key::Delete => {
+                    self.secondary_recording = false;
+                    self.prefs.secondary_hotkey = HotkeySpec::SECONDARY_DEFAULT;
+                    source::application::save_settings(&self.prefs);
+                    let show = HotkeySpec::SECONDARY_DEFAULT.display();
+                    eprintln!("设置页：次级动作键收到 Backspace/Delete ⇒ 恢复默认 {show}（已写 settings.json）");
+                    self.hotkey_note(&format!("✓ 次级动作键恢复默认：{show}"), true);
+                }
+                other => {
+                    let Some(spec) = spec_from_press(other, m) else {
+                        return; // 方向键之类：继续等，不提示（与主热键同一口径）
+                    };
+                    let show = spec.display();
+                    // 这颗键不进系统，所以不需要"试注册"那一级；判据全在本地，落定即生效。
+                    // 被拒时**留在录制态**：提示语写的是"换一个"，退出录制就会自相矛盾
+                    //（主热键那条 2026-10-20 真机踩过，见上面的长注释）。
+                    if let Err(msg) = spec.check_secondary(
+                        &self.hotkey_active,
+                        self.typeback_active.as_ref(),
+                        LOCAL_TAKEN,
+                    ) {
+                        self.hotkey_note(&format!("⚠ {show}：{msg}"), false);
+                        eprintln!(
+                            "设置页：次级动作键 {show} 未采纳（{msg}），当前仍是 {}",
+                            self.prefs.secondary_hotkey.display()
+                        );
+                        return;
+                    }
+                    self.secondary_recording = false;
+                    self.prefs.secondary_hotkey = spec;
+                    source::application::save_settings(&self.prefs);
+                    eprintln!("设置页：次级动作键 → {show}（已写 settings.json）");
+                    self.hotkey_note(&format!("✓ 次级动作键：{show}"), true);
                 }
             }
             return;
@@ -4194,14 +4316,78 @@ impl LauncherApp {
                                 .small(),
                             );
                             ui.separator();
+                            // 批次 E3-丙（FR-ACT-01「Ctrl+Enter 走次级动作」/ 开发计划 B3）：
+                            // 用户 2026-10-26 裁定两种形态都做、默认快捷键版、可切换、键也可自定义。
+                            ui.label(egui::RichText::new("次级动作键（选中一行后按它）").strong());
+                            let mut mode = self.prefs.secondary_action;
+                            ui.horizontal(|ui| {
+                                for m in [SecondaryAction::Shortcut, SecondaryAction::Panel] {
+                                    ui.selectable_value(&mut mode, m, m.label());
+                                }
+                            });
+                            if mode != self.prefs.secondary_action {
+                                self.prefs.secondary_action = mode;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：次级动作形态 → {}（已写 settings.json）",
+                                    mode.as_str()
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.horizontal(|ui| {
+                                let shown = if self.secondary_recording {
+                                    "按下新组合…（Esc / Tab 取消，Backspace / Delete 恢复默认）"
+                                        .to_string()
+                                } else {
+                                    self.prefs.secondary_hotkey.display()
+                                };
+                                ui.label(egui::RichText::new(shown).monospace());
+                                if ui
+                                    .button(if self.secondary_recording {
+                                        "取消录制"
+                                    } else {
+                                        "录制新键"
+                                    })
+                                    .clicked()
+                                {
+                                    self.secondary_recording = !self.secondary_recording;
+                                    eprintln!(
+                                        "设置页：次级动作键录制 {}（当前 {}）",
+                                        if self.secondary_recording { "开始" } else { "取消" },
+                                        self.prefs.secondary_hotkey.display()
+                                    );
+                                }
+                                ui.add_enabled_ui(!self.secondary_recording, |ui| {
+                                    if ui.button("恢复默认").clicked() {
+                                        self.prefs.secondary_hotkey = HotkeySpec::SECONDARY_DEFAULT;
+                                        source::application::save_settings(&self.prefs);
+                                        eprintln!(
+                                            "设置页：次级动作键恢复默认 {}（已写 settings.json）",
+                                            HotkeySpec::SECONDARY_DEFAULT.display()
+                                        );
+                                        ui.ctx().request_repaint();
+                                    }
+                                });
+                            });
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "「快捷键版」＝按 {} 直接做一条：文件行 / 目录行「在资源管理器里定位」，网页搜索行「复制网址」；「面板版」＝跟 → 一样进操作面板，动作进去再选。\n应用条目、系统命令、自定义命令没有\"一眼就是它\"的次级动作 —— 快捷键版会提示你按 → 看全部，不替你猜（Enter 本来就是打开，再配一个别名只会让两个键争同一件事）。\n这颗键只在搜索页、没有弹窗、没开面板时生效，而且不注册给系统：不会抢别的程序的键，也不会像全局呼出键那样被系统整条吞掉。必须带 Ctrl 或 Alt（裸键与单带 Shift 的键都只是打字），Win 组合设不了（egui 在 Windows 上不把 Win 传上来）。\n改完立刻生效并直接写 settings.json —— 系统里没有它，不需要\"试注册\"那一级，也就没有\"被别的程序占用\"这回事。",
+                                    self.prefs.secondary_hotkey.display()
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
                             let toggle_key = self.hotkey_active.display();
                             let typeback_key = self
                                 .typeback_active
                                 .map(|t| t.display())
                                 .unwrap_or_else(|| "（补字符未启用）".to_string());
+                            let secondary_key = self.prefs.secondary_hotkey.display();
                             egui::Grid::new("hotkeys_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                                 for (key, desc) in [
                                     (toggle_key.as_str(), "全局呼出 / 隐藏（上一张卡片可改）"),
+                                    (secondary_key.as_str(), "次级动作：快捷键版直接做一条（文件行定位 / 网页行复制网址），面板版等于 →（上一张卡片可改）"),
                                     (typeback_key.as_str(), "补字符：把呼出键吞掉的那个字符打回焦点窗口（上一张卡片可改）"),
                                     ("↑ / ↓", "选择条目"),
                                     ("PgUp / PgDn", "结果列表翻页（列表滚动跟随选中项）"),
@@ -4682,6 +4868,12 @@ impl LauncherApp {
             self.typeback_armed = false;
             eprintln!("设置页：窗口隐藏 ⇒ 退出取键（录制/选键状态不跨隐藏保留）");
             self.sync_keypick_suspend();
+        }
+        // 批次 E3-丙：次级动作键框同理，但它没进 `sync_keypick_suspend`（那颗键不在系统里，
+        // 没有"装回去"这回事），所以只落自己的旗标。
+        if self.secondary_recording {
+            self.secondary_recording = false;
+            eprintln!("设置页：窗口隐藏 ⇒ 退出次级动作键录制");
         }
         let Some(before) = self.ime_before.take() else {
             return;
@@ -5208,6 +5400,150 @@ impl LauncherApp {
         ctx.request_repaint();
     }
 
+    /// 批次 E3-丙：「所在位置」做成面板版与快捷键版共用的一条。`via` 是日志前缀——
+    /// 面板那一路传「操作面板」，日志文本与批次 P1 逐字一致（真机判据直接 grep 那个前缀）。
+    fn do_reveal(
+        &mut self,
+        ctx: &egui::Context,
+        via: &str,
+        target: &actions::PanelTarget,
+        source_path: &str,
+    ) -> PanelOutcome {
+        match reveal_target(&target.path, source_path) {
+            Some(p) => {
+                eprintln!(
+                    "{via}：所在位置（{} 个字符的路径不落日志）→ 关闭到托盘",
+                    p.chars().count()
+                );
+                self.select_in_explorer(ctx, &p);
+                PanelOutcome::Gone
+            }
+            None => {
+                eprintln!("{via}：所在位置落空（{:?}：没有可定位的本地路径）", target.subject);
+                self.toast = Some((
+                    "⚠ 这一条没有能在资源管理器里定位的本地路径".to_string(),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_ERR,
+                ));
+                ctx.request_repaint_after(TOAST_TTL);
+                PanelOutcome::Stay
+            }
+        }
+    }
+
+    /// 批次 E3-丙：剪贴板三格共用的一条（面板的复制路径 / 复制网址 / 复制名称）。
+    /// 内容多半是从查询现出来的 ⇒ 日志只记长度与是哪一格（FR-SYS-03）。
+    fn do_copy(
+        &mut self,
+        ctx: &egui::Context,
+        via: &str,
+        target: &actions::PanelTarget,
+        id: actions::ActionId,
+    ) -> PanelOutcome {
+        let text = match id {
+            actions::ActionId::CopyName => target.name_to_copy(),
+            actions::ActionId::CopyUrl => target.path.clone(),
+            _ => target.path_to_copy(),
+        };
+        let verb = match id {
+            actions::ActionId::CopyName => "名称",
+            actions::ActionId::CopyUrl => "网址",
+            _ => "路径",
+        };
+        match copy_to_clipboard(&text) {
+            Ok(()) => {
+                eprintln!(
+                    "{via}：已复制{verb}（{} 个字符，内容不落日志）",
+                    text.chars().count()
+                );
+                self.toast = Some((
+                    format!("✓ 已复制{verb}：{text}"),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_OK,
+                ));
+            }
+            Err(e) => {
+                eprintln!("{via}：复制{verb}失败：{e}");
+                self.toast = Some((
+                    format!("⚠ 复制失败：{e}"),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_ERR,
+                ));
+            }
+        }
+        ctx.request_repaint_after(TOAST_TTL);
+        PanelOutcome::Stay
+    }
+
+    /// 批次 E3-丙（FR-ACT-01「`Ctrl+Enter` 走次级动作」/ 开发计划 B3）：那颗可配的次级动作键。
+    ///
+    /// 两种形态由 `prefs.secondary_action` 决定，作用对象都是"当前选中行"：
+    /// - [`SecondaryAction::Panel`] ＝ `→` 那个入口（同一个 [`Self::open_panel`]，同一套现场保存）；
+    /// - [`SecondaryAction::Shortcut`] 执行 [`actions::secondary_action_for`] 给的那**一条**动作
+    ///   （文件行 / 目录行 → 所在位置，网页搜索行 → 复制网址）。
+    ///
+    /// 快捷键版刻意不包含"打开"：Enter 本来就是打开，再给它配一个别名只会让两个键争同一件事。
+    /// 不在那两格里的对象（应用条目、系统命令、自定义命令…）不猜也不静默——明说"按 → 看全部动作"。
+    fn run_secondary_action(&mut self, ctx: &egui::Context, row: Row) {
+        let key = self.prefs.secondary_hotkey.display();
+        let plan = self.plan();
+        let Some((target, open)) =
+            panel_for_row(row, &plan.head, &plan.results, &self.items, &self.path_states)
+        else {
+            eprintln!("次级动作 {key}：这一行没有可处置的对象（计算器 / 终端 / 提示 / 分类行）");
+            self.toast = Some((
+                "这一行没有可处置的对象".to_string(),
+                Instant::now() + TOAST_TTL,
+                TOAST_OK,
+            ));
+            ctx.request_repaint_after(TOAST_TTL);
+            return;
+        };
+        if self.prefs.secondary_action == SecondaryAction::Panel {
+            eprintln!("次级动作 {key}：面板版 ⇒ 进操作面板（{:?}）", target.subject);
+            self.open_panel(ctx, row);
+            return;
+        }
+        let Some(id) = actions::secondary_action_for(target.subject) else {
+            eprintln!(
+                "次级动作 {key}：快捷键版对这一行没有默认动作（{:?}）⇒ 提示按 → 看全部",
+                target.subject
+            );
+            self.toast = Some((
+                format!("这一行没有 {key} 的默认动作，按 → 打开操作面板"),
+                Instant::now() + TOAST_TTL,
+                TOAST_OK,
+            ));
+            ctx.request_repaint_after(TOAST_TTL);
+            return;
+        };
+        let source_path = match &open {
+            PanelOpen::Entry { entry, .. } => entry.source_path.as_str(),
+            PanelOpen::Path => "",
+        };
+        eprintln!(
+            "次级动作 {key}：快捷键版 ⇒ {}（{:?}）",
+            id.label(),
+            target.subject
+        );
+        match id {
+            actions::ActionId::Reveal => {
+                self.do_reveal(ctx, "次级动作", &target, source_path);
+            }
+            actions::ActionId::CopyUrl => {
+                self.do_copy(ctx, "次级动作", &target, id);
+            }
+            other => {
+                // 动作表以后扩了映射项、而这里还没接它的执行路径 ⇒ 退回面板，别静默什么都不做。
+                eprintln!(
+                    "次级动作 {key}：{} 尚未接入快捷键版，退回操作面板",
+                    other.label()
+                );
+                self.open_panel(ctx, row);
+            }
+        }
+    }
+
     /// 批次 P1（FR-ACT-03 / FR-ACT-04）：执行面板里选中的那条动作。
     ///
     /// **学习统计以原查询记**，这是 FR-ACT-03 定这条流程的理由：用户打的是 `chr`，学会的就该是
@@ -5379,66 +5715,12 @@ impl LauncherApp {
                     PanelOpen::Entry { entry, .. } => entry.source_path.as_str(),
                     PanelOpen::Path => "",
                 };
-                match reveal_target(&target.path, source_path) {
-                    Some(p) => {
-                        eprintln!(
-                            "操作面板：所在位置（{} 个字符的路径不落日志）→ 关闭到托盘",
-                            p.chars().count()
-                        );
-                        self.select_in_explorer(ctx, &p);
-                        PanelOutcome::Gone
-                    }
-                    None => {
-                        eprintln!("操作面板：所在位置落空（{:?}：没有可定位的本地路径）", target.subject);
-                        self.toast = Some((
-                            "⚠ 这一条没有能在资源管理器里定位的本地路径".to_string(),
-                            Instant::now() + TOAST_TTL,
-                            TOAST_ERR,
-                        ));
-                        ctx.request_repaint_after(TOAST_TTL);
-                        PanelOutcome::Stay
-                    }
-                }
+                self.do_reveal(ctx, "操作面板", &target, source_path)
             }
             // ---- 剪贴板三格：都不关窗（下一步是去别处粘贴，不是收工）----
             actions::ActionId::CopyPath
             | actions::ActionId::CopyUrl
-            | actions::ActionId::CopyName => {
-                let text = match id {
-                    actions::ActionId::CopyName => target.name_to_copy(),
-                    actions::ActionId::CopyUrl => target.path.clone(),
-                    _ => target.path_to_copy(),
-                };
-                let verb = match id {
-                    actions::ActionId::CopyName => "名称",
-                    actions::ActionId::CopyUrl => "网址",
-                    _ => "路径",
-                };
-                match copy_to_clipboard(&text) {
-                    Ok(()) => {
-                        // 内容多半来自查询 ⇒ 日志只记长度与是哪一格（FR-SYS-03）。
-                        eprintln!(
-                            "操作面板：已复制{verb}（{} 个字符，内容不落日志）",
-                            text.chars().count()
-                        );
-                        self.toast = Some((
-                            format!("✓ 已复制{verb}：{text}"),
-                            Instant::now() + TOAST_TTL,
-                            TOAST_OK,
-                        ));
-                    }
-                    Err(e) => {
-                        eprintln!("操作面板：复制{verb}失败：{e}");
-                        self.toast = Some((
-                            format!("⚠ 复制失败：{e}"),
-                            Instant::now() + TOAST_TTL,
-                            TOAST_ERR,
-                        ));
-                    }
-                }
-                ctx.request_repaint_after(TOAST_TTL);
-                PanelOutcome::Stay
-            }
+            | actions::ActionId::CopyName => self.do_copy(ctx, "操作面板", &target, id),
             actions::ActionId::Recycle => {
                 // `recycle_path` 给的是裸 Win32 码（`SHFileOperationW` 不按 HRESULT 说话）：
                 // 1223 = 用户在那句「永久删除？」警告里点了"否"，其余非零才是真失败。
@@ -5783,8 +6065,8 @@ impl eframe::App for LauncherApp {
         // 所以它必须在 `hotkey_frame` 之后、渲染之前入队）。
         if self.visible {
             if let Some(msg) = self.startup_notice.take() {
-                self.toast = Some((msg, Instant::now() + TOAST_TTL, TOAST_ERR));
-                ui.ctx().request_repaint_after(TOAST_TTL);
+                self.toast = Some((msg, Instant::now() + TOAST_TTL_STARTUP, TOAST_ERR));
+                ui.ctx().request_repaint_after(TOAST_TTL_STARTUP);
             }
         }
 
@@ -5990,7 +6272,9 @@ impl eframe::App for LauncherApp {
         // 批次 R：补字符键框选键和主热键录制是同一类状态——都在等一次按键，都不该被本程序的
         // 快捷键抢走（`take_keypick` 里的 `take_record_press` 已把整帧 Key 事件清空，这扇门是
         // 让"取键时不响应快捷键"这件事读得出来的那道显式保险）。
-        let recording = self.hotkey_recording || self.typeback_armed;
+        // 批次 E3-丙的次级动作键框同理：它录的恰好也是窗口内热键，不挡就会"按什么键都先执行一次"。
+        let recording =
+            self.hotkey_recording || self.typeback_armed || self.secondary_recording;
 
         let mut launch: Option<LaunchItem> = None;
         let mut launch_from_list = false;
@@ -6265,6 +6549,15 @@ impl eframe::App for LauncherApp {
                     && caret_at_end(ui.ctx(), &self.query)
                     && take_fresh_key(ui.ctx(), egui::Key::ArrowRight);
 
+                // ---- 批次 E3-丙：次级动作键（`Ctrl+Enter` 一类**窗口内**热键）----
+                // 位置有讲究：必须在这里把事件收走。下面 Enter 那一档用的是 `key_pressed`，
+                // 它不看修饰键 ⇒ 不收走的话 `Ctrl+Enter` 会先跑次级动作、再把选中项也跑一遍，
+                // 一次按键干两件事（真机最容易撞见的正是这一条）。面板开着时不接管：
+                // 面板里 `Ctrl+Enter` 就是 `Enter`，仍是"执行高亮动作"，与批次 P1 的口径一致。
+                let secondary_hit = !self.settings_open
+                    && self.panel.is_none()
+                    && take_local_hotkey(ui, self.prefs.secondary_hotkey);
+
                 if let Some(by) = panel_exit {
                     self.close_panel(ui.ctx(), by, true);
                 } else if panel_enter {
@@ -6272,6 +6565,12 @@ impl eframe::App for LauncherApp {
                     let row = row_at(self.selected, plan.results.len(), plan.head.len());
                     if let Some(row) = row {
                         self.open_panel(ui.ctx(), row);
+                    }
+                } else if secondary_hit {
+                    let plan = self.plan();
+                    let row = row_at(self.selected, plan.results.len(), plan.head.len());
+                    if let Some(row) = row {
+                        self.run_secondary_action(ui.ctx(), row);
                     }
                 } else if hit_cm {
                     // 批次 F6：☰ 主菜单的键盘入口（用户裁定「三条杠菜单 + 快捷键都留」）。
@@ -7755,6 +8054,9 @@ impl eframe::App for LauncherApp {
                         .corner_radius(10.0)
                         .inner_margin(egui::Margin::symmetric(14, 8))
                         .show(ui, |ui| {
+                            // Area 里的 label 默认不限宽 ⇒ 长句会画成一整行、越过窗口被裁掉。
+                            // 与速查弹窗同口径按窗口宽度收（留出胶囊内边距），让它自己换行。
+                            ui.set_max_width((ui.ctx().content_rect().width() - 72.0).max(160.0));
                             ui.label(egui::RichText::new(msg).size(13.0).color(fade(*text_c)));
                         });
                 });
@@ -9692,5 +9994,111 @@ mod nav_tests {
             large_text_of(Some(&calc), Some(&url), ""),
             Some("https://example.com/?q=1".to_string())
         );
+    }
+
+    /// 批次 E3：启动期写盘门禁的四种组合。`Lost` 出现在任一份上就必须挡写盘——
+    /// 只盯清单、或把 `Lost` 折进 `Option` 都漏得掉"设置坏了但清单好"那一格。
+    /// 名字也要跟着回来：Toast 与日志得说清是哪一份文件，含糊成"某个配置"等于没说。
+    #[test]
+    fn lost_evidence_blocks_writes_for_either_file() {
+        let none: Option<Corrupted> = None;
+        let kept: Option<Corrupted> = Some(Corrupted::Kept(std::path::PathBuf::from(
+            "user_items.json.bad",
+        )));
+
+        assert!(
+            lost_evidence_labels([("settings.json", &none), ("user_items.json", &none)])
+                .is_empty(),
+            "两份都没坏 ⇒ 不许挡写盘"
+        );
+        assert_eq!(
+            lost_evidence_labels([
+                ("settings.json", &Some(Corrupted::Lost)),
+                ("user_items.json", &kept),
+            ]),
+            vec!["settings.json"],
+            "留证成功的 Kept 不该被当成事故"
+        );
+        assert_eq!(
+            lost_evidence_labels([
+                ("settings.json", &none),
+                ("user_items.json", &Some(Corrupted::Lost)),
+            ]),
+            vec!["user_items.json"],
+        );
+        assert_eq!(
+            lost_evidence_labels([
+                ("settings.json", &Some(Corrupted::Lost)),
+                ("user_items.json", &Some(Corrupted::Lost)),
+            ]),
+            vec!["settings.json", "user_items.json"],
+            "两份都没留住 ⇒ 两份都要报出来"
+        );
+    }
+
+    /// 批次 E3-丙：窗口内热键（次级动作键）的匹配。
+    ///
+    /// 真机最怕的两条在这里钉住：① 裸 Enter **不算**命中——算的话我们会在 Enter 那一档之前
+    /// 把"运行选中项"吃掉；② 多按一个 Shift 不算命中——`Modifiers::matches_logically` 恰好相反
+    ///（`consume_key` 就是被它坑过两次：Shift+Tab、Shift+数字），所以这里必须逐位相等。
+    #[test]
+    fn window_hotkey_matches_modifiers_exactly() {
+        let bt = |mods, code| HotkeySpec { mods, vk: code };
+        let m = |ctrl: bool, alt: bool, shift: bool| egui::Modifiers {
+            ctrl,
+            alt,
+            shift,
+            ..Default::default()
+        };
+        let ctrl_enter = HotkeySpec::SECONDARY_DEFAULT;
+
+        assert!(local_hotkey_hits(
+            ctrl_enter,
+            egui::Key::Enter,
+            m(true, false, false)
+        ));
+        assert!(
+            !local_hotkey_hits(ctrl_enter, egui::Key::Enter, m(false, false, false)),
+            "裸 Enter 归「运行选中项」，不是次级动作"
+        );
+        assert!(
+            !local_hotkey_hits(ctrl_enter, egui::Key::Enter, m(true, false, true)),
+            "多带 Shift 是另一组"
+        );
+        assert!(!local_hotkey_hits(
+            ctrl_enter,
+            egui::Key::Enter,
+            m(false, true, false)
+        ));
+        assert!(
+            !local_hotkey_hits(ctrl_enter, egui::Key::Space, m(true, false, false)),
+            "同一个修饰键、换成别的键不算"
+        );
+        assert!(
+            !local_hotkey_hits(
+                bt(HKF_CONTROL, VK_RETURN),
+                egui::Key::ArrowLeft,
+                m(true, false, false)
+            ),
+            "映射不出 VK 的键永远不命中"
+        );
+
+        // NOREPEAT 只是注册位：带不带都不影响比对（设置页存的草稿恒不带）。
+        let alt_f6 = bt(HKF_ALT | HKF_NOREPEAT, 0x75);
+        assert!(local_hotkey_hits(alt_f6, egui::Key::F6, m(false, true, false)));
+        assert!(!local_hotkey_hits(alt_f6, egui::Key::F6, m(true, false, false)));
+
+        // 手改 settings.json 塞进来的 Win 位：egui 在 Windows 上传不上来 ⇒ 恒不命中。
+        // 这一条防的是"把 Win 当成没按修饰键"⇒ 裸 Enter 变成次级动作键。
+        assert!(!local_hotkey_hits(
+            bt(HKF_WIN | HKF_CONTROL, VK_RETURN),
+            egui::Key::Enter,
+            m(true, false, false)
+        ));
+        assert!(!local_hotkey_hits(
+            bt(HKF_WIN, VK_RETURN),
+            egui::Key::Enter,
+            m(false, false, false)
+        ));
     }
 }

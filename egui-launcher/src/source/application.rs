@@ -419,6 +419,8 @@ fn settings_from_map(
     take_field!(map, s, "", learn_rank, LearnRank);
     take_field!(map, s, "", toggle_hotkey, HotkeySpec);
     take_field!(map, s, "", typeback_hotkey, Option<HotkeySpec>);
+    take_field!(map, s, "", secondary_action, SecondaryAction);
+    take_field!(map, s, "", secondary_hotkey, HotkeySpec);
     take_field!(
         map,
         s,
@@ -684,6 +686,20 @@ pub struct AppSettings {
     #[serde(default)]
     pub typeback_hotkey: Option<HotkeySpec>,
 
+    /// 次级动作的形态（批次 E3-丙，2026-10-26 用户正文「快捷键版和面板版两个都做，设置中加一个
+    /// 配置，默认快捷键版，用户可以更改配置选择"面板版"」）。见 [`SecondaryAction`]。
+    #[serde(default)]
+    pub secondary_action: SecondaryAction,
+
+    /// 次级动作键（同批）。**窗口内热键**，不是全局键：只在搜索页有焦点时生效，
+    /// 不注册给系统、也不进热键线程。缺省 `Ctrl+Enter`（需求书 FR-ACT-01 的原文键位）。
+    ///
+    /// 兜底值必须显式指定：`#[serde(default)]` 只会调 `HotkeySpec::default()`，那是**呼出**键
+    /// `Ctrl+Alt+Space` ⇒ 旧配置文件读出来的次级动作键会跟呼出键同组（永远收不到按键，
+    /// 而且它还是个全局键）。DEFAULT ≠ SECONDARY_DEFAULT 这件事在这一格上是要命的。
+    #[serde(default = "secondary_hotkey_default")]
+    pub secondary_hotkey: HotkeySpec,
+
     /// 网页搜索引擎表（FR-SRC-11，批次 T）。字段缺省＝[`websearch::builtin_engines`] 那九条，
     /// 所以旧 `settings.json` 照旧解析、不写就不丢内置项。
     /// 本批**没有编辑入口**：设置页还没有「数据源 / 网页搜索」那一页（与 FR-CFG-04 的偏差已登记），
@@ -790,6 +806,8 @@ impl Default for AppSettings {
             learn_rank: LearnRank::default(),
             toggle_hotkey: HotkeySpec::default(),
             typeback_hotkey: None,
+            secondary_action: SecondaryAction::default(),
+            secondary_hotkey: HotkeySpec::SECONDARY_DEFAULT,
             web_engines: crate::source::websearch::builtin_engines(),
             seed_round: 0,
             sources_off: Vec::new(),
@@ -888,6 +906,13 @@ impl HotkeySpec {
         vk: VK_SPACE,
     };
 
+    /// 批次 E3-丙：次级动作键的出厂值 = `Ctrl+Enter`（需求书 FR-ACT-01 的原文键位）。
+    /// 与 [`Self::DEFAULT`] 一样写成 const，好让 `Default` 之外的地方也能直接引用同一份值。
+    pub const SECONDARY_DEFAULT: Self = Self {
+        mods: HKF_CONTROL | HKF_NOREPEAT,
+        vk: VK_RETURN,
+    };
+
     /// 去掉 [`HKF_NOREPEAT`]：它是行为位，不是键名的一部分，比对与展示都要剥掉它。
     pub fn mods_named(&self) -> u32 {
         self.mods & !HKF_NOREPEAT
@@ -980,12 +1005,55 @@ impl HotkeySpec {
         let mine = (self.mods_named(), self.vk);
         table.iter().any(|(m, v)| (*m & !HKF_NOREPEAT, *v) == mine)
     }
+
+    /// 窗口内热键（[`AppSettings::secondary_hotkey`]）的判据。**与 [`check`](Self::check) 分家**
+    /// 是因为管的不是一回事：那条管"能不能注册成全局键"（裸 `` ` `` 可以、单带 Shift 不行），
+    /// 这条管"窗口里按下去会不会把打字吃掉"——全局键被系统整条吞掉，窗口内热键只吃本程序这一下，
+    /// 所以裸键在这里一条都不放开（裸 `` ` `` 的代价已经在全局那一侧付过了）。
+    pub fn check_secondary(
+        &self,
+        toggle: &HotkeySpec,
+        typeback: Option<&HotkeySpec>,
+        local_table: &[(u32, u32)],
+    ) -> Result<(), &'static str> {
+        let m = self.mods_named();
+        let function = (VK_F1..=VK_F24).contains(&self.vk);
+        let letterish =
+            matches!(self.vk, VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN | VK_OEM_3);
+        if !(function || letterish) {
+            return Err("只收字母、数字、空格、回车、反引号 ` 与 F1–F24");
+        }
+        if m & HKF_WIN != 0 {
+            return Err("窗口内热键用不了 Win 键：egui 在 Windows 上不把 Win 传上来，设了也永远匹配不到");
+        }
+        if m & (HKF_CONTROL | HKF_ALT) == 0 {
+            return Err("窗口内热键必须带 Ctrl 或 Alt：裸键与单带 Shift 的键都只是打字，抢走就再也打不出来");
+        }
+        if (m, self.vk) == (toggle.mods_named(), toggle.vk) {
+            return Err("不能和全局呼出热键同一组：那个组合被系统整条吞掉，窗口里永远收不到");
+        }
+        if let Some(t) = typeback {
+            if (m, self.vk) == (t.mods_named(), t.vk) {
+                return Err("不能和补字符热键同一组：那颗键要留给把字符还回去");
+            }
+        }
+        if self.conflicts_local(local_table) {
+            return Err("这组键已被本程序的固定快捷键占用（完整键表见 ? 速查表）");
+        }
+        Ok(())
+    }
 }
 
 impl Default for HotkeySpec {
     fn default() -> Self {
         Self::DEFAULT
     }
+}
+
+/// `AppSettings::secondary_hotkey` 的 serde 兜底。单独写一个 fn 是因为 `#[serde(default)]`
+/// 只会调 `Default::default()`（= 呼出键 Ctrl+Alt+Space），两者不是同一个值。
+fn secondary_hotkey_default() -> HotkeySpec {
+    HotkeySpec::SECONDARY_DEFAULT
 }
 
 /// VK → 展示名。范围外的码原样写成 `VK#xNN`，让日志里看得见"没映射到"而不是显示空白。
@@ -1175,6 +1243,39 @@ impl RowDensity {
             Self::Roomy => "roomy",
             Self::Dense => "dense",
             Self::Theme => "theme",
+        }
+    }
+}
+
+/// 批次 E3-丙（FR-ACT-01「`Ctrl+Enter` 走次级动作」+ 开发计划 B3）：那颗键按下去干什么。
+///
+/// 用户 2026-10-26 裁定两种形态都做、默认快捷键版、可切换，所以这不是"二选一裁掉一个"，
+/// 而是同一个键的两种落点。快捷键版执行**一条**确定的次级动作（不给面板，也就没有"再选一次"）；
+/// 面板版等于把 `→` 那个入口搬到这颗可配的键上，动作由用户在面板里选。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecondaryAction {
+    /// 默认：直接执行 [`crate::actions::secondary_action_for`] 给出的那条动作。
+    #[default]
+    Shortcut,
+    /// 打开与 `→` 完全相同的操作面板（过滤词从空开始）。
+    Panel,
+}
+
+impl SecondaryAction {
+    /// 落盘与设置页用的档位名（与 [`Scope::as_str`] 同口径）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shortcut => "shortcut",
+            Self::Panel => "panel",
+        }
+    }
+
+    /// 设置页单选用的显示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shortcut => "快捷键版",
+            Self::Panel => "面板版",
         }
     }
 }
@@ -1860,7 +1961,8 @@ pub fn reset_learning(items: &mut [LaunchItem]) -> usize {
 
 /// 批次 F7（FR-CFG-08）：恢复默认**只重置偏好里的口径类字段**，用户资产一概不动。
 ///
-/// 保留：`toggle_hotkey` / `typeback_hotkey`（热键）、`web_engines`（自定义引擎）、
+/// 保留：`toggle_hotkey` / `typeback_hotkey` / `secondary_hotkey`（热键三格——按哪颗键是用户的
+/// 手感，不该被"恢复默认"改掉）、`web_engines`（自定义引擎）、
 /// `hidden` 与 `hidden_stash`（被隐藏的条目及其快照）、`seed_round`（已补种到第几轮——重置它会让下一轮启动
 /// 把用户删掉的出厂条目整批复活）。`user_items.json` 里的自定义命令、置顶、学习统计、
 /// 分类标签也不经过这里。
@@ -1875,6 +1977,8 @@ pub fn restore_defaults(s: &mut AppSettings) {
     s.list_rows = ListRows::default();
     s.row_density = RowDensity::default();
     s.default_scope = Scope::default();
+    // 批次 E3-丙：次级动作回到「快捷键版」。键位属于热键三格，保留。
+    s.secondary_action = SecondaryAction::default();
     // 批次 F8：宽度 / 记住位置 / 状态栏 / 淡入也回厂，位置一起清掉（下次启动居中）。
     s.appearance = Appearance::default();
 }
@@ -4309,6 +4413,58 @@ mod hotkey_tests {
         );
     }
 
+    /// 批次 E3-丙：窗口内热键（次级动作键）的判据。它管的是"按下去会不会把打字吃掉"，
+    /// 与全局热键那条（裸 `` ` `` 可以、单带 Shift 不行）刻意不同源 —— 见 `check_secondary` 的注释。
+    ///
+    /// 证伪思路：把任意一条规则从 `check_secondary` 里删掉，下面必有一条断言变红；
+    /// 反方向（把 `check` 的规则误抄进来）也有断言盯着——裸 `` ` `` 在 `check` 里是合法例外，
+    /// 在这里必须是**非法**的。
+    #[test]
+    fn secondary_hotkey_needs_ctrl_or_alt_and_avoids_local_bindings() {
+        let bt = |mods, code| HotkeySpec { mods, vk: code };
+        let toggle = bt(HKF_ALT | HKF_NOREPEAT, vk_f(6)); // 出厂呼出键 Alt+F6
+        let typeback = bt(HKF_CONTROL | HKF_NOREPEAT, vk('B'));
+        let table = [(HKF_CONTROL | HKF_NOREPEAT, vk('I'))];
+        let check = |spec: HotkeySpec| spec.check_secondary(&toggle, Some(&typeback), &table);
+
+        // 出厂值（Ctrl+Enter）本身就是这条判据的正面样本，顺带钉住"比对不看 NOREPEAT"：
+        // 出厂值带 NOREPEAT，而 toggle / typeback 这里故意不带。
+        assert!(check(HotkeySpec::SECONDARY_DEFAULT).is_ok());
+        assert!(check(bt(HKF_CONTROL | HKF_NOREPEAT, vk('J'))).is_ok());
+        assert!(
+            check(bt(HKF_CONTROL | HKF_ALT | HKF_NOREPEAT, VK_RETURN)).is_ok(),
+            "两枚修饰键都按着也是合法组合"
+        );
+        assert!(
+            check(bt(HKF_CONTROL | HKF_SHIFT, VK_RETURN)).is_ok(),
+            "Shift 在这里是实义位（与呼出键同一个口径：附加 Shift 不算另一组）"
+        );
+
+        // 裸键 / 单带 Shift：窗口内抢走它就等于再也打不出来。
+        let bare = check(bt(HKF_NOREPEAT, VK_RETURN)).unwrap_err();
+        assert!(bare.contains("Ctrl 或 Alt"), "实得：{bare}");
+        let shift = check(bt(HKF_SHIFT | HKF_NOREPEAT, VK_RETURN)).unwrap_err();
+        assert!(shift.contains("Ctrl 或 Alt"), "实得：{shift}");
+        // 裸 ` 在全局那条里是唯一例外，在这里不行（那颗键的代价已经在全局侧付过了）。
+        assert!(check(bt(0, VK_OEM_3)).is_err());
+
+        // Win 位：egui 在 Windows 上不把 Win 传上来，设了永远匹配不到。
+        let win = check(bt(HKF_WIN | HKF_CONTROL | HKF_NOREPEAT, VK_RETURN)).unwrap_err();
+        assert!(win.contains("Win"), "实得：{win}");
+
+        // 可录集合与全局那条同一套（复用一个映射，两处判据才不会各自漂）。
+        let code = check(bt(HKF_CONTROL, 0x08)).unwrap_err(); // VK_BACK
+        assert!(code.contains("只收"), "实得：{code}");
+
+        // 同组冲突三连：呼出键 / 补字符键 / 本程序固定快捷键。
+        let same_toggle = check(bt(HKF_ALT, vk_f(6))).unwrap_err();
+        assert!(same_toggle.contains("呼出"), "实得：{same_toggle}");
+        let same_typeback = check(bt(HKF_CONTROL, vk('B'))).unwrap_err();
+        assert!(same_typeback.contains("补字符"), "实得：{same_typeback}");
+        let local = check(bt(HKF_CONTROL, vk('I'))).unwrap_err();
+        assert!(local.contains("固定快捷键"), "实得：{local}");
+    }
+
     #[test]
     fn settings_field_defaults_when_absent_and_round_trips() {
         // 旧 settings.json 没有这个字段 ⇒ #[serde(default)] 必须兜住，不能整份解析失败。
@@ -4319,6 +4475,17 @@ mod hotkey_tests {
         assert_eq!(
             s.typeback_hotkey, None,
             "没有补字符热键字段的老文件应读成 None"
+        );
+        // 批次 E3-丙：次级动作两格同理——老文件里没有这两个键 ⇒ 快捷键版 + Ctrl+Enter。
+        assert_eq!(
+            s.secondary_action,
+            SecondaryAction::Shortcut,
+            "缺字段按用户裁定的默认：快捷键版"
+        );
+        assert_eq!(
+            s.secondary_hotkey,
+            HotkeySpec::SECONDARY_DEFAULT,
+            "缺字段按 FR-ACT-01 原文的 Ctrl+Enter"
         );
 
         let custom = AppSettings {
@@ -4345,6 +4512,15 @@ mod hotkey_tests {
         let back: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.toggle_hotkey, custom.toggle_hotkey);
         assert_eq!(back.typeback_hotkey, custom.typeback_hotkey);
+        // 次级动作形态落盘用稳定名（批次 E3-丙）。
+        assert!(
+            json.contains(r#""secondary_action":"shortcut""#),
+            "形态要写成可读的稳定名，实得：{json}"
+        );
+        assert!(
+            json.contains(r#""secondary_hotkey":{"mods":16386,"vk":13}"#),
+            "Ctrl+Enter = HKF_CONTROL 2 | HKF_NOREPEAT 16384 = 16386，vk 13，实得：{json}"
+        );
         // `null` 也必须认（用户手改文件时写"不要这个键"最自然的写法）。
         let nul = br#"{"toggle_hotkey":{"mods":3,"vk":32},"typeback_hotkey":null}"#;
         let s: AppSettings = serde_json::from_slice(nul).expect("null 应能解析");
@@ -4482,6 +4658,39 @@ mod config_tests {
 
     fn write(p: &Path, text: &str) {
         std::fs::write(p, text.as_bytes()).expect("临时目录写不了");
+    }
+
+    /// 让一个目录"读得进、写不出"——`Corrupted::Lost` 的唯一入口就靠这个造出来。
+    /// 用 SID `*S-1-1-0` 而不是 `Everyone`：中文系统上组名是本地化的，`icacls` 只认英文名或 SID。
+    /// deny 的是 `WD`（写数据/新增数据）、`AD`（追加/建子项）、`DE`（删除）：
+    /// 少了 `DE` 就还能改名（改名要的是文件的 DELETE 权限），少了 `WD/AD` 就还能另存副本，
+    /// 三样缺一样都到不了 `Lost`。
+    struct ReadOnlyDir {
+        dir: PathBuf,
+    }
+
+    impl ReadOnlyDir {
+        fn apply(dir: &Path) -> Option<Self> {
+            let out = std::process::Command::new("icacls")
+                .arg(dir)
+                .arg("/deny")
+                .arg("*S-1-1-0:(OI)(CI)(WD,AD,DE)")
+                .output()
+                .ok()?;
+            out.status.success().then(|| Self {
+                dir: dir.to_path_buf(),
+            })
+        }
+    }
+
+    impl Drop for ReadOnlyDir {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("icacls")
+                .arg(&self.dir)
+                .arg("/remove:d")
+                .arg("*S-1-1-0")
+                .output();
+        }
     }
 
     /// 证伪实验①：某一格类型写错 ⇒ **只兜那一格**，同文件其余字段照读，且不产生 `.bad`。
@@ -4839,6 +5048,47 @@ mod config_tests {
         let (prefs, fault) = load_settings_at(&p);
         assert!(matches!(fault, Some(Corrupted::Kept(_))), "实得 {fault:?}");
         assert_eq!(prefs.confirm_actions, true, "默认值启动");
+    }
+
+    /// 批次 E3：`Corrupted::Lost` 在补这条之前**没有任何一条路径走到过**——唯一提到它的是
+    /// `a_real_list_file_is_an_array_not_a_two_tuple` 里那句"Lost 不该发生"的 panic 断言，
+    /// 也就是说这个分支的正确性全靠读代码。这里把"改名与另存都失败"真造出来：
+    /// 目录 deny 写入（读照常）⇒ 10 个 `.bad` 名额与毫秒时间戳两格都写不出去 ⇒ 必须报 `Lost`，
+    /// 并且**原文件一个字节都不许被碰**——那正是 `Lost` 存在的全部理由。
+    #[test]
+    fn quarantine_reports_lost_when_the_directory_refuses_writes() {
+        let dir = temp_dir("e3-lost");
+        let p = dir.join("user_items.json");
+        let original = b"[1,2]".to_vec();
+        std::fs::write(&p, &original).expect("临时目录写不了");
+
+        let guard = ReadOnlyDir::apply(&dir)
+            .expect("icacls 加 deny 失败 ⇒ 这条测不到 Lost，不许算通过");
+        // 控制实验：deny 真生效的判据是"新建文件失败"。没生效就说明这台机器上
+        // 构造根本没做出来，此时往下跑只会得到一个与 Lost 无关的结果。
+        assert!(
+            std::fs::write(dir.join("acl-control.txt"), b"x").is_err(),
+            "目录仍可新建文件 ⇒ deny 没生效，这条测试的结论不算数"
+        );
+
+        let outcome = quarantine(&p, &original);
+        assert_eq!(outcome, Corrupted::Lost, "两条留证路都写不出时必须报 Lost");
+        assert_eq!(
+            std::fs::read(&p).expect("原文件该还在"),
+            original,
+            "Lost 场景下原文件必须原样留着（这正是调用方不许写盘的理由）"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("读不动目录")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "user_items.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "两路都没留成证，就不该有 .bad / 副本之类的残留，实得 {leftovers:?}"
+        );
+        drop(guard);
     }
 
     /// 「无 BOM」是需求书明写的：写盘首三字节不许是 EF BB BF。

@@ -347,6 +347,25 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
     out
 }
 
+/// 批次 E3-丙（FR-ACT-01「`Ctrl+Enter` 走次级动作」）：快捷键版按这一条判据**直接做一件事**，
+/// 不给面板、也就没有第二次选择。映射只收需求书原文点名的两格，且与面板的准入条件**逐格对齐**
+/// （面板里 `Reveal` 的准入就是 `File` / `Folder` 且路径是文件系统路径，`CopyUrl` 的准入就是
+/// `Url`；两边同一份 `Subject` ⇒ 不存在"面板里有、快捷键说没有"的行）：
+///
+/// - 文件 / 文件夹 ⇒ 所在位置（`explorer /select,`）；
+/// - 网址 / 协议串 ⇒ 复制网址；
+/// - 其余（应用条目、Store 应用、命名项、内置动作行）⇒ `None`，它们要做什么得在面板里选。
+///
+/// 原文第三格「文本 ⇒ 粘贴」**没做**：它与 P1 那五个粘贴 / 批量动作同一个前置（FR-ACT-05 多选），
+/// 不为它开一条没有多选语义的半截实现。
+pub fn secondary_action_for(subject: Subject) -> Option<ActionId> {
+    match subject {
+        Subject::File | Subject::Folder => Some(ActionId::Reveal),
+        Subject::Url => Some(ActionId::CopyUrl),
+        _ => None,
+    }
+}
+
 fn row(id: ActionId, subtitle: &str, keys: &'static str) -> Action {
     Action {
         id,
@@ -747,6 +766,51 @@ mod tests {
             assert!(!id.label().is_empty());
             assert!(!id.keywords().is_empty(), "{id:?} 没有英文别名");
             assert!(!id.badge().is_empty());
+        }
+    }
+
+    /// 批次 E3-丙：快捷键版的映射只收需求书原文点名的两格，其余一律交给面板。
+    #[test]
+    fn shortcut_mapping_is_the_two_cells_the_spec_names() {
+        assert_eq!(secondary_action_for(Subject::File), Some(ActionId::Reveal));
+        assert_eq!(secondary_action_for(Subject::Folder), Some(ActionId::Reveal));
+        assert_eq!(secondary_action_for(Subject::Url), Some(ActionId::CopyUrl));
+        for s in [
+            Subject::App,
+            Subject::StoreApp,
+            Subject::Namespace,
+            Subject::Internal,
+        ] {
+            assert_eq!(secondary_action_for(s), None, "{s:?} 的次级动作得在面板里选");
+        }
+    }
+
+    /// 更硬的一条：**快捷键给出的动作，面板里必须有**——否则两种形态说的就不是同一件事，
+    /// 用户切到面板版会发现"矩阵里没有这一格"。逐 Subject 取上游真实形态的路径来构造。
+    #[test]
+    fn shortcut_never_offers_an_action_the_panel_does_not() {
+        let cases = [
+            (Subject::App, "C:\\Windows\\notepad.exe"),
+            (Subject::App, "calc.exe"),
+            (
+                Subject::StoreApp,
+                "shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            ),
+            (Subject::Namespace, "shell:RecycleBinFolder"),
+            (Subject::Url, "https://example.com/?q=1"),
+            (Subject::Url, "ms-settings:display"),
+            (Subject::File, "C:\\Windows\\notepad.exe"),
+            (Subject::Folder, "C:\\Windows"),
+            (Subject::Internal, "internal:settings"),
+        ];
+        for (subject, path) in cases {
+            let t = target(subject, path);
+            if let Some(id) = secondary_action_for(subject) {
+                assert!(
+                    has(&t, id),
+                    "{subject:?}（{path}）的快捷键动作 {id:?} 在面板里不存在"
+                );
+            }
         }
     }
 }

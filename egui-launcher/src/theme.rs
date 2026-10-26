@@ -723,6 +723,26 @@ pub fn install_fonts(ctx: &egui::Context, font_name: &str) {
         }
         break;
     }
+    // 符号回退（2026-10-26 沙箱截图抓到）：egui 自带那三套字体与微软雅黑都没有 U+2713 `✓`
+    // 和 U+2139 `ℹ`（自带的 emoji 字体只有 `⚠` 那一类），提示条里「✓ 已复制…」整行开头
+    // 显示成方框。Segoe UI Symbol 这几个码位齐全（本机 skrifa 逐字问过），排在链尾——
+    // 只有前面都缺字时才被问到，已有的字形一个都不变。
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
+        if skrifa::FontRef::from_index(&bytes, 0).is_ok() {
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = 0;
+            fonts
+                .font_data
+                .insert("symbol".to_owned(), std::sync::Arc::new(data));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push("symbol".to_owned());
+            }
+        }
+    }
     ctx.set_fonts(fonts);
 }
 
