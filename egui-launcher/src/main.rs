@@ -1077,7 +1077,8 @@ fn top_drag_strip_w(item_spacing_x: f32) -> f32 {
 
 /// 搜索框的占位提示。**批次 F6 起改短**：输入框放大到 22pt 之后，原先那串十来个键名的长提示
 /// 会被输入框右缘裁掉（留半句话比没有更糟）。完整键表有两处入口——☰ 菜单本身（Ctrl+M）
-/// 和查询框打 `?` 的速查表（批次 A8，2026-10-24 批次 F6 起 **37 条**）。
+/// 和查询框打 `?` 的速查表（批次 A8 起有；批次 F6 那阵注释里写的是 37 条，
+/// 2026-10-26 批次 B8 之后现量 52 条——`grep -c '^    CheatEntry {' src/source/cheatsheet.rs` 随时可复量）。
 const SEARCH_HINT: &str = "搜索…（Enter 运行 · Ctrl+M 菜单 · ? 帮助 · Esc 关闭）";
 
 /// 状态栏开着时的占位提示（FR-UIX-08「两者耦合」的定义）：键位说明已经落在状态栏左/右两格，
@@ -1449,6 +1450,22 @@ fn take_fresh_key(ctx: &egui::Context, wanted: egui::Key) -> bool {
     fresh
 }
 
+/// 本帧有没有「不带任何修饰键的 Backspace 按下」——**只读不收**，这是它与 [`take_fresh_key`] 的分工。
+///
+/// 批次 B8（2026-10-26）用它换掉 `i.key_pressed(Backspace)`：`key_pressed` 不看修饰键，于是面板里
+/// 过滤词为空时按 `Ctrl+Backspace`（egui 原生「删前一个词」）会**同时**被判成「退出面板」，
+/// 一次按键干两件事，且删词那一半根本没字可删（真机抓到的正是这一格）。
+/// 刻意不 `retain`：退格事件还要留给 TextEdit 做真正的删词/删字符，收走它等于把输入框的退格弄聋。
+fn fresh_plain_backspace(ctx: &egui::Context) -> bool {
+    ctx.input(|i| {
+        i.events.iter().any(|ev| {
+            matches!(ev,
+                egui::Event::Key { key: egui::Key::Backspace, pressed: true, modifiers, .. }
+                if *modifiers == egui::Modifiers::NONE)
+        })
+    })
+}
+
 // ---- 批次 E4（FR-ACT-05）：多标记与批量 ----
 
 /// 这一行可标记的路径（`None` = 这一行不是文件/文件夹）。
@@ -1564,6 +1581,80 @@ fn caret_at_end(ctx: &egui::Context, query: &str) -> bool {
     // `index` 是 `CharIndex`（0.36 的字符下标新类型，`.0` 才是那个 `usize`），
     // 所以右边也得按"字符数"给，按字节比会在中文查询上判错。
     range.primary.index.0 >= query.chars().count()
+}
+
+/// `Ctrl+C` 这一格让不让给输入框（批次 B8，FR-ACT-10 附录 A）。
+///
+/// 让出的条件与 egui 的 TextEdit **读同一份状态**：焦点在查询框且选区非空。
+/// `builder.rs:1114` 那句就是 `Event::Copy => if !cursor_range.is_empty() { 复制选区 }`，
+/// 而它用的 `state.cursor` 正是这里 `load` 出来的那一份（折叠选区在 `builder.rs:556-566`
+/// 就地写回）⇒ 判据不可能和控件自己的判断错开。没有选区时 TextEdit 对 `Copy` 什么都不做，
+/// 这一格才归本程序的「复制这一行」——与 AHK 版
+/// `SearchWindow.ahk:1408` 的 `if (shift || _HasTextSelection()) return;` 同口径。
+fn query_box_owns_copy(ctx: &egui::Context) -> bool {
+    if !ctx.memory(|mem| mem.has_focus(search_field_id())) {
+        return false;
+    }
+    let Some(st) = egui::widgets::text_edit::TextEditState::load(ctx, search_field_id()) else {
+        return false;
+    };
+    // `char_range()` 为 `None` = 从没点过输入框；`is_empty()` = 只有一个插入点、没有选区。
+    st.cursor.char_range().is_some_and(|r| !r.is_empty())
+}
+
+/// 这一帧有没有 `Ctrl+C`（批次 B8）。
+///
+/// **不能**写成 `consume_key(MODIFIERS_COMMAND, Key::C)`：egui-winit 在源头就把 Ctrl+C 折成
+/// 一条 `Event::Copy` 然后 `return`（`egui-winit-0.36.2/src/lib.rs:1019-1027`），
+/// `Event::Key{ C, ctrl }` 根本不会进队列 ⇒ 那条分支编译通过、单测只要不投 `Event::Copy`
+/// 也照样"通过"，真机上却是一颗永远不响的死键（`consume_key` 那一类"绿检 ≠ 对测"的老坑，
+/// 见 [[feedback-workflow-rules]]）。命中后把这条 `Copy` 摘掉：不摘的话同帧稍后渲染的
+/// TextEdit 也会吃到它，一次按键往剪贴板写两遍。
+fn take_copy_press(events: &mut Vec<egui::Event>, yield_to_text_edit: bool) -> bool {
+    if yield_to_text_edit {
+        return false;
+    }
+    let Some(pos) = events.iter().position(|e| matches!(e, egui::Event::Copy)) else {
+        return false;
+    };
+    events.remove(pos);
+    true
+}
+
+/// 滚轮 → 本帧的选中位移（`-1` / `0` / `+1`），批次 B8（FR-ACT-10 附录 A「滚轮移动选中」）。
+///
+/// 只看纵向净增量的**符号**、不看量：一格滚轮移一行是 AHK `_OnMouseWheel`
+/// （`SearchWindow.ahk:1542` `MoveSelection(delta >= 0x8000 ? 1 : -1)`）的口径；照像素走会因为
+/// 鼠标不同、`line_scroll_speed` 不同而"一格跳好几行"。同一帧内先求和 ⇒ 上下各来一条等于没动。
+///
+/// 符号两头都对过源码：`delta.y > 0` 是"往上滚"（`event.rs:157-161` 说正向=内容向下移、露出前面的行，
+/// `scroll_area.rs:1234` 也正是拿正向增量去减 `offset`）⇒ 选中往**上**走 `-1`，与 AHK 反向那半格一致。
+///
+/// 读原始 `Event::MouseWheel` 而不是 `i.smooth_scroll_delta()`：后者被 egui 的滚轮平滑器拆成几帧
+/// 吐出（`input_state/wheel_state.rs:138-143` 对 `Unit::Line` 一律先存进 `unprocessed_wheel_delta`，
+/// 再由 `after_events` 逐帧分账），按住一格滚轮会让选中连跳好几行；而那个状态机是
+/// `InputState` 的**私有字段**（`mod.rs:227`），外面清不掉 ⇒ 只能不去读它。
+/// 配套的"这一帧别让列表自己吃滚轮"在渲染处用 `ScrollSource { mouse_wheel: false }` 关。
+/// 带任何修饰键的滚轮不接管（Shift=横向、Alt=纵向覆盖、Ctrl=缩放，见 `mod.rs:117-118`），留给 egui。
+fn wheel_selection_step(events: &[egui::Event]) -> i32 {
+    let net: f32 = events
+        .iter()
+        .filter_map(|e| match e {
+            egui::Event::MouseWheel { delta, modifiers, .. }
+                if *modifiers == egui::Modifiers::NONE =>
+            {
+                Some(delta.y)
+            }
+            _ => None,
+        })
+        .sum();
+    if net > 0.0 {
+        -1
+    } else if net < 0.0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// 「这一串此刻在不在盘上」——只有对该形态是路径的串才去 `stat`，
@@ -2067,6 +2158,24 @@ fn open_log_file() {
     }
 }
 
+/// F4（批次 B8，FR-ACT-10 附录 A「打开配置文件」）：打开配置所在的目录。
+///
+/// 口径偏差入档：需求书这一句在 AHK 版对着"打开 `settings.ini` 那一个文件"，本程序的现场是
+/// 同一个数据目录里的**两份 JSON 加一份日志**（`settings.json` / `user_items.json` /
+/// `launcher.log`）⇒ 没有"那一个文件"可开，开目录让用户自己在资源管理器里挑。
+/// 走 [`shell_execute`] 的系统关联程序（与「打开日志」同一条路），不另起 `explorer.exe`。
+/// 返回 `Err(原因)` 给调用方出 Toast：点了没反应比点了有话说更糟。
+fn open_config_folder() -> Result<(), String> {
+    let dir = source::application::data_dir();
+    if !dir.exists() {
+        return Err(format!("配置目录还不存在：{}", dir.display()));
+    }
+    let path = dir.display().to_string();
+    shell_execute(&path, "", None).map_err(|e| format!("打开配置目录失败：{e}"))?;
+    eprintln!("快捷键 F4：打开配置目录（{path}）");
+    Ok(())
+}
+
 // ---- 批次 A2（FR-SRC-17）内置动作的两条系统调用 ----
 
 /// 起一条控制台工具（`shutdown.exe`）。本程序是 GUI 子系统，不起控制台；
@@ -2225,8 +2334,9 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     slot.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 本程序自己占用的组合（录制端落定前的预检表）。**表里的每一条都对着 `ui()` 里一次真实的
-/// `consume_key`**（Ctrl+Shift+N 新建、Ctrl+E 编辑、Ctrl+I 批量导入、Ctrl+D 打开目录、
+/// 本程序自己占用的组合（录制端落定前的预检表）。**表里的每一条都对着 `ui()` 里一次真实的取键**
+/// （`consume_key`、`take_fresh_key`，以及批次 B8 那一下走 `take_copy_press` 的复制）
+/// （Ctrl+Shift+N 新建、Ctrl+E 编辑、Ctrl+I 批量导入、Ctrl+D 打开目录、
 /// Ctrl+Shift+D 删除、Ctrl+Shift+P 置顶、Ctrl+N/P 与 Ctrl+J/K 循环导航、Ctrl+M 开 ☰ 主菜单、
 /// Ctrl+L 大字显示、Ctrl+数字 与 Alt+数字 执行第 N 行），
 /// 不多写一条：表是"避让本程序的功能键"，不是"避开所有看着眼熟的键"，多出来的条目会白白
@@ -2241,8 +2351,14 @@ fn hotkey_lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// 没有一处是 `consume_key`。】
 /// 【2026-10-24 批次 F7 补一条：`Ctrl+Del`（主界面隐藏出厂条目）同样不进表——`Delete`
 /// 不在可录集合里，录制端永远产不出这个组合，也就撞不上；表只收改得出来的组合。】
+/// 【2026-10-26 批次 B8 破一处先例：上面那句"裸键录不进来"**对 F1–F4 不成立**——
+/// [`HotkeySpec::check`] 对功能键放行不带修饰（`application.rs:957` 的 `if function { return Ok(()) }`），
+/// 所以裸 `F1`…`F4` 是录得出来的组合，本程序绑了它们就必须进表。同批的 `Ctrl+C` 更硬：
+/// egui-winit 把 Ctrl+C 折成 `Event::Copy` 后**不再投递 `Event::Key`**
+/// （`egui-winit-0.36.2/src/lib.rs:1019-1027`），窗口内热键录成这一组会永远等不到自己那一帧。】
 /// 表里的修饰键一律不带 `HKF_NOREPEAT`（比对时两边都剥）。
 const LOCAL_TAKEN: &[(u32, u32)] = &[
+    (HKF_CONTROL, 0x43),             // Ctrl+C 复制这一行（批次 B8；复制的不是选中文本，见 take_copy_press）
     (HKF_CONTROL, 0x44),             // Ctrl+D 打开所在目录
     (HKF_CONTROL, 0x45),             // Ctrl+E 编辑选中项
     (HKF_CONTROL, 0x47),             // Ctrl+G 缺省分类范围 all ⇄ basic（批次 G1）
@@ -2277,6 +2393,13 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_ALT, 0x37),
     (HKF_ALT, 0x38),
     (HKF_ALT, 0x39),
+    // 批次 B8（FR-ACT-10）：裸 F1–F4。0x70..=0x73 就是 VK_F1..VK_F4，`take_fresh_key` 只认
+    // 不带修饰的那一层，所以 `Ctrl+F1` / `Alt+F1` 仍然留给用户录；把这四格裸键登记进表，
+    // 挡的是"录成全局呼出键 ⇒ 系统整条吞掉，窗口里那颗 F1 就此失聪"（同批次 R 裸 `` ` `` 那一层代价）。
+    (0, 0x70), // F1 关于本程序
+    (0, 0x71), // F2 打开 / 返回设置页（Ctrl+, 的别名）
+    (0, 0x72), // F3 编辑选中项（Ctrl+E 的别名）
+    (0, 0x73), // F4 打开配置文件所在目录
 ];
 
 /// `egui::Key` → Virtual-Key。**逐个列举、不做算术**：egui 的 `Key` 枚举没有显式判别值
@@ -4706,7 +4829,7 @@ impl LauncherApp {
                                     ("Enter", "运行选中项；弹窗/确认框确定；无匹配弹新增"),
                                     ("Esc", "关 ☰ 菜单 → 关确认框 → 关弹窗 → 设置页返回 → 清空输入 → 关闭到托盘（按序）"),
                                     ("Ctrl+Shift+N", "新建快捷项（选中的是文件行时预填这一行的路径与类型）"),
-                                    ("Ctrl+E", "编辑选中项"),
+                                    ("Ctrl+E / F3", "编辑选中项（F3 是批次 B8 加的别名，同一条路；面板开着时都不接管）"),
                                     ("Delete", "删除选中项（仅输入为空时；弹确认框）"),
                                     ("Ctrl+Shift+D", "删除选中项（不受输入限制；弹确认框）"),
                                     ("Ctrl+D", "打开选中项所在目录（文件行：在资源管理器里定位这个文件）"),
@@ -4721,7 +4844,11 @@ impl LauncherApp {
                                     (" 报告（空格开头）", "第六式：空格开头进文件模式（Shift+空格 插入的那个真空格）"),
                                     ("文件行右键", "复制路径 / 在资源管理器中显示 / 添加为快捷项（文件行不在清单里 ⇒ 编辑、删除、置顶对它不适用）"),
                                     ("Ctrl+I", "批量导入全部"),
-                                    ("Ctrl+,", "打开 / 返回设置页"),
+                                    ("Ctrl+, / F2", "打开 / 返回设置页（F2 是批次 B8 加的别名；两颗键在设置页上也照样有效）"),
+                                    ("F1", "关于本程序：版本、程序位置、清单条数（Esc 关闭；批次 B8）"),
+                                    ("F4", "打开配置文件所在的目录（settings.json / user_items.json / launcher.log 都在那一层；批次 B8）"),
+                                    ("Ctrl+C", "复制当前这一行：文件取路径、计算器取数字、应用与命令取名称（批次 B8）；输入框里有选区时先复制选中的文字；不关窗"),
+                                    ("鼠标滚轮", "在结果列表上滚一格＝选中上/下一行，两端夹住不回绕；列表位置仍由「滚动跟随选中」负责（批次 B8）"),
                                 ] {
                                     ui.label(egui::RichText::new(key).monospace());
                                     ui.label(desc);
@@ -6910,16 +7037,31 @@ impl eframe::App for LauncherApp {
             // 「打开日志」**不配快捷键**（用户 2026-10-19 裁定「不必要弄一个快捷键，将来有其他需求
             // 替换掉就可以」）⇒ 只走托盘菜单那一条路，Ctrl+Shift+L 已释放。这条也是「每个功能必须
             // 配快捷键」那条立规的第二例外（第一例外是批次 K 的"设置页开关类不另配键"）。
+            // ---- 批次 B8（FR-ACT-10 附录 A）：F1 关于 / F2 设置 ----
+            // 这两颗开的是"整窗口级"的界面（关于弹窗、设置页），搜索页与设置页都该有效，所以在
+            // 下面那个 `!settings_open` 分岔**之前**取键。裸功能键走 `take_fresh_key`：只认不带修饰
+            // 那一层（`Ctrl+F1`、`Alt+F1` 仍留给用户录），手法与 `→`/`←`/`Insert` 同一条口径。
+            let hit_f1 = take_fresh_key(ui.ctx(), egui::Key::F1);
+            let hit_f2 = take_fresh_key(ui.ctx(), egui::Key::F2);
+            if hit_f1 {
+                self.about_open = true;
+                // 与 Ctrl+, 同一条理由：☰ 只在搜索页渲染，键盘打开别的界面时必须把旗标落下，
+                // 否则回到搜索页那一帧会带着一个"没人负责关闭"的菜单。
+                self.menu_open = false;
+                eprintln!("快捷键 F1：打开「关于本程序」");
+                ui.ctx().request_repaint();
+            }
             let hit_comma =
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma));
-            if hit_comma {
+            if hit_comma || hit_f2 {
                 self.settings_open = !self.settings_open;
                 self.focus_query = true;
                 // 批次 F6：☰ 只在搜索页渲染 ⇒ 进设置页必须先把旗标落下，
                 // 否则回到搜索页的第一帧会带着一个"没人负责关闭"的菜单。
                 self.menu_open = false;
                 eprintln!(
-                    "快捷键 Ctrl+,：设置页 {}",
+                    "快捷键 {}：设置页 {}",
+                    if hit_f2 { "F2" } else { "Ctrl+," },
                     if self.settings_open {
                         "打开"
                     } else {
@@ -6928,6 +7070,18 @@ impl eframe::App for LauncherApp {
                 );
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
+                // ---- 批次 B8（FR-ACT-10 附录 A）：F3 编辑 · F4 打开配置文件 · Ctrl+C 复制这一行 ----
+                // `F3` 与 `Ctrl+C` 的对象都是"当前高亮的那一行"⇒ 面板开着时不接管（那一屏的"这一行"
+                // 是一条动作，复制/编辑它反而说不清指谁；`Insert` 在批次 E4 同口径让位）。
+                // `F4` 开的是配置目录，与选中行无关⇒ 面板里也照常有效，跟 F1/F2 一样不设这道闸。
+                let hit_f3 = self.panel.is_none() && take_fresh_key(ui.ctx(), egui::Key::F3);
+                let hit_f4 = take_fresh_key(ui.ctx(), egui::Key::F4);
+                // `Ctrl+C` 先问输入框有没有活要干：焦点在查询框且选区非空 ⇒ 让给 egui 复制选中的文字
+                //（判据与 TextEdit 读同一份 `TextEditState`，见 [`query_box_owns_copy`]）。
+                // 不能用 `consume_key(COMMAND, C)`——那颗键在 egui-winit 就被折成 `Event::Copy` 了。
+                let yield_copy = query_box_owns_copy(ui.ctx());
+                let hit_copy = self.panel.is_none()
+                    && ui.input_mut(|i| take_copy_press(&mut i.events, yield_copy));
                 // Ctrl+Shift+N 新建、Ctrl+Shift+P 置顶、Ctrl+Shift+D 删除（2026-10-22 用户改键：
                 // Ctrl+N/Ctrl+P 让给"下一项/上一项"，与需求书 FR-ACT-10 原文的 `Ctrl+P/N` 移动对齐；
                 // 置顶挪到 Shift 层，与新建同层对称）。
@@ -6958,6 +7112,11 @@ impl eframe::App for LauncherApp {
                         hot(egui::Modifiers::COMMAND, egui::Key::L),
                     )
                 };
+                // 批次 B8：`F3` 就是 `Ctrl+E` 的别名（需求书附录 A 那两格写的是同一个动作）⇒ 直接
+                // 并进去，下面编辑那三处判据一处都不用改。`edit_via` 只为日志能分清这一下是哪颗键
+                // （`Ctrl+E` 原本在现场不留一行日志，真机取证时"F3 到底走没走到"就没有可读的凭据）。
+                let edit_via: &'static str = if hit_f3 { "F3" } else { "Ctrl+E" };
+                let hit_e = hit_e || hit_f3;
                 // 裸 Delete 只在搜索框为空时接管：有输入时它是文本编辑键，不能抢。
                 let hit_del = self.query.trim().is_empty()
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
@@ -7078,9 +7237,7 @@ impl eframe::App for LauncherApp {
                     None
                 } else if take_fresh_key(ui.ctx(), egui::Key::ArrowLeft) {
                     Some("←")
-                } else if self.query.is_empty()
-                    && ui.input(|i| i.key_pressed(egui::Key::Backspace))
-                {
+                } else if self.query.is_empty() && fresh_plain_backspace(ui.ctx()) {
                     Some("空输入的 Backspace")
                 } else {
                     None
@@ -7158,6 +7315,74 @@ impl eframe::App for LauncherApp {
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
                             eprintln!("快捷键 Insert：第 {} 行不是文件/文件夹，未标记", here + 1);
+                        }
+                    }
+                } else if hit_copy {
+                    // FR-ACT-10 附录 A「`Ctrl+C` 复制」：复制**当前这一行**。内容 = FR-UIX-10 大字
+                    // 显示那一串（同一条 [`large_text_of`]，也就是 AHK `ResultItem.CopyText()` 的口径：
+                    // 文件/目录/网址取路径、计算器取纯数字、应用与命令取名称）。
+                    // 查询框里选中的文字在上面已经让出去了，这一格碰不到它。
+                    // **与 AHK 的一处有意偏差**：AHK `_CopySelected()` 复制前把搜索窗 `Hide()`
+                    //（`SearchWindow.ahk:1481`），这里让窗口留在原地——复制完通常紧接着要粘到别处，
+                    // 关窗会让用户以为按键没生效；与本程序面板里那三条复制同口径（复制不关窗）。
+                    let text = {
+                        let plan = self.plan();
+                        let item = item_rank(self.selected, plan.head.len())
+                            .and_then(|r| plan.results.get(r))
+                            .map(|i| &self.items[*i]);
+                        // 第三个参数给空串：`large_text_of` 的"没有选中行"兜底是回落到查询原文，
+                        // 那是 Ctrl+L 大字的语义（AHK `_ShowLargeType` 的 `Input.Value`）；
+                        // 复制要的是"这一行"，一行都没有时必须什么都不复制（AHK `_CopySelected` 同）。
+                        large_text_of(plan.head.get(self.selected), item, "")
+                    };
+                    match text {
+                        Some(text) => match copy_to_clipboard(&text) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "快捷键 Ctrl+C：已复制这一行（{} 个字符，内容不落日志）",
+                                    text.chars().count()
+                                );
+                                self.toast = Some((
+                                    format!("✓ 已复制：{text}"),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_OK,
+                                ));
+                                ui.ctx().request_repaint_after(TOAST_TTL);
+                            }
+                            Err(e) => {
+                                eprintln!("快捷键 Ctrl+C：复制失败：{e}");
+                                self.toast = Some((
+                                    format!("⚠ 复制失败：{e}"),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_ERR,
+                                ));
+                                ui.ctx().request_repaint_after(TOAST_TTL);
+                            }
+                        },
+                        None => {
+                            eprintln!("快捷键 Ctrl+C：这一屏没有可复制的行（选中第 {} 行）", self.selected + 1);
+                            self.toast = Some((
+                                "⚠ 这一屏没有可复制的行".to_string(),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_ERR,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                        }
+                    }
+                } else if hit_f4 {
+                    match open_config_folder() {
+                        Ok(()) => {
+                            self.menu_open = false;
+                            ui.ctx().request_repaint();
+                        }
+                        Err(e) => {
+                            eprintln!("快捷键 F4：{e}");
+                            self.toast = Some((
+                                format!("⚠ {e}"),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_ERR,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
                         }
                     }
                 } else if hit_cm {
@@ -7307,6 +7532,10 @@ impl eframe::App for LauncherApp {
                         let name = s.name.clone();
                         let (path, source_path) = (s.path.clone(), s.source_path.clone());
                         if hit_e {
+                            eprintln!(
+                                "快捷键 {edit_via}：弹出编辑对话框（第 {} 行，名称不落日志）",
+                                self.selected + 1
+                            );
                             self.dialog = Some(DialogState::from_item(&s));
                             self.dialog_enter_armed = true;
                         } else if hit_csp {
@@ -7964,13 +8193,33 @@ impl eframe::App for LauncherApp {
                     self.selected = 0;
                 }
                 // 键盘导航：↑↓ 移动选中，Enter 运行选中项。对话框/确认框开着时让位给它们（Enter=确定）。
-                if self.dialog.is_none()
+                let keys_live = self.dialog.is_none()
                     && self.confirm.is_none()
                     && self.batch_confirm.is_none()
                     && self.internal_confirm.is_none()
                     && !self.about_open
-                    && self.help_entry.is_none()
-                {
+                    && self.help_entry.is_none();
+                // 批次 B8（FR-ACT-10 附录 A「滚轮移动选中」，口径同 AHK `_OnMouseWheel`）：
+                // 一格滚轮 = 选中上/下一行，两端夹住不回绕（与 ↑↓ 同一条边界）。列表位置不另外滚，
+                // 交给下面既有的"选中跟随"（`follow_selection` → `scroll_to_me(Align::Center)`），
+                // 所以滚轮仍然看得见后面的行，只是每格走一行——要快走有 PgUp/PgDn 一整页。
+                // 配套的"这段列表不直接吃滚轮"在 `ScrollArea::scroll_source` 那一句，判据同 `keys_live`：
+                // 两头必须用同一个条件，否则会出现"移了选中又按平滑增量滚了一截列表"的两倍位移。
+                if keys_live {
+                    let wheel = ui.input(|i| wheel_selection_step(&i.events));
+                    if wheel != 0 {
+                        let before = self.selected;
+                        if wheel > 0 {
+                            self.selected = (self.selected + 1).min(total - 1);
+                        } else {
+                            self.selected = self.selected.saturating_sub(1);
+                        }
+                        if self.selected != before {
+                            eprintln!("滚轮：选中移到第 {} 行（共 {total} 行）", self.selected + 1);
+                        }
+                    }
+                }
+                if keys_live {
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         self.selected = (self.selected + 1).min(total - 1);
                     } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
@@ -8036,6 +8285,13 @@ impl eframe::App for LauncherApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .max_height(list_h)
+                    // 批次 B8：滚轮这一格归"移动选中"（上面那段），列表不再直接吃滚轮；
+                    // 滚动条拖拽与触摸拖滚照常留着，键盘（↑↓/PgUp）也照常。
+                    // `!keys_live` 时（弹窗/确认框/关于页盖在上面）恢复默认行为，那时选中不跟着动。
+                    .scroll_source(egui::containers::scroll_area::ScrollSource {
+                        mouse_wheel: !keys_live,
+                        ..Default::default()
+                    })
                     .show(ui, |ui| {
                         ui.spacing_mut().interact_size.y = row_h;
                         ui.spacing_mut().item_spacing.y = row_spacing;
@@ -10840,6 +11096,49 @@ mod nav_tests {
             .conflicts_local(LOCAL_TAKEN),
             "Ctrl+L 大字显示，必须被本地表挡住"
         );
+        // ---- 批次 B8（FR-ACT-10）新增的五格 ----
+        // `Ctrl+C`：本程序绑了"复制这一行"，必须挡。不挡的代价不是崩，是**静默降级**——
+        // 窗口内热键录成 Ctrl+C 后 `local_hotkey_hits` 永远等不到那条 `Event::Key`
+        //（egui-winit 在源头就把它折成 `Event::Copy` 了），用户改完键得到一颗死键。
+        assert!(
+            HotkeySpec {
+                mods: HKF_CONTROL | HKF_NOREPEAT,
+                vk: 0x43
+            }
+            .conflicts_local(LOCAL_TAKEN),
+            "Ctrl+C 复制这一行，必须被本地表挡住"
+        );
+        // 裸 F1–F4：`HotkeySpec::check` 对功能键放行不带修饰 ⇒ 这四颗是**真录得出来**的裸键
+        //（与"裸键录不进来"那条先例不同，见 `LOCAL_TAKEN` 上方的 2026-10-26 注记）。
+        for vk in [0x70u32, 0x71, 0x72, 0x73] {
+            let bare = HotkeySpec {
+                mods: HKF_NOREPEAT,
+                vk,
+            };
+            assert!(bare.check().is_ok(), "裸 F 键必须录得进来，否则表里这条是空的");
+            assert!(
+                bare.conflicts_local(LOCAL_TAKEN),
+                "裸 0x{vk:02X} 本程序绑了，必须被本地表挡住"
+            );
+            // 带修饰那一层仍然留给用户（`take_fresh_key` 只认 `Modifiers::NONE`）。
+            assert!(
+                !HotkeySpec {
+                    mods: HKF_CONTROL | HKF_NOREPEAT,
+                    vk
+                }
+                .conflicts_local(LOCAL_TAKEN),
+                "Ctrl+F(0x{vk:02X}) 本程序没绑，该让用户录"
+            );
+        }
+        // 只绑到 F4：F5 往后没占用，不许顺手多挡一条（表越宽，用户能录的组合越少）。
+        assert!(
+            !HotkeySpec {
+                mods: HKF_NOREPEAT,
+                vk: 0x74
+            }
+            .conflicts_local(LOCAL_TAKEN),
+            "F5 本程序没绑，不该出现在表里"
+        );
     }
 
     #[test]
@@ -10919,6 +11218,123 @@ mod nav_tests {
         assert_eq!(
             large_text_of(Some(&calc), Some(&url), ""),
             Some("https://example.com/?q=1".to_string())
+        );
+    }
+
+    /// 批次 B8-甲：`Ctrl+C` 的取键通道。
+    ///
+    /// **输入形态照上游真实赋值构造**（不是照"我以为 winit 会投什么"）：
+    /// `egui-winit-0.36.2/src/lib.rs:1019-1027` 在 Ctrl+C 上只 push 一条 `Event::Copy`
+    /// 然后 `return`，一条 `Event::Key{ C, ctrl }` 都不会进队列。所以这里既要钉住
+    /// "`Event::Copy` 才算命中"，也要钉住"光有 `Key{C}` 不算"——后者正是那条会编译、
+    /// 会绿、真机上永远是死键的写法（`consume_key(COMMAND, C)`）。
+    #[test]
+    fn copy_press_reads_the_copy_event_and_not_the_c_key() {
+        // ① 真机形态：只有 Event::Copy ⇒ 命中，且事件被摘走（同帧 TextEdit 不能再复制一遍）。
+        let mut events = vec![egui::Event::Copy, egui::Event::Copy];
+        assert!(take_copy_press(&mut events, false));
+        assert_eq!(events.len(), 1, "只摘走一条，另一条留给下一帧的同一判据");
+        assert!(take_copy_press(&mut events, false));
+        assert!(events.is_empty(), "命中过的那条必须从队列里消失");
+
+        // ② 只有 Key{C, ctrl}：不算命中（这正是 consume_key 那条死键的现场）。
+        let mut events = vec![egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: Some(egui::Key::C),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }];
+        assert!(
+            !take_copy_press(&mut events, false),
+            "`Event::Key{{C, ctrl}}` 在本机永远不会出现，不许当成命中"
+        );
+        assert_eq!(events.len(), 1);
+
+        // ③ 输入框有选区 ⇒ 让位：返回 false，且**不许**摘走那条 Copy（否则选中文本复制就死了）。
+        let mut events = vec![egui::Event::Copy];
+        assert!(!take_copy_press(&mut events, true));
+        assert_eq!(events.len(), 1, "让位时事件必须原样留给 TextEdit");
+
+        // ④ 剪切板上的邻居不许混进来：Cut / Paste 都不算复制这一行。
+        let mut events = vec![egui::Event::Cut, egui::Event::Paste("x".into())];
+        assert!(!take_copy_press(&mut events, false));
+        assert_eq!(events.len(), 2);
+    }
+
+    /// 批次 B8-丙：滚轮 → 选中位移。符号口径两头都对过源码
+    /// （`data/input/event.rs:157-161` 正向=内容向下移=往上翻；`scroll_area.rs:1234` 拿正向去减
+    /// `offset`；AHK `_OnMouseWheel` 反向上滚给 `MoveSelection(-1)`）⇒ 向上滚 = `-1`。
+    #[test]
+    fn wheel_moves_selection_one_row_per_notch() {
+        let wheel = |y: f32, mods: egui::Modifiers| {
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, y),
+                phase: egui::TouchPhase::Move,
+                modifiers: mods,
+            }
+        };
+        let none = egui::Modifiers::NONE;
+        // 向下滚（负向）= 下一行；向上滚 = 上一行。
+        assert_eq!(wheel_selection_step(&[wheel(-1.0, none)]), 1);
+        assert_eq!(wheel_selection_step(&[wheel(1.0, none)]), -1);
+        // 一格一行，不看量：触控板一条大增量、`Unit::Point` 的连续滚动都只走一行。
+        assert_eq!(wheel_selection_step(&[wheel(-14.0, none)]), 1);
+        assert_eq!(
+            wheel_selection_step(&[wheel(-1.0, none), wheel(-1.0, none), wheel(-1.0, none)]),
+            1,
+            "同帧三条也只移一行（连续滚由每一帧各管一次）"
+        );
+        // 一帧内上下各一条 = 抵消，不动选中。
+        assert_eq!(wheel_selection_step(&[wheel(-1.0, none), wheel(1.0, none)]), 0);
+        // 带任何修饰键不接管：Ctrl=缩放、Shift=横向、Alt=egui 的纵向覆盖，都留给 egui。
+        assert_eq!(wheel_selection_step(&[wheel(-1.0, egui::Modifiers::COMMAND)]), 0);
+        assert_eq!(wheel_selection_step(&[wheel(-1.0, egui::Modifiers::SHIFT)]), 0);
+        assert_eq!(wheel_selection_step(&[wheel(-1.0, egui::Modifiers::ALT)]), 0);
+        // 别的键事件不算滚轮。
+        assert_eq!(
+            wheel_selection_step(&[egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: none,
+            }]),
+            0
+        );
+        assert_eq!(wheel_selection_step(&[]), 0);
+    }
+
+    /// 批次 B8-丙：`Ctrl+C` 复制的"这一行"就是大字那一串，但**没有选中行时必须什么都不是**。
+    /// 第三个参数传空串是这条与 `Ctrl+L` 唯一的差别：大字按 AHK `_ShowLargeType` 回落到输入框原文，
+    /// 复制按 AHK `_CopySelected`（`item` 取不到就 `return`）——把查询原文复制走是另一件事。
+    #[test]
+    fn copy_line_of_row_uses_the_same_text_but_never_the_query() {
+        use crate::source::calc::CalcHit;
+
+        let calc = HeadRow::Calc(CalcHit {
+            title: "= 14".into(),
+            subtitle: String::new(),
+            copy: "14".into(),
+        });
+        assert_eq!(large_text_of(Some(&calc), None, ""), Some("14".to_string()));
+        let app = LaunchItem {
+            name: "记事本".into(),
+            kind: ItemKind::App,
+            path: "C:\\Windows\\System32\\notepad.exe".into(),
+            ..Default::default()
+        };
+        assert_eq!(large_text_of(None, Some(&app), ""), Some("记事本".to_string()));
+        assert_eq!(
+            large_text_of(None, None, "jsq"),
+            Some("jsq".to_string()),
+            "大字那侧：没有选中行就用输入框原文（这条不许被复制改掉）"
+        );
+        assert_eq!(
+            large_text_of(None, None, ""),
+            None,
+            "复制这侧：一行都没有 ⇒ 什么都不复制（空串喂的是查询回落那一格）"
         );
     }
 

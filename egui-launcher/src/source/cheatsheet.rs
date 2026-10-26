@@ -482,12 +482,14 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: None,
     },
     CheatEntry {
-        key: "Ctrl+E",
+        key: "Ctrl+E / F3",
         title: "编辑选中项",
         summary: "改名称 / 关键字 / 命令行",
         detail: "编辑清单里的那一条。文件搜索行不在清单里，对它不适用（它对「添加为快捷项」有意义）。\n\
-                 内置命令（系统命令分组）的类型是只读的，改不了运行方式。",
-        tags: "key 编辑 edit",
+                 内置命令（系统命令分组）的类型是只读的，改不了运行方式。\n\
+                 `F3` 是批次 B8（2026-10-26，需求书附录 A）加的别名，与 `Ctrl+E` 完全同一条路；\n\
+                 操作面板开着时两者都不接管（跟 `Insert` 同口径）。",
+        tags: "key f3 编辑 edit",
         group: Group::Keys,
         source: None,
         settings_page: None,
@@ -590,11 +592,69 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: None,
     },
     CheatEntry {
-        key: "Ctrl+,",
+        key: "Ctrl+C",
+        title: "复制这一行",
+        summary: "文件取路径、计算器取数字、应用取名称；不关窗",
+        detail: "复制的是当前高亮那一行的「可复制内容」，与 `Ctrl+L` 大字显示同一串（批次 B8，2026-10-26）：\n\
+                 文件 / 目录 / 网页搜索行取路径或网址，计算器行取算出来的数字，\n\
+                 清单里的应用与命令取名称，参数提示行取命令原文。\n\
+                 搜索框里有焦点且选中了文字时，这一颗键让给输入框——复制的是你选中的那段字，不是列表行。\n\
+                 复制完窗口留在原地（AHK 版是复制即关窗，这里不关，方便接着 Ctrl+V）。\n\
+                 这一屏没有可复制的行时只给一句提示。复制的内容不写日志，只记字符数。",
+        tags: "key ctrl c 复制 copy 剪贴板",
+        group: Group::Keys,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
+        key: "F1",
+        title: "关于本程序",
+        summary: "版本、程序位置、清单条数；Esc 关闭",
+        detail: "弹窗里有版本号、exe 的路径、当前清单条目数，和一句「日志不记查询框原文」的说明。\n\
+                 批次 B8（2026-10-26，需求书附录 A）新增；与 `F2` 同为「整窗口级」，\n\
+                 设置页开着时照样按得动。☰ 菜单里没有这一项，托盘菜单里也没有。\n\
+                 关闭：Esc 或点「关闭 (Esc)」，关掉后焦点回到搜索框。",
+        tags: "key f1 关于 about 版本",
+        group: Group::Keys,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
+        key: "F4",
+        title: "打开配置文件所在目录",
+        summary: "在资源管理器里打开配置目录（不是单个文件）",
+        detail: "需求书附录 A 原文是「打开配置文件」，这里打开的是那个目录：\n\
+                 目录里同时有 `settings.json`、`user_items.json` 和 `launcher.log`，\n\
+                 指到某一个文件没有唯一答案，所以给目录（批次 B8 登记的口径偏差）。\n\
+                 清单目录可写时就在 exe 旁边，否则退到 `%LOCALAPPDATA%`——两种情况都按实际那一个打开。\n\
+                 与选中行无关，操作面板开着时也有效。目录不存在时给一句提示。",
+        tags: "key f4 配置 文件 settings.json 目录 打开",
+        group: Group::Keys,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
+        key: "Ctrl+Backspace",
+        title: "删掉输入框里前一个词",
+        summary: "egui 输入框自带，本程序没有接管这颗键",
+        detail: "光标在搜索框里时 `Ctrl+Backspace` 删前一个词，有选区时删掉选区——\n\
+                 这一段是 egui 的 TextEdit 自己做的，本程序没有注册这颗键。\n\
+                 对面的 `Ctrl+Del` 删后一个词，但输入框为空时 `Ctrl+Del` 是「隐藏选中项」。\n\
+                 「空过滤词按 Backspace ＝退出操作面板」只认不带修饰的那一下（批次 B8 同日真机抓到\n\
+                 `Ctrl+Backspace` 会连面板一起退出，已改成看事件自带的修饰键）。",
+        tags: "key ctrl backspace 删词 退格 删除 输入框",
+        group: Group::Keys,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
+        key: "Ctrl+, / F2",
         title: "打开 / 返回设置页",
         summary: "六页：通用 / 功能 / 热键 / 数据源 / 外观 / 高级",
-        detail: "打开设置页；已开着时按它返回搜索页（与 Esc 的「设置页返回搜索」同一档）。",
-        tags: "key 设置 settings preferences",
+        detail: "打开设置页；已开着时按它返回搜索页（与 Esc 的「设置页返回搜索」同一档）。\n\
+                 `F2` 是批次 B8（2026-10-26，需求书附录 A）加的别名，两颗键走同一段代码；\n\
+                 设置页已经开着时它也有效（与 `F1` 同为「整窗口级」，取键在分页之前）。",
+        tags: "key f2 设置 settings preferences",
         group: Group::Keys,
         source: None,
         settings_page: None,
@@ -633,6 +693,22 @@ pub const ENTRIES: &[CheatEntry] = &[
         detail: "顶栏搜索框与 ☰ 之间那条约 20px 的空白、设置页标题右侧的空白、列表右侧的空白都能拖。\n\
                  中键不再执行任何条目（2026-10-18 已废弃）。",
         tags: "mouse 拖动 移动 窗口 drag",
+        group: Group::Window,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
+        key: "鼠标滚轮",
+        title: "移动选中",
+        summary: "一格一行，到顶到底停住不回绕",
+        detail: "批次 B8（2026-10-26，需求书附录 A「滚轮移动选中」，口径同 AHK 版）：\n\
+                 在结果列表上滚一格 = 选中上移或下移一行，边界与 ↑↓ 完全一样（不绕回）。\n\
+                 列表位置不另外滚，仍由既有的「滚动跟随选中」负责，所以后面的行照样看得见。\n\
+                 一格只走一行，不会又移选中又滚一截——两处用的是同一个判据。\n\
+                 要快走有 PgUp / PgDn（一整页）。带修饰的滚轮不移动选中。\n\
+                 新增/编辑弹窗、删除确认、批量确认、关于页、帮助页盖在上面时，\n\
+                 滚轮回到默认行为：只滚列表，不动选中。",
+        tags: "mouse 滚轮 滚动 wheel scroll 选中",
         group: Group::Window,
         source: None,
         settings_page: None,
@@ -819,7 +895,7 @@ mod tests {
             all.iter().any(|e| e.key.contains("空格")),
             "`?` 里看不到空格开头的文件模式"
         );
-        for needle in ["file", "文件", "快捷键", "终端", "计算器"] {
+        for needle in ["file", "文件", "快捷键", "终端", "计算器", "复制", "滚轮", "关于"] {
             assert!(entries(needle, &all_on).iter().all(|e| matches(e, needle)));
             assert!(
                 !entries(needle, &all_on).is_empty(),
