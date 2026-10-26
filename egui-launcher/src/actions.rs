@@ -31,6 +31,9 @@ pub enum Subject {
     Folder,
     /// 启动器自己的内置动作（`internal:<id>`）。路径串对用户没有意义 ⇒ 不供复制路径。
     Internal,
+    /// 批次 E4（FR-ACT-05）：**一批被标记的文件/文件夹**。不是清单里的一行，而是 `Insert`
+    /// 攒下来的集合 ⇒ 动作表整张换掉（[`batch_actions`]），不再走 [`actions_for`] 的单体条件表。
+    Batch,
 }
 
 /// 一个动作的 id。`main.rs` 的 `run_action()` 按它分派；本文件按它给标签、副标题与键位提示。
@@ -51,6 +54,14 @@ pub enum ActionId {
     Delete,
     TogglePin,
     LargeType,
+    // ---- 批次 E4（FR-ACT-05）：批量动作。只在 [`Subject::Batch`] 那张表里出现 ----
+    OpenAll,
+    CopyFiles,
+    CutFiles,
+    CopyPaths,
+    CopyTo,
+    AddAll,
+    RecycleAll,
 }
 
 /// 面板里的一行。`label` 是标题，`subtitle` 是弱色补充（路径、网址、代价说明），
@@ -80,6 +91,9 @@ pub struct PanelTarget {
     /// `editable` 时是条目的 uid（与 `LaunchItem::uid()` 同口径）。
     pub uid: Option<String>,
     pub pinned: bool,
+    /// 批次 E4：`Subject::Batch` 时这一批的路径（原样，`Insert` 攒下来的次序）。
+    /// 其它对象恒为空——单体动作表不看它，按键只影响表头文案里的条数。
+    pub batch: Vec<String>,
 }
 
 impl PanelTarget {
@@ -270,10 +284,60 @@ pub fn subject_for(kind: ItemKind, path: &str, is_dir: bool) -> Subject {
 // 动作表
 // ---------------------------------------------------------------------------
 
+/// 批次 E4（FR-ACT-05）：**一批**被标记项的动件表（对照 AHK `ActionCatalog.ListForMany`）。
+///
+/// 次序照 AHK：打开 → 复制 → 剪切 → 复制路径 → 复制到 → 加入命令 → 回收站。
+/// 与 AHK 的两处有意偏离（都写进需求书 FR-ACT-05 的日期注记）：
+/// ① AHK 的「移动到」依赖 QuickSwitch 里"当前文件管理器目录"这个概念，本程序没有 ⇒ 不做；
+/// ② AHK 的「复制到」只在 QuickSwitch 报告了一个目录时才出现，本程序没有那个上下文 ⇒
+///    恒给一条，目的地由系统的文件夹选择框当场问。
+pub fn batch_actions(t: &PanelTarget) -> Vec<Action> {
+    let n = t.batch.len();
+    let mut out = Vec::new();
+    out.push(row(ActionId::OpenAll, &format!("依次打开这 {n} 项"), "Enter"));
+    out.push(row(
+        ActionId::CopyFiles,
+        "以文件对象放进剪贴板，可在资源管理器粘贴",
+        "",
+    ));
+    out.push(row(
+        ActionId::CutFiles,
+        "粘贴时把原件移走（会写剪切标记）",
+        "",
+    ));
+    out.push(row(
+        ActionId::CopyPaths,
+        &format!("{n} 条路径，每行一条"),
+        "",
+    ));
+    out.push(row(
+        ActionId::CopyTo,
+        "选一个文件夹，把这一批复制过去",
+        "",
+    ));
+    out.push(row(
+        ActionId::AddAll,
+        "每一项存成一条快捷命令（已有的跳过）",
+        "",
+    ));
+    out.push(row(
+        ActionId::RecycleAll,
+        "移入回收站（可还原），执行前再确认一次",
+        "",
+    ));
+    out
+}
+
 /// FR-ACT-04 的条件表。**顺序即面板顺序**，两条不变量由单测钉住：「打开」恒为第一项
 /// （Enter 与数字键落下去就是它，与结果模式的默认动作同一口径），「大字显示」恒为最后一项
 /// （与 AHK `ListFor()` 的收尾一致）。
+///
+/// 批次 E4：`Subject::Batch` 整张换表，早退在条件表之前——批量对象没有"名称/路径/可编辑性"
+/// 这些单体属性，硬套进来会让每条判据都要多一个"是不是批量"的分支。
 pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
+    if t.subject == Subject::Batch {
+        return batch_actions(t);
+    }
     let fs = is_fs_path(&t.path);
     // 应用条目常常只有命令名（`calc.exe`）而非全路径；提权/定位/属性只对「盘上真有其文件」
     // 的那批有意义 ⇒ App 这一格要求 fs && exists。文件行/目录行天然是 fs。
@@ -401,6 +465,13 @@ impl ActionId {
             ActionId::Delete => "删除",
             ActionId::TogglePin => "置顶",
             ActionId::LargeType => "大字显示",
+            ActionId::OpenAll => "全部打开",
+            ActionId::CopyFiles => "复制文件",
+            ActionId::CutFiles => "剪切文件",
+            ActionId::CopyPaths => "复制全部路径",
+            ActionId::CopyTo => "复制到…",
+            ActionId::AddAll => "全部加入命令",
+            ActionId::RecycleAll => "全部回收站",
         }
     }
 
@@ -420,6 +491,11 @@ impl ActionId {
             ActionId::Delete => "删除",
             ActionId::Recycle => "回收",
             ActionId::TogglePin => "置顶",
+            ActionId::OpenAll | ActionId::AddAll => "执行",
+            ActionId::CopyFiles | ActionId::CopyTo => "复制",
+            ActionId::CutFiles => "剪切",
+            ActionId::CopyPaths => "复制",
+            ActionId::RecycleAll => "回收",
         }
     }
 
@@ -443,6 +519,13 @@ impl ActionId {
             ActionId::Delete => &["delete", "del", "remove"],
             ActionId::TogglePin => &["pin", "top", "stick", "unpin"],
             ActionId::LargeType => &["large", "type", "zoom", "big", "font"],
+            ActionId::OpenAll => &["openall", "open", "run", "all", "many"],
+            ActionId::CopyFiles => &["copyfiles", "copy", "files", "cf"],
+            ActionId::CutFiles => &["cutfiles", "cut", "move", "files", "cutall"],
+            ActionId::CopyPaths => &["copypaths", "paths", "copy", "all", "cp"],
+            ActionId::CopyTo => &["copyto", "destination", "folder", "copy"],
+            ActionId::AddAll => &["addall", "add", "command", "all", "save"],
+            ActionId::RecycleAll => &["recycleall", "recycle", "trash", "all"],
         }
     }
 }
@@ -506,6 +589,7 @@ mod tests {
             editable: true,
             uid: Some(format!("custom:测试|{path}")),
             pinned: false,
+            batch: Vec::new(),
         }
     }
 
@@ -762,10 +846,56 @@ mod tests {
         for id in [
             Open, RunAs, OpenWith, Reveal, CopyPath, CopyUrl, CopyName, OpenTerminal,
             Properties, Recycle, Edit, AddCommand, Delete, TogglePin, LargeType,
+            OpenAll, CopyFiles, CutFiles, CopyPaths, CopyTo, AddAll, RecycleAll,
         ] {
             assert!(!id.label().is_empty());
             assert!(!id.keywords().is_empty(), "{id:?} 没有英文别名");
             assert!(!id.badge().is_empty());
+        }
+    }
+
+    /// 批次 E4：批量对象走另一张表——七条、次序照 AHK `ListForMany`，且**没有**单体那些格子
+    /// （编辑/删除/置顶/大字/属性/所在位置）；标着「回收」的那条必须排在最后，与 AHK 的收尾一致。
+    #[test]
+    fn a_batch_target_gets_the_seven_ahk_actions_in_order() {
+        let mut t = target(Subject::Batch, "");
+        t.title = "已标记的 3 项".to_string();
+        t.editable = false;
+        t.uid = None;
+        t.batch = vec![
+            "D:\\a.txt".to_string(),
+            "D:\\b.txt".to_string(),
+            "D:\\docs".to_string(),
+        ];
+        let list = actions_for(&t);
+        let got: Vec<ActionId> = list.iter().map(|a| a.id).collect();
+        assert_eq!(
+            got,
+            vec![
+                ActionId::OpenAll,
+                ActionId::CopyFiles,
+                ActionId::CutFiles,
+                ActionId::CopyPaths,
+                ActionId::CopyTo,
+                ActionId::AddAll,
+                ActionId::RecycleAll,
+            ]
+        );
+        // Enter 落在第一格（「全部打开」），与结果模式的默认动作同一口径。
+        assert_eq!(list[0].keys, "Enter");
+        // 表头文案里的条数来自 `batch`，不是 `path`（批量对象没有单一路径）。
+        assert!(list[0].subtitle.contains('3'), "{}", list[0].subtitle);
+        assert!(list[3].subtitle.contains('3'), "{}", list[3].subtitle);
+        for id in [
+            ActionId::Edit,
+            ActionId::Delete,
+            ActionId::TogglePin,
+            ActionId::LargeType,
+            ActionId::Properties,
+            ActionId::Reveal,
+            ActionId::Open,
+        ] {
+            assert!(!got.contains(&id), "批量表里不该有 {id:?}");
         }
     }
 

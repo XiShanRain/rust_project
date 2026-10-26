@@ -20,13 +20,18 @@ use windows::Win32::Foundation::{
     LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
+};
 use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
 use windows::core::PCWSTR;
 // FR-SRC-10：计算器结果行 Enter ＝「把纯数字写进剪贴板」。三件套在 DataExchange，
 // GlobalAlloc/GlobalLock 在 Memory（该模块没有 feature 门，已随 Win32_Foundation 白送）。
+// 批次 E4（FR-ACT-05）：「Preferred DropEffect」是**运行时注册的自定义格式**，
+// 名字要交给 RegisterClipboardFormatW 换 id，没有现成常量。
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
@@ -45,20 +50,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
-    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE,
-    SEE_MASK_FLAG_NO_UI, SHFILEOPSTRUCTW, SHFileOperationW, SHObjectProperties, SHOP_FILEPATH,
-    SHELLEXECUTEINFOW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
-    SHEmptyRecycleBinW, ShellExecuteExW,
+    DROPFILES, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING, FOS_FORCEFILESYSTEM,
+    FOS_PICKFOLDERS, FO_COPY, FO_DELETE, FileOpenDialog, IFileOpenDialog, SEE_MASK_FLAG_NO_UI,
+    SHFILEOPSTRUCTW, SHFileOperationW, SHObjectProperties, SHOP_FILEPATH, SHELLEXECUTEINFOW,
+    SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW,
+    SIGDN_FILESYSPATH, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ChangeWindowMessageFilterEx, CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowThreadProcessId, HWND_BROADCAST,
     HWND_MESSAGE, IsIconic, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetTimer, SetWindowPos, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COPYDATA, WM_DESTROY, WM_HOTKEY,
-    WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW,
+    RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_RESTORE,
+    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetTimer,
+    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COPYDATA,
+    WM_DESTROY, WM_HOTKEY, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW,
 };
 
 /// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
@@ -775,6 +781,13 @@ struct LauncherApp {
     /// 设置页「次级动作」卡片的键框正在等一次按键。这颗键**不注册给系统**（不占别人的键、
     /// 也不进热键线程），所以不需要 `*_awaiting` / `*_active` 那一套回执；录制完直接落配置。
     secondary_recording: bool,
+    // ---- 批次 E4：FR-ACT-05 多标记与批量 ----
+    /// 已标记的路径（原样保存；比较不分大小写，与 Windows 路径口径一致）。
+    /// 每次呼出清空——AHK `SearchWindow.Marked := Map()` 也是这条口径，标记不跨呼出周期存活。
+    marked: Vec<String>,
+    /// 「全部回收站」的执行前确认（Some=确认框开着，里面是待回收的路径）。
+    /// 与删除确认同一形态：这一帧只问，按「确定」那一帧才逐个进回收站。
+    batch_confirm: Option<Vec<String>>,
 }
 
 fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths: Vec<String>) {
@@ -844,27 +857,123 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
         if OpenClipboard(None).is_err() {
             return Err("打开剪贴板失败（可能正被别的程序占着）".to_string());
         }
-        let done = write_text_format(&wide);
+        let done = EmptyClipboard()
+            .map_err(|e| format!("清空剪贴板失败：{e}"))
+            .and_then(|_| write_text_format(&wide));
         let _ = CloseClipboard();
         done
     }
 }
 
-/// 必须在剪贴板已打开的状态下调用。UTF-16 带末尾 NUL 是 `CF_UNICODETEXT` 规定的形态。
+/// 必须在剪贴板已打开、且已 `EmptyClipboard` 之后调用。UTF-16 带末尾 NUL 是 `CF_UNICODETEXT`
+/// 规定的形态。
 fn write_text_format(wide: &[u16]) -> Result<(), String> {
-    let len = wide.len() * std::mem::size_of::<u16>();
+    // SAFETY：`u16` 的字节视图只在这一个调用里用，`wide` 活到函数返回。
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            wide.as_ptr().cast::<u8>(),
+            wide.len() * std::mem::size_of::<u16>(),
+        )
+    };
+    write_clipboard_bytes(CF_UNICODETEXT, bytes)
+}
+
+/// 批次 E4（FR-ACT-05）：`CF_HDROP` 的格式号。与 `CF_UNICODETEXT` 同一口径——常量在
+/// `Win32::System::Ole`，但 `SetClipboardData` 收 `u32` ⇒ 写死 15，不为一个数字多开一条 feature。
+const CF_HDROP: u32 = 15;
+
+/// 资源管理器读的那条"复制还是剪切"标记。它不是一个数字格式号，而是注册格式
+/// `Preferred DropEffect`，值是 4 字节 `DWORD`。
+const PREFERRED_DROPEFFECT: &str = "Preferred DropEffect";
+const DROPEFFECT_COPY: u32 = 1;
+const DROPEFFECT_MOVE: u32 = 2;
+
+/// `CF_HDROP` 的载荷：`DROPFILES` 头 + 一串 UTF-16 路径（每条以 NUL 结尾）+ 末尾再一个 NUL。
+///
+/// `pFiles` 是"文件表在整块内存里的字节偏移"，必须等于结构体长度；`fWide=TRUE` 才是宽字符表
+///（资源管理器两种都认，但中文路径只有宽字符不会丢）。
+/// 抽成纯函数是为了能钉字节布局——真机验证一次要动资源管理器，单测每次都能跑。
+fn build_dropfiles(paths: &[String]) -> Vec<u8> {
+    let header = std::mem::size_of::<DROPFILES>();
+    let mut data = vec![0u8; header];
+    let head = DROPFILES {
+        pFiles: header as u32,
+        pt: POINT { x: 0, y: 0 },
+        fNC: false.into(),
+        fWide: true.into(),
+    };
+    // SAFETY：`head` 是一块就地初始化的 `#[repr(C)]` 结构，按字节拷进同样大小的缓冲区。
     unsafe {
-        EmptyClipboard().map_err(|e| format!("清空剪贴板失败：{e}"))?;
-        let h = GlobalAlloc(GMEM_MOVEABLE, len).map_err(|e| format!("分配剪贴板内存失败：{e}"))?;
+        std::ptr::copy_nonoverlapping(
+            (&head as *const DROPFILES).cast::<u8>(),
+            data.as_mut_ptr(),
+            header,
+        );
+    }
+    for path in paths {
+        for unit in path.encode_utf16() {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        data.extend_from_slice(&0u16.to_le_bytes());
+    }
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data
+}
+
+/// 把一批文件/目录放进剪贴板，并标明这一批是复制还是剪切（`cut=true` 写
+/// `DROPEFFECT_MOVE`，资源管理器粘贴时就会把原件移走）。
+///
+/// 「剪切」全部靠这个 `DropEffect` 成立：只写 `CF_HDROP` 的话资源管理器一律按复制处理，
+/// 这正是需求书那句「剪切须写 `DropEffect` 才能被资源管理器识别」的意思。
+fn copy_files_to_clipboard(paths: &[String], cut: bool) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("没有可放进剪贴板的路径".to_string());
+    }
+    let data = build_dropfiles(paths);
+    let effect = if cut { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
+    let name: Vec<u16> = PREFERRED_DROPEFFECT
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    // SAFETY：`name` 以 NUL 结尾且活到调用返回。
+    let fmt = unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) };
+    if fmt == 0 {
+        return Err("注册剪贴板格式 Preferred DropEffect 失败".to_string());
+    }
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return Err("打开剪贴板失败（可能正被别的程序占着）".to_string());
+        }
+        let done = EmptyClipboard()
+            .map_err(|e| format!("清空剪贴板失败：{e}"))
+            .and_then(|_| {
+                write_clipboard_bytes(CF_HDROP, &data)?;
+                // 文件已经进剪贴板之后这一步才失败：不谎报"整体失败"，但必须说清后果——
+                // 资源管理器会按"复制"处理，用户以为剪走了、其实原件还在。
+                write_clipboard_bytes(fmt, &effect.to_le_bytes()).map_err(|e| {
+                    format!("文件已放进剪贴板，但剪贴标记没写成功（会按复制处理）：{e}")
+                })
+            });
+        let _ = CloseClipboard();
+        done
+    }
+}
+
+/// 把一段字节装进 `GMEM_MOVEABLE` 全局内存并交给剪贴板。**必须在剪贴板已打开、
+/// 且已 `EmptyClipboard` 之后调用**；`GlobalUnlock` 不能省——带着锁的句柄交给系统会让
+/// `SetClipboardData` 直接失败。句柄一旦交出去就归系统所有，只有失败路径才自己 `GlobalFree`。
+fn write_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<(), String> {
+    unsafe {
+        let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1))
+            .map_err(|e| format!("分配剪贴板内存失败：{e}"))?;
         let p = GlobalLock(h);
         if p.is_null() {
             let _ = GlobalFree(Some(h));
             return Err("锁定剪贴板内存失败".to_string());
         }
-        std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), p.cast::<u8>(), len);
-        // 带着锁的句柄交给系统 ⇒ SetClipboardData 直接失败，必须先解锁。
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.cast::<u8>(), bytes.len());
         let _ = GlobalUnlock(h);
-        if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_err() {
+        if SetClipboardData(format, Some(HANDLE(h.0))).is_err() {
             let _ = GlobalFree(Some(h));
             return Err("写入剪贴板失败".to_string());
         }
@@ -1294,6 +1403,9 @@ enum PanelOpen {
     /// 只有路径 / URL（文件行、网页搜索行）：直接 `ShellExecuteExW`。
     /// 不进清单、不记学习——FR-SYS-03：这些串都是从查询框现搜出来的。
     Path,
+    /// 批次 E4（FR-ACT-05）：一批被标记的路径。没有清单身份、没有"当前打开的那一个"——
+    /// 表里七条动作各自对整个 `target.batch` 动手。
+    Batch,
 }
 
 /// 面板里执行完一条动作之后的现场处置。四条出路语义上互斥，所以做成枚举而不是两个 bool。
@@ -1335,6 +1447,61 @@ fn take_fresh_key(ctx: &egui::Context, wanted: egui::Key) -> bool {
         }
     });
     fresh
+}
+
+// ---- 批次 E4（FR-ACT-05）：多标记与批量 ----
+
+/// 这一行可标记的路径（`None` = 这一行不是文件/文件夹）。
+///
+/// 判据照需求书原文「仅 `file`/`folder` 且 `arg≠""`」：`arg` 在 AHK 版里就是文件/目录条目的
+/// 路径字段（`ResultItem.Arg`），本程序对应 `LaunchItem::path` 与 `FileHit::path`。
+/// 应用/命令/URL/命名项/提示行一律不可标记——批量动作全是文件系统动作，对它们没有意义。
+fn markable_path(
+    row: Row,
+    head: &[HeadRow],
+    results: &[usize],
+    items: &[LaunchItem],
+) -> Option<String> {
+    match row {
+        Row::Head(h) => match head.get(h)? {
+            HeadRow::File(hit) => {
+                let p = hit.path.trim();
+                (!p.is_empty()).then(|| p.to_string())
+            }
+            _ => None,
+        },
+        Row::Item(rank) => {
+            let it = items.get(*results.get(rank)?)?;
+            let file_like = matches!(it.kind, ItemKind::File | ItemKind::Folder);
+            let p = it.path.trim();
+            (file_like && !p.is_empty()).then(|| p.to_string())
+        }
+    }
+}
+
+/// 标记集合的判定：Windows 路径不分大小写，`C:\A` 与 `c:\a` 是同一条。
+fn is_marked(marked: &[String], path: &str) -> bool {
+    marked.iter().any(|p| p.eq_ignore_ascii_case(path))
+}
+
+/// `Insert` 的切换。返回 `true` = 这一下是**加上**标记，`false` = 取消。
+/// 保留首次加入的次序：批量动作按这个顺序执行（AHK 的 `Map` 也是插入序）。
+fn toggle_mark(marked: &mut Vec<String>, path: &str) -> bool {
+    match marked.iter().position(|p| p.eq_ignore_ascii_case(path)) {
+        Some(pos) => {
+            marked.remove(pos);
+            false
+        }
+        None => {
+            marked.push(path.to_string());
+            true
+        }
+    }
+}
+
+/// 状态栏左格在有标记时的说法：先说清"现在攒着什么"，再说怎么取消、怎么动手。
+fn marked_hint(count: usize) -> String {
+    format!("已标记 {count} 项 · Insert 取消 · → 批量操作")
 }
 
 /// 一次按键是否命中某个**窗口内**热键（批次 E3-丙）。
@@ -1476,6 +1643,7 @@ fn panel_for_row(
             editable: true,
             uid: Some(it.uid()),
             pinned: it.pinned,
+            batch: Vec::new(),
         }
     };
     match row {
@@ -1508,6 +1676,7 @@ fn panel_for_row(
                     editable: false,
                     uid: None,
                     pinned: false,
+                    batch: Vec::new(),
                 },
                 PanelOpen::Path,
             )),
@@ -1521,6 +1690,7 @@ fn panel_for_row(
                     editable: false,
                     uid: None,
                     pinned: false,
+                    batch: Vec::new(),
                 },
                 PanelOpen::Path,
             )),
@@ -1728,6 +1898,136 @@ fn recycle_path(path: &str) -> Result<(), u16> {
         // 用户在那句"永久删除"警告里点了否，系统返回 1223（ERROR_CANCELLED）——
         // 这不是故障，调用方要按"取消"说。
         Err(code as u16)
+    }
+}
+
+/// 批次 E4（FR-ACT-05）「复制到」：系统文件夹选择框（`IFileOpenDialog` + `FOS_PICKFOLDERS`）。
+/// 返回 `Ok(None)` = 用户取消（这不是故障，调用方要说「已取消」而不是「失败」）。
+///
+/// 走 COM 而不是 `SHBrowseForFolder`：后者是 IE 时代的老对话框，没有地址栏、不能贴路径，
+/// 用户要挑一个深层目录时几乎没法用。COM 公寓在这里补一次 STA（与 `show_properties` 同一口径，
+/// 已初始化/被别人设成别的公寓都不影响 in-proc，所以**不配对 `CoUninitialize`**）。
+fn pick_folder() -> Result<Option<String>, String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| format!("文件夹选择框创建失败：{e}"))?;
+        let mut opts = dialog
+            .GetOptions()
+            .map_err(|e| format!("读取对话框选项失败：{e}"))?;
+        opts |= FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM;
+        dialog
+            .SetOptions(opts)
+            .map_err(|e| format!("设置对话框选项失败：{e}"))?;
+        // 1223 = 用户点「取消」。它不是错误 ⇒ 返回 None，让上层说「已取消」。
+        if let Err(e) = dialog.Show(None) {
+            return if e.code() == windows::core::HRESULT::from_win32(1223) {
+                Ok(None)
+            } else {
+                Err(format!("文件夹选择框失败：{e}"))
+            };
+        }
+        let item = dialog
+            .GetResult()
+            .map_err(|e| format!("取文件夹选择结果失败：{e}"))?;
+        let raw = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|e| format!("取文件夹路径失败：{e}"))?;
+        let text = raw.to_string().unwrap_or_default();
+        let _ = CoTaskMemFree(Some(raw.as_ptr() as *const core::ffi::c_void));
+        Ok(Some(text).filter(|s| !s.trim().is_empty()))
+    }
+}
+
+/// `path` 是否就是 `dest` 或位于 `dest` 之下（不分大小写，尾分隔符先剥掉）。
+/// 批次 E4「复制到」的第一道闸：把文件夹复制进它自己（或它的子孙）会被系统报错，
+/// 更糟的是资源管理器会真的开始无限递归复制。AHK 版同一道闸（`CopyMany` 里那个 `InStr = 1`）。
+fn same_or_under(path: &str, dest: &str) -> bool {
+    let norm = |s: &str| s.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    let p = norm(path);
+    let d = norm(dest);
+    if p.is_empty() || d.is_empty() {
+        return false;
+    }
+    p == d || {
+        // 逐段比前缀：`D:\a` 不能把 `D:\ab` 当成自己的子目录。
+        let mut prefix = d.clone();
+        prefix.push('\\');
+        p.starts_with(&prefix)
+    }
+}
+
+/// 「复制到」的执行：`SHFileOperationW` + `FO_COPY`，多个来源、一个目标目录。
+/// 用系统自己的复制（有进度条、有重名询问、可取消），返回实际参与复制的条数。
+///
+/// 与 `recycle_path` 同一条错误口径：`Err(u16)` 是裸 Win32 码，1223 = 用户取消。
+/// `pFrom` 要「双 NUL 结尾」，所以每条路径自己带一个 `\0`，末尾再补一个（`wide_z` 又补一个）。
+fn copy_many_to(paths: &[String], dest: &str) -> Result<usize, u16> {
+    let usable: Vec<&str> = paths
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty() && !same_or_under(p, dest))
+        .collect();
+    if usable.is_empty() {
+        return Ok(0);
+    }
+    let from: String = usable
+        .iter()
+        .map(|p| format!("{p}\0"))
+        .collect::<String>()
+        + "\0";
+    let from = wide_z(&from);
+    let to = wide_z(&format!("{dest}\0"));
+    let mut op = SHFILEOPSTRUCTW::default();
+    op.wFunc = FO_COPY;
+    op.pFrom = PCWSTR(from.as_ptr());
+    op.pTo = PCWSTR(to.as_ptr());
+    // 不给 `FOF_NOCONFIRMATION`：重名要不要覆盖必须由系统问用户。
+    // 也不给 `FOF_SILENT`：复制大文件时那根进度条是"还在干活"的唯一凭据。
+    op.fFlags = 0;
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code == 0 {
+        Ok(usable.len())
+    } else {
+        Err(code as u16)
+    }
+}
+
+/// 两条路径是否指向同一个目标（不分大小写、尾分隔符不计）。
+/// 「全部加入命令」的去重判据：AHK `CustomCommandProvider.FindByTarget` 同口径。
+fn same_target_path(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    !a.trim().is_empty() && norm(a) == norm(b)
+}
+
+/// 批次 E4「全部加入命令」：一条路径 → 一条清单条目，形态照单条的「添加为命令」
+/// （`DialogState::from_input` → `to_item`）：名称取末段、别名按拼音首字母生成、图标源就是它自己。
+/// 目录与文件的 `kind` 当场 `is_dir` 判——收进来的路径都是从结果列表里挑的，盘上基本都在。
+fn command_item_from_path(path: &str) -> LaunchItem {
+    let trimmed = path.trim();
+    let bare = trimmed.trim_end_matches(['\\', '/']);
+    let is_dir = std::path::Path::new(bare).is_dir();
+    let leaf = bare.rsplit(['\\', '/']).next().unwrap_or(bare);
+    let leaf = leaf.trim_end_matches(".lnk");
+    let name = if leaf.is_empty() {
+        trimmed.to_string()
+    } else {
+        leaf.to_string()
+    };
+    let keyword = source::application::default_keyword(&name);
+    LaunchItem {
+        name,
+        path: trimmed.to_string(),
+        arguments: String::new(),
+        working_dir: None,
+        source_path: trimmed.to_string(),
+        kind: if is_dir {
+            ItemKind::Folder
+        } else {
+            ItemKind::File
+        },
+        keyword,
+        ..Default::default()
     }
 }
 
@@ -2894,6 +3194,8 @@ impl LauncherApp {
             typeback_armed: false,
             keypick_suspended: false,
             secondary_recording: false,
+            marked: Vec::new(),
+            batch_confirm: None,
         };
         // 立即为已有项起图标加载器（source_path 为空的种子会被 extract 自然跳过）。
         let source_paths: Vec<String> = seed
@@ -4800,6 +5102,9 @@ impl LauncherApp {
         // 呼出后把键盘焦点给搜索框（下一帧渲染 TextEdit 时 request_focus）
         self.focus_query = true;
         self.selected = 0;
+        // 批次 E4（FR-ACT-05）：标记不跨呼出周期存活（AHK `SearchWindow.Marked := Map()` 同口径）。
+        // 留着上一轮的标记，下次呼出一按 `→` 就会对用户早已忘记的一组文件动手。
+        self.marked.clear();
         // FR-SRC-06：每次呼出强制重算一轮（刚插上的 U 盘 / 刚恢复的网络盘要立刻反映），
         // 放在 hwnd 早退之前——没有窗口句柄时四态也该刷新。
         self.refresh_path_states(true);
@@ -4859,6 +5164,11 @@ impl LauncherApp {
             if let Some(ctx) = CTX.get() {
                 caret_to_end(ctx, chars);
             }
+        }
+        // 批次 E4：批量回收站的确认框同样不跨隐藏保留——留着的话下次呼出会直接看见一句
+        // 「把这 N 项移到回收站？」，而用户早已忘了自己标过什么。
+        if self.batch_confirm.take().is_some() {
+            eprintln!("全部回收站：窗口隐藏 ⇒ 取消确认（未删除）");
         }
         // 批次 R：窗口一隐藏，eframe 就不再跑 `ui()` ⇒ `hotkey_frame` 末尾那条边沿检测等不到
         // 下一帧。取键态若还开着，全局呼出会一直停在"临时注销"状态（按了没反应），所以在这里
@@ -5377,6 +5687,50 @@ impl LauncherApp {
         true
     }
 
+    /// 批次 E4（FR-ACT-05）：`→` 的**批量入口**——有标记时开的是这一张表，与当前选中哪一行无关
+    /// （AHK `_OpenActions()` 同口径：`Marked.Count` 非零就对自己的集合动手）。
+    ///
+    /// 现场处理与单条目面板一致：存查询原文、存选中行、清空查询当过滤词。
+    /// 「恢复选中行」按此刻的选中记——批量面板不对应某一行，退出时落在原处最不意外。
+    fn open_batch_panel(&mut self, ctx: &egui::Context) -> bool {
+        if self.marked.is_empty() {
+            return false;
+        }
+        let paths = self.marked.clone();
+        let target = actions::PanelTarget {
+            title: format!("已标记的 {} 项", paths.len()),
+            subject: actions::Subject::Batch,
+            path: String::new(),
+            arguments: String::new(),
+            // 批量对象不靠「存在」开关任何一格：批量的七条都对路径本身动手，
+            // 中途删掉的文件由各条动作自己报失败并计数。
+            exists: true,
+            editable: false,
+            uid: None,
+            pinned: false,
+            batch: paths,
+        };
+        let panel_actions = actions::actions_for(&target);
+        eprintln!(
+            "批量面板：进入（已标记 {} 项，动作 {} 条；路径不落日志）",
+            target.batch.len(),
+            panel_actions.len()
+        );
+        self.panel = Some(PanelState {
+            saved_query: self.query.clone(),
+            saved_selected: self.selected,
+            target,
+            actions: panel_actions,
+            open: PanelOpen::Batch,
+        });
+        self.set_query(
+            ctx,
+            String::new(),
+            "批量面板：查询框改作过滤词（原查询已存，原文不落日志）",
+        );
+        true
+    }
+
     /// 批次 P1（FR-ACT-03）：退出面板回结果模式（`Esc` / `←` / 空输入 `Backspace` / 执行完一条换屏动作）。
     /// 恢复**原输入文字与选中行**是写进验收的两句，顺序有讲究：`set_query` 内部带着
     /// `selected = 0`，所以放回行号必须排在它**之后**。
@@ -5519,7 +5873,8 @@ impl LauncherApp {
         };
         let source_path = match &open {
             PanelOpen::Entry { entry, .. } => entry.source_path.as_str(),
-            PanelOpen::Path => "",
+            // 这条路径只从结果模式进来（`self.panel.is_none()` 才取键），批量面板不在其中。
+            PanelOpen::Path | PanelOpen::Batch => "",
         };
         eprintln!(
             "次级动作 {key}：快捷键版 ⇒ {}（{:?}）",
@@ -5608,11 +5963,17 @@ impl LauncherApp {
                         }
                     }
                 }
+                // 批量面板的表里没有「打开」这一格（第一格是 `OpenAll`）；
+                // 真走到这里说明动作表与这里的分派脱节了，别静默丢掉这一按。
+                PanelOpen::Batch => {
+                    eprintln!("操作面板：批量面板里没有单体的「打开」，这一按未处理");
+                    PanelOutcome::Stay
+                }
             },
             actions::ActionId::RunAs => {
                 let dir = match &open {
                     PanelOpen::Entry { entry, .. } => entry.working_dir.as_deref(),
-                    PanelOpen::Path => None,
+                    PanelOpen::Path | PanelOpen::Batch => None,
                 };
                 match shell_execute_runas(&target.path, &target.arguments, dir) {
                     Ok(()) => {
@@ -5713,7 +6074,7 @@ impl LauncherApp {
             actions::ActionId::Reveal => {
                 let source_path = match &open {
                     PanelOpen::Entry { entry, .. } => entry.source_path.as_str(),
-                    PanelOpen::Path => "",
+                    PanelOpen::Path | PanelOpen::Batch => "",
                 };
                 self.do_reveal(ctx, "操作面板", &target, source_path)
             }
@@ -5812,6 +6173,184 @@ impl LauncherApp {
                     }
                 }
                 PanelOutcome::Reland(new_target)
+            }
+            // ---- 批次 E4（FR-ACT-05）：批量七条。只可能出现在 `Subject::Batch` 的面板里 ----
+            actions::ActionId::OpenAll => {
+                let total = target.batch.len();
+                let mut failed = 0usize;
+                for p in &target.batch {
+                    if let Err(e) = shell_execute(p, "", None) {
+                        failed += 1;
+                        eprintln!("批量面板：全部打开失败一项（系统错误）：{e}");
+                    }
+                }
+                if failed == total {
+                    eprintln!("批量面板：全部打开 {total} 项全部失败，窗口留在原地");
+                    self.toast = Some((
+                        format!("⚠ {total} 项都没能打开"),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_ERR,
+                    ));
+                    ctx.request_repaint_after(TOAST_TTL);
+                    PanelOutcome::Stay
+                } else {
+                    eprintln!(
+                        "批量面板：全部打开 {total} 项（失败 {failed} 项；路径不落日志）→ 关闭到托盘"
+                    );
+                    self.collapse_after_run(ctx);
+                    PanelOutcome::Gone
+                }
+            }
+            actions::ActionId::CopyFiles | actions::ActionId::CutFiles => {
+                let cut = id == actions::ActionId::CutFiles;
+                let n = target.batch.len();
+                let verb = if cut { "剪切" } else { "复制" };
+                match copy_files_to_clipboard(&target.batch, cut) {
+                    Ok(()) => {
+                        eprintln!("批量面板：{n} 项已{verb}进剪贴板（路径不落日志）");
+                        self.toast = Some((
+                            format!("✓ 已{verb} {n} 项，去资源管理器粘贴"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("批量面板：{verb}文件失败：{e}");
+                        self.toast = Some((
+                            format!("⚠ {verb}文件失败：{e}"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_ERR,
+                        ));
+                    }
+                }
+                ctx.request_repaint_after(TOAST_TTL);
+                PanelOutcome::Stay
+            }
+            actions::ActionId::CopyPaths => {
+                let n = target.batch.len();
+                // Windows 换行：贴进记事本/终端都是一行一条（AHK `CopyPaths` 同口径）。
+                let joined = target.batch.join("\r\n");
+                match copy_to_clipboard(&joined) {
+                    Ok(()) => {
+                        eprintln!("批量面板：已复制 {n} 条路径（内容不落日志）");
+                        self.toast = Some((
+                            format!("✓ 已复制 {n} 条路径（每行一条）"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_OK,
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("批量面板：复制路径失败：{e}");
+                        self.toast = Some((
+                            format!("⚠ 复制失败：{e}"),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_ERR,
+                        ));
+                    }
+                }
+                ctx.request_repaint_after(TOAST_TTL);
+                PanelOutcome::Stay
+            }
+            actions::ActionId::CopyTo => {
+                let n = target.batch.len();
+                let outcome = match pick_folder() {
+                    Ok(None) => {
+                        eprintln!("批量面板：复制到 — 用户在文件夹选择框里取消，未复制");
+                        ("已取消，未复制".to_string(), TOAST_OK)
+                    }
+                    Ok(Some(dest)) => match copy_many_to(&target.batch, &dest) {
+                        Ok(0) => {
+                            eprintln!("批量面板：复制到 — 全部来源都在目标目录里，没有可复制的项");
+                            ("这些项都在目标文件夹里，无需复制".to_string(), TOAST_OK)
+                        }
+                        Ok(done) => {
+                            eprintln!(
+                                "批量面板：复制到完成 {done}/{n} 项（目标目录名不落日志）"
+                            );
+                            (
+                                format!(
+                                    "✓ 已复制 {done} 项到「{}」",
+                                    actions::leaf_name(&dest)
+                                ),
+                                TOAST_OK,
+                            )
+                        }
+                        Err(1223) => {
+                            eprintln!("批量面板：复制到 — 用户在系统复制里取消");
+                            ("已取消，未复制".to_string(), TOAST_OK)
+                        }
+                        Err(code) => {
+                            eprintln!("批量面板：复制到失败（系统返回 {code}）");
+                            (format!("⚠ 复制到失败（系统返回 {code}）"), TOAST_ERR)
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("批量面板：文件夹选择框失败：{e}");
+                        (format!("⚠ {e}"), TOAST_ERR)
+                    }
+                };
+                self.toast = Some((outcome.0, Instant::now() + TOAST_TTL, outcome.1));
+                ctx.request_repaint_after(TOAST_TTL);
+                PanelOutcome::Stay
+            }
+            actions::ActionId::AddAll => {
+                let mut added: Vec<LaunchItem> = Vec::new();
+                let mut skipped = 0usize;
+                for p in &target.batch {
+                    if self.items.iter().any(|it| same_target_path(&it.path, p)) {
+                        skipped += 1;
+                        continue;
+                    }
+                    added.push(command_item_from_path(p));
+                }
+                if added.is_empty() {
+                    eprintln!("批量面板：全部加入命令 — {skipped} 项都已在清单里，未新增");
+                    self.toast = Some((
+                        "这些项都已在清单里（未新增）".to_string(),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_OK,
+                    ));
+                } else {
+                    let before = self.items.len();
+                    let old = self.items.clone();
+                    self.items =
+                        dedup_items([std::mem::take(&mut self.items), added.clone()].concat());
+                    self.carry_stats(&old);
+                    let grew = self.items.len().saturating_sub(before);
+                    let sources: Vec<String> = added
+                        .iter()
+                        .map(|i| i.source_path.clone())
+                        .filter(|p| !p.is_empty() && !self.icons.contains_key(p.as_str()))
+                        .collect();
+                    if !sources.is_empty() {
+                        spawn_icon_loader(self.icon_tx.clone(), sources);
+                    }
+                    self.save_items();
+                    eprintln!(
+                        "批量面板：全部加入命令 — 新增 {grew} 条，跳过 {skipped} 条已存在（名称不落日志）"
+                    );
+                    let tail = if skipped > 0 {
+                        format!("（跳过 {skipped} 条已存在）")
+                    } else {
+                        String::new()
+                    };
+                    self.toast = Some((
+                        format!("✓ 已加入 {grew} 条命令{tail}"),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_OK,
+                    ));
+                }
+                ctx.request_repaint_after(TOAST_TTL);
+                PanelOutcome::Stay
+            }
+            actions::ActionId::RecycleAll => {
+                let paths = target.batch.clone();
+                eprintln!(
+                    "批量面板：全部回收站 — 先弹确认（{} 项，未删除）",
+                    paths.len()
+                );
+                self.batch_confirm = Some(paths);
+                PanelOutcome::Stay
             }
             actions::ActionId::LargeType => {
                 // 复用 FR-UIX-10 的大字视口：铺的就是这一项的名字（`target.title`）。
@@ -6172,6 +6711,7 @@ impl eframe::App for LauncherApp {
             // Modal（添加/编辑框、删除确认框）或设置页开着时失焦不关到托盘，否则半成品表单/正在看的设置随窗口一起消失；已武装的定时器一并撤销。
             if self.dialog.is_some()
                 || self.confirm.is_some()
+                || self.batch_confirm.is_some()
                 || self.internal_confirm.is_some()
                 || self.about_open
                 || self.help_entry.is_some()
@@ -6332,6 +6872,7 @@ impl eframe::App for LauncherApp {
             && !recording
             && self.dialog.is_none()
             && self.confirm.is_none()
+            && self.batch_confirm.is_none()
             && self.internal_confirm.is_none()
             && self.pending_destructive.is_none()
             && !self.about_open
@@ -6558,19 +7099,66 @@ impl eframe::App for LauncherApp {
                     && self.panel.is_none()
                     && take_local_hotkey(ui, self.prefs.secondary_hotkey);
 
+                // ---- 批次 E4（FR-ACT-05）：`Insert` 标记 / 取消标记 ----
+                // 只认"新按"、只认无修饰（与 `take_fresh_key` 同一口径）。面板开着时不接管：
+                // 面板里的 `Insert` 没有动作表条目，抢走它只会让过滤词框少一个键。
+                let hit_insert =
+                    self.panel.is_none() && take_fresh_key(ui.ctx(), egui::Key::Insert);
+
                 if let Some(by) = panel_exit {
                     self.close_panel(ui.ctx(), by, true);
                 } else if panel_enter {
-                    let plan = self.plan();
-                    let row = row_at(self.selected, plan.results.len(), plan.head.len());
-                    if let Some(row) = row {
-                        self.open_panel(ui.ctx(), row);
+                    // 批次 E4：有标记时 `→` 进的是批量面板——与当前选中哪一行无关
+                    // （AHK `_OpenActions()`：`Marked.Count` 非零就对自己的集合动手）。
+                    if !self.marked.is_empty() {
+                        self.open_batch_panel(ui.ctx());
+                    } else {
+                        let plan = self.plan();
+                        let row = row_at(self.selected, plan.results.len(), plan.head.len());
+                        if let Some(row) = row {
+                            self.open_panel(ui.ctx(), row);
+                        }
                     }
                 } else if secondary_hit {
                     let plan = self.plan();
                     let row = row_at(self.selected, plan.results.len(), plan.head.len());
                     if let Some(row) = row {
                         self.run_secondary_action(ui.ctx(), row);
+                    }
+                } else if hit_insert {
+                    // 标记后选中自动下移一行（AHK `ToggleMark` 同口径；加到最后一行就停在原地，
+                    // 不绕回开头——用户按 `Insert` 是"接着标下一个"，不是"从头再来"）。
+                    // 路径不落日志（FR-SYS-03：这些路径来自查询框现搜出来的结果）。
+                    let plan = self.plan();
+                    let row = row_at(self.selected, plan.results.len(), plan.head.len());
+                    let total = row_count(plan.results.len(), plan.head.len());
+                    let here = self.selected;
+                    let path = row.and_then(|r| {
+                        markable_path(r, &plan.head, &plan.results, &self.items)
+                    });
+                    match path {
+                        Some(path) => {
+                            let added = toggle_mark(&mut self.marked, &path);
+                            if self.selected + 1 < total {
+                                self.selected += 1;
+                            }
+                            eprintln!(
+                                "快捷键 Insert：第 {} 行{}标记（共 {} 项已标记；路径不落日志）",
+                                here + 1,
+                                if added { "已" } else { "已取消" },
+                                self.marked.len()
+                            );
+                            ui.ctx().request_repaint();
+                        }
+                        None => {
+                            self.toast = Some((
+                                "这一行不是文件/文件夹，不能标记".to_string(),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_ERR,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                            eprintln!("快捷键 Insert：第 {} 行不是文件/文件夹，未标记", here + 1);
+                        }
                     }
                 } else if hit_cm {
                     // 批次 F6：☰ 主菜单的键盘入口（用户裁定「三条杠菜单 + 快捷键都留」）。
@@ -7260,6 +7848,7 @@ impl eframe::App for LauncherApp {
             });
             if self.dialog.is_none()
                 && self.confirm.is_none()
+                && self.batch_confirm.is_none()
                 && self.internal_confirm.is_none()
                 && !self.about_open
                 && self.help_entry.is_none()
@@ -7305,6 +7894,7 @@ impl eframe::App for LauncherApp {
             // 弹窗/确认框/帮助页打开时整块撤掉，与原来的让位规则一致。
             if !(self.dialog.is_some()
                 || self.confirm.is_some()
+                || self.batch_confirm.is_some()
                 || self.internal_confirm.is_some()
                 || self.about_open
                 || self.help_entry.is_some())
@@ -7376,6 +7966,7 @@ impl eframe::App for LauncherApp {
                 // 键盘导航：↑↓ 移动选中，Enter 运行选中项。对话框/确认框开着时让位给它们（Enter=确定）。
                 if self.dialog.is_none()
                     && self.confirm.is_none()
+                    && self.batch_confirm.is_none()
                     && self.internal_confirm.is_none()
                     && !self.about_open
                     && self.help_entry.is_none()
@@ -7663,7 +8254,14 @@ impl eframe::App for LauncherApp {
                                         } else {
                                             "文件（FR-SRC-14）"
                                         });
-                                        let sel = ui.selectable_label(is_sel, hit.title.clone());
+                                        // 批次 E4：标记的落款用标题前缀 `✓`（与置顶的 📌 同一手法），
+                                        // 不另开列宽——行号徽标与图标在标记前后保持同一 x 坐标。
+                                        let shown = if is_marked(&self.marked, &hit.path) {
+                                            format!("✓ {}", hit.title)
+                                        } else {
+                                            hit.title.clone()
+                                        };
+                                        let sel = ui.selectable_label(is_sel, shown);
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
@@ -7891,7 +8489,12 @@ impl eframe::App for LauncherApp {
                                     ui.add_space(icon);
                                 }
                                 // FR-SRC-19：置顶项名称前加 📌 角标（免鼠标可辨）。
-                                let shown = if item.pinned { format!("📌 {}", item.name) } else { item.name.clone() };
+                                // 批次 E4：标记项再加一层 `✓` 前缀（与 📌 同一手法，不另开列宽）。
+                                let marked = is_marked(&self.marked, &item.path);
+                                let mut shown = if item.pinned { format!("📌 {}", item.name) } else { item.name.clone() };
+                                if marked {
+                                    shown = format!("✓ {shown}");
+                                }
                                 let sel = ui.selectable_label(is_sel, shown);
                                 if is_sel && follow_selection {
                                     sel.scroll_to_me(Some(egui::Align::Center));
@@ -7961,13 +8564,20 @@ impl eframe::App for LauncherApp {
                     }
                     _ => None,
                 };
-                let left = status_left_text(
-                    self.panel.is_some(),
-                    browse,
-                    in_file_mode,
-                    self.prefs.tab_mode,
-                    matches!(self.prefs.default_scope, Scope::Basic),
-                );
+                // 批次 E4（FR-ACT-05）：有标记时左格改说"攒着什么、怎么取消、怎么动手"。
+                // 面板开着仍说怎么回结果——那一格是退出口，比标记数更要紧。
+                let marks = self.marked.len();
+                let left = if self.panel.is_none() && marks > 0 {
+                    marked_hint(marks)
+                } else {
+                    status_left_text(
+                        self.panel.is_some(),
+                        browse,
+                        in_file_mode,
+                        self.prefs.tab_mode,
+                        matches!(self.prefs.default_scope, Scope::Basic),
+                    )
+                };
                 // 左格剪到右格之前：360 宽 + 长路径时宁可截断，也不让两段字叠在一起。
                 // 右格占位按面板开合给两档：结果模式多一组「→ 操作」（键帽 + 词），留到 232；
                 // 面板模式只有 Enter 那一枚，回到原来的 170。
@@ -7992,18 +8602,21 @@ impl eframe::App for LauncherApp {
                 // 「还没有行动作面板，画个死键帽反而误导」；面板有了，判据也照面板的真实入口
                 // 取——只有 `panel_for_row` 认得的行（条目 / 自定义命令 / 文件 / 搜索）才亮，
                 // 计算器、终端、提示行按 `→` 是什么都不做的，就不给它们许诺。
+                // 批次 E4：有标记时 `→` 恒可进——开的是**批量面板**，与当前选中哪一行无关
+                // （AHK `_OpenActions()` 同口径：`Marked.Count` 非零就对自己的集合动手）。
                 let panel_ready = self.panel.is_none()
-                    && match selected_row {
-                        Some(row) => panel_for_row(
-                            row,
-                            &plan.head,
-                            &results,
-                            &self.items,
-                            &self.path_states,
-                        )
-                        .is_some(),
-                        None => false,
-                    };
+                    && (marks > 0
+                        || match selected_row {
+                            Some(row) => panel_for_row(
+                                row,
+                                &plan.head,
+                                &results,
+                                &self.items,
+                                &self.path_states,
+                            )
+                            .is_some(),
+                            None => false,
+                        });
                 let mut right = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(bar.shrink2(egui::vec2(0.0, 4.0)))
@@ -8017,7 +8630,7 @@ impl eframe::App for LauncherApp {
                 status_key_cap(&mut right, "Enter", &self.theme);
                 if panel_ready {
                     right.label(
-                        egui::RichText::new("操作")
+                        egui::RichText::new(if marks > 0 { "批量" } else { "操作" })
                             .size(self.theme.title_font_size)
                             .color(self.theme.title),
                     );
@@ -8350,6 +8963,99 @@ impl eframe::App for LauncherApp {
                     ui.ctx().request_repaint();
                 }
                 ConfirmResult::Keep => {}
+            }
+        }
+
+        // ---- 批次 E4（FR-ACT-05）：批量回收站的执行确认 ----
+        // 与删除确认同形态：这一帧只问，按「确定」那一帧才逐个进回收站；Esc 由下方全局分段链处理。
+        // 确认框撤掉之后**面板还开着**——用户取消时不希望连现场一起丢。
+        if let Some(paths) = self.batch_confirm.clone() {
+            enum BatchRecycleResult {
+                Keep,
+                Yes,
+                No,
+            }
+            let modal = egui::Modal::new(egui::Id::new("batch_recycle_confirm")).show(
+                ui.ctx(),
+                |ui| {
+                    ui.heading(format!("把这 {} 项移到回收站？", paths.len()));
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(
+                            "可以从回收站还原。网络盘、超出回收站容量的文件会被永久删除——那种情况下系统会先问一次。",
+                        )
+                        .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("执行后这一批标记会清空，面板也会收起。")
+                            .weak()
+                            .small(),
+                    );
+                    let mut result = BatchRecycleResult::Keep;
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        result = BatchRecycleResult::Yes;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("移到回收站 (Enter)").clicked() {
+                            result = BatchRecycleResult::Yes;
+                        }
+                        if ui.button("取消 (Esc)").clicked() {
+                            result = BatchRecycleResult::No;
+                        }
+                    });
+                    result
+                },
+            );
+            match modal.inner {
+                BatchRecycleResult::Yes => {
+                    if let Some(paths) = self.batch_confirm.take() {
+                        let total = paths.len();
+                        let (mut done, mut failed, mut cancelled) = (0usize, 0usize, 0usize);
+                        for p in &paths {
+                            match recycle_path(p) {
+                                Ok(()) => done += 1,
+                                // 1223 = 用户在那句「永久删除」警告里点了"否"。
+                                Err(1223) => cancelled += 1,
+                                Err(c) => {
+                                    failed += 1;
+                                    eprintln!("批量面板：回收一项失败（系统返回 {c}）");
+                                }
+                            }
+                        }
+                        self.refresh_path_states(true);
+                        self.marked.clear();
+                        eprintln!(
+                            "全部回收站：{total} 项 → 成功 {done}、失败 {failed}、取消 {cancelled}（路径不落日志）"
+                        );
+                        self.close_panel(ui.ctx(), "全部回收站", true);
+                        let (msg, color) = if failed > 0 {
+                            (
+                                format!("⚠ {total} 项里 {failed} 项没能移入回收站"),
+                                TOAST_ERR,
+                            )
+                        } else if cancelled > 0 {
+                            (
+                                format!("已移入回收站 {done} 项，{cancelled} 项被取消"),
+                                TOAST_OK,
+                            )
+                        } else {
+                            (
+                                format!("✓ 已把 {done} 项移入回收站（可从回收站还原）"),
+                                TOAST_OK,
+                            )
+                        };
+                        self.toast = Some((msg, Instant::now() + TOAST_TTL, color));
+                        ui.ctx().request_repaint_after(TOAST_TTL);
+                        self.focus_query = true;
+                    }
+                }
+                BatchRecycleResult::No => {
+                    eprintln!("全部回收站：按「取消」，未删除");
+                    self.batch_confirm = None;
+                    self.focus_query = true;
+                    ui.ctx().request_repaint();
+                }
+                BatchRecycleResult::Keep => {}
             }
         }
 
@@ -8747,6 +9453,11 @@ impl eframe::App for LauncherApp {
                 ui.ctx().request_repaint();
             } else if self.about_open {
                 self.about_open = false;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
+            } else if self.batch_confirm.is_some() {
+                eprintln!("全部回收站确认：按 Esc 取消，未删除");
+                self.batch_confirm = None;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
             } else if self.confirm.is_some() {
@@ -9642,6 +10353,221 @@ mod nav_tests {
             keys: "",
         });
         assert_eq!(enter_action_label(Some(&action)), "回收");
+    }
+
+    /// FR-ACT-05 的可标记判据：需求书写「仅 `file`/`folder` 且 `arg≠""`」。
+    /// `arg` 在 AHK 里是文件/目录条目的路径，本程序就是 `path`；所以判据＝
+    /// 「是文件/目录 且 路径非空」。**别把应用/命令条目放进来**——批量动作全是文件系统动作。
+    #[test]
+    fn insert_marks_only_rows_that_name_a_file_or_folder() {
+        let items = [
+            // 0：文件条目
+            LaunchItem {
+                name: "a.txt".into(),
+                path: "D:\\a.txt".into(),
+                kind: ItemKind::File,
+                ..Default::default()
+            },
+            // 1：目录条目
+            LaunchItem {
+                name: "docs".into(),
+                path: "D:\\docs".into(),
+                kind: ItemKind::Folder,
+                ..Default::default()
+            },
+            // 2：应用条目——路径是 exe，但不是"文件/目录"这一类的清单条目
+            LaunchItem {
+                name: "记事本".into(),
+                path: "notepad.exe".into(),
+                kind: ItemKind::App,
+                ..Default::default()
+            },
+            // 3：文件条目但路径为空（畸形数据）⇒ 不能标记
+            LaunchItem {
+                name: "空路径".into(),
+                path: "   ".into(),
+                kind: ItemKind::File,
+                ..Default::default()
+            },
+        ];
+        let results = [0usize, 1, 2, 3];
+        let head = [
+            HeadRow::File(source::filesearch::FileHit {
+                title: "b.txt".into(),
+                path: "D:\\b.txt".into(),
+                is_dir: false,
+                subtitle: String::new(),
+            }),
+            HeadRow::Calc(source::calc::CalcHit {
+                title: "= 2".into(),
+                subtitle: String::new(),
+                copy: "2".into(),
+            }),
+        ];
+        // 文件行按原路径返回（不带引号、不归一）。
+        assert_eq!(
+            markable_path(Row::Head(0), &head, &results, &items).as_deref(),
+            Some("D:\\b.txt")
+        );
+        // 计算器行不是文件/目录。
+        assert_eq!(markable_path(Row::Head(1), &head, &results, &items), None);
+        assert_eq!(
+            markable_path(Row::Item(0), &head, &results, &items).as_deref(),
+            Some("D:\\a.txt")
+        );
+        assert_eq!(
+            markable_path(Row::Item(1), &head, &results, &items).as_deref(),
+            Some("D:\\docs")
+        );
+        assert_eq!(markable_path(Row::Item(2), &head, &results, &items), None);
+        assert_eq!(markable_path(Row::Item(3), &head, &results, &items), None);
+        // 名次越界 ⇒ None，不 panic（选中行与计划不同帧时宁可什么都不做）。
+        assert_eq!(markable_path(Row::Item(9), &head, &results, &items), None);
+        assert_eq!(markable_path(Row::Head(9), &head, &results, &items), None);
+    }
+
+    /// `Insert` 的切换口径：大小写不敏感（Windows 路径）、重复标记＝取消、次序按首次加入。
+    #[test]
+    fn marking_toggles_case_insensitively_and_keeps_insertion_order() {
+        let mut marked: Vec<String> = Vec::new();
+        assert!(toggle_mark(&mut marked, "D:\\A.txt"));
+        assert!(is_marked(&marked, "d:\\a.txt"));
+        assert!(toggle_mark(&mut marked, "D:\\b.txt"));
+        assert!(is_marked(&marked, "d:\\A.TXT"));
+        assert_eq!(marked, vec!["D:\\A.txt".to_string(), "D:\\b.txt".to_string()]);
+        // 同一条路径换个大小写再按一次 Insert ＝ 取消，且不改变其余条目的次序。
+        assert!(!toggle_mark(&mut marked, "d:\\a.TXT"));
+        assert!(!is_marked(&marked, "D:\\A.txt"));
+        assert_eq!(marked, vec!["D:\\b.txt".to_string()]);
+        assert_eq!(marked_hint(1), "已标记 1 项 · Insert 取消 · → 批量操作");
+    }
+
+    /// `CF_HDROP` 的字节布局。资源管理器对这块缓冲区没有任何容错余地——`pFiles` 差 1
+    /// 就整片读空、`fWide` 错就按 ANSI 解释中文路径、末尾少一个 NUL 就把后面那块内存当路径，
+    /// 所以逐段钉住：头长、偏移、`fWide`、UTF-16 小端、每条路径各自 NUL 尾 + 整体再补一个。
+    #[test]
+    fn dropfiles_layout_matches_the_cf_hdrop_contract() {
+        let paths = vec!["D:\\a.txt".to_string(), "D:\\中文 目录".to_string()];
+        let data = build_dropfiles(&paths);
+        let header = std::mem::size_of::<DROPFILES>();
+
+        // ① 头：pFiles 必须指向文件表起点（＝头长），pt 归零，fNC=0，fWide=1。
+        assert_eq!(
+            u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize,
+            header
+        );
+        let f_wide_off = header - 4;
+        assert_eq!(
+            u32::from_le_bytes(data[f_wide_off..f_wide_off + 4].try_into().unwrap()),
+            1,
+            "fWide 必须是 1，否则中文路径按 ANSI 解释"
+        );
+        let f_nc_off = header - 8;
+        assert_eq!(
+            u32::from_le_bytes(data[f_nc_off..f_nc_off + 4].try_into().unwrap()),
+            0
+        );
+        let pt_y_off = header - 8 - 8;
+        for off in [pt_y_off, pt_y_off + 4] {
+            assert_eq!(
+                i32::from_le_bytes(data[off..off + 4].try_into().unwrap()),
+                0
+            );
+        }
+        // 结构体自己也得认同一套偏移（下面用真实结构体再对比一次，改 DROPFILES 导入不会静默错位）。
+        let head = DROPFILES {
+            pFiles: header as u32,
+            pt: POINT { x: 0, y: 0 },
+            fNC: false.into(),
+            fWide: true.into(),
+        };
+        // SAFETY：`head` 是就地初始化的 `#[repr(C)]` 结构，只按字节读。
+        let head_bytes = unsafe {
+            std::slice::from_raw_parts((&head as *const DROPFILES).cast::<u8>(), header)
+        };
+        assert_eq!(&data[..header], head_bytes);
+
+        // ② 文件表：UTF-16LE，每条路径各自以 NUL 结尾，整块末尾再一个 NUL。
+        let mut expect: Vec<u8> = Vec::new();
+        for p in &paths {
+            for unit in p.encode_utf16() {
+                expect.extend_from_slice(&unit.to_le_bytes());
+            }
+            expect.extend_from_slice(&0u16.to_le_bytes());
+        }
+        expect.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(&data[header..], &expect[..]);
+
+        // ③ 反解一遍：按 `pFiles` 偏移读双 NUL 结尾的宽串表，得回原路径与原次序。
+        let table = &data[header..];
+        let units: Vec<u16> = table
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let mut got: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for u in units {
+            if u == 0 {
+                if cur.is_empty() {
+                    break;
+                }
+                got.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(char::from_u32(u as u32).unwrap());
+            }
+        }
+        assert_eq!(got, paths);
+
+        // ④ 空清单：头 + 一个 NUL 结尾符，仍然是一块结构上合法的缓冲区（不会越界读）。
+        let empty = build_dropfiles(&[]);
+        assert_eq!(empty.len(), header + 2);
+        assert_eq!(&empty[header..], &[0u8, 0u8]);
+    }
+
+    /// 「复制到」的第一道闸：把文件夹复制进它自己（或它的子孙）会被系统拒绝，更糟的是
+    /// 资源管理器可能开始递归复制。逐段比前缀是为了不把 `D:\ab` 当成 `D:\a` 的子目录。
+    #[test]
+    fn copy_to_skips_sources_that_live_at_or_under_the_destination() {
+        assert!(same_or_under("D:\\a", "D:\\a"));
+        assert!(same_or_under("D:\\a", "D:\\A\\")); // 尾分隔符与大小写都不计
+        assert!(same_or_under("D:\\a\\b", "D:\\a"));
+        assert!(same_or_under("\\\\nas\\share\\proj\\x", "\\\\nas\\share\\proj"));
+        assert!(!same_or_under("D:\\ab", "D:\\a"));
+        assert!(!same_or_under("C:\\x", "D:\\a"));
+        assert!(!same_or_under("", "D:\\a"));
+        assert!(!same_or_under("D:\\a", ""));
+    }
+
+    /// 「全部加入命令」的去重判据与条目生成。判据照 AHK `FindByTarget`：不分大小写、尾分隔符不计；
+    /// 条目名称取末段（`.lnk` 后缀去掉），目录按 `is_dir` 归一成 `Folder`。
+    #[test]
+    fn add_all_matches_targets_and_builds_command_items() {
+        assert!(same_target_path("D:\\a.txt", "d:\\A.TXT"));
+        assert!(same_target_path("D:\\docs\\", "D:\\docs"));
+        assert!(!same_target_path("D:\\a.txt", "D:\\b.txt"));
+        // 空路径不参与"已存在"判定（畸形数据不该把正常条目挡掉）。
+        assert!(!same_target_path("", ""));
+        assert!(!same_target_path("   ", "D:\\a"));
+
+        // 不存在的路径 ⇒ 文件型条目，名称取末段、扩展名保留（与单条「添加为命令」同口径）。
+        let ghost = command_item_from_path("D:\\tmp\\报告.docx");
+        assert_eq!(ghost.name, "报告.docx");
+        assert_eq!(ghost.path, "D:\\tmp\\报告.docx");
+        assert_eq!(ghost.kind, ItemKind::File);
+        assert_eq!(ghost.source_path, "D:\\tmp\\报告.docx");
+        // `.lnk` 后缀去掉（与 `make_item_from_input` 同一格）。
+        assert_eq!(
+            command_item_from_path("D:\\tmp\\Chrome.lnk").name,
+            "Chrome"
+        );
+
+        // 真目录 ⇒ 目录型条目（用临时目录，不碰用户数据）。
+        let dir = std::env::temp_dir().join("egui-launcher-e4-add-all");
+        let _ = std::fs::create_dir_all(&dir);
+        let item = command_item_from_path(&dir.display().to_string());
+        assert_eq!(item.kind, ItemKind::Folder, "{}", dir.display());
+        assert_eq!(item.name, "egui-launcher-e4-add-all");
+        let _ = std::fs::remove_dir(&dir);
     }
 
     /// `→` 进面板、状态栏那枚 `→` 键帽、右键「操作…」三个入口共用这一条判据。
