@@ -2560,6 +2560,13 @@ impl LauncherApp {
         // 而 `Themes\` 只该读一遍（坏文件在日志里只出现一次）。
         theme: theme::Theme,
         theme_choices: Vec<String>,
+        // 批次 E2：启动路径上的设置只由 `main` 读这一次，结果原样递进来（`reload_config` 那条
+        // 用户手动重载除外）。以前这里读第二遍，而第一遍已经把
+        // 坏文件改名隔离掉了 ⇒ 第二遍看到的是"文件不存在、没有故障"，那句界面提示永远轮不到出场
+        // （2026-10-25 真机：只有 settings.json 坏时屏幕上什么都不提示）。顺带一条：类型不符的
+        // 降级日志从前一次启动打两遍，也是这第二次读造成的。
+        settings: source::application::AppSettings,
+        broken_settings: Option<Corrupted>,
     ) -> Self {
         let (icon_tx, icon_rx) = mpsc::channel();
         let (apps_tx, apps_rx) = mpsc::channel();
@@ -2583,7 +2590,7 @@ impl LauncherApp {
         items = dedup_items(items);
         // §4.2.1 出厂命令集的补齐：老清单（settings 里的轮次落后）启动时补一次缺，补完记账。
         // 只加不删、已有条目一律不动；记账之后删掉的条目不会自己回来（找回用设置页那个按钮）。
-        let (mut prefs, broken_settings) = source::application::load_settings();
+        let mut prefs = settings;
         // 两种下场分开说：`Kept` 报得出留证落点，`Lost` 只能请人工处理，并且要立刻把"本轮对它
         // 只读不写"通知到下面那条补齐路径（2026-10-22 真机⑫：留证没成功时照样播种写盘，
         // 把唯一那份坏文件覆盖了——那一次日志里就写着「覆盖写会丢掉唯一证据」）。
@@ -2621,8 +2628,13 @@ impl LauncherApp {
             (Some(items_bad), Some(settings_bad)) => Some(format!(
                 "⚠ 两个配置文件坏了，已分别改名留底：{items_bad} ／ {settings_bad}，本次从空清单 + 出厂默认启动"
             )),
-            (Some(a), None) | (None, Some(a)) => Some(format!(
-                "⚠ 配置文件坏了，已改名留底：{a}，本次从出厂默认启动（你的原文件没有被覆盖）"
+            // 两句分开写：只有清单坏的时候说"从出厂默认启动"等于告诉用户他的设置被重置了，
+            // 而实际是设置一切照常、只有清单按空的处理（2026-10-25 真机截屏抓到）。
+            (Some(a), None) => Some(format!(
+                "⚠ 配置文件坏了，已改名留底：{a}，本次按空清单启动（你的设置照常，原文件没有被覆盖）"
+            )),
+            (None, Some(a)) => Some(format!(
+                "⚠ 配置文件坏了，已改名留底：{a}，本次按出厂默认启动（你的清单照常，原文件没有被覆盖）"
             )),
             (None, None) => None,
         };
@@ -5654,6 +5666,9 @@ impl Default for LauncherApp {
             // 真启动路径由 `main` 解析主题再传进来。
             theme::Theme::light(),
             Vec::new(),
+            // 同一条取向：兜底构造不碰盘上的设置文件，出厂默认 + "没有故障"就够测试用。
+            source::application::AppSettings::default(),
+            None,
         )
     }
 }
@@ -8671,16 +8686,19 @@ fn main() -> eframe::Result {
     IPC_TX.set(ipc_tx).ok();
     let (notify_tx, notify_rx) = mpsc::channel();
     // 批次 Q：热键在设置里可改，而注册发生在 `LauncherApp::new` 之前（热键线程自己那条消息循环），
-    // 所以这里先读一次 settings.json。多读一次这个几十十字节的文件，换掉一个"配置要穿过
-    // intent 才能到线程"的接线，值得。批次 R 起这一次读还要带出补字符热键。
+    // 所以这里读一次 settings.json。批次 R 起这一次读还要带出补字符热键。
+    // 批次 E2 起这是**启动路径上唯一一次**读设置（另一处 `reload_config` 是用户手动"重新加载配置"，
+    // 不在启动链上）：读到的值与故障一起传进 `LauncherApp::new`。
+    // 以前下面还会读第二遍，而这一次读顺手把坏文件改名隔离了 ⇒ 第二遍只看见"文件不存在"，
+    // FR-CFG-02 那句界面提示因此从不出现（类型不符的降级日志反倒一次启动打两遍）。
     let (configured, broken) = source::application::load_settings();
     match &broken {
         Some(Corrupted::Kept(p)) => eprintln!(
             "配置损坏：热键线程用的 settings.json 解析失败，已隔离为 {}，本轮按出厂热键注册",
             p.display()
         ),
-        // 这一次读只喂热键线程、不写盘，所以 `Lost` 在这里不需要停手；`LauncherApp::new`
-        // 里那次读才挂着"留证没成功就不写"的门禁。
+        // 这一次读自己不写盘，所以 `Lost` 在这里不需要停手；"留证没成功就不写"那道门禁吃的是
+        // 下面传进 `LauncherApp::new` 的这份 `broken`，门禁本身没有因为少了一次读而变空。
         Some(Corrupted::Lost) => {
             eprintln!(
                 "配置损坏：settings.json 解析失败且留证没成功 ⇒ 热键线程按出厂热键注册（这一次只读不写）"
@@ -8769,6 +8787,8 @@ fn main() -> eframe::Result {
                 intent,
                 start_theme,
                 start_theme_choices,
+                configured,
+                broken,
             )))
         }),
     )
