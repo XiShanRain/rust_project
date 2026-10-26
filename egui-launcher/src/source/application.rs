@@ -227,6 +227,42 @@ pub enum Corrupted {
     Lost,
 }
 
+/// 把 serde 错误原文里**双引号包着的那段**抹掉，只留形态。
+///
+/// 为什么要抹：`invalid type: string "…"` 那一段就是出问题的那格**内容**，而这三份文件
+/// （`settings.json` / `user_items.json` / `search_history.json`）存的就是用户自己写的东西
+/// ——FR-SYS-03 定的口径是"日志绝不记用户原文"，批次 E2 已经为逐格容错那条路做过同一件事
+/// （`json_kind` 只记形态）。2026-10-27 真机探针：把 `search_history.json` 写成
+/// `"C3隐私探针ABC"`，日志里原样出现了那串 ⇒ 整份解析失败这条路的报文是漏的那一格。
+/// 反斜杠转义要跟着走，否则串里的 `\"` 会提前把引号区关掉、把后半截留在明面上。
+fn serde_shape(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    for ch in msg.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            if !in_str {
+                out.push(ch);
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_str = !in_str;
+            out.push('"');
+            continue;
+        }
+        if !in_str {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// 读 + 解析，失败即留证。清单与偏好共用这一条判据，两条路不能各写一份。
 fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Loaded<T> {
     let bytes = match std::fs::read(path) {
@@ -236,7 +272,8 @@ fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Loaded<T>
     match serde_json::from_slice::<T>(&bytes) {
         Ok(v) => Ok(v),
         Err(e) => {
-            eprintln!("source: {path:?} 解析失败: {e}");
+            // 报文只留形态：serde 原文会把出问题那格的内容一起打出来（见 [`serde_shape`]）。
+            eprintln!("source: {path:?} 解析失败: {}", serde_shape(&e.to_string()));
             Err(quarantine(path, &bytes))
         }
     }
@@ -5301,6 +5338,27 @@ mod config_tests {
         let (got, fault) = load_settings_at(&p);
         assert!(fault.is_none());
         assert_eq!(got.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+
+    /// 批次 C3 真机补跑（2026-10-27）抓到的一条：整份解析失败那条报文会把出问题那格的**内容**
+    /// 一起打进 `launcher.log`（探针串 `"C3隐私探针ABC"` 原样出现过）。形态与行列号要留着——
+    /// 将来还得靠它判坏形；只把双引号里那段抹掉。
+    #[test]
+    fn serde_shape_blanks_quoted_values_but_keeps_the_shape() {
+        let s = r#"invalid type: string "C3隐私探针ABC", expected a sequence at line 1 column 19"#;
+        assert_eq!(
+            serde_shape(s),
+            r#"invalid type: string "", expected a sequence at line 1 column 19"#
+        );
+        // 串里带转义引号：`\"` 不许提前关掉引号区，否则后半截 `b"` 会留在明面上。
+        let esc = r#"invalid type: string "a\"b", expected a sequence at line 1 column 8"#;
+        assert_eq!(
+            serde_shape(esc),
+            r#"invalid type: string "", expected a sequence at line 1 column 8"#
+        );
+        // 数字 / map 这类坏形原文里没有双引号 ⇒ 一字不改（行列号照留）。
+        let num = "invalid type: integer `1`, expected a string at line 1 column 2";
+        assert_eq!(serde_shape(num), num);
     }
 
     /// 批次 C3（FR-QRY-10）：记一条历史的四条规矩，每条都对应一次"用户看得出来的别扭"。
