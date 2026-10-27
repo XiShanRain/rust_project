@@ -921,13 +921,37 @@ impl AppSettings {
 // ---- FR-WIN-02 全局呼出热键（批次 Q）----
 //
 // 位值与 Virtual-Key 码在这里重述一遍，而不是从 `windows` crate 引：判据（[`HotkeySpec::check`]）
-// 和展示名（[`HotkeySpec::display`]）必须是纯函数，才能在 `cargo test` 里跑满而不碰系统；
-// `src/main.rs` 那边用的是 windows 的同名常量，两边是同一套数。
+// 和展示名（[`HotkeySpec::display`]）必须是纯函数，才能在 `cargo test` 里跑满而不碰系统。
+//
+// 【2026-10-27 更正】本轮修复前，上面那句末尾还写着「`src/main.rs` 那边用的是 windows 的同名
+// 常量，两边是同一套数」——**Shift 这一位不是**。那句话随本批删掉，原文照录在这里（不悄悄抹）。
+// 这四位唯一的出口是 `main.rs:2902` 的
+// `RegisterHotKey(.., HOT_KEY_MODIFIERS(spec.mods), ..)`，所以这里的数字必须逐位等于 Win32 的
+// `MOD_ALT=0x1 / MOD_CONTROL=0x2 / MOD_SHIFT=0x4 / MOD_WIN=0x8 / MOD_NOREPEAT=0x4000`；
+// 首版把 Shift 抄成了 `0x0010`（那是 `VK_SHIFT` 的扫描位概念，不是 MOD 位），后果不是显示错而是
+// **整条全局键永远注册不上**：带 Shift 的 `mods` 交给 `RegisterHotKey` 直接返回失败，
+// `GetLastError()=1004`。实测（`target/e6/hkprobe.ps1`，同一台机器同一个消息窗）：
+// `mods=0x4012` 配 F12 失败 1004、配 F13 同样失败 1004（换了键就换不掉 ⇒ 不是"被别人占用"），
+// `mods=0x4006` 配 F12 成功。【同日补测 `target/e6/hkprobe2.ps1`：那轮用的是 F12/F13，"换键还失败"
+// 并不足以排掉"这两位本来就被别人占着"这一条解释 ⇒ 换 **F15/F16**（本机没有实体键、也没人占）重跑：
+// `0x4010`（只有那颗错的 Shift）失败 1004、`0x4012` 失败 1004、`0x4004` 与 `0x4006` 成功；同一条
+// `0x4012` 在 F12 上也是失败、`0x4006` 在 F12 上成功 ⇒ 拒绝来自**那一位本身**，与选哪个键无关。
+// 探针的读法陷阱一并记下：注册**成功**时 `GetLastWin32Error()` 会给一个陈旧值（这台机器上是 203），
+// 只有返回 FALSE 时那位数才有意义。】
+// 为什么能拖两个批次没人发现：`grep -c 注册失败` 在 `target/debug`、`target/e5`、`target/c3` 三份
+// 日志里都是 0 ⇒ 这台机器上从来没真存进过一条带 Shift 的组合，失败分支一次都没走过。
+// 而 [`HotkeySpec::check`] 是明确放行 `Ctrl+Shift+<键>` 的
+// （`application.rs` 里 `ok(HKF_SHIFT | HKF_CONTROL, VK_OEM_3)` 那条单测就是它的正面样本）
+// ⇒ 判据说合法、系统说非法，两边在 Shift 这一位上分叉了整整两个批次。
+// 修法是改这一枚常量，别的地方（`check` / `display` / `mods_named` / `conflicts_local` /
+// 窗口内热键的逐位相等）都只按符号位比较，与位值无关，跟着一起对上。
+// 边界：修复前录进 `settings.json` 的带 Shift 组合存的是 `0x10`，那位现在读作"没按 Shift"。
+// 那种值从来没注册成功过 ⇒ 不存在"以前能用、现在坏了"的旧数据；真遇到就重录一次，不加迁移。
 
 pub const HKF_ALT: u32 = 0x0001;
 pub const HKF_CONTROL: u32 = 0x0002;
 pub const HKF_WIN: u32 = 0x0008;
-pub const HKF_SHIFT: u32 = 0x0010;
+pub const HKF_SHIFT: u32 = 0x0004;
 /// 按住不放不连发。老版本写死在注册调用里，批次 Q 起恒带上（没有配置它的入口）。
 pub const HKF_NOREPEAT: u32 = 0x4000;
 
@@ -4460,6 +4484,31 @@ mod hotkey_tests {
         assert_eq!(HotkeySpec::default(), HotkeySpec::DEFAULT);
         assert!(HotkeySpec::DEFAULT.check().is_ok());
         assert_eq!(HotkeySpec::DEFAULT.display(), "Ctrl+Alt+Space");
+    }
+
+    /// 2026-10-27 批次 E6：这五枚位值的**唯一出口**是 `main.rs` 里
+    /// `RegisterHotKey(.., HOT_KEY_MODIFIERS(spec.mods), ..)` ⇒ 它们必须是 Win32 的那五个数。
+    /// 首版 Shift 抄成 `0x0010`（`MOD_SHIFT` 其实是 `0x0004`），`check()` 放行、`display()` 也显示，
+    /// 但系统回 `1004` ⇒ 带 Shift 的全局键**从来没注册成功过**。这条断言就是把那两个字节钉住：
+    /// 谁再改回 `0x10`，单元测试当场变红（真机侧的对偶证据见 `target/e6/hkprobe.ps1` 的三行输出）。
+    #[test]
+    fn modifier_bits_are_the_win32_mod_values() {
+        assert_eq!(HKF_ALT, 0x0001, "MOD_ALT");
+        assert_eq!(HKF_CONTROL, 0x0002, "MOD_CONTROL");
+        assert_eq!(HKF_SHIFT, 0x0004, "MOD_SHIFT —— 不是 VK_SHIFT，也不是 0x10");
+        assert_eq!(HKF_WIN, 0x0008, "MOD_WIN");
+        assert_eq!(HKF_NOREPEAT, 0x4000, "MOD_NOREPEAT");
+        // 判据端的连带事实：Ctrl+Shift+<键> 是 `check()` 认可的组合，位值修对之后两端才第一次对上。
+        assert!(
+            HotkeySpec {
+                mods: HKF_CONTROL | HKF_SHIFT | HKF_NOREPEAT,
+                vk: VK_OEM_3
+            }
+            .check()
+            .is_ok()
+        );
+        // 而且 `0x10` 现在不再是任何一位 ⇒ 旧那份值不会被误认成 Shift。
+        assert_eq!(HotkeySpec { mods: 0x0010, vk: VK_A }.display(), "A");
     }
 
     #[test]

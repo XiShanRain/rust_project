@@ -1765,6 +1765,15 @@ fn local_hotkey_hits(spec: HotkeySpec, key: egui::Key, m: egui::Modifiers) -> bo
 /// 为什么必须收走：`Enter` 那一档用的是 `key_pressed`，它不看修饰键 ⇒ 不收走的话
 /// `Ctrl+Enter` 会同时跑次级动作和选中项，一次按键干两件事。为什么只 retain 掉自己那一格而不清空
 /// 整帧：清空会把同一帧的 Esc 和所有固定快捷键一起变聋（批次 R 踩过这个坑，见 [`take_record_press`]）。
+///
+/// **自重复那一条也收走，但不回报命中**（批次 E6 修的缺陷，2026-10-27）。`repeat` 这一位是 egui
+/// 自己按跨帧的 `keys_down` 改写的（`input_state/mod.rs:393` + `:400-413`
+/// `let first_press = keys_down.insert(*key); *repeat = !first_press`），而 `num_presses` 数事件时
+/// **不看** `repeat`（`:753-764`，文档原话 "Includes key-repeat events"）。原先只在 `fresh` 时
+/// 才 retain ⇒ 第一帧之后那颗键的重复投递原样留在这一帧里，`key_pressed(Enter)` 就为真：
+/// **按住 `Ctrl+Enter` 不放，第一次是定位、之后每一帧都在"启动选中项"**——一次按键先做一件事、
+/// 接着连做另一件事。改成"组合是我的就收，只有新按才回报"，按住不放于是只有一次动作，
+/// 与批次 P1 给 `→`/`←` 定的那条产品口径同型（「按住不放不会连跳」，见 [`take_fresh_key`]）。
 fn take_local_hotkey(ui: &mut egui::Ui, spec: HotkeySpec) -> bool {
     let ours = |ev: &egui::Event| {
         matches!(ev,
@@ -1777,9 +1786,9 @@ fn take_local_hotkey(ui: &mut egui::Ui, spec: HotkeySpec) -> bool {
         fresh = i.events.iter().any(|ev| {
             ours(ev) && matches!(ev, egui::Event::Key { pressed: true, repeat: false, .. })
         });
-        if fresh {
-            i.events.retain(|ev| !ours(ev));
-        }
+        // 无条件 retain：见上面「自重复那一条也收走」。`ours` 只认这一组键 + 逐位相等的修饰键，
+        // 所以收走的范围严格等于"这颗键自己的事件（含抬起）"，不会碰到裸 Enter 或别的组合。
+        i.events.retain(|ev| !ours(ev));
     });
     fresh
 }
@@ -2668,6 +2677,12 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_ALT, 0x37),
     (HKF_ALT, 0x38),
     (HKF_ALT, 0x39),
+    // 批次 E6（FR-ACT-01 最后一格「`Alt+Enter` ⇒ 复制这一行」）。0x0D = `VK_RETURN`
+    // （`application.rs` 的 `SECONDARY_DEFAULT` 用的就是它），而 `HotkeySpec::check` **收**回车
+    // ⇒ 这一格跟 `Ctrl+Enter` 一样是录得出来的组合：不登记就能把它绑成全局键，
+    // 代价与批次 R 裸 `` ` `` 同型——`RegisterHotKey` 吞掉之后窗口里那颗 `Alt+Enter` 就此失聪，
+    // 而且 `Alt+Enter` 是系统里最常见的"属性对话框"与终端换行，抢走还顺手抹掉别人的。
+    (HKF_ALT, 0x0D),                  // Alt+Enter 复制这一行（与 Ctrl+C 同一份载荷）
     // 批次 B8（FR-ACT-10）：裸 F1–F4。0x70..=0x73 就是 VK_F1..VK_F4，`take_fresh_key` 只认
     // 不带修饰的那一层，所以 `Ctrl+F1` / `Alt+F1` 仍然留给用户录；把这四格裸键登记进表，
     // 挡的是"录成全局呼出键 ⇒ 系统整条吞掉，窗口里那颗 F1 就此失聪"（同批次 R 裸 `` ` `` 那一层代价）。
@@ -2676,6 +2691,19 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (0, 0x72), // F3 编辑选中项（Ctrl+E 的别名）
     (0, 0x73), // F4 打开配置文件所在目录
 ];
+
+/// 批次 E6（FR-ACT-01「`Alt+Enter` 复制这一行」）：窗口内热键的比对值。
+///
+/// 与 [`LOCAL_TAKEN`] 里那一格必须是同一份数值——那边挡的是"用户把它录成全局键"，
+/// 这边做的是"窗口里按它要能命中"。写成 const 而不现造：`HotkeySpec` 的两个字段要直接
+/// 对上 `RegisterHotKey` 的口径（`HKF_ALT` / `VK_RETURN`），漂一位就变成另一颗键。
+/// 它**不进** `RegisterHotKey`：AHK 那一颗也只在搜索窗内有效——`SearchWindow.ahk:1284-1286`
+/// 的 `case 0x0D: _Execute(ctrl ? "ctrl" : alt ? "alt" : "")` 读的是自己窗口里的
+/// `WM_KEYDOWN`/`WM_SYSKEYDOWN`，全局按 Alt+Enter 去抢别人的属性框不是需求。
+const ALT_ENTER: HotkeySpec = HotkeySpec {
+    mods: HKF_ALT,
+    vk: VK_RETURN,
+};
 
 /// `egui::Key` → Virtual-Key。**逐个列举、不做算术**：egui 的 `Key` 枚举没有显式判别值
 /// （`src/data/key.rs` 按声明顺序自动编号），依赖一升级编号就可能漂，而这里产出的数要直接
@@ -5139,7 +5167,7 @@ impl LauncherApp {
                             });
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "「快捷键版」＝按 {} 直接做一条：文件行 / 目录行「在资源管理器里定位」，网页搜索行「复制网址」；「面板版」＝跟 → 一样进操作面板，动作进去再选。\n应用条目、系统命令、自定义命令没有\"一眼就是它\"的次级动作 —— 快捷键版会提示你按 → 看全部，不替你猜（Enter 本来就是打开，再配一个别名只会让两个键争同一件事）。\n这颗键只在搜索页、没有弹窗、没开面板时生效，而且不注册给系统：不会抢别的程序的键，也不会像全局呼出键那样被系统整条吞掉。必须带 Ctrl 或 Alt（裸键与单带 Shift 的键都只是打字），Win 组合设不了（egui 在 Windows 上不把 Win 传上来）。\n改完立刻生效并直接写 settings.json —— 系统里没有它，不需要\"试注册\"那一级，也就没有\"被别的程序占用\"这回事。",
+                                    "「快捷键版」＝按 {} 直接做一条：文件行 / 目录行「在资源管理器里定位」，网页搜索行「复制网址」，计算器 / 文本行「粘贴到原窗口」（2026-10-27 批次 E5 起；这一条要求呼出时记下了\"之前的窗口\"，没记下就拒投并明说，不会假装投过了）；「面板版」＝跟 → 一样进操作面板，动作进去再选。\n应用条目、系统命令、自定义命令没有\"一眼就是它\"的次级动作 —— 快捷键版会提示你按 → 看全部，不替你猜（Enter 本来就是打开，再配一个别名只会让两个键争同一件事）。\n这颗键只在搜索页、没有弹窗、没开面板时生效，而且不注册给系统：不会抢别的程序的键，也不会像全局呼出键那样被系统整条吞掉。必须带 Ctrl 或 Alt（裸键与单带 Shift 的键都只是打字），Win 组合设不了（egui 在 Windows 上不把 Win 传上来）。\n改完立刻生效并直接写 settings.json —— 系统里没有它，不需要\"试注册\"那一级，也就没有\"被别的程序占用\"这回事。",
                                     self.prefs.secondary_hotkey.display()
                                 ))
                                 .weak()
@@ -5155,7 +5183,7 @@ impl LauncherApp {
                             egui::Grid::new("hotkeys_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                                 for (key, desc) in [
                                     (toggle_key.as_str(), "全局呼出 / 隐藏（上一张卡片可改）"),
-                                    (secondary_key.as_str(), "次级动作：快捷键版直接做一条（文件行定位 / 网页行复制网址），面板版等于 →（上一张卡片可改）"),
+                                    (secondary_key.as_str(), "次级动作：快捷键版直接做一条（文件行定位 / 网页行复制网址 / 文本行粘贴到原窗口），面板版等于 →（上一张卡片可改）"),
                                     (typeback_key.as_str(), "补字符：把呼出键吞掉的那个字符打回焦点窗口（上一张卡片可改）"),
                                     ("↑ / ↓", "选择条目"),
                                     ("Ctrl+↑ / Ctrl+↓", "翻搜索历史：往更早一条 / 往更新一条，翻到最末再按 Ctrl+↓ 回到你自己敲的那串（批次 C3；上限见「通用」页「搜索历史」，面板与文件模式下不接管）"),
@@ -6763,12 +6791,25 @@ impl LauncherApp {
                 }
             }
             actions::ActionId::CopyFiles | actions::ActionId::CutFiles => {
+                // 批次 E6（FR-ACT-04 单行形态）：这一对 `ActionId` 现在两张表都有。单体面板的
+                // `batch` 恒空 ⇒ 取它自己那一条路径，于是两条通道写进剪贴板的载荷只差条数，
+                // `CF_HDROP` / `Preferred DropEffect` 的构造完全同一份代码。
                 let cut = id == actions::ActionId::CutFiles;
-                let n = target.batch.len();
+                let paths: Vec<String> = if target.batch.is_empty() {
+                    vec![target.path.clone()]
+                } else {
+                    target.batch.clone()
+                };
+                let n = paths.len();
+                let via = if target.batch.is_empty() {
+                    "操作面板"
+                } else {
+                    "批量面板"
+                };
                 let verb = if cut { "剪切" } else { "复制" };
-                match copy_files_to_clipboard(&target.batch, cut) {
+                match copy_files_to_clipboard(&paths, cut) {
                     Ok(()) => {
-                        eprintln!("批量面板：{n} 项已{verb}进剪贴板（路径不落日志）");
+                        eprintln!("{via}：{n} 项已{verb}进剪贴板（路径不落日志）");
                         self.toast = Some((
                             format!("✓ 已{verb} {n} 项，去资源管理器粘贴"),
                             Instant::now() + TOAST_TTL,
@@ -6776,7 +6817,7 @@ impl LauncherApp {
                         ));
                     }
                     Err(e) => {
-                        eprintln!("批量面板：{verb}文件失败：{e}");
+                        eprintln!("{via}：{verb}文件失败：{e}");
                         self.toast = Some((
                             format!("⚠ {verb}文件失败：{e}"),
                             Instant::now() + TOAST_TTL,
@@ -7809,6 +7850,17 @@ impl eframe::App for LauncherApp {
                     && self.panel.is_none()
                     && take_local_hotkey(ui, self.prefs.secondary_hotkey);
 
+                // ---- 批次 E6（FR-ACT-01 最后一格）：`Alt+Enter` 复制这一行 ----
+                // 与 `Ctrl+Enter` 同一手法、同一条理由：下面 Enter 那档用 `key_pressed`，不看修饰键
+                // ⇒ 不在这里把事件收走，`Alt+Enter` 就会"复制完再把选中项执行一遍"（启动一个程序
+                // 去复制一行文本，是这一格最容易撞出来的事故）。排在次级动作键**之后**取：用户把那
+                // 颗键自定义成别的组合时，`Alt+Enter` 仍归本条（`check_secondary` 现在也会用
+                // `LOCAL_TAKEN` 挡下"把次级键录成 Alt+Enter"，所以两者不会争同一帧）。
+                // 面板开着时**不接管**，于是事件原样落到面板的 Enter 那档 ⇒ `Alt+Enter` ＝执行高亮
+                // 动作，与 AHK 一致（`_Execute` 在 `Mode="actions"` 分支整个忽略 modifier，
+                // `SearchWindow.ahk:1029-1038`）⇒ 这一格连偏差都不算。
+                let alt_enter_hit = self.panel.is_none() && take_local_hotkey(ui, ALT_ENTER);
+
                 // ---- 批次 E4（FR-ACT-05）：`Insert` 标记 / 取消标记 ----
                 // 只认"新按"、只认无修饰（与 `take_fresh_key` 同一口径）。面板开着时不接管：
                 // 面板里的 `Insert` 没有动作表条目，抢走它只会让过滤词框少一个键。
@@ -7870,14 +7922,20 @@ impl eframe::App for LauncherApp {
                             eprintln!("快捷键 Insert：第 {} 行不是文件/文件夹，未标记", here + 1);
                         }
                     }
-                } else if hit_copy {
-                    // FR-ACT-10 附录 A「`Ctrl+C` 复制」：复制**当前这一行**。内容 = FR-UIX-10 大字
+                } else if hit_copy || alt_enter_hit {
+                    // FR-ACT-10 附录 A「`Ctrl+C` 复制」与 FR-ACT-01「`Alt+Enter` 复制这一行」：
+                    // 两颗键在 AHK 里就是同一份载荷——`ActionCatalog.RunModifier(item,"alt")`
+                    // 调的 `CopyText(item.CopyText())`（`ActionCatalog.ahk:37-39`）与 `_CopySelected()`
+                    //（`SearchWindow.ahk:1480-1486`）取的是同一个 `ResultItem.CopyText()`
+                    //（`ResultItem.ahk:55-59`）⇒ 本程序也共用这一坨，只把键名分开记进日志。
+                    // 内容 = FR-UIX-10 大字
                     // 显示那一串（同一条 [`large_text_of`]，也就是 AHK `ResultItem.CopyText()` 的口径：
                     // 文件/目录/网址取路径、计算器取纯数字、应用与命令取名称）。
                     // 查询框里选中的文字在上面已经让出去了，这一格碰不到它。
                     // **与 AHK 的一处有意偏差**：AHK `_CopySelected()` 复制前把搜索窗 `Hide()`
                     //（`SearchWindow.ahk:1481`），这里让窗口留在原地——复制完通常紧接着要粘到别处，
                     // 关窗会让用户以为按键没生效；与本程序面板里那三条复制同口径（复制不关窗）。
+                    let key_name = if alt_enter_hit { "Alt+Enter" } else { "Ctrl+C" };
                     let text = {
                         let plan = self.plan();
                         let item = item_rank(self.selected, plan.head.len())
@@ -7892,7 +7950,7 @@ impl eframe::App for LauncherApp {
                         Some(text) => match copy_to_clipboard(&text) {
                             Ok(()) => {
                                 eprintln!(
-                                    "快捷键 Ctrl+C：已复制这一行（{} 个字符，内容不落日志）",
+                                    "快捷键 {key_name}：已复制这一行（{} 个字符，内容不落日志）",
                                     text.chars().count()
                                 );
                                 self.toast = Some((
@@ -7903,7 +7961,7 @@ impl eframe::App for LauncherApp {
                                 ui.ctx().request_repaint_after(TOAST_TTL);
                             }
                             Err(e) => {
-                                eprintln!("快捷键 Ctrl+C：复制失败：{e}");
+                                eprintln!("快捷键 {key_name}：复制失败：{e}");
                                 self.toast = Some((
                                     format!("⚠ 复制失败：{e}"),
                                     Instant::now() + TOAST_TTL,
@@ -7913,7 +7971,7 @@ impl eframe::App for LauncherApp {
                             }
                         },
                         None => {
-                            eprintln!("快捷键 Ctrl+C：这一屏没有可复制的行（选中第 {} 行）", self.selected + 1);
+                            eprintln!("快捷键 {key_name}：这一屏没有可复制的行（选中第 {} 行）", self.selected + 1);
                             self.toast = Some((
                                 "⚠ 这一屏没有可复制的行".to_string(),
                                 Instant::now() + TOAST_TTL,
@@ -11719,6 +11777,47 @@ mod nav_tests {
             .conflicts_local(LOCAL_TAKEN),
             "Ctrl+C 复制这一行，必须被本地表挡住"
         );
+        // ---- 批次 E6（FR-ACT-01 最后一格）：`Alt+Enter` 复制这一行 ----
+        // 这一格与 `Ctrl+Enter`（`HotkeySpec::SECONDARY_DEFAULT`）是同一个 VK，只差修饰键 ⇒
+        // `check` 收它（回车在可录名单里），不挡就能把它绑成全局呼出键或次级键。
+        // 代价与批次 R 裸 `` ` `` 同型但更宽：`Alt+Enter` 在系统里是"属性对话框"（资源管理器、
+        // 任务计划程序…）与终端确认换行的常用键，`RegisterHotKey` 一吞，别人那颗也没了。
+        let alt_enter = HotkeySpec {
+            mods: HKF_ALT | HKF_NOREPEAT,
+            vk: 0x0D,
+        };
+        assert!(
+            alt_enter.conflicts_local(LOCAL_TAKEN),
+            "Alt+Enter 复制这一行，必须被本地表挡住"
+        );
+        // 挡住的是**精确那一格**：多加一层修饰键的 `Ctrl+Alt+Enter` 本程序没绑，仍留给用户
+        // （与上面 `Ctrl+F1` 那条同一口径：表越宽，用户能录的组合越少）。
+        assert!(
+            !HotkeySpec {
+                mods: HKF_ALT | HKF_CONTROL | HKF_NOREPEAT,
+                vk: 0x0D
+            }
+            .conflicts_local(LOCAL_TAKEN),
+            "Ctrl+Alt+Enter 本程序没绑，不该出现在表里"
+        );
+        // 次级动作键走的是另一道判据（`check_secondary` 里也读这张表）⇒ 单独钉一次：
+        // 用户不能把 `Ctrl+Enter` 换成 `Alt+Enter`，否则两颗键争同一帧，本批那条就得重新排次序。
+        assert!(
+            HotkeySpec {
+                mods: HKF_ALT,
+                vk: VK_RETURN
+            }
+            .check_secondary(&HotkeySpec::DEFAULT, None, LOCAL_TAKEN)
+            .is_err(),
+            "次级动作键不许录成 Alt+Enter（已被窗口内热键占用）"
+        );
+        // 出厂那颗 `Ctrl+Enter` 仍然合法——上面那句挡的是"改成 Alt+Enter"，不是"回车类全禁"。
+        assert!(
+            HotkeySpec::SECONDARY_DEFAULT
+                .check_secondary(&HotkeySpec::DEFAULT, None, LOCAL_TAKEN)
+                .is_ok(),
+            "出厂的 Ctrl+Enter 次级键不许被自己这张表挡掉"
+        );
         // 裸 F1–F4：`HotkeySpec::check` 对功能键放行不带修饰 ⇒ 这四颗是**真录得出来**的裸键
         //（与"裸键录不进来"那条先例不同，见 `LOCAL_TAKEN` 上方的 2026-10-26 注记）。
         for vk in [0x70u32, 0x71, 0x72, 0x73] {
@@ -12201,6 +12300,128 @@ mod nav_tests {
             egui::Key::Enter,
             m(false, false, false)
         ));
+    }
+
+    /// 批次 E6（FR-ACT-01「`Alt+Enter` 复制这一行」）：这颗键的取用。
+    ///
+    /// 用真 `Context` + 真 `Ui`（手法照 `shift_digit_is_left_for_text_instead_of_bare_digit`）而不
+    /// 只测 [`local_hotkey_hits`]，是因为本批要钉的是**两件事**：① 命中只认逐位相等那一种组合；
+    /// ② 命中之后那一条 `Event::Key` 必须从这一帧消失。②才是"一次按键干两件事"的发生现场——
+    /// 下面 Enter 那一档读 `key_pressed`，而 `num_presses` 数的就是同一份 `events`（egui 0.36.2
+    /// `input_state/mod.rs:691-711`），事件不删就会"复制完又把选中项启动一遍"。
+    /// 键帧按上游真实赋值构造：Windows 上 egui-winit 把 `command` 直接抄成 `ctrl`
+    ///（`egui-winit-0.36.2/src/lib.rs:492-500`），`Alt` 没有这种副本。
+    #[test]
+    fn alt_enter_is_taken_and_leaves_the_other_enter_frames_alone() {
+        use egui::{Event, Modifiers, RawInput};
+        fn key(k: egui::Key, modifiers: Modifiers) -> Event {
+            Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }
+        }
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        };
+        // 一次跑完返回：(本批那颗键命中没有, 这一帧还剩几条 Enter 键事件)
+        let run = |events: Vec<Event>| {
+            let ctx = egui::Context::default();
+            let mut hit = false;
+            let mut left = 0usize;
+            let mut out = ctx.run_ui(RawInput { events, ..Default::default() }, |ui| {
+                hit = take_local_hotkey(ui, ALT_ENTER);
+                left = ui.input(|i| {
+                    i.events
+                        .iter()
+                        .filter(|e| {
+                            matches!(e, Event::Key {
+                                key: egui::Key::Enter,
+                                pressed: true,
+                                ..
+                            })
+                        })
+                        .count()
+                });
+            });
+            // FullOutput 的纹理增量不落地就会在 drop 时 panic（epaint textures.rs:337），单测里清掉。
+            out.textures_delta.clear();
+            (hit, left)
+        };
+        assert_eq!(
+            run(vec![key(egui::Key::Enter, alt)]),
+            (true, 0),
+            "Alt+Enter 命中 ⇒ 自己那一格必须消失，否则同帧的 Enter 档会再执行一次选中项"
+        );
+        assert_eq!(
+            run(vec![key(egui::Key::Enter, Modifiers::NONE)]),
+            (false, 1),
+            "裸 Enter 归「运行选中项」，一颗事件都不许动"
+        );
+        assert_eq!(
+            run(vec![key(egui::Key::Enter, Modifiers { ctrl: true, command: true, ..Modifiers::NONE })]),
+            (false, 1),
+            "Ctrl+Enter 是出厂的次级动作键，本批不许把它一起收走"
+        );
+        assert_eq!(
+            run(vec![key(egui::Key::Enter, Modifiers { alt: true, shift: true, ..Modifiers::NONE })]),
+            (false, 1),
+            "多按一个 Shift 是另一组键（`consume_key` 的 matches_logically 恰恰相反，见批次 E3-丙 那条坑）"
+        );
+        // 同一帧里两条并存（按住 Alt 又松了一次裸 Enter 这种注入实测会造出来的形状）：
+        // 只准收自己那一格，第二格必须留着——批次 R 清空整帧那个坑的判据（见 [`take_record_press`]）。
+        assert_eq!(
+            run(vec![
+                key(egui::Key::Enter, alt),
+                key(egui::Key::Enter, Modifiers::NONE)
+            ]),
+            (true, 1),
+            "只 retain 掉 Alt+Enter 那一格，同帧的裸 Enter 必须还在"
+        );
+        // 长按自动重复**不接管**，而且重复那一条要连事件一起收走——这是本批抓到的真缺陷：
+        // 原先只在命中时才 retain，于是第一帧之后 egui 自己生成的重复投递原样留在这一帧，
+        // 而下游那一档用的 `key_pressed` 数的是 `pressed: true`、**不看** `repeat`（`:753-764`）
+        // ⇒ 按住不放＝复制一次，之后每帧"运行选中项"一次。
+        // 这一格差点被写成假测试，同样是 egui 源码挡下来的：`repeat` 不是调用方填的那个值——
+        // `begin_pass` 按**跨帧的** `keys_down` 把它改写（`input_state/mod.rs:393`+`:400-413`：
+        // `let first_press = keys_down.insert(*key); *repeat = !first_press`），
+        // 单帧里手工塞一条 `repeat: true` 会被改回 `false`，于是"命中"。
+        // ⇒ 真形状只能用同一个 `Context` 连跑两帧来造：第二帧那颗键才真的是 repeat。
+        let ctx = egui::Context::default();
+        // 一次跑完返回：(命中没有, 取键前这条事件的 repeat 位, 取键后 `key_pressed(Enter)`)
+        let frame = |ev: Event| {
+            let mut hit = false;
+            let mut marked_repeat = false;
+            let mut enter_pressed = false;
+            let mut out = ctx.run_ui(RawInput { events: vec![ev], ..Default::default() }, |ui| {
+                // 取键**之前**读 `repeat`：这一位是"egui 改写了调用方填的值"那条事实的现量。
+                marked_repeat = ui.input(|i| {
+                    i.events.iter().any(|e| {
+                        matches!(e, Event::Key { key: egui::Key::Enter, repeat: true, .. })
+                    })
+                });
+                hit = take_local_hotkey(ui, ALT_ENTER);
+                // 取键**之后**问下游真正用的那条判据，而不是自己数事件：钉的是症状本身。
+                enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            });
+            out.textures_delta.clear();
+            (hit, marked_repeat, enter_pressed)
+        };
+        let press = key(egui::Key::Enter, alt);
+        assert_eq!(
+            frame(press.clone()),
+            (true, false, false),
+            "第一帧是真按：命中，egui 不把它标成重复，且同帧的「运行选中项」判据为假"
+        );
+        assert_eq!(
+            frame(press),
+            (false, true, false),
+            "同一个 pressed 事件再来一帧 ⇒ egui 自己标成 repeat ⇒ 本批那颗键不命中；\
+             这一条也必须收走 ⇒ `key_pressed(Enter)` 为假（长按不连发选中项）"
+        );
     }
 
     /// 批次 E5：「粘贴到原窗口」三道闸里有两道发生在**碰键盘之前**，所以单测盖得到；

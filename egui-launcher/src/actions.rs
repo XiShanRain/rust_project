@@ -414,6 +414,24 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
     out.push(row(ActionId::CopyName, &t.name_to_copy(), ""));
     // 在终端打开：目录进本目录，文件进父目录（AHK `_ParentDir` 同口径），且必须真实存在。
     if on_disk && t.exists {
+        // 批次 E6（FR-ACT-04 原文的单行形态）：复制文件 / 剪切文件。门与 AHK `_FileActions`
+        // （`ActionCatalog.ahk:312-316`）逐字对齐——「盘符或 UNC 开头」且「此刻真的存在」，
+        // 就是这一整套 `on_disk && t.exists`：AHK 用 `FileExist`，对目录同样返回真。
+        // 位置也照 AHK：紧跟两条复制之后、在终端打开之前。两条共用一套措辞，因为做的是
+        // 同一件事的两种形态（差别只在剪不剪）。批量版（FR-ACT-05，批次 E4）用的就是
+        // 同一对 `ActionId`，所以两种形态在剪贴板上写的东西一模一样。
+        // AHK 的「复制到/移动到」（同函数 317-326 行）依赖 QuickSwitch 的"当前文件管理器目录"，
+        // 本程序没有那个上下文 ⇒ 单行版仍只有批量面板那条「复制到…」（FR-ACT-05 偏差①已登记）。
+        out.push(row(
+            ActionId::CopyFiles,
+            "以文件对象放进剪贴板，可在资源管理器粘贴",
+            "",
+        ));
+        out.push(row(
+            ActionId::CutFiles,
+            "粘贴时把原件移走（会写剪切标记）",
+            "",
+        ));
         let dir = if dir_like {
             t.path.clone()
         } else {
@@ -782,12 +800,57 @@ mod tests {
     fn a_missing_path_loses_only_the_actions_that_have_to_touch_the_disk() {
         let mut gone = target(Subject::File, "D:\\tmp\\deleted.docx");
         gone.exists = false;
-        for id in [ActionId::OpenWith, ActionId::OpenTerminal, ActionId::Properties, ActionId::Recycle] {
+        // 批次 E6：复制文件 / 剪切文件放进剪贴板的东西是要被**粘到别处**的，原件不在就是空话
+        // ⇒ 与属性、回收站同一道门（AHK `_FileActions` 的 `FileExist`）。
+        for id in [
+            ActionId::OpenWith,
+            ActionId::OpenTerminal,
+            ActionId::Properties,
+            ActionId::Recycle,
+            ActionId::CopyFiles,
+            ActionId::CutFiles,
+        ] {
             assert!(!has(&gone, id), "不存在的路径不该有 {id:?}");
         }
         for id in [ActionId::Open, ActionId::Reveal, ActionId::CopyPath, ActionId::CopyName] {
             assert!(has(&gone, id), "这一条不该随存在性消失：{id:?}");
         }
+    }
+
+    /// 批次 E6（FR-ACT-04 原文的单行形态）：单体表里那两格文件对象动作。
+    /// 钉三件事——**有**（单行版不是批量版专属）、**位置**（照 AHK 排在两条复制之后、
+    /// 在终端打开之前）、**同一份载荷**（与批量表用的是同一对 `ActionId`，所以剪贴板里
+    /// 的东西按条数走：一行 ⇒ `batch` 只有那一条路径）。
+    #[test]
+    fn a_single_row_panel_offers_copy_and_cut_of_that_one_file() {
+        for (subject, path) in [
+            (Subject::File, "C:\\Windows\\notepad.exe"),
+            (Subject::Folder, "C:\\Windows"),
+        ] {
+            let t = target(subject, path);
+            let got = ids(&t);
+            let pos = |id: ActionId| got.iter().position(|a| *a == id).unwrap();
+            assert!(got.contains(&ActionId::CopyFiles) && got.contains(&ActionId::CutFiles));
+            assert!(pos(ActionId::CopyName) < pos(ActionId::CopyFiles), "{:?}：两格要排在复制名称之后", subject);
+            assert!(pos(ActionId::CopyFiles) < pos(ActionId::OpenTerminal), "{:?}:要排在在终端打开之前", subject);
+            // 两条相邻且顺序是"复制在前、剪切在后"（AHK `_FileActions` 315-316 行的 push 次序）。
+            assert_eq!(got[pos(ActionId::CopyFiles) + 1], ActionId::CutFiles, "{:?}", subject);
+        }
+        // 非文件系统路径一律没有：URL / Store / 命名项 / 内置动作，以及**裸名应用条目**。
+        for t in [
+            target(Subject::Url, "https://example.com/?q=1"),
+            target(Subject::StoreApp, "shell:AppsFolder\\Microsoft.Copilot_8wekyb3d8bbwe!App"),
+            target(Subject::Namespace, "shell:RecycleBinFolder"),
+            target(Subject::Internal, "internal:lock"),
+            target(Subject::App, "calc.exe"),
+        ] {
+            for id in [ActionId::CopyFiles, ActionId::CutFiles] {
+                assert!(!has(&t, id), "{} 不该有 {id:?}", t.path);
+            }
+        }
+        // 指向真实全路径的应用条目**有**（它就是盘上的一个文件，AHK 的判据只看形状与存在）。
+        let real = target(Subject::App, "C:\\Windows\\System32\\notepad.exe");
+        assert!(has(&real, ActionId::CopyFiles) && has(&real, ActionId::CutFiles));
     }
 
     #[test]
@@ -858,8 +921,11 @@ mod tests {
                 .map(|i| all[i].label.clone())
                 .collect()
         };
-        // 子串：中文标题直接命中。
-        assert_eq!(hit("复制"), ["复制路径", "复制名称"]);
+        // 子串：中文标题直接命中。批次 E6 起「复制」在文件行命中三格（多出「复制文件」），
+        // 而「剪切文件」一格都不命中——它的标题、别名（cut/move/files/cf）里没有「复制」，
+        // 这正是别名表要防的串味。
+        assert_eq!(hit("复制"), ["复制路径", "复制名称", "复制文件"]);
+        assert_eq!(hit("剪切"), ["剪切文件"]);
         // 多词是 AND：`复制 路径` 只剩复制路径。
         assert_eq!(hit("复制 路径"), ["复制路径"]);
         assert!(hit("复制 不存在的词").is_empty());
