@@ -395,24 +395,30 @@ enum SettingsTab {
     Hotkeys,
     /// 批次 A10：每个数据源一行开关。这一页的条目由注册表渲染，不在这里硬编。
     Sources,
-    /// 批次 F1（FR-UIX-01）：主题选择 + 主题目录入口。第 5 页。
+    /// 批次 D7（FR-SRC-02 / FR-SRC-14）：文件索引的扫描目录与时机。第 5 页。
+    /// 插在「数据源」后面：它本来就是文件源那一行的展开。
+    /// 【2026-10-27 批次 D7：插入本页，外观/高级的页号顺延为 6/7。】
+    FileSearch,
+    /// 批次 F1（FR-UIX-01）：主题选择 + 主题目录入口。~~第 5 页~~【批次 D7 起第 6 页】。
     Appearance,
-    /// 批次 F7（D3 + D6）：重置学习排序 / 恢复默认 / 隐藏的条目。第 6 页。
+    /// 批次 F7（D3 + D6）：重置学习排序 / 恢复默认 / 隐藏的条目。~~第 6 页~~【批次 D7 起第 7 页】。
     /// 这一页只有破坏性动作与低频维护项，所以排在最后。
     Advanced,
 }
 
 impl SettingsTab {
-    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=外观 6=高级）；
-    /// 越界返回 None，由调用方落回通用。
+    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级）；
+    /// 越界返回 None，由调用方落回通用。批次 D7 起第 5 页由「外观」改为「文件搜索」，
+    /// 原第 5/6 页顺延——`-Preferences 5/6` 的旧语义随之变，与设置页分类栏一起改口径。
     fn from_page(page: u32) -> Option<Self> {
         match page {
             1 => Some(Self::General),
             2 => Some(Self::Features),
             3 => Some(Self::Hotkeys),
             4 => Some(Self::Sources),
-            5 => Some(Self::Appearance),
-            6 => Some(Self::Advanced),
+            5 => Some(Self::FileSearch),
+            6 => Some(Self::Appearance),
+            7 => Some(Self::Advanced),
             _ => None,
         }
     }
@@ -3589,7 +3595,7 @@ impl LauncherApp {
             path_states: std::collections::HashMap::new(),
             path_in_flight: false,
             path_scanned_at: Instant::now(),
-            sources: source::default_sources(),
+            sources: source::default_sources_with(&prefs),
             startup_notice: notice,
             selected: 0,
             scroll_followed: 0,
@@ -3886,14 +3892,14 @@ impl LauncherApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=外观 6=高级）。
+    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级）。
     fn open_settings_page(&mut self, page: u32) {
         self.settings_open = true;
         self.settings_tab = match SettingsTab::from_page(page) {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=外观 6=高级），落回通用"
+                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级），落回通用"
                 );
                 SettingsTab::General
             }
@@ -4525,6 +4531,7 @@ impl LauncherApp {
                     ("功能", SettingsTab::Features),
                     ("热键", SettingsTab::Hotkeys),
                     ("数据源", SettingsTab::Sources),
+                    ("文件搜索", SettingsTab::FileSearch),
                     ("外观", SettingsTab::Appearance),
                     ("高级", SettingsTab::Advanced),
                 ] {
@@ -5274,6 +5281,196 @@ impl LauncherApp {
                                     ui.add_space(6.0);
                                 }
                             }
+                        }
+                        SettingsTab::FileSearch => {
+                            // 批次 D7（FR-SRC-02 / FR-SRC-14）：文件索引的范围与时机。
+                            // 所有改动走同一条路：改 prefs → 写 settings.json；下一帧 poll 循环里
+                            // `apply_settings` 把新范围喂给文件源，`set_scope` 比对不同才重扫
+                            // ⇒ 「保存即重扫」是自动的，这一页不用自己碰 sources。
+                            ui.label(egui::RichText::new("扫描目录").strong());
+                            let mut folders = self.prefs.file_folders.clone();
+                            let mut commit_folders = false;
+                            let mut remove_row: Option<usize> = None;
+                            for (i, f) in folders.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let resp = ui
+                                        .add(
+                                            egui::TextEdit::singleline(f)
+                                                .hint_text("%USERPROFILE%\\Documents 或 D:\\data")
+                                                .desired_width(ui.available_width() - 44.0),
+                                        )
+                                        .on_hover_text("支持 %环境变量%；目录不存在时这一行不参与扫描");
+                                    // 路径是打字输入：提交在失焦那刻，不是每个键一写盘一重扫。
+                                    if resp.changed() && resp.lost_focus() {
+                                        *f = f.trim().to_string();
+                                        commit_folders = true;
+                                    }
+                                    if ui.button("删除").clicked() {
+                                        remove_row = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = remove_row {
+                                folders.remove(i);
+                                commit_folders = true;
+                            }
+                            if ui.button("添加目录").clicked() {
+                                folders.push(String::new());
+                                commit_folders = true;
+                            }
+                            if commit_folders {
+                                self.prefs.file_folders = folders;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：文件扫描目录已改（现 {} 个条目，路径不落日志）",
+                                    self.prefs.file_folders.len()
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "改完点别处（离开输入框）生效；添加/删除立刻生效。生效后自动在后台重建索引，\
+                                     旧索引在建成前继续可用，不卡界面。目录不存在的行跳过。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            ui.label(egui::RichText::new("排除的目录名").strong());
+                            let mut exclude = self.prefs.file_exclude.clone();
+                            let mut commit_exclude = false;
+                            let mut remove_ex: Option<usize> = None;
+                            for (i, x) in exclude.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(x)
+                                            .hint_text("node_modules")
+                                            .desired_width(ui.available_width() - 44.0),
+                                    );
+                                    // 按目录名整段跳过（大小写不敏感），连它下面的文件一起不进索引。
+                                    if resp.changed() && resp.lost_focus() {
+                                        *x = x.trim().to_string();
+                                        commit_exclude = true;
+                                    }
+                                    if ui.button("删除").clicked() {
+                                        remove_ex = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = remove_ex {
+                                exclude.remove(i);
+                                commit_exclude = true;
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("添加目录名").clicked() {
+                                    exclude.push(String::new());
+                                    commit_exclude = true;
+                                }
+                                if ui.button("恢复默认排除").clicked() {
+                                    exclude =
+                                        source::filesearch::default_scope_exclude();
+                                    commit_exclude = true;
+                                }
+                            });
+                            if commit_exclude {
+                                self.prefs.file_exclude = exclude;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：文件排除表已改（现 {} 个条目）",
+                                    self.prefs.file_exclude.len()
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "排除按目录名整段跳过（大小写不敏感），连它下面的文件一起不进索引。\
+                                     「恢复默认排除」把整张表写回出厂七条（node_modules / .git 等）——\
+                                     自己加的条目会被清掉，误删可以再加回来。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            ui.label(egui::RichText::new("档位").strong());
+                            ui.horizontal(|ui| {
+                                ui.label("递归深度");
+                                let mut depth = self.prefs.file_depth;
+                                let before = depth;
+                                for (v, l) in [(2usize, "2"), (4, "4（默认）"), (6, "6"), (8, "8")] {
+                                    ui.selectable_value(&mut depth, v, l);
+                                }
+                                if depth != before {
+                                    self.prefs.file_depth = depth;
+                                    source::application::save_settings(&self.prefs);
+                                    eprintln!("设置页：file_depth = {depth}（已写 settings.json）");
+                                    ui.ctx().request_repaint();
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("条目上限");
+                                let mut cap = self.prefs.file_max_entries;
+                                let before = cap;
+                                for (v, l) in [
+                                    (10_000usize, "1 万"),
+                                    (30_000, "3 万（默认）"),
+                                    (100_000, "10 万"),
+                                ] {
+                                    ui.selectable_value(&mut cap, v, l);
+                                }
+                                if cap != before {
+                                    self.prefs.file_max_entries = cap;
+                                    source::application::save_settings(&self.prefs);
+                                    eprintln!("设置页：file_max_entries = {cap}（已写 settings.json）");
+                                    ui.ctx().request_repaint();
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("重扫间隔");
+                                let mut mins = self.prefs.file_refresh_minutes;
+                                let before = mins;
+                                for (v, l) in [
+                                    (5u64, "5 分钟"),
+                                    (15, "15 分钟"),
+                                    (30, "30 分钟（默认）"),
+                                    (60, "60 分钟"),
+                                    (180, "180 分钟"),
+                                ] {
+                                    ui.selectable_value(&mut mins, v, l);
+                                }
+                                if mins != before {
+                                    self.prefs.file_refresh_minutes = mins;
+                                    source::application::save_settings(&self.prefs);
+                                    eprintln!(
+                                        "设置页：file_refresh_minutes = {mins}（已写 settings.json）"
+                                    );
+                                    ui.ctx().request_repaint();
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("最小字数");
+                                let mut mql = self.prefs.file_min_query_len;
+                                let before = mql;
+                                for (v, l) in [(1usize, "1"), (2, "2（默认）"), (3, "3")] {
+                                    ui.selectable_value(&mut mql, v, l);
+                                }
+                                if mql != before {
+                                    self.prefs.file_min_query_len = mql;
+                                    source::application::save_settings(&self.prefs);
+                                    eprintln!(
+                                        "设置页：file_min_query_len = {mql}（已写 settings.json）"
+                                    );
+                                    ui.ctx().request_repaint();
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "「（默认）」标的是出厂档。手改 settings.json 越过档位的值照常生效，\
+                                     界面上不选中任何档，点任意一档即覆盖。最小字数管的是进文件模式（'词 / 空格开头）\
+                                     的门槛，与普通搜索无关。",
+                                )
+                                .weak()
+                                .small(),
+                            );
                         }
                         SettingsTab::Appearance => {
                             // 批次 F8（FR-UIX-02/03/07/08）：窗口小节。宽度即时生效；记住位置、
@@ -7054,6 +7251,17 @@ impl LauncherApp {
             && self.help_entry.is_none()
     }
 
+    /// 本查询在不在文件模式（批次 D7：最小字数可配了）。判据与 `FileSource::plan` 必须同一档：
+    /// 两者都读 `settings.json` 那一格、都过 [`ScanScope::clamp_min_query_len`] 这道夹子——
+    /// 以前 `route()` 全局一个缺省值，无所谓；现在界面这边的"在不在文件模式"若用缺省 2 字、
+    /// 源那边用配置值，配成 1 或 3 时两边的答案就会分叉。
+    fn file_route(&self, raw: &str) -> source::filesearch::Route {
+        source::filesearch::route_at(
+            raw,
+            source::filesearch::ScanScope::clamp_min_query_len(self.prefs.file_min_query_len),
+        )
+    }
+
     /// FR-QRY-10（批次 C3）：一次成功执行 = 记一条搜索历史。
     ///
     /// 文本由调用方给，不读 `self.query`：操作面板那一路此刻框里是**过滤词**，用户真正的查询
@@ -7254,8 +7462,13 @@ impl eframe::App for LauncherApp {
         // 关掉的源连 poll 都不调：`FileSource::poll` 顺手会派下一轮索引，放进来等于开关只关了
         // 搜索、后台仍在读盘（2026-10-22 真机：`files` 关着启动，日志仍出现「本轮建成 604 条」）。
         for s in self.sources.iter_mut() {
-            if self.prefs.source_on(s.id()) && s.poll() {
-                ui.ctx().request_repaint();
+            if self.prefs.source_on(s.id()) {
+                // 批次 D7「保存即重扫」：设置里的扫描范围与源手里的不同 ⇒ 这里换给源
+                //（`set_scope` 相等去重，同值零成本；文件源之外全部默认空操作）。
+                s.apply_settings(&self.prefs);
+                if s.poll() {
+                    ui.ctx().request_repaint();
+                }
             }
         }
         // E1：配置坏过一次的那句说明，等窗口真被看见才说（Toast 会被 `on_show` 清空，
@@ -7625,7 +7838,7 @@ impl eframe::App for LauncherApp {
                 let hist_step = if recall_history_allowed(
                     self.panel.is_some(),
                     !matches!(
-                        source::filesearch::route(&self.query),
+                        self.file_route(&self.query),
                         source::filesearch::Route::NotOurs
                     ),
                     self.keys_live(),
@@ -8009,7 +8222,7 @@ impl eframe::App for LauncherApp {
                     // 批次 X：Ctrl+F 进文件模式 = 在已有输入前补一个 `'` 触发符（打的词留着当过滤词，
                     // 不要用户重打一遍）。已经在文件模式里就不叠第二个前缀——`''词` 会被当成
                     // 文件名的一部分去匹配，那一下按键把用户的查询弄脏了，比没反应更糟。
-                    let p = source::filesearch::route(&self.query);
+                    let p = self.file_route(&self.query);
                     let already = self.query.starts_with('\'')
                         || self.query.starts_with(' ')
                         || matches!(
@@ -8728,7 +8941,7 @@ impl eframe::App for LauncherApp {
             let results = plan.results;
             let total = row_count(results.len(), head_len);
             let status_shown = self.prefs.appearance.status_bar && total > 0;
-            let file_route = source::filesearch::route(&self.query);
+            let file_route = self.file_route(&self.query);
             let in_file_mode = !matches!(file_route, source::filesearch::Route::NotOurs);
 
             // 2026-10-24 修滚轮：列表右侧那块「拖空白移动窗口」的手柄必须与 ScrollArea 同层。
@@ -10738,6 +10951,21 @@ mod nav_tests {
             "有输入时数字本来就是查询文本"
         );
         assert!(!bare_digit_allowed("   ", true));
+    }
+
+    /// 批次 D7：插入「文件搜索」第 5 页后外观/高级顺延，`-Preferences 5/6` 语义随之变。
+    /// 这条钉住 1..=7 的整张映射——只测旧值漂没漂是不够的，页号是线性协议，两端都得钉。
+    #[test]
+    fn settings_tab_page_mapping_covers_one_through_seven() {
+        assert_eq!(SettingsTab::from_page(1), Some(SettingsTab::General));
+        assert_eq!(SettingsTab::from_page(2), Some(SettingsTab::Features));
+        assert_eq!(SettingsTab::from_page(3), Some(SettingsTab::Hotkeys));
+        assert_eq!(SettingsTab::from_page(4), Some(SettingsTab::Sources));
+        assert_eq!(SettingsTab::from_page(5), Some(SettingsTab::FileSearch));
+        assert_eq!(SettingsTab::from_page(6), Some(SettingsTab::Appearance));
+        assert_eq!(SettingsTab::from_page(7), Some(SettingsTab::Advanced));
+        assert_eq!(SettingsTab::from_page(8), None, "越界要给 None，调用方落回通用");
+        assert_eq!(SettingsTab::from_page(0), None);
     }
 
     /// 2026-10-24 用户报障：空输入框按 Shift+2 想打 @，被裸数字那档当成 `2` 执行了。

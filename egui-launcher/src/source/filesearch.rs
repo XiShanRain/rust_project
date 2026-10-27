@@ -12,6 +12,9 @@
 //!   四类型词 / 五 `folder` / 六空格开头），触发符没打全之前普通搜索照常 ⇒ 不会"打着打着列表塌了"。
 //! - **索引范围是三个用户目录，不是全量扫盘**。开发计划第七章把它列为高风险项
 //!   （`node_modules`/`.git` 一进去就是几十万条），扩表必须先配排除规则与设置页（D7/A10）。
+//!   【2026-10-27 批次 D7：范围/深度/排除/上限/刷新/最小字数六个旋钮可配了（[`ScanScope`]），
+//!   "三个用户目录"从决定降格为**缺省值**——上面的守则不变：扩范围是用户自己的选择，
+//!   程序替他把排除规则先垫好。】
 //! - **索引不跨启动保存**：冷启动重建一次（后台），此后每 30 分钟一轮。半小时内新建的文件
 //!   搜不到是这批改的代价，而浏览模式（直接打路径）永远是即时的。
 //! - **打分阶梯自定**（100/90/80/60/30），多词取最低分＝AND 语义；与 §4.3 那张清单条目分值表
@@ -45,11 +48,15 @@ pub const MAX_ENTRIES: usize = 30_000;
 pub const MIN_QUERY_LEN: usize = 2;
 /// 需求书「结果上限 30」。
 pub const MAX_RESULTS: usize = 30;
-/// 需求书的 `refresh_minutes`（默认 30）。
-pub const REBUILD_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// 需求书的 `refresh_minutes`（默认 30）。设置页的档位值也以分钟存（批次 D7）。
+pub const REFRESH_MINUTES_DEFAULT: u64 = 30;
+/// 需求书的 `refresh_minutes`（缺省档的具体值）。
+pub const REBUILD_INTERVAL: Duration = Duration::from_secs(REFRESH_MINUTES_DEFAULT * 60);
 
 /// 需求书的 `scope_exclude`：按目录名整段跳过（连它下面的文件一起不进气）。
 /// 后两个只在范围扩到盘根时才会碰到，留着是因为这一张表将来会加目录。
+/// 【2026-10-27 批次 D7：这张表从写死降格为 [`ScanScope::default`] 的缺省值，
+/// 用户可在设置页增删（「恢复默认排除」写回这份）。】
 const EXCLUDE_DIRS: [&str; 7] = [
     "node_modules",
     ".git",
@@ -59,6 +66,74 @@ const EXCLUDE_DIRS: [&str; 7] = [
     "$recycle.bin",
     "system volume information",
 ];
+
+/// 出厂排除表（批次 D7：设置页「恢复默认排除」与 `AppSettings` 的 serde 缺省都取这份）。
+pub fn default_scope_exclude() -> Vec<String> {
+    EXCLUDE_DIRS.iter().map(|s| s.to_string()).collect()
+}
+
+/// 出厂范围目录：`Desktop` 在实机上常被重定向到 OneDrive，所以两个位置都试，
+/// 存在才算进范围（[`build_index`] 会滤掉不存在的）。存 `%USERPROFILE%` 形态的原始串——
+/// 设置文件里不落机器相关的绝对路径，展开与存在性过滤都在建索引时做。
+pub fn default_scope_folders() -> Vec<String> {
+    SCOPE_FOLDER_NAMES
+        .iter()
+        .map(|name| format!("%USERPROFILE%\\{name}"))
+        .collect()
+}
+
+/// FR-SRC-02 / FR-SRC-14 的可配扫描范围（批次 D7）。六个字段一一对应需求书那六个旋钮
+/// （`scope_folders` / `scope_depth` / `scope_exclude` / `max_entries` / `refresh_minutes` /
+/// `min_query_length`），缺省＝批次 X 的那组常量值，**零漂移**——老配置文件里没有这几格时，
+/// 行为与 D7 之前一字不差。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanScope {
+    /// 原始串（支持 `%VAR%`，[`crate::source::custom::expand_env`] 展开）。
+    /// 存原始串不存展开结果：设置文件可移植，展开失败（变量不存在）就是那个路径不存在。
+    pub folders: Vec<String>,
+    /// 递归层数：1 = 只列直接子项。
+    pub depth: usize,
+    /// 按目录名整段跳过（大小写不敏感，[`walk`] 里比对）。
+    pub exclude: Vec<String>,
+    /// 整张索引的条目上限（也是单目录浏览的读入上限，见 [`scan_dir`]）。
+    pub max_entries: usize,
+    /// 两轮重扫的最小间隔（`refresh_minutes` 存分钟、这里存成 [`Duration`]）。
+    pub refresh: Duration,
+    /// 过滤词不足这个字数不进文件模式（[`route_at`] 的闸）。
+    pub min_query_len: usize,
+}
+
+impl Default for ScanScope {
+    fn default() -> Self {
+        Self {
+            folders: default_scope_folders(),
+            depth: SCOPE_DEPTH,
+            exclude: default_scope_exclude(),
+            max_entries: MAX_ENTRIES,
+            refresh: REBUILD_INTERVAL,
+            min_query_len: MIN_QUERY_LEN,
+        }
+    }
+}
+
+impl ScanScope {
+    /// 最小字数这一格的档位表（1..=8）。`sanitized` 与 `main.rs` 的文件模式判据共用它——
+    /// 两处口径不许分叉，`FileSource::plan` 用夹过的值，界面提示也得用同一个值。
+    pub fn clamp_min_query_len(n: usize) -> usize {
+        n.clamp(1, 8)
+    }
+
+    /// 数值四格夹回有意义的区间。手改配置、或将来设置页之外的来源给出的垃圾值
+    /// 不崩、不零深度死循环、不无限扫盘；`exclude` / `folders` 不在这里洗——
+    /// 空目录清单就是"不索引任何东西"，是合法（虽然没意义）的用户选择。
+    pub fn sanitized(mut self) -> Self {
+        self.depth = self.depth.clamp(1, 16);
+        self.max_entries = self.max_entries.clamp(1_000, 1_000_000);
+        self.refresh = self.refresh.max(Duration::from_secs(60));
+        self.min_query_len = Self::clamp_min_query_len(self.min_query_len);
+        self
+    }
+}
 
 /// 第四式的类型词表：需求书 FR-SRC-14 那张表原样（`doc`/`pic`/`video`/`audio`/`zip`/`exe`/`cad`）。
 pub const TYPE_WORDS: [(&str, &[&str]); 7] = [
@@ -141,22 +216,9 @@ pub enum FileUpdate {
     },
 }
 
-/// 实际进入索引范围的目录（存在的才算）。
-pub fn scope_folders() -> Vec<PathBuf> {
-    let home = match std::env::var_os("USERPROFILE") {
-        Some(v) => PathBuf::from(v),
-        None => return Vec::new(),
-    };
-    SCOPE_FOLDER_NAMES
-        .iter()
-        .map(|name| home.join(name))
-        .filter(|p| p.is_dir())
-        .collect()
-}
-
-pub fn spawn_rebuild(tx: mpsc::Sender<FileUpdate>) {
+pub fn spawn_rebuild(tx: mpsc::Sender<FileUpdate>, scope: ScanScope) {
     thread::spawn(move || {
-        let entries = build_index();
+        let entries = build_index(&scope);
         let _ = tx.send(FileUpdate::Index(entries));
     });
 }
@@ -188,6 +250,11 @@ pub struct FileSource {
     /// 同一查询串一帧里会被 `plan()` 算好几遍（空格判据、渲染、Enter…），而文件源要扫三万条
     /// ⇒ 按查询串缓存本轮命中。索引回报到达时清空，别让新索引撞上旧缓存。
     hits_cache: Option<(String, Vec<FileHit>)>,
+    /// 当前生效的扫描范围（批次 D7）。改动经 [`Self::set_scope`] 进来：与现行值不同就记一笔
+    /// 待扫账——在途那一轮用的是旧范围，等它回报的那帧再补一轮强制重扫。
+    scope: ScanScope,
+    /// 有范围改动还没扫到的那笔账。
+    scope_pending: bool,
 }
 
 impl Default for FileSource {
@@ -202,24 +269,49 @@ impl Default for FileSource {
             dir_hits: None,
             dir_in_flight: None,
             hits_cache: None,
+            scope: ScanScope::default(),
+            scope_pending: false,
         }
     }
 }
 
 impl FileSource {
+    /// 按给定范围造一个源（批次 D7：冷启动就按配置扫，不经历"先按缺省扫一轮再推倒重来"）。
+    pub fn with_scope(scope: ScanScope) -> Self {
+        let mut s = Self::default();
+        s.scope = scope;
+        s
+    }
+
+    /// 批次 D7：范围可配。与现行值不同 ⇒ 「保存即重扫」。不在途就立刻派一轮（它带的就是
+    /// 新范围）；在途那一轮用的是旧范围 ⇒ 只记一笔待扫账，等它回报的那帧由 [`Self::poll`]
+    /// 补派。范围快照在派出那一刻定死，中途再改不影响在途的这轮。
+    pub fn set_scope(&mut self, scope: ScanScope) {
+        if scope == self.scope {
+            return;
+        }
+        self.scope = scope;
+        if self.rebuild_in_flight {
+            self.scope_pending = true;
+        } else {
+            self.refresh_index(true);
+        }
+    }
+
     /// 派一轮后台索引重建。同一时刻只跑一轮，回收据的那帧才允许下一轮；
-    /// `force` 忽略最小间隔（冷启动那一次）。
+    /// `force` 忽略最小间隔（冷启动那一次）。范围快照在派出那一刻定死，
+    /// 中途改设置不影响在途的这轮。
     fn refresh_index(&mut self, force: bool) {
         if self.rebuild_in_flight {
             return;
         }
         if let Some(built) = self.indexed_at {
-            if !force && built.elapsed() < REBUILD_INTERVAL {
+            if !force && built.elapsed() < self.scope.refresh {
                 return;
             }
         }
         self.rebuild_in_flight = true;
-        spawn_rebuild(self.tx.clone());
+        spawn_rebuild(self.tx.clone(), self.scope.clone());
     }
 
     /// 派一次目录浏览（读一层，不递归）。列目录也是磁盘 I/O——一个十万文件的下载夹
@@ -245,8 +337,9 @@ impl FileSource {
     }
 
     /// 本查询该不该由文件源独占整张列表。返回 `None` = 没有触发符，普通合并照常。
+    /// 最小字数用自己那份 [`ScanScope::min_query_len`]，不是 [`route`] 的缺省值。
     fn plan(&mut self, query: &str) -> Option<Vec<SourceRow>> {
-        let route = route(query);
+        let route = route_at(query, self.scope.min_query_len);
         match route {
             Route::NotOurs => None,
             Route::Browse { dir, filter } => {
@@ -315,6 +408,12 @@ impl DataSource for FileSource {
         self.refresh_index(true);
     }
 
+    /// 批次 D7「保存即重扫」：设置里的扫描范围变了就换。`set_scope` 自己做相等去重，
+    /// 同值的帧零成本；在途轮的补扫账也由它记。
+    fn apply_settings(&mut self, prefs: &crate::source::application::AppSettings) {
+        self.set_scope(prefs.file_scan_scope());
+    }
+
     fn poll(&mut self) -> bool {
         let mut changed = false;
         while let Ok(update) = self.rx.try_recv() {
@@ -326,8 +425,16 @@ impl DataSource for FileSource {
                     self.rebuild_in_flight = false;
                     // 新索引配旧缓存就是"用上一轮的命中回答这一轮的查询"⇒ 一起清掉。
                     self.hits_cache = None;
+                    // 这轮是在途时改的范围 ⇒ 它带回的是旧范围的索引，补一轮按新范围扫。
+                    if self.scope_pending {
+                        self.scope_pending = false;
+                        self.refresh_index(true);
+                    }
+                    let dirs = self.scope.folders.len();
+                    let depth = self.scope.depth;
+                    let cap = self.scope.max_entries;
                     eprintln!(
-                        "文件索引：本轮建成 {n} 条（范围＝桌面/下载/文档，深度 4，上限 3 万）"
+                        "文件索引：本轮建成 {n} 条（范围＝清单 {dirs} 个目录，深度 {depth}，上限 {cap} 条）"
                     );
                     changed = true;
                 }
@@ -370,7 +477,13 @@ fn is_apostrophe(c: char) -> bool {
 }
 
 /// 五式触发 → [`Route`]。判据只看查询串本身（当帧可观测状态），不看索引、不看磁盘。
+/// 最小字数取缺省档 [`MIN_QUERY_LEN`]；`FileSource` 走 [`route_at`] 用自己那份可配值。
 pub fn route(raw: &str) -> Route {
+    route_at(raw, MIN_QUERY_LEN)
+}
+
+/// 同 [`route`]，但最小字数由调用方给（批次 D7 起可配）。
+pub fn route_at(raw: &str, min_query_len: usize) -> Route {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Route::NotOurs;
@@ -422,7 +535,7 @@ pub fn route(raw: &str) -> Route {
     if !(space_mode || apostrophe || prefix_word) {
         return Route::NotOurs;
     }
-    if words.iter().map(|w| w.chars().count()).sum::<usize>() < MIN_QUERY_LEN {
+    if words.iter().map(|w| w.chars().count()).sum::<usize>() < min_query_len {
         return Route::NotOurs;
     }
     Route::Search {
@@ -495,20 +608,30 @@ pub fn parent_query(dir: &str) -> Option<String> {
 
 // ---- 索引构建（后台线程）----
 
-pub fn build_index() -> Vec<FileEntry> {
+pub fn build_index(scope: &ScanScope) -> Vec<FileEntry> {
     let mut out = Vec::new();
-    for root in scope_folders() {
-        if out.len() >= MAX_ENTRIES {
+    for raw in &scope.folders {
+        if out.len() >= scope.max_entries {
             break;
         }
-        walk(&root, SCOPE_DEPTH, &mut out);
+        let root = PathBuf::from(expand_env(raw.trim()));
+        if !root.is_dir() {
+            continue;
+        }
+        walk(&root, scope.depth, scope.max_entries, &scope.exclude, &mut out);
     }
-    out.truncate(MAX_ENTRIES);
+    out.truncate(scope.max_entries);
     out
 }
 
-fn walk(dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
-    if depth == 0 || out.len() >= MAX_ENTRIES {
+fn walk(
+    dir: &Path,
+    depth: usize,
+    max_entries: usize,
+    exclude: &[String],
+    out: &mut Vec<FileEntry>,
+) {
+    if depth == 0 || out.len() >= max_entries {
         return;
     }
     // 打不开的目录（拒绝访问、正在断开的网络位置）静默跳过：NFR-04，一个目录读不动
@@ -517,11 +640,11 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
         return;
     };
     for entry in rd.flatten() {
-        if out.len() >= MAX_ENTRIES {
+        if out.len() >= max_entries {
             return;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if EXCLUDE_DIRS.iter().any(|x| name.eq_ignore_ascii_case(x)) {
+        if exclude.iter().any(|x| name.eq_ignore_ascii_case(x)) {
             continue;
         }
         // `DirEntry::file_type` 在 Windows 上直接取自目录枚举，不是再一次 stat。
@@ -533,7 +656,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
             is_dir,
         });
         if is_dir {
-            walk(&path, depth - 1, out);
+            walk(&path, depth - 1, max_entries, exclude, out);
         }
     }
 }
@@ -1019,9 +1142,10 @@ mod tests {
     #[test]
     fn excluded_dirs_are_named_by_the_risk_table() {
         // 开发计划第七章点名的两类爆炸源必须在排除表里，否则范围一旦扩大就会索引几十万条。
+        let exclude = ScanScope::default().exclude;
         for name in ["node_modules", ".git", "__pycache__"] {
             assert!(
-                EXCLUDE_DIRS.iter().any(|x| x.eq_ignore_ascii_case(name)),
+                exclude.iter().any(|x| x.eq_ignore_ascii_case(name)),
                 "{name} 必须在排除表里"
             );
         }
@@ -1029,18 +1153,19 @@ mod tests {
 
     #[test]
     fn walk_depth_limit_and_entry_cap_hold() {
-        // 深度 1 ⇒ 只到直接子项，孙子不进索引。这里不用 SCOPE_DEPTH 而是显式传 1，
-        // 因为常量是"范围有多大"的策略，不是"递归能不能停"的正确性。
+        // 深度 1 ⇒ 只到直接子项，孙子不进索引。这里不用缺省深度而是显式传 1，
+        // 因为深度是"范围有多大"的策略，不是"递归能不能停"的正确性。
+        let scope = ScanScope::default();
         let dir = std::env::temp_dir().join("egui-launcher-filesearch-walk");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("child")).expect("建两层目录");
         std::fs::write(dir.join("child").join("leaf.txt"), b"x").expect("写测试文件");
         let mut out = Vec::new();
-        walk(&dir, 2, &mut out);
+        walk(&dir, 2, scope.max_entries, &scope.exclude, &mut out);
         assert!(out.iter().any(|e| e.name == "child" && e.is_dir));
         assert!(out.iter().any(|e| e.name == "leaf.txt"));
         let mut shallow = Vec::new();
-        walk(&dir, 1, &mut shallow);
+        walk(&dir, 1, scope.max_entries, &scope.exclude, &mut shallow);
         assert!(shallow.iter().any(|e| e.name == "child"));
         assert!(
             !shallow.iter().any(|e| e.name == "leaf.txt"),
@@ -1050,14 +1175,146 @@ mod tests {
     }
 
     #[test]
-    fn scope_is_three_user_folders_not_the_whole_disk() {
-        // 这条锁住"范围"这个决定本身：将来谁把它扩到用户根目录，这条测试会红，
-        // 逼他先去处理排除规则与设置页（开发计划第七章那条高风险项）。
-        assert_eq!(SCOPE_FOLDER_NAMES.len(), 6);
-        assert_eq!(SCOPE_DEPTH, 4);
-        assert_eq!(MAX_ENTRIES, 30_000);
-        assert_eq!(MIN_QUERY_LEN, 2);
-        assert_eq!(MAX_RESULTS, 30);
-        assert_eq!(REBUILD_INTERVAL, Duration::from_secs(30 * 60));
+    fn scope_defaults_are_the_batch_x_constants() {
+        // 这条锁住"缺省范围"这个决定本身：D7 把六个旋钮开放成配置，但缺省必须与
+        // 批次 X 写死的那组一字不差（老配置文件没有这几格 ⇒ 行为零漂移）。
+        let s = ScanScope::default();
+        assert_eq!(s.folders, default_scope_folders());
+        assert_eq!(s.folders.len(), 6);
+        assert_eq!(s.depth, 4);
+        assert_eq!(s.max_entries, 30_000);
+        assert_eq!(s.min_query_len, 2);
+        assert_eq!(s.refresh, Duration::from_secs(30 * 60));
+        assert_eq!(ScanScope::default().exclude.len(), 7);
+    }
+
+    #[test]
+    fn sanitized_clamps_garbage_values() {
+        let s = ScanScope {
+            depth: 0,
+            max_entries: 0,
+            refresh: Duration::from_secs(0),
+            min_query_len: 0,
+            ..ScanScope::default()
+        }
+        .sanitized();
+        assert_eq!(s.depth, 1, "零深度在 walk 里就是死闸，这里夹到最小有效档");
+        assert_eq!(s.max_entries, 1_000);
+        assert_eq!(s.refresh, Duration::from_secs(60));
+        assert_eq!(s.min_query_len, 1);
+        let big = ScanScope {
+            depth: 999,
+            max_entries: usize::MAX,
+            min_query_len: 999,
+            ..ScanScope::default()
+        }
+        .sanitized();
+        assert_eq!(big.depth, 16);
+        assert_eq!(big.max_entries, 1_000_000);
+        assert_eq!(big.min_query_len, 8);
+    }
+
+    #[test]
+    fn build_index_honors_the_scope() {
+        let root = std::env::temp_dir().join("egui-launcher-filesearch-scope");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("keep").join("deep")).expect("建目录树");
+        std::fs::write(root.join("keep").join("top.txt"), b"x").expect("写文件");
+        std::fs::write(root.join("keep").join("deep").join("down.txt"), b"x").expect("写文件");
+        std::fs::create_dir_all(root.join("skipme")).expect("建排除目录");
+        std::fs::write(root.join("skipme").join("no.txt"), b"x").expect("写文件");
+
+        // 范围＝这个临时目录、深度 1（只列直接子项）、排除 skipme。
+        let scope = ScanScope {
+            folders: vec![root.to_string_lossy().into_owned()],
+            depth: 1,
+            exclude: vec!["skipme".to_string()],
+            ..ScanScope::default()
+        };
+        let index = build_index(&scope);
+        let names: Vec<&str> = index.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"keep"), "范围内的目录进索引");
+        assert!(!names.contains(&"skipme"), "排除表按名整段跳过");
+        assert!(!names.contains(&"down.txt"), "深度 1 不下到孙子层");
+
+        // 不存在的目录条目滤掉，不报错、不让整轮失败。
+        let ghost = ScanScope {
+            folders: vec![root.join("no-such").to_string_lossy().into_owned()],
+            ..ScanScope::default()
+        };
+        assert!(build_index(&ghost).is_empty());
+
+        // %USERPROFILE% 形态的原始串能展开（缺省清单就是这种形态）。
+        let envd = ScanScope {
+            folders: vec![format!("%USERPROFILE%\\{}", "Desktop")],
+            depth: 1,
+            ..ScanScope::default()
+        };
+        let _ = build_index(&envd); // 只验不崩：Desktop 存在与否随机器而定。
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn route_at_respects_the_configured_min_query_len() {
+        // 缺省档（2 字）下单字不进文件模式；配成 1 字就该进。
+        assert_eq!(route_at("'x", 2), Route::NotOurs);
+        assert!(matches!(route_at("'x", 1), Route::Search { .. }));
+        // 配成 3 字 ⇒ 两字词也不进。
+        assert_eq!(route_at("'报 告", 3), Route::NotOurs);
+        assert!(matches!(route_at("'报 告", 2), Route::Search { .. }));
+        assert_eq!(route("'x"), route_at("'x", MIN_QUERY_LEN));
+    }
+
+    #[test]
+    fn set_scope_schedules_a_forced_rescan_and_dedupes() {
+        let mut src = FileSource::default();
+        assert!(!src.rebuild_in_flight);
+
+        // 同值 ⇒ 什么都不动。
+        src.set_scope(ScanScope::default());
+        assert!(!src.rebuild_in_flight);
+        assert!(!src.scope_pending);
+
+        let root = std::env::temp_dir().join("egui-launcher-filesearch-setscope");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("建临时目录");
+        let changed = ScanScope {
+            folders: vec![root.to_string_lossy().into_owned()],
+            depth: 1,
+            ..ScanScope::default()
+        };
+
+        // 空闲时改值 ⇒ 立刻派一轮（真线程，带的就是新范围），不欠账。
+        src.set_scope(changed.clone());
+        assert!(src.rebuild_in_flight, "保存即重扫");
+        assert!(!src.scope_pending, "派出的这轮已经是新范围，不欠账");
+        assert_eq!(src.scope, changed);
+
+        // 在途时改值 ⇒ 只记账，派不出去（闸门挡着）；旧范围的回报到达那帧补派新范围。
+        src.rebuild_in_flight = true;
+        let older = ScanScope {
+            depth: 1,
+            ..ScanScope::default()
+        };
+        src.scope = older;
+        src.scope_pending = false;
+        src.set_scope(changed.clone());
+        assert!(src.scope_pending, "在途那轮是旧范围 ⇒ 欠一笔待扫账");
+        assert_eq!(src.scope, changed);
+
+        let tx = src.tx.clone();
+        tx.send(FileUpdate::Index(vec![FileEntry {
+            name: "stub".to_string(),
+            path: root.join("stub").to_string_lossy().into_owned(),
+            is_dir: false,
+        }]))
+        .expect("注一条回报");
+        src.poll();
+        assert!(!src.scope_pending, "回报采纳后待扫账清零");
+        assert!(src.rebuild_in_flight, "补派的新一轮在途");
+        assert_eq!(src.index.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

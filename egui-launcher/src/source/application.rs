@@ -477,6 +477,12 @@ fn settings_from_map(
     take_field!(map, s, "", default_scope, Scope);
     take_field!(map, s, "", appearance, Appearance);
     take_field!(map, s, "", history_size, usize);
+    take_field!(map, s, "", file_folders, Vec<String>);
+    take_field!(map, s, "", file_depth, usize);
+    take_field!(map, s, "", file_exclude, Vec<String>);
+    take_field!(map, s, "", file_max_entries, usize);
+    take_field!(map, s, "", file_refresh_minutes, u64);
+    take_field!(map, s, "", file_min_query_len, usize);
     s
 }
 
@@ -821,6 +827,34 @@ pub struct AppSettings {
     /// 与 [`AppSettings::term_shell`] 对陌生稳定名回落 `cmd` 同一口径）。
     #[serde(default = "default_history_size")]
     pub history_size: usize,
+
+    /// 文件索引的扫描目录清单（FR-SRC-02 / FR-SRC-14 的 `scope_folders`，批次 D7）。
+    /// 存 `%VAR%` 形态的原始串（缺省＝[`filesearch::default_scope_folders`] 那六条，
+    /// `Desktop` 与 OneDrive 重定向位都列上、建索引时滤掉不存在的）。
+    /// 空清单＝不索引任何东西，是合法（虽然没意义）的用户选择，不判坏。
+    #[serde(default = "default_file_folders")]
+    pub file_folders: Vec<String>,
+
+    /// 递归深度（`scope_depth`）。缺省 4；设置页给 2/4/6/8 四个档位。
+    #[serde(default = "default_file_depth")]
+    pub file_depth: usize,
+
+    /// 按目录名排除（`scope_exclude`）。缺省＝[`filesearch::default_scope_exclude`] 那七条；
+    /// 设置页可增删，「恢复默认排除」写回缺省。
+    #[serde(default = "default_file_exclude")]
+    pub file_exclude: Vec<String>,
+
+    /// 整张索引的条目上限（`max_entries`）。缺省 30000；设置页给 1万/3万/10万 三个档位。
+    #[serde(default = "default_file_max_entries")]
+    pub file_max_entries: usize,
+
+    /// 两轮重扫的间隔分钟数（`refresh_minutes`）。缺省 30；设置页给 5/15/30/60/180 五个档位。
+    #[serde(default = "default_file_refresh_minutes")]
+    pub file_refresh_minutes: u64,
+
+    /// 进文件模式的最小过滤字数（`min_query_length`）。缺省 2；设置页给 1/2/3 三个档位。
+    #[serde(default = "default_file_min_query_len")]
+    pub file_min_query_len: usize,
 }
 
 fn default_terminal_shell() -> String {
@@ -867,6 +901,12 @@ impl Default for AppSettings {
             default_scope: Scope::default(),
             appearance: Appearance::default(),
             history_size: HISTORY_SIZE_DEFAULT,
+            file_folders: default_file_folders(),
+            file_depth: default_file_depth(),
+            file_exclude: default_file_exclude(),
+            file_max_entries: default_file_max_entries(),
+            file_refresh_minutes: default_file_refresh_minutes(),
+            file_min_query_len: default_file_min_query_len(),
         }
     }
 }
@@ -881,6 +921,31 @@ pub const HISTORY_SIZE_MAX: usize = 200;
 
 fn default_history_size() -> usize {
     HISTORY_SIZE_DEFAULT
+}
+
+// 文件搜索的六格缺省（批次 D7）——与 [`filesearch::ScanScope::default`] 同源，零漂移。
+fn default_file_folders() -> Vec<String> {
+    crate::source::filesearch::default_scope_folders()
+}
+
+fn default_file_depth() -> usize {
+    crate::source::filesearch::SCOPE_DEPTH
+}
+
+fn default_file_exclude() -> Vec<String> {
+    crate::source::filesearch::default_scope_exclude()
+}
+
+fn default_file_max_entries() -> usize {
+    crate::source::filesearch::MAX_ENTRIES
+}
+
+fn default_file_refresh_minutes() -> u64 {
+    crate::source::filesearch::REFRESH_MINUTES_DEFAULT
+}
+
+fn default_file_min_query_len() -> usize {
+    crate::source::filesearch::MIN_QUERY_LEN
 }
 
 impl AppSettings {
@@ -899,6 +964,21 @@ impl AppSettings {
     /// FR-CFG-01 那条不变量），所以每一次用到都过这道夹子。`0` 是合法的"不记历史"。
     pub fn history_limit(&self) -> usize {
         self.history_size.min(HISTORY_SIZE_MAX)
+    }
+
+    /// 文件源实际用的扫描范围（批次 D7）：六格汇编成 [`filesearch::ScanScope`] 并夹回
+    /// 有效区间（[`ScanScope::sanitized`]）。夹子在这一步过、**不在读盘时改写配置**——
+    /// 与 [`history_limit`](Self::history_limit) 同一条不变量。
+    pub fn file_scan_scope(&self) -> crate::source::filesearch::ScanScope {
+        crate::source::filesearch::ScanScope {
+            folders: self.file_folders.clone(),
+            depth: self.file_depth,
+            exclude: self.file_exclude.clone(),
+            max_entries: self.file_max_entries,
+            refresh: std::time::Duration::from_secs(self.file_refresh_minutes * 60),
+            min_query_len: self.file_min_query_len,
+        }
+        .sanitized()
     }
 
     /// 开 / 关一个源；返回 `true` ＝ 状态真的有变化（调用方据此写盘）。
@@ -5034,6 +5114,13 @@ mod config_tests {
         x.row_density = RowDensity::Roomy;
         x.default_scope = Scope::Basic;
         x.history_size = 7;
+        // 批次 D7 的六格：同样要"特值进、特值出"，缺一行 take_field! 就得在这条上红。
+        x.file_folders = vec!["C:\\probe-scope".to_string()];
+        x.file_depth = 6;
+        x.file_exclude = vec!["probe-skip".to_string()];
+        x.file_max_entries = 100_000;
+        x.file_refresh_minutes = 15;
+        x.file_min_query_len = 3;
         x.appearance = Appearance {
             width: 720.0,
             status_bar: false,
@@ -5078,6 +5165,40 @@ mod config_tests {
         assert_eq!(got.appearance.fade, true, "appearance.fade");
         assert_eq!(got.history_size, 7, "history_size");
         assert_eq!(got.history_limit(), 7, "history_limit：配置值小于上限时原样");
+        assert_eq!(
+            got.file_folders,
+            vec!["C:\\probe-scope".to_string()],
+            "file_folders"
+        );
+        assert_eq!(got.file_depth, 6, "file_depth");
+        assert_eq!(got.file_exclude, vec!["probe-skip".to_string()], "file_exclude");
+        assert_eq!(got.file_max_entries, 100_000, "file_max_entries");
+        assert_eq!(got.file_refresh_minutes, 15, "file_refresh_minutes");
+        assert_eq!(got.file_min_query_len, 3, "file_min_query_len");
+        assert_eq!(got.file_scan_scope().depth, 6, "file_scan_scope 汇编");
+        assert_eq!(got.file_scan_scope().refresh.as_secs(), 15 * 60);
+    }
+
+    /// 批次 D7：六格 → [`filesearch::ScanScope`] 的汇编与夹子。缺省零漂移
+    /// （＝老配置没有这几格时行为与 D7 之前一字不差），垃圾值夹回有效区间。
+    #[test]
+    fn file_scope_fields_assemble_into_a_sanitized_scan_scope() {
+        let s = AppSettings::default();
+        assert_eq!(
+            s.file_scan_scope(),
+            crate::source::filesearch::ScanScope::default(),
+            "缺省六格与数据源缺省范围零漂移"
+        );
+        let mut bad = AppSettings::default();
+        bad.file_depth = 0;
+        bad.file_max_entries = 0;
+        bad.file_refresh_minutes = 0;
+        bad.file_min_query_len = 0;
+        let g = bad.file_scan_scope();
+        assert_eq!(g.depth, 1, "零深度夹到最小有效档");
+        assert_eq!(g.max_entries, 1_000);
+        assert_eq!(g.refresh, std::time::Duration::from_secs(60));
+        assert_eq!(g.min_query_len, 1);
     }
 
     /// 「缺失项补默认」＋批次 J 那次的老写法：`space_to_run` 曾是布尔。

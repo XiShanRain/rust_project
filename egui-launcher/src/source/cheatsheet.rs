@@ -58,7 +58,7 @@ pub struct CheatEntry {
     pub group: Group,
     /// 依赖哪个数据源：该源关掉时这一条整条不出现。`None` ＝ 与数据源无关。
     pub source: Option<SourceId>,
-    /// 帮助页上「打开设置页」跳到第几页（1=通用 2=功能 3=热键 4=数据源 5=外观）。
+    /// 帮助页上「打开设置页」跳到第几页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级）。
     pub settings_page: Option<u32>,
 }
 
@@ -191,14 +191,28 @@ pub const ENTRIES: &[CheatEntry] = &[
     CheatEntry {
         key: "'报告",
         title: "文件模式第二式：按文件名搜",
-        summary: "在 桌面/下载/文档 的索引里找",
+        summary: "在配置范围的索引里找（默认：桌面/下载/文档）",
         detail: "撇号后直接跟词。撇号可以是半角 `'`、弯引号 `‘`/`’`（中文输入法常打出这个）或全角 `＇`。\n\
-                 索引范围：桌面、下载、文档，深度四级以内，3 万条封顶；每 30 分钟重扫一轮。\n\
+                 索引范围/深度/上限/重扫间隔/最小字数都在设置页「文件搜索」可调；\n\
+                 缺省：桌面、下载、文档，深度 4，3 万条封顶，每 30 分钟重扫一轮。\n\
                  结果最多 30 条。Enter 用系统关联程序打开；选中文件夹行时 Tab 进入该目录。",
-        tags: "file 文件 文件名 搜索 撇号 apostrophe",
+        tags: "file 文件 文件名 搜索 撇号 apostrophe 索引 范围",
         group: Group::Files,
         source: Some(SourceId::Files),
-        settings_page: Some(4),
+        settings_page: Some(5),
+    },
+    CheatEntry {
+        key: "索引范围",
+        title: "文件索引：范围与时机可配",
+        summary: "设置 → 文件搜索：目录 / 深度 / 上限 / 重扫 / 最小字数",
+        detail: "扫描目录默认是三个用户目录（Desktop 与 OneDrive 重定向位都算），可以增删、支持 %环境变量%。\n\
+                 递归深度 2/4/6/8，条目上限 1万/3万/10万，重扫间隔 5～180 分钟，进文件模式的最小字数 1/2/3。\n\
+                 排除表按目录名整段跳过，node_modules / .git 等出厂七条可「恢复默认排除」。\n\
+                 改动保存后自动在后台重建索引，旧索引在建成前继续可用。",
+        tags: "file 索引 范围 目录 深度 上限 重扫 排除 设置 scope index",
+        group: Group::Files,
+        source: Some(SourceId::Files),
+        settings_page: Some(5),
     },
     CheatEntry {
         key: "（空格开头）报告",
@@ -586,7 +600,7 @@ pub const ENTRIES: &[CheatEntry] = &[
         tags: "key 隐藏 hide hidden 条目 扫描 恢复",
         group: Group::Keys,
         source: None,
-        settings_page: Some(6),
+        settings_page: Some(7),
     },
     CheatEntry {
         key: "Ctrl+L",
@@ -912,8 +926,9 @@ mod tests {
             if let Some(page) = e.settings_page {
                 // 批次 F1 加了第 5 页「外观」，上界跟着走（现量：SettingsTab::from_page 认 1..=5）。
                 // 【2026-10-24 批次 F7：加了第 6 页「高级」，上界改为 1..=6。】
+                // 【2026-10-27 批次 D7：插入第 5 页「文件搜索」，外观/高级顺延为 6/7，上界 1..=7。】
                 assert!(
-                    (1..=6).contains(&page),
+                    (1..=7).contains(&page),
                     "「{}」指向不存在的设置页 {page}",
                     e.title
                 );

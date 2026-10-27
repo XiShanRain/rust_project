@@ -197,6 +197,11 @@ pub trait DataSource {
     /// 只有真持有索引的源需要覆盖（目前是文件源）；调用方负责先看开关——
     /// 关掉的源不该因为一条命令就在后台读盘。
     fn rebuild(&mut self) {}
+    /// 配置变更的回调（批次 D7）：源自己认领 `AppSettings` 里与它相关的格。默认什么都不做。
+    /// 调用方在每帧的 poll 循环里、**只对开着的源**喂一遍——与 `poll` 同一道开关闸，
+    /// 关掉的源不该因为改了设置就在后台读盘。文件源在这里比对扫描范围，
+    /// 变了就走「保存即重扫」（`set_scope` 用相等比较去重，同值零成本）。
+    fn apply_settings(&mut self, _prefs: &application::AppSettings) {}
 }
 
 /// 注册表。**顺序就是报文次序**：先按此序问独占，再按此序拼头段，最后按此序取结果。
@@ -204,14 +209,23 @@ pub trait DataSource {
 /// 新源加在哪儿，决定它压不压得住别人：
 /// - 想在用户自己的命令/引擎之后 ⇒ 加在 `Files` 附近；
 /// - 想抢在它们之前 ⇒ 往前放（目前 `Custom` 在最前，是因为"用户数据压过出厂数据"）。
+/// 全缺省设置的注册表。只有单测在用（`main.rs` 走 [`default_sources_with`]）；
+/// 顺序不许漂，两个入口共享同一张 vec。
+#[cfg(test)]
 pub fn default_sources() -> Vec<Box<dyn DataSource>> {
+    default_sources_with(&application::AppSettings::default())
+}
+
+/// 同上，但文件源按配置的扫描范围造（批次 D7：冷启动一轮就按 `settings.json` 里的
+/// 目录/深度扫，不经历"先按缺省扫一轮再推倒重来"）。
+pub fn default_sources_with(prefs: &application::AppSettings) -> Vec<Box<dyn DataSource>> {
     vec![
         // 两个显式语法排最前：`?` / `>` 是用户明说"这条给速查表 / 终端"，不该被同名关键字抢走。
         Box::new(cheatsheet::CheatSource),
         Box::new(terminal::TerminalSource),
         Box::new(custom::CustomSource),
         Box::new(websearch::WebSource),
-        Box::new(filesearch::FileSource::default()),
+        Box::new(filesearch::FileSource::with_scope(prefs.file_scan_scope())),
         Box::new(calc::CalcSource),
         Box::new(application::AppsSource),
     ]
