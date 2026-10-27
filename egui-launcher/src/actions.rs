@@ -34,6 +34,11 @@ pub enum Subject {
     /// 批次 E4（FR-ACT-05）：**一批被标记的文件/文件夹**。不是清单里的一行，而是 `Insert`
     /// 攒下来的集合 ⇒ 动作表整张换掉（[`batch_actions`]），不再走 [`actions_for`] 的单体条件表。
     Batch,
+    /// 批次 E5（FR-ACT-01 第三格）：**一串算出来的文本**——计算器行的结果与换算值。
+    /// 它不是磁盘上的东西、也不是协议串：`path` 里放的就是那串文本本身，所以「打开」这一格
+    /// 对它没有意义（把 `14` 交给 `ShellExecute` 会去搜一个叫 14 的程序）。整张表换掉
+    /// （[`text_actions`]），与 [`Subject::Batch`] 同一处理方式。
+    Text,
 }
 
 /// 一个动作的 id。`main.rs` 的 `run_action()` 按它分派；本文件按它给标签、副标题与键位提示。
@@ -62,6 +67,11 @@ pub enum ActionId {
     CopyTo,
     AddAll,
     RecycleAll,
+    // ---- 批次 E5（FR-ACT-01 第三格）：文本对象。只在 [`Subject::Text`] 那张表里出现 ----
+    /// 把这串文本打字打进呼出启动器之前的那个窗口（AHK `PasteText` 的同一条，注入方式有意不同）。
+    PasteText,
+    /// 把这串文本放进剪贴板——与结果模式按 Enter 同一条动作，所以它是这张表的第一格。
+    CopyText,
 }
 
 /// 面板里的一行。`label` 是标题，`subtitle` 是弱色补充（路径、网址、代价说明），
@@ -328,15 +338,43 @@ pub fn batch_actions(t: &PanelTarget) -> Vec<Action> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// 文本对象的动作表（批次 E5）
+// ---------------------------------------------------------------------------
+
+/// 批次 E5（FR-ACT-01 第三格「文本 ⇒ 粘贴」）：计算器行那串算出来的文本能做的三件事。
+///
+/// 第一格刻意不是「打开」而是「复制」，但**守的是同一条不变量的本义**——面板第一行永远等于
+/// 结果模式里 Enter 落下去做的那件事，而计算器行的 Enter 本来就是复制数字（FR-SRC-10 批次 S）。
+/// 给它配一个假的「打开」会把这串文本交给 `ShellExecuteExW`，等于让启动器去搜一个叫 `14` 的程序。
+///
+/// 「大字显示」仍垫底，与单体表、批量表同一条收尾。
+fn text_actions(t: &PanelTarget) -> Vec<Action> {
+    let n = t.path.chars().count();
+    vec![
+        row(ActionId::CopyText, "只带这一串值，与 Enter 同一条", "Enter"),
+        row(
+            ActionId::PasteText,
+            &format!("打进呼出前的那个窗口，不碰你的剪贴板（{n} 个字符）"),
+            "",
+        ),
+        row(ActionId::LargeType, "铺满屏幕中央放大显示", "Ctrl+L"),
+    ]
+}
+
 /// FR-ACT-04 的条件表。**顺序即面板顺序**，两条不变量由单测钉住：「打开」恒为第一项
 /// （Enter 与数字键落下去就是它，与结果模式的默认动作同一口径），「大字显示」恒为最后一项
 /// （与 AHK `ListFor()` 的收尾一致）。
 ///
 /// 批次 E4：`Subject::Batch` 整张换表，早退在条件表之前——批量对象没有"名称/路径/可编辑性"
 /// 这些单体属性，硬套进来会让每条判据都要多一个"是不是批量"的分支。
+/// 批次 E5：`Subject::Text` 同理另换一张（见 [`text_actions`]）。
 pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
     if t.subject == Subject::Batch {
         return batch_actions(t);
+    }
+    if t.subject == Subject::Text {
+        return text_actions(t);
     }
     let fs = is_fs_path(&t.path);
     // 应用条目常常只有命令名（`calc.exe`）而非全路径；提权/定位/属性只对「盘上真有其文件」
@@ -412,20 +450,24 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
 }
 
 /// 批次 E3-丙（FR-ACT-01「`Ctrl+Enter` 走次级动作」）：快捷键版按这一条判据**直接做一件事**，
-/// 不给面板、也就没有第二次选择。映射只收需求书原文点名的两格，且与面板的准入条件**逐格对齐**
+/// 不给面板、也就没有第二次选择。映射只收需求书原文点名的三格，且与面板的准入条件**逐格对齐**
 /// （面板里 `Reveal` 的准入就是 `File` / `Folder` 且路径是文件系统路径，`CopyUrl` 的准入就是
 /// `Url`；两边同一份 `Subject` ⇒ 不存在"面板里有、快捷键说没有"的行）：
 ///
 /// - 文件 / 文件夹 ⇒ 所在位置（`explorer /select,`）；
 /// - 网址 / 协议串 ⇒ 复制网址；
+/// - 算出来的文本（计算器行）⇒ 粘贴进呼出前的那个窗口（批次 E5，2026-10-27）；
 /// - 其余（应用条目、Store 应用、命名项、内置动作行）⇒ `None`，它们要做什么得在面板里选。
 ///
-/// 原文第三格「文本 ⇒ 粘贴」**没做**：它与 P1 那五个粘贴 / 批量动作同一个前置（FR-ACT-05 多选），
-/// 不为它开一条没有多选语义的半截实现。
+/// ~~原文第三格「文本 ⇒ 粘贴」**没做**：它与 P1 那五个粘贴 / 批量动作同一个前置（FR-ACT-05 多选），
+/// 不为它开一条没有多选语义的半截实现。~~【2026-10-27 批次 E5 更正：这一格的前置**从来不是多选**，
+/// 是本程序没有"呼出前的那个窗口"这份记账——AHK `App.RememberActiveWindow()` 那一格。E5 补了记账，
+/// 于是它落到 [`Subject::Text`] + [`ActionId::PasteText`] 上，与多选无关。】
 pub fn secondary_action_for(subject: Subject) -> Option<ActionId> {
     match subject {
         Subject::File | Subject::Folder => Some(ActionId::Reveal),
         Subject::Url => Some(ActionId::CopyUrl),
+        Subject::Text => Some(ActionId::PasteText),
         _ => None,
     }
 }
@@ -472,6 +514,8 @@ impl ActionId {
             ActionId::CopyTo => "复制到…",
             ActionId::AddAll => "全部加入命令",
             ActionId::RecycleAll => "全部回收站",
+            ActionId::PasteText => "粘贴到原窗口",
+            ActionId::CopyText => "复制这一串",
         }
     }
 
@@ -488,6 +532,8 @@ impl ActionId {
             | ActionId::AddCommand
             | ActionId::LargeType => "执行",
             ActionId::CopyPath | ActionId::CopyUrl | ActionId::CopyName => "复制",
+            ActionId::CopyText => "复制",
+            ActionId::PasteText => "粘贴",
             ActionId::Delete => "删除",
             ActionId::Recycle => "回收",
             ActionId::TogglePin => "置顶",
@@ -526,6 +572,8 @@ impl ActionId {
             ActionId::CopyTo => &["copyto", "destination", "folder", "copy"],
             ActionId::AddAll => &["addall", "add", "command", "all", "save"],
             ActionId::RecycleAll => &["recycleall", "recycle", "trash", "all"],
+            ActionId::PasteText => &["paste", "pastetext", "send"],
+            ActionId::CopyText => &["copytext", "copy", "value", "result"],
         }
     }
 }
@@ -899,12 +947,49 @@ mod tests {
         }
     }
 
-    /// 批次 E3-丙：快捷键版的映射只收需求书原文点名的两格，其余一律交给面板。
+    /// 批次 E5：文本对象（计算器行）另有一张三格表。第一格是 Enter 本来做的那件事（复制这一串），
+    /// **不是**一个假的「打开」——把这串值交给 `ShellExecuteExW` 等于让启动器去搜一个叫 `14` 的程序。
+    /// 粘贴那条的副标题报字符数，供真机只看日志就能判定贴出去的是哪一串。
     #[test]
-    fn shortcut_mapping_is_the_two_cells_the_spec_names() {
+    fn a_text_target_gets_copy_paste_large_and_never_a_launch() {
+        let mut t = target(Subject::Text, "1,024");
+        t.title = "= 1,024".to_string();
+        t.editable = false;
+        t.uid = None;
+        let list = actions_for(&t);
+        let got = ids(&t);
+        assert_eq!(
+            got,
+            vec![ActionId::CopyText, ActionId::PasteText, ActionId::LargeType]
+        );
+        assert_eq!(list[0].keys, "Enter");
+        assert!(list[1].subtitle.contains('5'), "{}", list[1].subtitle);
+        for id in [
+            ActionId::Open,
+            ActionId::CopyPath,
+            ActionId::CopyUrl,
+            ActionId::CopyName,
+            ActionId::Reveal,
+            ActionId::RunAs,
+            ActionId::Properties,
+            ActionId::Recycle,
+            ActionId::Edit,
+            ActionId::Delete,
+            ActionId::TogglePin,
+            ActionId::AddCommand,
+        ] {
+            assert!(!got.contains(&id), "文本对象不该有 {id:?}");
+        }
+    }
+
+    /// 批次 E3-丙 + E5：快捷键版的映射只收需求书原文点名的三格，其余一律交给面板。
+    #[test]
+    fn shortcut_mapping_is_the_three_cells_the_spec_names() {
         assert_eq!(secondary_action_for(Subject::File), Some(ActionId::Reveal));
         assert_eq!(secondary_action_for(Subject::Folder), Some(ActionId::Reveal));
         assert_eq!(secondary_action_for(Subject::Url), Some(ActionId::CopyUrl));
+        // FR-ACT-01 原文第三格（批次 E5）：文本 ⇒ 粘贴。
+        assert_eq!(secondary_action_for(Subject::Text), Some(ActionId::PasteText));
         for s in [
             Subject::App,
             Subject::StoreApp,
@@ -932,6 +1017,7 @@ mod tests {
             (Subject::File, "C:\\Windows\\notepad.exe"),
             (Subject::Folder, "C:\\Windows"),
             (Subject::Internal, "internal:settings"),
+            (Subject::Text, "1,024"),
         ];
         for (subject, path) in cases {
             let t = target(subject, path);

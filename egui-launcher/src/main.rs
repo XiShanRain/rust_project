@@ -60,11 +60,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ChangeWindowMessageFilterEx, CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowThreadProcessId, HWND_BROADCAST,
-    HWND_MESSAGE, IsIconic, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
+    HWND_MESSAGE, IsIconic, IsWindow, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_RESTORE,
-    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetTimer,
-    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COPYDATA,
-    WM_DESTROY, WM_HOTKEY, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW,
+    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW,
 };
 
 /// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
@@ -994,6 +994,204 @@ fn write_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+// ---- 批次 E5（FR-ACT-01 第三格「文本 ⇒ 粘贴」）：呼出前那个窗口的记账与注入 ----
+
+/// 呼出之前那个窗口的句柄数值；`0` = 这次没记下（呼出时系统前台本来就是空的）。
+/// `HWND` 是裸指针、不 `Sync`，与 [`HOTKEY_HWND`] 同一处理：存数值、用时还原。
+static PREVIOUS_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// 一批最多投多少个 UTF-16 单元。`SendInput` 对单次调用的事件数有系统上限，
+/// 计算器行那串值远用不到分块，留分块是因为这张表的文本格以后可能吃到换算长串。
+const PASTE_CHUNK_UNITS: usize = 64;
+
+/// 投字之前等焦点落到目标窗口的上限与步进。见 [`paste_text_into_previous_window`] 的闸 ③：
+/// `SetForegroundWindow` 报 TRUE 之后，前台换人可能还要几毫秒才在 `GetForegroundWindow` 上看得见。
+/// 上限取 300ms 而不是 AHK 的 1s——这条循环堵在 UI 线程上，再长就是用户能感觉到的卡顿。
+const FOCUS_SETTLE_TIMEOUT: Duration = Duration::from_millis(300);
+const FOCUS_SETTLE_POLL: Duration = Duration::from_millis(10);
+
+/// 只取窗口类名。**标题一个字不取**：标题里经常带着用户正在编辑的正文，
+/// 与 [`inject_typeback_char`] 那条"前台只记 hwnd + 类名"的隐私口径同一条。
+fn window_class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    let n = (n.max(0) as usize).min(buf.len());
+    String::from_utf16_lossy(&buf[..n])
+}
+
+/// 记一次"呼出之前的前台窗口"。AHK 版同一格是 `App.RememberActiveWindow()`——
+/// 本程序此前**没有这份记账**，这就是 FR-ACT-01 第三格一直做不下去的真正前置
+/// （不是 FR-ACT-05 多选，那个批次 E4 就交付了）。
+///
+/// 三条规矩：
+/// · 前台为空 ⇒ 清零。宁可以说"没记下"然后拒绝粘贴，不能留着上一次的窗口当这次的目标。
+/// · 前台就是本程序自己 ⇒ **保留上一次那一个**，不覆盖。这是 AHK 的同一条判据：重复呼出、
+///   托盘点自己、大字窗把焦点借走又还回来，这些时刻的前台都不是用户要贴回去的窗口。
+///   可见却失焦的那几种情况（弹窗／设置页／大字窗开着，FR-WIN-04 不关窗）也走这一格，
+///   所以这个函数在 `show_now` 里**每次呼出都调**，不只调"隐藏→显示"那条边沿。
+/// · 其余 ⇒ 记下，日志报 hwnd + 类名。
+fn remember_previous_window(own: Option<HWND>) {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        PREVIOUS_HWND.store(0, Ordering::Relaxed);
+        eprintln!("paste: 呼出时系统前台为空 ⇒ 这次没有可粘贴的目标");
+        return;
+    }
+    if let Some(me) = own {
+        if me.0 == fg.0 {
+            return;
+        }
+    }
+    let raw = fg.0 as usize;
+    let changed = PREVIOUS_HWND.swap(raw, Ordering::Relaxed) != raw;
+    if changed {
+        eprintln!(
+            "paste: 记下「呼出前的窗口」= 0x{raw:x}({})",
+            window_class_name(fg)
+        );
+    }
+}
+
+/// 把一串文本**逐字符打字**进 [`PREVIOUS_HWND`] 那个窗口。
+/// 成功返回落点描述（hwnd + 类名，不含内容），失败返回"为什么一个字都没投"。
+///
+/// 三道闸，任何一道不过都还没碰过键盘：
+/// 1. 记到了句柄，且 [`IsWindow`] 说它还在（原窗口已关 ⇒ 清空记账，避免下次还往死句柄上撞）；
+/// 2. [`SetForegroundWindow`] 报 TRUE —— 系统可以整条拒绝（前台锁），只看返回值不够；
+/// 3. 再问 [`GetForegroundWindow`] 是不是它——这一条才是"焦点真回来了"的事实；缺了它，
+///    投出去的字符会落进还拿着焦点的本程序输入框里，用户看到一串凭空多出来的数字。
+///    不等一帧而是**最多等 [`FOCUS_SETTLE_TIMEOUT`]**：换人是异步的，同帧看一眼会把该贴成功的
+///    那次拒掉（AHK 版在同一个位置等 1 秒，见 `App.FocusPreviousWindow()`）。
+///
+/// 走 `KEYEVENTF_UNICODE` 而不是 AHK 的"借剪贴板 → `^v` → 还原"：还原之前那一段里用户按
+/// `Ctrl+V` 会贴出错东西，剪贴板内容还会被监听型程序拿走；计算器那串值是短的纯文本，
+/// Unicode 通道 `wVk = 0` ⇒ `Ctrl+Enter` 那颗还按着的 `Ctrl` 不会被折成新的快捷键
+/// （与 [`inject_typeback_char`] 同一套理由，那一条已真机验过记事本与微软拼音）。
+///
+/// 与那条的**唯一区别**：typeback 打的是本程序自己的输入框（呼出时已按 E-05 切过英文），
+/// 这里打的是别人家的窗口，它的输入法状态我不知道 ⇒ 投字那一小段要自己按快照临时切英文、
+/// 投完还回去。少了这一步，中文 IME 会把事件吃掉而 `SendInput` 仍报全部成功（批次 E5 真机
+/// 抓到的，见下面那段注）。
+fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
+    if text.is_empty() {
+        return Err("这一行没有可粘贴的内容".to_string());
+    }
+    let raw = PREVIOUS_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return Err("这次呼出没记下「之前的窗口」⇒ 一个字都没投".to_string());
+    }
+    let hwnd = HWND(raw as *mut _);
+    if unsafe { !IsWindow(Some(hwnd)).as_bool() } {
+        PREVIOUS_HWND.store(0, Ordering::Relaxed);
+        return Err(format!(
+            "原来那个窗口（0x{raw:x}）已经关掉了 ⇒ 一个字都没投"
+        ));
+    }
+    let target = window_class_name(hwnd);
+    if unsafe { !SetForegroundWindow(hwnd).as_bool() } {
+        return Err(format!(
+            "系统没让 0x{raw:x}({target}) 到前台（前台锁）⇒ 一个字都没投"
+        ));
+    }
+    // ---- 闸 ③：等焦点真的落到目标窗口，最多 FOCUS_SETTLE_TIMEOUT ----
+    // 只看一帧会误拒：调用这一条的时候本程序的窗还盖在上面（`do_paste` 是投完字才收窗的），
+    // `SetForegroundWindow` 说 TRUE 只是"允许切"，前台换人可能晚几毫秒才在 `GetForegroundWindow`
+    // 上看得见。AHK 版同样是等的（`App.FocusPreviousWindow()` = `WinActivate` +
+    // `WinWaitActive(..., , 1)`），这里把上限收短。等不到才拒——宁可一个字都不投，
+    // 也不往此刻真正拿着焦点的那个窗口里打。
+    let mut settle_polls = 0usize;
+    let settle_deadline = Instant::now() + FOCUS_SETTLE_TIMEOUT;
+    loop {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.0 == hwnd.0 {
+            break;
+        }
+        if Instant::now() >= settle_deadline {
+            let now_cls = if fg.0.is_null() {
+                "无".to_string()
+            } else {
+                window_class_name(fg)
+            };
+            return Err(format!(
+                "焦点没回到原窗口（现在前台是 0x{:x}({now_cls})，等了 {settle_polls} 次）⇒ 一个字都没投",
+                fg.0 as usize
+            ));
+        }
+        thread::sleep(FOCUS_SETTLE_POLL);
+        settle_polls += 1;
+    }
+    if settle_polls > 0 {
+        eprintln!("paste: 焦点等了 {settle_polls} 次才落到 0x{raw:x}({target})");
+    }
+    let units: Vec<u16> = text.encode_utf16().collect();
+    // ---- 批次 E5 真机抓到的根因：`KEYEVENTF_UNICODE` 的事件**先过一遍目标那边的输入法** ----
+    // 目标挂着中文模式的 IME 时，`SendInput` 照样返回"全部收下"，字却一个字都不落地——
+    // 报成功的假回执，比报错难查得多。第一轮之所以看着是好的，是本程序自己"呼出时切英文"
+    // 那一次恰好切在了记事本上（那一刻前台还是它），关窗时又按 E-05 原样还回中文
+    // ⇒ 第二轮起投进去的全被 IME 吃掉。所以打字这一小段要**自己**把目标的输入法按住，
+    // 投完立刻按快照还回去（含中途失败那条路），不改用户的输入法设置。
+    let ime_wnd = ime_wnd_of(hwnd);
+    let ime_before = ime_wnd.map(|w| get_ime_state(w));
+    if let (Some(w), Some(before)) = (ime_wnd, ime_before) {
+        switch_ime_to_english(w, before);
+    }
+    let mut sent = 0usize;
+    let mut failed: Option<String> = None;
+    for chunk in units.chunks(PASTE_CHUNK_UNITS) {
+        let input = |unit: u16, up: bool| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: unit,
+                    dwFlags: if up {
+                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                    } else {
+                        KEYEVENTF_UNICODE
+                    },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let events: Vec<INPUT> = chunk
+            .iter()
+            .flat_map(|u| [input(*u, false), input(*u, true)])
+            .collect();
+        let n = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) } as usize;
+        sent += n;
+        if n != events.len() {
+            // 已经投出去的那一部分收不回来，所以这条要说清"贴了一半"，
+            // 而不是给一个看起来像"什么都没做"的失败。字符数不是内容，可落日志。
+            failed = Some(format!(
+                "投到 0x{raw:x}({target}) 时系统只收了 {sent}/{} 个事件 ⇒ 这串可能只贴了一半",
+                units.len() * 2
+            ));
+            break;
+        }
+    }
+    if let (Some(w), Some(before)) = (ime_wnd, ime_before) {
+        restore_ime(w, before);
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    // 输入法快照是状态不是内容，可以落日志——这一行同时是上面那条根因的取证口：
+    // 若哪天又出现"报成功却没字"，先看这里的 before 是不是 open=true/conv 带 NATIVE。
+    let ime_note = match ime_before {
+        Some(s) => format!(
+            "，目标输入法 before open={} conv=0x{:X} ⇒ 投字期间临时切英文",
+            s.open, s.conv
+        ),
+        None => "，目标无 IME 窗口 ⇒ 没动输入法".to_string(),
+    };
+    eprintln!(
+        "paste: 已向 0x{raw:x}({target}) 投出 {} 个字符（SendInput {sent} 个事件{ime_note}）；内容不落日志",
+        units.len()
+    );
+    Ok(format!("0x{raw:x}({target})"))
+}
+
 // ---- FR-ACT-10 键盘导航的纯计算部分（不碰 egui 状态，可单测）----
 
 /// 列表可视区之外被顶栏 + 内边距 + 外框吃掉的高度，用于把窗口高换算成「一页可见几行」。
@@ -1402,8 +1600,10 @@ struct PanelState {
     open: PanelOpen,
 }
 
-/// [`PanelState::open`] 的两种形态，差别只有一件事：**有没有清单身份**
-/// （学习统计与脱敏日志都挂在身份上）。
+/// [`PanelState::open`] 此刻四种形态。批次 P1 写下"两种形态，差别只有一件事：**有没有清单身份**
+/// （学习统计与脱敏日志都挂在身份上）"——那一句到批次 E5 只算部分成立：
+/// `Entry` / `Path` / `Batch` 三档的差别确实是身份，而新加的 [`PanelOpen::Value`] 差的是**对象种类**
+/// （那一档根本没有"打开"这个动作可做）。
 enum PanelOpen {
     /// 清单里的条目：交给与 Enter 完全同一条 [`LauncherApp::launch_with_log`]
     /// （内置动作 `internal:` 的分派、自定义命令的脱敏日志都在里面），只是学习用的词换成进来时那串。
@@ -1421,6 +1621,11 @@ enum PanelOpen {
     /// 批次 E4（FR-ACT-05）：一批被标记的路径。没有清单身份、没有"当前打开的那一个"——
     /// 表里七条动作各自对整个 `target.batch` 动手。
     Batch,
+    /// 批次 E5（FR-ACT-01 第三格）：**一串文本**（计算器行的结果 / 换算值）。
+    /// `target.path` 里放的就是那一串本身，所以这一档**没有"打开"**：把它交给
+    /// `ShellExecuteExW` 等于让启动器去搜一个叫 `14` 的程序。表里只有复制 / 粘贴 / 大字三格，
+    /// 都不会走到这里执行——`ActionId::Open` 明确拒绝这一档（见 [`LauncherApp::run_panel_action`]）。
+    Value,
 }
 
 /// 面板里执行完一条动作之后的现场处置。四条出路语义上互斥，所以做成枚举而不是两个 bool。
@@ -1739,9 +1944,13 @@ fn user_cancelled(e: &windows::core::Error) -> bool {
 /// 把「当前高亮行」翻译成面板需要的两份数据（动作表输入 + 「打开」的可执行形态）。
 /// 返回 `None` = 这一行没有可处置的对象 ⇒ `→` 保持 TextEdit 的原义，不抢键。
 ///
-/// 「哪些行有面板」与「Enter 按下去干什么」是两件事，判据**刻意不同源**：计算器那一串数字
+/// 「哪些行有面板」与「Enter 按下去干什么」是两件事，判据**刻意不同源**：~~计算器那一串数字~~
 /// 没有路径可复制、终端行是一条命令而不是一个东西、`valid=false` 的提示行压根不该被执行——
 /// 硬给它们一张动作表只会供出一排按了报错的按钮。
+/// 【2026-10-27 批次 E5 更正：计算器行**已经进了**这张判据——但它用的不是路径那张表，
+/// 是 [`actions::Subject::Text`] 那张三格表（复制这一串 / 粘贴到原窗口 / 大字显示），
+/// 一条会走到 `ShellExecuteExW` 的动作都没有，所以"供出一排按了报错的按钮"这个担心
+/// 对文本对象不成立。终端行与提示行仍然按原话排除。】
 ///
 /// 参数拆成 `head` / `results` 两片而不是 `&Plan`：渲染那一帧把 `plan.results` 搬出来当局部量
 /// 用了（条目循环要按下标取），整块 `&plan` 在那里是"部分移动后再借用"，编译不过。
@@ -1820,7 +2029,26 @@ fn panel_for_row(
                 },
                 PanelOpen::Path,
             )),
-            // 计算器 / 终端 / 各类提示行（`valid=false`）/ 分类行：没有可处置的对象。
+            // 批次 E5（FR-ACT-01 第三格）：计算器行第一次有动作表。
+            // 对象是**那一串文本**，不是路径：`path` 里放 `hit.copy`（不带千分位、不带单位的那一份，
+            // 与 Enter 复制的是同一个串），`title` 用行上显示的那一句（`= 1,024`）只为大字显示用。
+            // `editable: false` + `uid: None` ⇒ 表里没有编辑 / 删除 / 置顶；`exists: true`
+            // 是因为"这一串刚算出来"不存在失效一说（四态只管磁盘上的东西）。
+            HeadRow::Calc(hit) => Some((
+                actions::PanelTarget {
+                    title: hit.title.clone(),
+                    subject: actions::Subject::Text,
+                    path: hit.copy.clone(),
+                    arguments: String::new(),
+                    exists: true,
+                    editable: false,
+                    uid: None,
+                    pinned: false,
+                    batch: Vec::new(),
+                },
+                PanelOpen::Value,
+            )),
+            // 终端 / 各类提示行（`valid=false`）/ 分类行：没有可处置的对象。
             _ => None,
         },
     }
@@ -1889,18 +2117,24 @@ fn set_ime_state(ime_wnd: HWND, open: bool, conv: usize) {
     }
 }
 
-/// 获取当前前台窗口的 IME 窗口句柄
-fn foreground_ime_wnd() -> Option<HWND> {
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0.is_null() {
-        return None;
-    }
+/// 取**任意**窗口的 IME 窗口句柄（跨进程可用：下面全是 `SendMessageTimeout`，
+/// 与 AHK 版 `Win.SetImeState` 同构）。批次 E5 往原窗口打字前要先问它这一句。
+fn ime_wnd_of(hwnd: HWND) -> Option<HWND> {
     let ime_wnd = unsafe { ImmGetDefaultIMEWnd(hwnd) };
     if ime_wnd.0.is_null() {
         None
     } else {
         Some(ime_wnd)
     }
+}
+
+/// 获取当前前台窗口的 IME 窗口句柄
+fn foreground_ime_wnd() -> Option<HWND> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    ime_wnd_of(hwnd)
 }
 
 /// E-05 第 2 档：切当前 IME 到英文模式（去掉 IME_CMODE_NATIVE 位 + 关闭 IME）
@@ -3600,6 +3834,11 @@ impl LauncherApp {
         // 批次 F1：隐藏期间系统明暗可能已经切了（选择 `System` 时要用新的），
         // 用户也可能刚改过 `Themes\*.json`。呼出是"重新读盘"的自然时机。
         self.sync_theme(ctx);
+        // 批次 E5：这一行必须在**动窗口之前**。此刻系统前台还是用户待的那个窗口，
+        // `ShowWindow` / `Focus` 之后就变成我们自己的了——FR-ACT-01 第三格「文本 ⇒ 粘贴」
+        // 要的"贴回哪儿"只有这一帧问得出来。每次呼出都问一遍，不只隐藏→显示的边沿：
+        // 弹窗／设置页／大字窗开着时失焦不关窗（FR-WIN-04），那种状态下前台已经不是我们。
+        remember_previous_window(self.self_hwnd);
         let iconic = self.is_iconic();
         if !self.visible || iconic {
             if iconic && self.visible {
@@ -5907,7 +6146,7 @@ impl LauncherApp {
         let Some((target, open)) =
             panel_for_row(row, &plan.head, &plan.results, &self.items, &self.path_states)
         else {
-            eprintln!("操作面板：这一行没有可处置的对象（计算器 / 终端 / 提示 / 分类行），不进面板");
+            eprintln!("操作面板：这一行没有可处置的对象（终端 / 提示 / 分类行），不进面板");
             return false;
         };
         // 「恢复选中行」按**这一行本身**记，不按此刻的选中记：键盘（`→`）进来时两者相等——
@@ -6043,6 +6282,7 @@ impl LauncherApp {
 
     /// 批次 E3-丙：剪贴板三格共用的一条（面板的复制路径 / 复制网址 / 复制名称）。
     /// 内容多半是从查询现出来的 ⇒ 日志只记长度与是哪一格（FR-SYS-03）。
+    /// 批次 E5 起是四格：多一条「复制这一串」（计算器行的值）。
     fn do_copy(
         &mut self,
         ctx: &egui::Context,
@@ -6053,11 +6293,14 @@ impl LauncherApp {
         let text = match id {
             actions::ActionId::CopyName => target.name_to_copy(),
             actions::ActionId::CopyUrl => target.path.clone(),
+            // 批次 E5：文本对象的 `path` 里就是那一串值，与 Enter 复制的同一份。
+            actions::ActionId::CopyText => target.path.clone(),
             _ => target.path_to_copy(),
         };
         let verb = match id {
             actions::ActionId::CopyName => "名称",
             actions::ActionId::CopyUrl => "网址",
+            actions::ActionId::CopyText => "这一串",
             _ => "路径",
         };
         match copy_to_clipboard(&text) {
@@ -6085,22 +6328,57 @@ impl LauncherApp {
         PanelOutcome::Stay
     }
 
+    /// 批次 E5（FR-ACT-01 第三格）：「粘贴到原窗口」做成面板版与快捷键版共用的一条。
+    /// `via` 是日志前缀（与 [`Self::do_reveal`] 同一手法，真机判据直接 grep 前缀分辨哪一路）。
+    ///
+    /// 成功 ⇒ `Gone`：用户的下一步是在**那个窗口**里接着干活，把我们留在原地只会让他再多按一次
+    /// `Esc`；所以先注入、再收窗，回执用 HUD 送到窗口外面（FR-UIX-09 那条口径）。
+    /// 失败 ⇒ `Stay` 且一个字都没投：[`paste_text_into_previous_window`] 的三道闸任何一道没过
+    /// 都在"碰键盘之前"，Toast 报的是哪一道挡的——不猜用户想贴哪儿，也不贴到别处去。
+    fn do_paste(
+        &mut self,
+        ctx: &egui::Context,
+        via: &str,
+        target: &actions::PanelTarget,
+    ) -> PanelOutcome {
+        let chars = target.path.chars().count();
+        match paste_text_into_previous_window(&target.path) {
+            Ok(where_) => {
+                eprintln!("{via}：已把 {chars} 个字符投给 {where_}（内容不落日志）");
+                self.hud.notify(
+                    ctx,
+                    format!("✓ 已粘贴 {chars} 个字符到原来的窗口"),
+                    &self.theme,
+                    hud::HOLD_FOREGROUND,
+                );
+                self.collapse_after_run(ctx);
+                PanelOutcome::Gone
+            }
+            Err(e) => {
+                eprintln!("{via}：粘贴未执行：{e}");
+                self.toast = Some((format!("⚠ {e}"), Instant::now() + TOAST_TTL, TOAST_ERR));
+                ctx.request_repaint_after(TOAST_TTL);
+                PanelOutcome::Stay
+            }
+        }
+    }
+
     /// 批次 E3-丙（FR-ACT-01「`Ctrl+Enter` 走次级动作」/ 开发计划 B3）：那颗可配的次级动作键。
     ///
     /// 两种形态由 `prefs.secondary_action` 决定，作用对象都是"当前选中行"：
     /// - [`SecondaryAction::Panel`] ＝ `→` 那个入口（同一个 [`Self::open_panel`]，同一套现场保存）；
     /// - [`SecondaryAction::Shortcut`] 执行 [`actions::secondary_action_for`] 给的那**一条**动作
-    ///   （文件行 / 目录行 → 所在位置，网页搜索行 → 复制网址）。
+    ///   （文件行 / 目录行 → 所在位置，网页搜索行 → 复制网址，计算器行 → 粘贴到原窗口）。
     ///
     /// 快捷键版刻意不包含"打开"：Enter 本来就是打开，再给它配一个别名只会让两个键争同一件事。
-    /// 不在那两格里的对象（应用条目、系统命令、自定义命令…）不猜也不静默——明说"按 → 看全部动作"。
+    /// 不在那三格里的对象（应用条目、系统命令、自定义命令…）不猜也不静默——明说"按 → 看全部动作"。
     fn run_secondary_action(&mut self, ctx: &egui::Context, row: Row) {
         let key = self.prefs.secondary_hotkey.display();
         let plan = self.plan();
         let Some((target, open)) =
             panel_for_row(row, &plan.head, &plan.results, &self.items, &self.path_states)
         else {
-            eprintln!("次级动作 {key}：这一行没有可处置的对象（计算器 / 终端 / 提示 / 分类行）");
+            eprintln!("次级动作 {key}：这一行没有可处置的对象（终端 / 提示 / 分类行）");
             self.toast = Some((
                 "这一行没有可处置的对象".to_string(),
                 Instant::now() + TOAST_TTL,
@@ -6130,7 +6408,8 @@ impl LauncherApp {
         let source_path = match &open {
             PanelOpen::Entry { entry, .. } => entry.source_path.as_str(),
             // 这条路径只从结果模式进来（`self.panel.is_none()` 才取键），批量面板不在其中。
-            PanelOpen::Path | PanelOpen::Batch => "",
+            // 批次 E5：`Value` 同样没有"源路径"——计算器行不在清单里，它只是一个算出来的串。
+            PanelOpen::Path | PanelOpen::Batch | PanelOpen::Value => "",
         };
         eprintln!(
             "次级动作 {key}：快捷键版 ⇒ {}（{:?}）",
@@ -6142,6 +6421,14 @@ impl LauncherApp {
                 self.do_reveal(ctx, "次级动作", &target, source_path);
             }
             actions::ActionId::CopyUrl => {
+                self.do_copy(ctx, "次级动作", &target, id);
+            }
+            // 批次 E5：第三格「文本 ⇒ 粘贴」。这条是唯一会**动到别人窗口**的，
+            // 所以 `do_paste` 里那三道闸一个字都不能省；失败它自己弹 Toast、窗口留在原地。
+            actions::ActionId::PasteText => {
+                self.do_paste(ctx, "次级动作", &target);
+            }
+            actions::ActionId::CopyText => {
                 self.do_copy(ctx, "次级动作", &target, id);
             }
             other => {
@@ -6225,11 +6512,24 @@ impl LauncherApp {
                     eprintln!("操作面板：批量面板里没有单体的「打开」，这一按未处理");
                     PanelOutcome::Stay
                 }
+                // 批次 E5：文本对象**刻意没有**「打开」——把 `14` 交给 `ShellExecuteExW`
+                // 是去搜一个叫 14 的程序。这里拒绝而不是回落 `Path` 那一条：面板的表已经不给
+                // 这一格了，走到这里只可能是两边分派脱节，宁可留人原地问一句。
+                PanelOpen::Value => {
+                    eprintln!("操作面板：文本对象没有「打开」这一说（那一串不是路径也不是协议）");
+                    self.toast = Some((
+                        "这一行是一串文本，没有能打开的东西".to_string(),
+                        Instant::now() + TOAST_TTL,
+                        TOAST_OK,
+                    ));
+                    ctx.request_repaint_after(TOAST_TTL);
+                    PanelOutcome::Stay
+                }
             },
             actions::ActionId::RunAs => {
                 let dir = match &open {
                     PanelOpen::Entry { entry, .. } => entry.working_dir.as_deref(),
-                    PanelOpen::Path | PanelOpen::Batch => None,
+                    PanelOpen::Path | PanelOpen::Batch | PanelOpen::Value => None,
                 };
                 match shell_execute_runas(&target.path, &target.arguments, dir) {
                     Ok(()) => {
@@ -6330,14 +6630,19 @@ impl LauncherApp {
             actions::ActionId::Reveal => {
                 let source_path = match &open {
                     PanelOpen::Entry { entry, .. } => entry.source_path.as_str(),
-                    PanelOpen::Path | PanelOpen::Batch => "",
+                    PanelOpen::Path | PanelOpen::Batch | PanelOpen::Value => "",
                 };
                 self.do_reveal(ctx, "操作面板", &target, source_path)
             }
-            // ---- 剪贴板三格：都不关窗（下一步是去别处粘贴，不是收工）----
+            // ---- 剪贴板三格：都不关窗（下一步是去别处粘贴，不是收工）。批次 E5 起多两格 ----
             actions::ActionId::CopyPath
             | actions::ActionId::CopyUrl
             | actions::ActionId::CopyName => self.do_copy(ctx, "操作面板", &target, id),
+            // 批次 E5：文本对象的「复制这一串」走同一条（只是取的是值不是路径）。
+            actions::ActionId::CopyText => self.do_copy(ctx, "操作面板", &target, id),
+            // 批次 E5：「粘贴到原窗口」是这张表里**唯一会把窗口收进托盘**的剪贴类动作——
+            // 焦点已经交还给用户原来那个窗口，把我们留在原地没有意义。
+            actions::ActionId::PasteText => self.do_paste(ctx, "操作面板", &target),
             actions::ActionId::Recycle => {
                 // `recycle_path` 给的是裸 Win32 码（`SHFileOperationW` 不按 HRESULT 说话）：
                 // 1223 = 用户在那句「永久删除？」警告里点了"否"，其余非零才是真失败。
@@ -6610,7 +6915,15 @@ impl LauncherApp {
             }
             actions::ActionId::LargeType => {
                 // 复用 FR-UIX-10 的大字视口：铺的就是这一项的名字（`target.title`）。
-                self.large_type.show(ctx, target.title.clone());
+                // 批次 E5 的文本对象例外——铺的是**那一串值**：计算器行的"这段文字本身"就是
+                // 数字（与 [`large_text_of`] 里 `HeadRow::Calc(hit) => hit.copy` 同一条口径），
+                // 标题那一串是 `= 1,024`，把等号铺满屏幕没有意义。
+                let text = if target.subject == actions::Subject::Text {
+                    target.path.clone()
+                } else {
+                    target.title.clone()
+                };
+                self.large_type.show(ctx, text);
                 PanelOutcome::Stay
             }
         };
@@ -9090,7 +9403,10 @@ impl eframe::App for LauncherApp {
                 // FR-UIX-08 右格原文的后半句「+ `→` 动作」。批次 F8 那颗键帽没画，理由是
                 // 「还没有行动作面板，画个死键帽反而误导」；面板有了，判据也照面板的真实入口
                 // 取——只有 `panel_for_row` 认得的行（条目 / 自定义命令 / 文件 / 搜索）才亮，
-                // 计算器、终端、提示行按 `→` 是什么都不做的，就不给它们许诺。
+                // ~~计算器、终端、提示行按 `→` 是什么都不做的，就不给它们许诺。~~
+                // 【2026-10-27 批次 E5：计算器行现在认得了（它给的是文本那张三格表），
+                // 这一格的判据本来就是现取 `panel_for_row`，所以键帽自己会跟着亮；
+                // 终端与各类提示行仍按原话不亮。】
                 // 批次 E4：有标记时 `→` 恒可进——开的是**批量面板**，与当前选中哪一行无关
                 // （AHK `_OpenActions()` 同口径：`Marked.Count` 非零就对自己的集合动手）。
                 let panel_ready = self.panel.is_none()
@@ -11128,11 +11444,6 @@ mod nav_tests {
         // 名次越界 ⇒ None，不 panic：选中行与计划不同帧时宁可什么都不做。
         assert!(!no_panel(Row::Item(3), &[]));
         for head in [
-            HeadRow::Calc(source::calc::CalcHit {
-                title: "= 2".into(),
-                subtitle: String::new(),
-                copy: "2".into(),
-            }),
             HeadRow::Terminal(source::terminal::TermHit {
                 shell: source::terminal::TermShell::Cmd,
                 command: "ipconfig".into(),
@@ -11165,6 +11476,24 @@ mod nav_tests {
         assert!(!target.editable);
         assert!(target.uid.is_none());
         assert!(matches!(open, PanelOpen::Path));
+
+        // 批次 E5：计算器行从上面那份"不该有面板"的名单里搬出来了
+        // （原先它是第一项，`title: "= 2"、copy: "2"`）。搬出来的理由不是"它现在能打开了"——
+        // 它**还是**打不开，而是它终于有了一张不含「打开」的表：复制这一串 / 粘贴到原窗口 / 大字。
+        let calc = HeadRow::Calc(source::calc::CalcHit {
+            title: "= 1,024".into(),
+            subtitle: String::new(),
+            copy: "1,024".into(),
+        });
+        let (target, open) = panel_for_row(Row::Head(0), &[calc], &[], &items, &states)
+            .expect("计算器行应有文本那张表");
+        assert_eq!(target.subject, actions::Subject::Text);
+        // `path` 里放的是**那一串值**（`copy`，不带等号），标题原样留着只给大字与面板抬头看。
+        assert_eq!(target.path, "1,024");
+        assert_eq!(target.title, "= 1,024");
+        assert!(!target.editable);
+        assert!(target.uid.is_none());
+        assert!(matches!(open, PanelOpen::Value));
     }
 
     #[test]
@@ -11872,5 +12201,33 @@ mod nav_tests {
             egui::Key::Enter,
             m(false, false, false)
         ));
+    }
+
+    /// 批次 E5：「粘贴到原窗口」三道闸里有两道发生在**碰键盘之前**，所以单测盖得到；
+    /// 第三道（焦点当场真的回到原窗口）只有真机测得出。这里钉的是判据的**次序**：
+    /// 空串先挡、死句柄次之、没记账最后，三条都返回 `Err` 且一条 `SendInput` 都不发。
+    /// 防的是以后有人把这几道挪到注入之后——症状是往此刻拿着焦点的本程序输入框里打进一串数字。
+    #[test]
+    fn the_paste_gates_refuse_before_anything_is_typed() {
+        let dead = HWND((usize::MAX >> 1) as *mut _);
+        let dead_raw = dead.0 as usize;
+        // ① 空串在句柄判据之前：记着一个死句柄也不该走到"投字符"那一步，也不该顺手清掉记账
+        //    （清空是"原窗口已关"那条分支的活儿，见 ②）。
+        PREVIOUS_HWND.store(dead_raw, Ordering::Relaxed);
+        assert!(
+            paste_text_into_previous_window("")
+                .unwrap_err()
+                .contains("没有可粘贴"),
+            "空串要先被挡下，而不是先去问句柄"
+        );
+        assert_eq!(PREVIOUS_HWND.load(Ordering::Relaxed), dead_raw);
+        // ② 原窗口已经关了 ⇒ 拒绝 + 清零记账，下一次不会再往同一个死句柄上撞。
+        //    `usize::MAX >> 1` 在 x64 上不可能是句柄值（内核句柄只占低 32 位）⇒ `IsWindow` 必 FALSE。
+        let e = paste_text_into_previous_window("42").unwrap_err();
+        assert!(e.contains("关掉了"), "{e}");
+        assert_eq!(PREVIOUS_HWND.load(Ordering::Relaxed), 0, "死句柄要清零");
+        // ③ 压根没记下架（这次呼出的前台是空的）⇒ 说的是"没记下"，不是"关掉了"。
+        let e = paste_text_into_previous_window("42").unwrap_err();
+        assert!(e.contains("没记下"), "{e}");
     }
 }
