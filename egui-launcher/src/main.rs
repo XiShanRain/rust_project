@@ -50,8 +50,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
-    DROPFILES, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING, FOS_FORCEFILESYSTEM,
-    FOS_PICKFOLDERS, FO_COPY, FO_DELETE, FileOpenDialog, IFileOpenDialog, SEE_MASK_FLAG_NO_UI,
+    DROPFILES, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING,
+    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FO_COPY, FO_DELETE, FileOpenDialog,
+    IFileOpenDialog, SEE_MASK_FLAG_NO_UI,
     SHFILEOPSTRUCTW, SHFileOperationW, SHObjectProperties, SHOP_FILEPATH, SHELLEXECUTEINFOW,
     SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW,
     SIGDN_FILESYSPATH, ShellExecuteExW,
@@ -443,6 +444,79 @@ enum Destructive {
 /// 添加/编辑对话框状态（FR-SRC-20 `AddDialog(prefill)`，对标 Delphi frmShortCut）。
 /// `edit_uid=Some(u)` 表示编辑既有项（按派生 uid 定位替换），`None` 表示新建。
 /// 身份用 uid 而非 `path`：同一 exe 不同参数是两个条目，按 path 会认错（2026-10-17）。
+/// 批次 D4（FR-CFG-06）：一次「选文件 / 选目录 / 拖入」算出来的值，以及它和表单现值的冲突。
+///
+/// Delphi 在 `btnFileClick` / `btnDirClick` 里对"别名"和"名称"各弹一次 `MessageBox` 问要不要
+/// 替换；这里合成一条问一次（两个字段一起答）。`*_old` 只在真有冲突时是 `Some`，文案要用。
+struct PickPrompt {
+    fill: source::import::ImportFill,
+    keyword_old: Option<String>,
+    name_old: Option<String>,
+}
+
+/// 这个 `fill` 要不要先问一句：别名/名称已经填了别的值 ⇒ 问；否则直接填。
+fn make_fill_prompt(dg: &DialogState, fill: &source::import::ImportFill) -> Option<PickPrompt> {
+    let keyword_old = dg.keyword.trim();
+    let name_old = dg.name.trim();
+    let keyword_old = (!keyword_old.is_empty() && keyword_old != fill.keyword)
+        .then(|| keyword_old.to_string());
+    let name_old =
+        (!name_old.is_empty() && name_old != fill.name).then(|| name_old.to_string());
+    (keyword_old.is_some() || name_old.is_some()).then(|| PickPrompt {
+        fill: fill.clone(),
+        keyword_old,
+        name_old,
+    })
+}
+
+/// 把 `fill` 写进表单。`replace_names = false`（用户答「保留」）时只补空着的两格，
+/// 命令行/参数/工作目录照填——那三格是"这条命令到底是什么"，不跟着名字走。
+fn apply_fill(dg: &mut DialogState, fill: &source::import::ImportFill, replace_names: bool) {
+    dg.path = fill.path.clone();
+    dg.arguments = fill.arguments.clone();
+    dg.working_dir = fill.working_dir.clone();
+    if replace_names || dg.keyword.trim().is_empty() {
+        dg.keyword = fill.keyword.clone();
+    }
+    if replace_names || dg.name.trim().is_empty() {
+        dg.name = fill.name.clone();
+    }
+    // 系统命令的 `internal:<id>` 不容许被类型推断改掉（同下方类型下拉只读那一条理由）。
+    if dg.kind != ItemKind::Internal {
+        dg.kind = fill.kind;
+    }
+}
+
+/// 批次 D4：把拖进来/选进来的路径按 Delphi 口径解出要填的整组值。
+///
+/// `.lnk` 解引用走本仓既有的 `resolve_lnk`（它的 `path` 已展开过环境变量）。Delphi 的
+/// `ResolveLink` 把目标与参数拼在同一行里，这里分开存（我们的条目本来就是 `path`/`arguments`
+/// 两格），但命名仍按"目标 + 参数"一整行算，否则 Chrome 的 `--app=` 特例不成立。
+///
+/// 解引用失败、或解析到 `%windir%\Installer\{…}` 里 ⇒ 照 Delphi 的做法**仍按 `.lnk` 本身**导入。
+fn import_from_path(path: &str) -> source::import::ImportFill {
+    let original = path.trim().trim_matches('"').to_string();
+    let mut target = original.clone();
+    let mut arguments = String::new();
+    let mut working_dir = String::new();
+    if original.to_ascii_lowercase().ends_with(".lnk") {
+        if let Some(it) = unsafe { source::application::resolve_lnk(std::path::Path::new(&original)) } {
+            let windir = std::env::var_os("windir")
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !it.path.trim().is_empty()
+                && !source::import::is_installer_target(&it.path, &windir)
+            {
+                target = it.path;
+                arguments = it.arguments;
+                working_dir = it.working_dir.unwrap_or_default();
+            }
+        }
+    }
+    let is_dir = std::path::Path::new(source::import::unquote(&target)).is_dir();
+    source::import::fill_from_import(&target, &arguments, &working_dir, is_dir)
+}
+
 struct DialogState {
     edit_uid: Option<String>,
     name: String,
@@ -456,6 +530,9 @@ struct DialogState {
     source_path: String,
     /// 批次 G1 分类标签的自由文本（逗号/空白分隔），提交时由 [`source::application::parse_tags_text`] 拆表。
     tags_text: String,
+    /// 批次 D4（FR-CFG-06）：选文件/选目录之后的"要不要覆盖已填的别名/名称"询问。
+    /// 挂在弹窗自己身上，是为了跟着弹窗一起消失——关框的路径有五六条，挨个清必漏一条。
+    fill_prompt: Option<PickPrompt>,
 }
 
 impl DialogState {
@@ -470,6 +547,7 @@ impl DialogState {
             kind: ItemKind::Command,
             source_path: String::new(),
             tags_text: String::new(),
+            fill_prompt: None,
         }
     }
     /// 用无匹配输入预填（路径/类型/名称由 make_item_from_input 推断）。
@@ -485,6 +563,7 @@ impl DialogState {
             kind: it.kind,
             source_path: String::new(),
             tags_text: String::new(),
+            fill_prompt: None,
         }
     }
     /// 用「发送到」转发的 .lnk 解析结果预填：命令行=真实目标，图标源=lnk 本体。
@@ -499,6 +578,7 @@ impl DialogState {
             kind: it.kind,
             source_path: it.source_path,
             tags_text: String::new(),
+            fill_prompt: None,
         }
     }
     /// 批次 X（FR-SRC-14 → FR-SRC-20）：从文件搜索行预填「添加快捷项」。
@@ -519,6 +599,7 @@ impl DialogState {
             },
             source_path: hit.path.clone(),
             tags_text: String::new(),
+            fill_prompt: None,
         }
     }
     /// 用既有项预填（编辑）。
@@ -533,6 +614,7 @@ impl DialogState {
             kind: it.kind,
             source_path: it.source_path.clone(),
             tags_text: it.tags.join(" "),
+            fill_prompt: None,
         }
     }
     /// 提交时生成条目；`source_path` 默认取 `path`（图标源，URL/无文件时 extract 自然失败退化无图标）。
@@ -2282,21 +2364,29 @@ fn recycle_path(path: &str) -> Result<(), u16> {
     }
 }
 
-/// 批次 E4（FR-ACT-05）「复制到」：系统文件夹选择框（`IFileOpenDialog` + `FOS_PICKFOLDERS`）。
+/// 批次 D4（FR-CFG-06）：「选文件…」「选目录…」共用的系统选择框。
+/// `want_dir = true` ⇒ `FOS_PICKFOLDERS`（批次 E4「复制到」原来那条路）；
+/// `false` ⇒ `FOS_FILEMUSTEXIST`（只能挑已存在的文件，防止手打一个不存在的名字）。
 /// 返回 `Ok(None)` = 用户取消（这不是故障，调用方要说「已取消」而不是「失败」）。
 ///
 /// 走 COM 而不是 `SHBrowseForFolder`：后者是 IE 时代的老对话框，没有地址栏、不能贴路径，
 /// 用户要挑一个深层目录时几乎没法用。COM 公寓在这里补一次 STA（与 `show_properties` 同一口径，
 /// 已初始化/被别人设成别的公寓都不影响 in-proc，所以**不配对 `CoUninitialize`**）。
-fn pick_folder() -> Result<Option<String>, String> {
+fn pick_path(want_dir: bool) -> Result<Option<String>, String> {
+    let what = if want_dir { "文件夹" } else { "文件" };
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| format!("文件夹选择框创建失败：{e}"))?;
+            .map_err(|e| format!("{what}选择框创建失败：{e}"))?;
         let mut opts = dialog
             .GetOptions()
             .map_err(|e| format!("读取对话框选项失败：{e}"))?;
-        opts |= FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM;
+        opts |= FOS_FORCEFILESYSTEM;
+        if want_dir {
+            opts |= FOS_PICKFOLDERS;
+        } else {
+            opts |= FOS_FILEMUSTEXIST;
+        }
         dialog
             .SetOptions(opts)
             .map_err(|e| format!("设置对话框选项失败：{e}"))?;
@@ -2305,19 +2395,29 @@ fn pick_folder() -> Result<Option<String>, String> {
             return if e.code() == windows::core::HRESULT::from_win32(1223) {
                 Ok(None)
             } else {
-                Err(format!("文件夹选择框失败：{e}"))
+                Err(format!("{what}选择框失败：{e}"))
             };
         }
         let item = dialog
             .GetResult()
-            .map_err(|e| format!("取文件夹选择结果失败：{e}"))?;
+            .map_err(|e| format!("取{what}选择结果失败：{e}"))?;
         let raw = item
             .GetDisplayName(SIGDN_FILESYSPATH)
-            .map_err(|e| format!("取文件夹路径失败：{e}"))?;
+            .map_err(|e| format!("取{what}路径失败：{e}"))?;
         let text = raw.to_string().unwrap_or_default();
         let _ = CoTaskMemFree(Some(raw.as_ptr() as *const core::ffi::c_void));
         Ok(Some(text).filter(|s| !s.trim().is_empty()))
     }
+}
+
+/// 批次 E4（FR-ACT-05）「复制到」的入口：只要目录。
+fn pick_folder() -> Result<Option<String>, String> {
+    pick_path(true)
+}
+
+/// 批次 D4（FR-CFG-06）「选文件…」的入口：只要文件。
+fn pick_file() -> Result<Option<String>, String> {
+    pick_path(false)
 }
 
 /// `path` 是否就是 `dest` 或位于 `dest` 之下（不分大小写，尾分隔符先剥掉）。
@@ -5981,6 +6081,113 @@ impl LauncherApp {
                 "IME restore: before open={} conv=0x{:X} | after open={} conv=0x{:X}",
                 before.open, before.conv, after.open, after.conv
             );
+        }
+    }
+
+    /// 批次 D4（FR-CFG-06）：把一组算好的值填进弹窗表单；别名/名称已有别的值就先挂询问。
+    /// 「选文件」「选目录」「拖入」三条路共用这一处收尾，免得三份冲突判定各写一遍走样。
+    /// 日志只记来源与"问没问"，**路径与别名不进日志**（批次 P 口径）。
+    fn fill_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        fill: source::import::ImportFill,
+        origin: &str,
+    ) {
+        let Some(dg) = self.dialog.as_mut() else {
+            return;
+        };
+        match make_fill_prompt(dg, &fill) {
+            Some(p) => {
+                dg.fill_prompt = Some(p);
+                eprintln!("弹窗：{origin}与已填的别名/名称不同，等用户选「替换」还是「保留」（内容不落日志）");
+            }
+            None => {
+                apply_fill(dg, &fill, true);
+                eprintln!("弹窗：{origin}已填入表单（内容不落日志）");
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// 批次 D4（FR-CFG-06）：拖动文件/文件夹到弹窗上（Delphi `frmShortCut` 的 `WM_DropFiles`）。
+    /// 只取第一个——`DroppedFileHandle` 里多选没走通（`DragAcceptFiles` 那条路 Delphi 也只取一个）。
+    fn dialog_drop(&mut self, ctx: &egui::Context, path: &str) {
+        let Some(kind) = self.dialog.as_ref().map(|d| d.kind) else {
+            return;
+        };
+        // 系统命令的命令行就是 `internal:<id>`，被外部路径覆盖后这条就执行不了了。
+        if kind == ItemKind::Internal {
+            self.internal_toast(ctx, "⚠ 系统命令不接受外部路径（命令行是 internal:<id>）", false);
+            return;
+        }
+        let fill = import_from_path(path);
+        let what = if fill.kind == ItemKind::Folder {
+            "拖入的文件夹"
+        } else {
+            "拖入的文件"
+        };
+        self.fill_dialog(ctx, fill, what);
+    }
+
+    /// 批次 D4（FR-CFG-06）：「选文件…」/「选目录…」。用户取消不算失败，只落一行日志。
+    fn dialog_pick(&mut self, ctx: &egui::Context, want_dir: bool) {
+        let what = if want_dir { "文件夹" } else { "文件" };
+        let picked = if want_dir { pick_folder() } else { pick_file() };
+        match picked {
+            Ok(Some(path)) => {
+                let fill = source::import::fill_from_pick(&path, want_dir);
+                let origin = if want_dir {
+                    "所选文件夹"
+                } else {
+                    "所选文件"
+                };
+                self.fill_dialog(ctx, fill, origin);
+            }
+            Ok(None) => {
+                eprintln!("弹窗：{what}选择已取消");
+                ctx.request_repaint();
+            }
+            Err(e) => self.internal_toast(ctx, &format!("⚠ {e}"), false),
+        }
+    }
+
+    /// 批次 D4（FR-CFG-06）「测试执行」：照当前表单启动一次，看能不能跑起来。
+    ///
+    /// 与列表里按 Enter 的区别：**不收窗、不记学习统计、不动使用统计**。用户还在编辑，
+    /// 收窗等于把没保存的内容丢了；统计只认真正入库的条目。
+    fn test_dialog_entry(&mut self, ctx: &egui::Context) {
+        // 先把要用的值抠出来：下面要借 `&mut self` 弹 Toast，不能同时握着 `self.dialog` 的借用。
+        let Some((kind, path, args, wd, name)) = self.dialog.as_ref().map(|dg| {
+            let wd = dg.working_dir.trim();
+            (
+                dg.kind,
+                dg.path.trim().to_string(),
+                dg.arguments.clone(),
+                (!wd.is_empty()).then(|| wd.to_string()),
+                dg.name.clone(),
+            )
+        }) else {
+            return;
+        };
+        // 内置动作不给测：`internal:<id>` 走 ShellExecute 只会失败，真跑起来则是直接执行危险动作。
+        if kind == ItemKind::Internal {
+            self.internal_toast(ctx, "⚠ 系统命令不提供测试执行（会直接触发内置动作）", false);
+            return;
+        }
+        if path.is_empty() {
+            self.internal_toast(ctx, "⚠ 命令行为空，没东西可测", false);
+            return;
+        }
+        let name = if name.trim().is_empty() { path.clone() } else { name };
+        match shell_execute(&path, &args, wd.as_deref()) {
+            Ok(_) => {
+                eprintln!("弹窗测试执行：已启动（名称/路径/参数不落日志）");
+                self.internal_toast(ctx, &format!("✓ 已测试启动「{name}」"), true);
+            }
+            Err(e) => {
+                eprintln!("弹窗测试执行失败：{e}");
+                self.internal_toast(ctx, &format!("⚠ 测试启动失败：{e}"), false);
+            }
         }
     }
 
@@ -9858,6 +10065,49 @@ impl eframe::App for LauncherApp {
                 Cancel,
             }
 
+            // 批次 D4（FR-CFG-06）：拖进来的文件只在这里接——弹窗关着时窗口失焦 50ms 就自藏
+            //（FR-WIN-04 的 HIDE_DELAY），根本拖不到；Delphi 的 `WM_DropFiles` 也只挂在
+            // `frmShortCut` 这一扇窗上。`dropped_files` 是**当帧**输入，这一帧不取就丢了。
+            let dropped = ui.ctx().input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path().to_str().map(str::to_string))
+                    .next()
+            });
+            if let Some(path) = dropped {
+                self.dialog_drop(ui.ctx(), &path);
+            }
+
+            // 批次 D4：三个只在弹窗里有效的热键。主界面那一整块快捷键以 `dialog.is_none()`
+            // 为门，所以不会撞车；`Ctrl+Enter` 在那里是次级动作键，此刻同样是关着的。
+            // 取键必须排在下面的 TextEdit 与 Enter 判据之前：`consume_key` 会把事件删掉，
+            // 否则这一下 `Ctrl+Enter` 之后还会被 `key_pressed(Enter)` 当成"确定"再跑一遍。
+            // `Ctrl+Shift+O` 要先吃：`consume_key(COMMAND, ·)` 对多余的 Shift 是放行的
+            //（与 Shift+Tab / Shift+空格同一个坑）。
+            let prompt_open = self.dialog.as_ref().is_some_and(|d| d.fill_prompt.is_some());
+            let (want_file, want_dir, want_test) = if prompt_open {
+                (false, false, false)
+            } else {
+                let hot =
+                    |mods: egui::Modifiers, k: egui::Key| ui.input_mut(|i| i.consume_key(mods, k));
+                let dir = hot(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::O);
+                let file = hot(egui::Modifiers::COMMAND, egui::Key::O);
+                let test = hot(egui::Modifiers::COMMAND, egui::Key::Enter);
+                (file, dir, test)
+            };
+            // 闭包里有系统对话框要开、有 `self.dialog` 的借用要握 ⇒ 三件事都先记旗标，
+            // 模态闭包返回之后再落（与列表那边"当帧只记、帧末才做"同一条口径）。
+            let mut pick_request: Option<bool> = if want_dir {
+                Some(true)
+            } else if want_file {
+                Some(false)
+            } else {
+                None
+            };
+            let mut test_request = want_test;
+            let mut prompt_answer: Option<bool> = None;
+
             let modal_resp =
                 egui::Modal::new(egui::Id::new("shortcut_dialog")).show(ui.ctx(), |ui| {
                     // 尺寸（2026-10-22 用户要求）：原来内容只有 ~300 宽、且不可拉伸。
@@ -9876,7 +10126,10 @@ impl eframe::App for LauncherApp {
                             // Enter＝确定（FR-SRC-20 快捷键）：开框当帧被 armed 吞掉；类型下拉展开时 Enter 归选项，不抢。
                             let armed = self.dialog_enter_armed;
                             self.dialog_enter_armed = false;
+                            // 「要不要替换」那条询问开着时 Enter 不提交：那一屏只有两个按钮，
+                            // 把"回车"当确定会连询问一起跳过（用户以为还没答）。
                             if !armed
+                                && !prompt_open
                                 && !egui::Popup::is_any_open(ui.ctx())
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter))
                             {
@@ -9907,6 +10160,46 @@ impl eframe::App for LauncherApp {
                                     "exe / 路径 / URL / shell: 目标"
                                 };
                                 row(ui, "命令行", &mut dg.path, path_hint);
+                                // 批次 D4（FR-CFG-06）三个辅助按钮。系统命令那一档整组禁用：
+                                // 它的命令行是 `internal:<id>`，被真实路径覆盖就再也执行不了。
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([label_w, 20.0], egui::Label::new(""));
+                                    let internal = dg.kind == ItemKind::Internal;
+                                    ui.add_enabled_ui(!internal, |ui| {
+                                        if ui
+                                            .button("选文件…")
+                                            .on_hover_text(
+                                                "Ctrl+O：命令行＝所选文件，别名/名称按文件名去扩展名",
+                                            )
+                                            .clicked()
+                                        {
+                                            pick_request = Some(false);
+                                        }
+                                        if ui
+                                            .button("选目录…")
+                                            .on_hover_text(
+                                                "Ctrl+Shift+O：命令行＝所选目录，别名/名称按目录末段",
+                                            )
+                                            .clicked()
+                                        {
+                                            pick_request = Some(true);
+                                        }
+                                        if ui
+                                            .button("测试执行")
+                                            .on_hover_text(
+                                                "Ctrl+Enter：照当前表单启动一次；窗口不收、不记使用统计",
+                                            )
+                                            .clicked()
+                                        {
+                                            test_request = true;
+                                        }
+                                    });
+                                    ui.label(
+                                        egui::RichText::new("也可把 .lnk / 程序 / 文件夹拖进来")
+                                            .weak()
+                                            .small(),
+                                    );
+                                });
                                 row(ui, "参数", &mut dg.arguments, "");
                                 row(ui, "工作目录", &mut dg.working_dir, "");
                                 row(
@@ -9936,6 +10229,35 @@ impl eframe::App for LauncherApp {
                                                 ItemKind::ALL[i].label().to_string()
                                             });
                                         dg.kind = ItemKind::ALL[idx];
+                                    }
+                                });
+                            }
+                            // 批次 D4：别名/名称已经有别的值 ⇒ 先问一句（Delphi 对两个字段各弹一次
+                            // `MessageBox`，这里合成一条）。按「保留」只补空着的两格，
+                            // 命令行/参数/工作目录照填——那三格是"这条命令到底是什么"。
+                            if let Some(p) = self.dialog.as_ref().and_then(|d| d.fill_prompt.as_ref())
+                            {
+                                ui.separator();
+                                let mut parts: Vec<String> = Vec::new();
+                                if let Some(old) = &p.keyword_old {
+                                    parts.push(format!("别名「{old}」→「{}」", p.fill.keyword));
+                                }
+                                if let Some(old) = &p.name_old {
+                                    parts.push(format!("名称「{old}」→「{}」", p.fill.name));
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}，要替换吗？",
+                                            parts.join("，")
+                                        ))
+                                        .strong(),
+                                    );
+                                    if ui.button("替换").clicked() {
+                                        prompt_answer = Some(true);
+                                    }
+                                    if ui.button("保留").clicked() {
+                                        prompt_answer = Some(false);
                                     }
                                 });
                             }
@@ -10037,6 +10359,27 @@ impl eframe::App for LauncherApp {
                     ui.ctx().request_repaint();
                 }
                 DlgResult::Keep => {}
+            }
+
+            // 批次 D4：三个辅助动作的落点。选文件/选目录会开阻塞的系统对话框，模态闭包里
+            // 正握着 `self.dialog` 的可变借用 ⇒ 一律挪到闭包返回之后再做。
+            if let Some(dir) = pick_request {
+                self.dialog_pick(ui.ctx(), dir);
+            }
+            if test_request {
+                self.test_dialog_entry(ui.ctx());
+            }
+            if let Some(replace) = prompt_answer {
+                if let Some(dg) = self.dialog.as_mut() {
+                    if let Some(p) = dg.fill_prompt.take() {
+                        apply_fill(dg, &p.fill, replace);
+                        eprintln!(
+                            "弹窗：导入值的别名/名称{}，命令行已填（内容不落日志）",
+                            if replace { "已替换" } else { "保留原值" }
+                        );
+                    }
+                }
+                ui.ctx().request_repaint();
             }
 
             // 对话框本帧关闭（确定成功/取消/空目标外全路径）→ 焦点还给搜索框。
@@ -10658,6 +11001,14 @@ impl eframe::App for LauncherApp {
                 self.confirm = None;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
+            } else if self.dialog.as_ref().is_some_and(|d| d.fill_prompt.is_some()) {
+                // 批次 D4：替换询问那一屏，Esc 只收询问、不关弹窗——这里按 Esc 的意思是
+                // "这次导入别换别名"，连整框一起关就把刚选的值和已填的内容全丢了。
+                if let Some(dg) = self.dialog.as_mut() {
+                    dg.fill_prompt = None;
+                }
+                eprintln!("弹窗：按 Esc 收起「要不要替换」询问，弹窗保留（内容不落日志）");
+                ui.ctx().request_repaint();
             } else if self.dialog.is_some() {
                 self.dialog = None;
                 self.focus_query = true; // Esc 关框后焦点同样还给搜索框
@@ -11006,6 +11357,70 @@ mod nav_tests {
     // 批次 Q 这里有一句单独的 `use crate::source::application::HKF_WIN;`，理由是"只有测试断言
     // 录制路径不许产出 Win 位，运行期没人读它"。批次 R 把这个前提推翻了（补字符卡片上的复选框
     // 就在运行期读它），所以改成靠上面那条 glob 带进来。
+
+    /// 批次 D4（FR-CFG-06）：两条最容易走样的规则钉在这里——①只有"已填了别的值"才问；
+    /// ②答「保留」时只保别名/名称，命令行那三格照换（它们是"这条命令到底是什么"）。
+    fn d4_fill(path: &str, keyword: &str, name: &str, kind: ItemKind) -> source::import::ImportFill {
+        source::import::ImportFill {
+            path: path.to_string(),
+            arguments: "arg".to_string(),
+            working_dir: r"C:\wd".to_string(),
+            keyword: keyword.to_string(),
+            name: name.to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn fill_prompt_only_asks_when_names_differ() {
+        let mut dg = DialogState::blank();
+        assert!(make_fill_prompt(&dg, &d4_fill("a", "k", "n", ItemKind::App)).is_none());
+
+        dg.keyword = "old".to_string();
+        dg.name = "n".to_string();
+        let p = make_fill_prompt(&dg, &d4_fill("a", "k", "n", ItemKind::App))
+            .expect("别名已填别的值，必须问");
+        assert_eq!(p.keyword_old.as_deref(), Some("old"));
+        assert!(p.name_old.is_none(), "名称一样就不该出现在询问里");
+
+        // 值相同（含前后空白）不算冲突。
+        dg.keyword = "  k ".to_string();
+        assert!(make_fill_prompt(&dg, &d4_fill("a", "k", "n", ItemKind::App)).is_none());
+    }
+
+    #[test]
+    fn apply_fill_keep_only_spares_the_names() {
+        let mut dg = DialogState::blank();
+        dg.keyword = "old".to_string();
+        dg.name = "oldname".to_string();
+        let fill = d4_fill(r"C:\x.exe", "k", "n", ItemKind::App);
+        apply_fill(&mut dg, &fill, false);
+        assert_eq!((dg.keyword.as_str(), dg.name.as_str()), ("old", "oldname"));
+        assert_eq!(dg.path, r"C:\x.exe", "命令行不跟着名字走");
+        assert_eq!(dg.arguments, "arg");
+        assert_eq!(dg.working_dir, r"C:\wd");
+
+        // 答「替换」才动名字；空着的格无论答什么都要补上。
+        let mut dg2 = DialogState::blank();
+        apply_fill(&mut dg2, &fill, false);
+        assert_eq!((dg2.keyword.as_str(), dg2.name.as_str()), ("k", "n"));
+        let mut dg3 = DialogState::blank();
+        dg3.keyword = "old".to_string();
+        apply_fill(&mut dg3, &fill, true);
+        assert_eq!(dg3.keyword, "k");
+    }
+
+    #[test]
+    fn apply_fill_never_rewrites_internal_kind() {
+        let mut dg = DialogState::blank();
+        dg.kind = ItemKind::Internal;
+        apply_fill(&mut dg, &d4_fill("internal:lock", "k", "n", ItemKind::App), true);
+        assert_eq!(
+            dg.kind,
+            ItemKind::Internal,
+            "系统命令的类型被改掉，这条就再也执行不了了"
+        );
+    }
 
     #[test]
     fn bare_digit_yields_to_calculator_when_calc_source_is_on() {

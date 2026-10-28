@@ -505,11 +505,45 @@ pub const ENTRIES: &[CheatEntry] = &[
                  这颗键只在搜索页、没有弹窗、没开面板时生效；它不注册给系统，所以不抢别的\n\
                  程序的键，也不会像全局呼出键那样被系统整条吞掉。必须带 Ctrl 或 Alt（裸键与\n\
                  单带 Shift 的键都只是打字），Win 组合设不了；键本身可在同一页录制、可恢复默认\n\
-                 （Backspace / Delete），改动立刻生效并写进 settings.json。",
+                 （Backspace / Delete），改动立刻生效并写进 settings.json。\n\
+                 新增/编辑弹窗开着时，这颗键在弹窗里改做「测试执行」——照当前表单启动一次，\n\
+                 窗口不收、不记使用统计（批次 D4，见 Ctrl+O 那条）。",
         tags: "key ctrl enter 次级 动作 secondary 定位 复制网址 粘贴 paste 计算器",
         group: Group::Keys,
         source: None,
         settings_page: Some(3),
+    },
+    CheatEntry {
+        key: "Ctrl+O",
+        title: "弹窗·选文件",
+        summary: "只在新增/编辑弹窗里生效：命令行＝所选文件，别名/名称按文件名推",
+        detail: "给新增/编辑弹窗补路径用的（需求书 FR-CFG-06），搜索页里这颗键不干别的。\n\
+                 开系统的文件选择框，只能挑已存在的文件——避免手打一个不存在的名字。选定后：\n\
+                 · 命令行＝那个文件的全路径；\n\
+                 · 别名/名称按 Delphi ALTRun 的 `btnFileClick` 口径从文件名推：剥掉最后一段扩展名，\n\
+                   以 `//` 开头的按网址处理（Chrome `--app=…` 那类命令行就是这么变成主机名的）。\n\
+                 那两格已经填了别的值 ⇒ 先问一句「替换 / 保留」；按「保留」只补空着的格，\n\
+                 命令行照样换（那才是这条命令到底是什么）。询问开着时按 Esc 只收询问、不关弹窗。\n\
+                 不想按键也可以直接把 .lnk / 程序 / 文件夹拖进弹窗（Delphi 的 `WM_DropFiles` 同款）：\n\
+                 .lnk 会解引用成它指向的目标，指向系统 Installer 缓存目录的 .lnk 则按 .lnk 本体导入。\n\
+                 系统命令（`internal:<id>`）那一档整组按钮与热键都不给用——命令行被覆盖就执行不了了。",
+        tags: "key 弹窗 dialog 选文件 浏览 browse 拖入 drop lnk 路径",
+        group: Group::Keys,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
+        key: "Ctrl+Shift+O",
+        title: "弹窗·选目录",
+        summary: "只在新增/编辑弹窗里生效：命令行＝所选目录，名字取目录末段",
+        detail: "和 `Ctrl+O` 同一条路，只是选的是文件夹（同一套系统选择框，切到选目录那档）。\n\
+                 命令行＝目录全路径；别名/名称取最后一个 `\\` 之后那一段，不剥扩展名——\n\
+                 `1.2图片` 这类名字带点的目录要原样保留（Delphi 在这条分支上先判 `DirectoryExists`）。\n\
+                 类型跟着变成「文件夹」。同样：那两格已有别的值先问「替换 / 保留」，Esc 只收询问。",
+        tags: "key 弹窗 dialog 选目录 选文件夹 目录 directory 浏览",
+        group: Group::Keys,
+        source: None,
+        settings_page: None,
     },
     CheatEntry {
         key: "Ctrl+Shift+N",
