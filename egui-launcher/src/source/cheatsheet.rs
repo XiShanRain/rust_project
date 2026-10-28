@@ -115,6 +115,24 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: None,
     },
     CheatEntry {
+        key: "{%p} {%c} {%wt}",
+        title: "参数标记",
+        summary: "命令行 / 参数里的替身，呼出那一刻取值；编码不是「无参数」才替换",
+        detail: "五个标记：`{%p}` 你填的参数 · `{%c}` 呼出那一刻的剪贴板文本 ·\
+                 `{%wd}` 前台窗口句柄（十进制）· `{%wt}` 它的标题 · `{%wc}` 它的窗口类名。\n\
+                 只在编辑弹窗的「编码」不是「无参数」时才替换；编码＝无参数时它们原样交给程序。\n\
+                 带标记却留着「无参数」的，保存时会追问一次。\n\
+                 四档编码：无参数＝直接启动；参数不编码＝原样代入；URL 编码＝空格变 `+`、中文按 UTF-8 百分号；\
+                 UTF-8 编码与 URL 编码同口径（留着只为认得 Delphi 的旧配置）。\n\
+                 编码不是「无参数」的条目，列表行名字前有一个 `*`。\n\
+                 窗口那三个取的是呼出之前的前台窗口，不是本程序；弹窗里的「测试执行」把 `{%p}` 当空值、\
+                 其余标记按当前现场展开。",
+        tags: "param 参数 标记 marker p c wd wt wc 编码 剪贴板 窗口 替身",
+        group: Group::Syntax,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
         key: "1+2",
         title: "计算器",
         summary: "能求成一个数时头段加一行",
@@ -717,6 +735,24 @@ pub const ENTRIES: &[CheatEntry] = &[
         group: Group::Keys,
         source: None,
         settings_page: Some(1),
+    },
+    CheatEntry {
+        key: "参数框",
+        title: "先填参数再运行",
+        summary: "编码≠无参数、且带 {%p}（或一个标记都没有）时，回车前先弹这一框",
+        detail: "批次 B6（2026-10-28，需求书 FR-ACT-07）：回车执行命中带参项时先出参数框，\
+                 填完再按一次回车才真的启动；Esc 取消，什么都不启动。\n\
+                 只有 `{%p}`（或「编码≠无参数却一个标记都没有」）会弹框；只写 `{%c}` / `{%wt}` 这类现场标记的条目直接启动。\n\
+                 框下面列出「最近用过的参数」，点一条就填进输入框；这张表是 `param_history.json`，\
+                 在框里按确定且值非空就记一条（启动失败也记）。顺序是文件里的先后（新的在前），\
+                 复用同一个值只加计数、不挪位置；最多 50 条，超出时删用得最少的那条（并列删靠后的）。\n\
+                 只有用户亲手敲进这个框的那串进历史；剪贴板、窗口标题这些现场值不存，参数原文也不写日志。\n\
+                 清空入口在「高级」页的「清空参数历史」（这一条不写备份）。\n\
+                 这一框不改变条目本身；编码、标记的写法在编辑弹窗里改（Ctrl+E）。",
+        tags: "key 参数 参数框 parameter prompt 历史 history 最近用过",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(7),
     },
     CheatEntry {
         key: "F1",

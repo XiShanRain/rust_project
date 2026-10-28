@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
+use super::params;
 use super::usage::UsageStats;
 use super::websearch;
 use crate::source::{DataSource, SearchCtx, SourceId};
@@ -110,6 +111,13 @@ pub struct LaunchItem {
     /// `#[serde(default)]` 让旧清单缺字段仍可解析（不写就是空标签，任何档都显示）。
     #[serde(default)]
     pub tags: Vec<String>,
+    /// FR-ACT-07（批次 B6，2026-10-28）：参数编码类型。缺省 `none` ⇒ 旧清单照旧直接启动。
+    ///
+    /// **不进 `uid()`**：身份仍是「类型+命令行+参数」，同一命令换一档编码不该变成另一条条目。
+    /// 代价是同命令、不同编码档的两条会被当成重复（Delphi 把 ParamType 也算进判重）——
+    /// 这条偏差写在 RELEASE_NOTES §六十，不静默改用户已有条目的身份。
+    #[serde(default)]
+    pub param_type: params::ParamType,
 }
 
 impl LaunchItem {
@@ -503,6 +511,9 @@ fn item_from_value(map: &serde_json::Map<String, serde_json::Value>, tag: &str) 
     take_field!(map, it, tag, use_count, u32);
     take_field!(map, it, tag, last_used_ms, i64);
     take_field!(map, it, tag, tags, Vec<String>);
+    // 批次 B6（FR-ACT-07）：缺这一格的老条目 / 这一格被手改成乱七八糟的条目都落回 `None`
+    //（＝照旧直接启动），不让一个编码档把整条吃掉。
+    take_field!(map, it, tag, param_type, params::ParamType);
     it
 }
 
@@ -1801,6 +1812,38 @@ pub fn today_iso() -> String {
         .get(..10)
         .unwrap_or_default()
         .to_string()
+}
+
+// ---- FR-ACT-07 批次 B6：参数历史（`param_history.json`）----
+
+/// 参数历史与清单同目录。**单独一份文件**：它每执行一次带参项就可能写一遍，
+/// 而 `user_items.json` 是用户会手改、期望别的东西别碰的清单（与搜索历史分开存同一条理由）。
+fn param_history_path() -> PathBuf {
+    user_list_path().with_file_name("param_history.json")
+}
+
+/// 读一份参数历史。读盘之后过一遍 [`ParamHistory::sanitize`]：手改过的文件也可能
+/// 出现空行/重复/超长，别让下拉框照着坏数据排。
+fn load_param_history_at(path: &Path) -> (params::ParamHistory, Option<Corrupted>) {
+    let (mut h, bad) = load_or_quarantine::<params::ParamHistory>(path);
+    h.sanitize();
+    (h, bad)
+}
+
+pub fn load_param_history() -> (params::ParamHistory, Option<Corrupted>) {
+    load_param_history_at(&param_history_path())
+}
+
+pub fn save_param_history(history: &params::ParamHistory) {
+    save_param_history_at(&param_history_path(), history);
+}
+
+/// 路径参数化的那一份（单测要能指向临时目录，绝不碰用户真实数据目录）。
+fn save_param_history_at(path: &Path, history: &params::ParamHistory) {
+    match serde_json::to_vec_pretty(history) {
+        Ok(json) => write_atomic(path, &json, "param_history.json"),
+        Err(e) => eprintln!("source: 序列化参数历史失败: {e}"),
+    }
 }
 
 /// 记一条历史：去重（**不分大小写**）后放到最前，超出 `limit` 的从尾部丢掉。
@@ -5812,6 +5855,114 @@ mod config_tests {
         write(&p, r#"{"schema_version": 1, "history_size": "很多"}"#);
         let (s, _) = load_settings_at(&p);
         assert_eq!(s.history_size, HISTORY_SIZE_DEFAULT, "类型不符只兜这一格");
+    }
+
+    /// 批次 B6：`param_type` 这一格对旧清单必须完全透明。
+    /// 钉的是真实上游形状——`user_items.json` 里没有这一格（用户正在用的那份就是这种）。
+    #[test]
+    fn launch_item_without_param_type_reads_as_none() {
+        let json = r#"[
+            {"name":"记事本","path":"notepad.exe","arguments":"","source_path":"",
+             "kind":"app","keyword":"np","pinned":true,"use_count":3,"last_used_ms":1,
+             "tags":["工具"]}
+        ]"#;
+        let items: Vec<LaunchItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].param_type,
+            params::ParamType::None,
+            "老清单缺这一格 ⇒ 无参数，行为不变"
+        );
+        // 回落之后必须还能原样写回去（不写就是缺省值，serde 会把它显式写出来，这是允许的）。
+        let back = serde_json::to_string(&items[0]).unwrap();
+        assert!(back.contains("\"param_type\":\"none\""));
+    }
+
+    #[test]
+    fn param_type_round_trips_on_the_item() {
+        let dir = temp_dir("b6-item");
+        let p = dir.join("user_items.json");
+        let item = LaunchItem {
+            name: "搜索".into(),
+            path: "https://example.com/s?wd={%p}".into(),
+            kind: ItemKind::Url,
+            param_type: params::ParamType::UrlQuery,
+            ..Default::default()
+        };
+        std::fs::write(&p, serde_json::to_vec_pretty(&[item.clone()]).unwrap()).unwrap();
+        let (back, fault) = load_user_items_at(&p);
+        assert!(fault.is_none());
+        assert_eq!(back, vec![item.clone()]);
+        // uid 不含 param_type：换一档编码不该变成另一条条目。
+        let mut other = back[0].clone();
+        other.param_type = params::ParamType::Utf8Query;
+        assert_eq!(other.uid(), item.uid());
+    }
+
+    /// 批次 B6：`param_history.json` 的读写。两条 E2 不变量同样适用——
+    /// **纯读不动盘**、**坏文件先留证再按空表启动**。
+    #[test]
+    fn param_history_starts_empty_without_touching_disk_and_round_trips() {
+        let dir = temp_dir("b6-file");
+        let p = dir.join("param_history.json");
+
+        let (h, fault) = load_param_history_at(&p);
+        assert!(h.is_empty() && fault.is_none(), "首次运行＝空表且没有事故");
+        assert!(!p.exists(), "纯读不许造出一个空文件");
+
+        let mut h = params::ParamHistory::default();
+        h.touch("百度 搜索");
+        h.touch("notepad C:\\a b.txt");
+        save_param_history_at(&p, &h);
+        let (back, fault2) = load_param_history_at(&p);
+        assert!(fault2.is_none());
+        assert_eq!(back, h);
+        assert!(
+            !std::fs::read(&p).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]),
+            "无 BOM 与偏好同口径"
+        );
+
+        save_param_history_at(&p, &params::ParamHistory::default());
+        let (cleared, fault3) = load_param_history_at(&p);
+        assert!(fault3.is_none());
+        assert!(cleared.is_empty(), "空表是合法内容，不是坏文件");
+    }
+
+    #[test]
+    fn a_broken_param_history_quarantines_instead_of_being_written_over() {
+        let dir = temp_dir("b6-bad");
+        let p = dir.join("param_history.json");
+        write(&p, r#"{"entries": "not-an-array"}"#);
+        let (h, fault) = load_param_history_at(&p);
+        assert!(h.is_empty());
+        let Some(Corrupted::Kept(kept)) = &fault else {
+            panic!("第一次留证该成功，实得 {fault:?}")
+        };
+        assert!(kept.exists() && !p.exists(), "证据在 {kept:?}，原位置要腾出来");
+        assert_eq!(
+            std::fs::read(kept).unwrap(),
+            br#"{"entries": "not-an-array"}"#,
+            "留的是原文，不是我们重排过的东西"
+        );
+    }
+
+    /// 手改过的历史文件：空行、重复、超上限都别照搬进下拉框。
+    #[test]
+    fn param_history_load_sanitizes_hand_edited_files() {
+        let dir = temp_dir("b6-clean");
+        let p = dir.join("param_history.json");
+        let mut entries = String::new();
+        for i in 0..(params::HISTORY_LIMIT + 5) {
+            entries.push_str(&format!(
+                "{{\"rank\": 0, \"text\": \"p{i}\"}},{{\"rank\":9,\"text\":\"  \"}},"
+            ));
+        }
+        write(&p, &format!("{{\"entries\":[{entries}{{\"rank\":1,\"text\":\"p0\"}}]}}"));
+        let (h, fault) = load_param_history_at(&p);
+        assert!(fault.is_none(), "重复不算坏文件，只是清洗");
+        assert_eq!(h.len(), params::HISTORY_LIMIT, "超上限截断");
+        assert_eq!(h.texts().filter(|t| *t == "p0").count(), 1, "重复只留一条");
+        assert!(h.texts().all(|t| !t.trim().is_empty()), "空白行不进来");
     }
 }
 

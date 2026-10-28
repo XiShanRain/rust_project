@@ -24,6 +24,7 @@ pub mod filesearch;
 pub mod icon;
 pub mod import;
 pub mod manage;
+pub mod params;
 pub mod pathcheck;
 pub mod system;
 pub mod terminal;

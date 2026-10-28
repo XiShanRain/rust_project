@@ -16,8 +16,8 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
 };
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM,
-    LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND,
+    LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
 use windows::Win32::System::Com::{
@@ -31,7 +31,8 @@ use windows::core::PCWSTR;
 // 批次 E4（FR-ACT-05）：「Preferred DropEffect」是**运行时注册的自定义格式**，
 // 名字要交给 RegisterClipboardFormatW 换 id，没有现成常量。
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+    SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
@@ -60,7 +61,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ChangeWindowMessageFilterEx, CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowThreadProcessId, HWND_BROADCAST,
+    GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_BROADCAST,
     HWND_MESSAGE, IsIconic, IsWindow, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_RESTORE,
     SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow,
@@ -450,6 +452,9 @@ enum Destructive {
     /// FR-SYS-06（批次 D8）：把 usage.json 清成空表。条目上的 `use_count` 不动（那是另一本账）。
     /// 与 [`Self::ClearHistory`] 一样不写备份——它清的是统计，留一份副本正好是「清除」二字的反面。
     ClearUsage,
+    /// FR-ACT-07（批次 B6）：把 param_history.json 清成空表（参数框下面那列最近用过的值）。
+    /// 与上面两条"清原文"的同一个理由：不写备份。
+    ClearParamHistory,
 }
 
 /// 批次 D5（FR-ACT-09）：批量管理页的两种确认（`Some`＝确认框开着）。
@@ -559,6 +564,11 @@ struct DialogState {
     source_path: String,
     /// 批次 G1 分类标签的自由文本（逗号/空白分隔），提交时由 [`source::application::parse_tags_text`] 拆表。
     tags_text: String,
+    /// 批次 B6（FR-ACT-07）：参数编码四档。`None`＝不展开标记、不弹参数框（旧条目的缺省）。
+    param_type: source::params::ParamType,
+    /// 批次 B6：本条已经露过一次「有标记但编码=不替换」的追问。存进弹窗自己身上——
+    /// 与 `fill_prompt` 同一条理由：框一关它就该消失，挂在 App 上要挨个关框路径去清。
+    marker_warn: bool,
     /// 批次 D4（FR-CFG-06）：选文件/选目录之后的"要不要覆盖已填的别名/名称"询问。
     /// 挂在弹窗自己身上，是为了跟着弹窗一起消失——关框的路径有五六条，挨个清必漏一条。
     fill_prompt: Option<PickPrompt>,
@@ -576,6 +586,8 @@ impl DialogState {
             kind: ItemKind::Command,
             source_path: String::new(),
             tags_text: String::new(),
+            param_type: source::params::ParamType::None,
+            marker_warn: false,
             fill_prompt: None,
         }
     }
@@ -592,6 +604,8 @@ impl DialogState {
             kind: it.kind,
             source_path: String::new(),
             tags_text: String::new(),
+            param_type: source::params::ParamType::None,
+            marker_warn: false,
             fill_prompt: None,
         }
     }
@@ -607,6 +621,8 @@ impl DialogState {
             kind: it.kind,
             source_path: it.source_path,
             tags_text: String::new(),
+            param_type: source::params::ParamType::None,
+            marker_warn: false,
             fill_prompt: None,
         }
     }
@@ -628,6 +644,8 @@ impl DialogState {
             },
             source_path: hit.path.clone(),
             tags_text: String::new(),
+            param_type: source::params::ParamType::None,
+            marker_warn: false,
             fill_prompt: None,
         }
     }
@@ -643,6 +661,8 @@ impl DialogState {
             kind: it.kind,
             source_path: it.source_path.clone(),
             tags_text: it.tags.join(" "),
+            param_type: it.param_type,
+            marker_warn: false,
             fill_prompt: None,
         }
     }
@@ -693,9 +713,19 @@ impl DialogState {
             kind,
             keyword: kw,
             tags: source::application::parse_tags_text(&self.tags_text),
+            param_type: self.param_type,
             // 新建默认未置顶、零统计；编辑既有项的置顶/使用统计在 DlgResult::Confirm 提交时旧值携带回填。
             ..Default::default()
         }
+    }
+    /// 批次 B6（FR-ACT-07）：保存前要不要追问「有标记但编码=不替换」。
+    ///
+    /// 判据只看**两个命令行格**：工作目录不参与展开（Delphi 也只处理命令行两格），
+    /// 把标记写在工作目录里本来就换不了，提醒它对不上号。
+    fn marker_warn_needed(&self) -> bool {
+        self.param_type == source::params::ParamType::None
+            && (source::params::has_marker(&self.path)
+                || source::params::has_marker(&self.arguments))
     }
 }
 
@@ -731,6 +761,26 @@ struct InternalConfirm {
     action: source::system::InternalAction,
     name: String,
     uid: String,
+}
+
+/// 批次 B6（FR-ACT-07）：参数框打开时扣下的那一份现场。
+///
+/// 只带"要启动谁"和身份；展开（标记 → 真实值）推迟到用户按「确定」那一帧——
+/// 打开框这一刻剪贴板可能还会被用户改掉，参数也该以他最后一次敲的为准。
+#[derive(Debug, Clone)]
+struct ParamPrompt {
+    /// 原条目（未展开），确定那一帧才按 [`LauncherApp::expand_for_launch`] 出副本。
+    entry: LaunchItem,
+    /// 学习统计 / 使用统计用的身份（原条目 uid，不是展开副本的派生 uid）。
+    uid: String,
+    /// 输入框里的参数（跨帧活着）。
+    text: String,
+    /// 这一按来自清单行 ⇒ 成功才累计使用次数并学别名（与 `<Row::Item>` 那两支同口径）。
+    from_list: bool,
+    /// 学别名用的那串词（清单进来是查询框，面板进来是面板存下的原查询）。
+    alias_word: String,
+    /// 来自自定义命令源（`HeadRow::Custom`）：成功要记一次 `Bucket::Custom`。
+    from_custom: bool,
 }
 
 /// 左键拖空白移动/缩放窗口的锚点。坐标一律用 Win32 权威值（物理像素）：egui 的 `outer_rect`
@@ -804,6 +854,17 @@ struct LauncherApp {
     dialog: Option<DialogState>, // FR-SRC-20 添加/编辑对话框（Some=打开）
     confirm: Option<ConfirmRequest>, // 删除确认弹窗（Some=打开；2026-10-18 用户要求，删除不再一键生效）
     internal_confirm: Option<InternalConfirm>, // 批次 A2：关机/重启/注销/清空回收站的执行确认
+    /// 批次 B6（FR-ACT-07）：参数框（Some=打开）。
+    param_prompt: Option<ParamPrompt>,
+    /// 参数框当帧吞掉 Enter（与 [`Self::dialog_enter_armed`] 同一条理由）。
+    param_enter_armed: bool,
+    /// 批次 B6：呼出瞬间的快照（剪贴板 / 前台窗口），只有带标记的条目会读它。
+    summon: source::params::Snapshot,
+    /// 批次 B6：参数历史的内存副本。确认一次写一次盘，读盘在启动那一次。
+    param_history: source::params::ParamHistory,
+    /// 参数历史文件坏过（`Corrupted::Lost`）⇒ 这一轮别把用户的旧文件覆盖掉
+    /// （与 `usage_blocked` / `history_blocked` 同一口径）。
+    param_history_blocked: bool,
     about_open: bool,                // 批次 A2：「关于本程序」弹窗（Some 的等价物，用 bool 更直白）
     help_entry: Option<source::cheatsheet::CheatHit>, // 批次 A8：速查表条目的帮助页（Some=打开）
     /// 批次 F7：设置页「高级」页的破坏性动作确认（Some=确认框开着）。
@@ -1152,6 +1213,80 @@ fn window_class_name(hwnd: HWND) -> String {
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     let n = (n.max(0) as usize).min(buf.len());
     String::from_utf16_lossy(&buf[..n])
+}
+
+/// 读一个窗口的标题。**只有 `{%wt}` 那一格用**：标题里经常带着用户正在编辑的正文，
+/// 取到之后直接交给呼出快照，绝不进日志（与 [`window_class_name`] 那条隐私口径同源）。
+fn window_title(hwnd: HWND) -> String {
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    let n = (n.max(0) as usize).min(buf.len());
+    String::from_utf16_lossy(&buf[..n])
+}
+
+/// 批次 B6（FR-ACT-07）：呼出瞬间的剪贴板文本（`{%c}` 的来源）。
+///
+/// 打不开剪贴板（正被别的程序占着）＝ `None` ⇒ 展开成空串。宁可让用户看见"参数少了"，
+/// 也不拿上一次呼出的旧内容冒充这一次的剪贴板。
+///
+/// 读的时候按 `CF_UNICODETEXT` 的约定走 NUL 结尾；1Mi 个 UTF-16 单元的上限只是防一份
+/// 没写结尾的坏数据把 UI 线程挂住（正常剪贴板远到不了这个量）。
+fn read_clipboard_text() -> Option<String> {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            eprintln!("参数标记：剪贴板打不开（可能正被别的程序占着）⇒ {{%c}} 这次是空值");
+            return None;
+        }
+        let text = match GetClipboardData(CF_UNICODETEXT) {
+            Ok(handle) if !handle.is_invalid() => {
+                let h = HGLOBAL(handle.0);
+                let p = GlobalLock(h);
+                let s = if p.is_null() {
+                    None
+                } else {
+                    let base = p.cast::<u16>();
+                    let mut units: Vec<u16> = Vec::new();
+                    for i in 0..(1usize << 20) {
+                        let u = *base.add(i);
+                        if u == 0 {
+                            break;
+                        }
+                        units.push(u);
+                    }
+                    let _ = GlobalUnlock(h);
+                    Some(String::from_utf16_lossy(&units))
+                };
+                s
+            }
+            // 剪贴板里没有文本（只有文件 / 图片，或者干脆是空的）⇒ 空值，不报错。
+            _ => None,
+        };
+        let _ = CloseClipboard();
+        if let Some(t) = &text {
+            // 长度可以入日志，原文不行（FR-SYS-03）。
+            eprintln!(
+                "参数标记：呼出快照读到剪贴板 {} 字（原文不落日志）",
+                t.chars().count()
+            );
+        }
+        text
+    }
+}
+
+/// 呼出快照的初值。构造那一刻窗口还没建出来（`self_hwnd` 为 `None`），所以不看"前台是不是自己"。
+/// 少了它，程序启动后**第一次**按回车运行的带标记条目会拿到一份空快照。
+fn initial_summon_snapshot() -> source::params::Snapshot {
+    let mut snap = source::params::Snapshot {
+        clipboard: read_clipboard_text().unwrap_or_default(),
+        ..Default::default()
+    };
+    let fg = unsafe { GetForegroundWindow() };
+    if !fg.0.is_null() {
+        snap.window_id = (fg.0 as usize).to_string();
+        snap.window_title = window_title(fg);
+        snap.window_class = window_class_name(fg);
+    }
+    snap
 }
 
 /// 记一次"呼出之前的前台窗口"。AHK 版同一格是 `App.RememberActiveWindow()`——
@@ -1517,6 +1652,18 @@ fn row_badge(ui: &mut egui::Ui, idx: usize, verb: &str) {
             .on_hover_text(format!("按 {num} 直接{verb}本行"));
         }
         None => ui.add_space(14.0),
+    }
+}
+
+/// 批次 B6（FR-ACT-07）：带参项在列表行上的 `*` 前缀（继承 Delphi 的 `*` 前缀语义）。
+///
+/// 判据取 `ParamType ≠ none`：那才是"启动前会替换标记 / 追问参数"的一档。
+/// 编码为空时命令行里即使写着标记也不会展开（Delphi 同口径），标 `*` 反而误导。
+fn param_row_mark(item: &LaunchItem) -> &'static str {
+    if item.param_type == source::params::ParamType::None {
+        ""
+    } else {
+        "* "
     }
 }
 
@@ -3555,6 +3702,8 @@ impl LauncherApp {
         // 批次 D8（FR-SYS-06）：使用统计。文件不在＝空表且**不写盘**——用户还没执行过任何东西，
         // 这时候落一个空 usage.json 是程序自己造的文件（与历史那条同一口径）。
         let (usage, broken_usage) = source::application::load_usage();
+        // 批次 B6（FR-ACT-07）：参数历史是第五份文件，门禁同样各管各的（只挡它自己的写）。
+        let (param_history, broken_param) = source::application::load_param_history();
         // §4.2.1 出厂命令集的补齐：老清单（settings 里的轮次落后）启动时补一次缺，补完记账。
         // 只加不删、已有条目一律不动；记账之后删掉的条目不会自己回来（找回用设置页那个按钮）。
         let mut prefs = settings;
@@ -3571,14 +3720,19 @@ impl LauncherApp {
         let history_blocked = matches!(broken_history, Some(Corrupted::Lost));
         // 批次 D8：统计是第四份文件，门禁同样各管各的（它没留住证只挡它自己的写）。
         let usage_blocked = matches!(broken_usage, Some(Corrupted::Lost));
+        // 批次 B6：参数历史同一条口径。
+        let param_history_blocked = matches!(broken_param, Some(Corrupted::Lost));
         // 给用户看的那一句把四份并进来：坏在哪个文件上他就得知道哪个，别说漏了让他以为没事。
-        let lost = if history_blocked || usage_blocked {
+        let lost = if history_blocked || usage_blocked || param_history_blocked {
             let mut v: Vec<&str> = lost_cfg;
             if history_blocked {
                 v.push("search_history.json");
             }
             if usage_blocked {
                 v.push("usage.json");
+            }
+            if param_history_blocked {
+                v.push("param_history.json");
             }
             v
         } else {
@@ -3589,6 +3743,7 @@ impl LauncherApp {
             ("user_items.json", &broken_list, "空清单"),
             ("search_history.json", &broken_history, "空历史"),
             ("usage.json", &broken_usage, "空统计"),
+            ("param_history.json", &broken_param, "空参数历史"),
         ] {
             match c {
                 Some(Corrupted::Kept(p)) => eprintln!(
@@ -3641,6 +3796,14 @@ impl LauncherApp {
             (Some(s), Some(u)) => Some(format!("{s}；使用统计也坏了，已改名留底：{u}")),
             (None, Some(u)) => Some(format!(
                 "⚠ 使用统计坏了，已改名留底：{u}，本次按空统计启动（原文件没有被覆盖）"
+            )),
+            (n, None) => n,
+        };
+        // 批次 B6：参数历史同一条写法（同样不改上面几条已对过屏幕的臂）。
+        let notice = match (notice, kept(&broken_param)) {
+            (Some(s), Some(p)) => Some(format!("{s}；参数历史也坏了，已改名留底：{p}")),
+            (None, Some(p)) => Some(format!(
+                "⚠ 参数历史坏了，已改名留底：{p}，本次按空参数历史启动（原文件没有被覆盖）"
             )),
             (n, None) => n,
         };
@@ -3790,6 +3953,11 @@ impl LauncherApp {
             dialog_enter_armed: false,
             confirm: None,
             internal_confirm: None,
+            param_prompt: None,
+            param_enter_armed: false,
+            summon: initial_summon_snapshot(),
+            param_history,
+            param_history_blocked,
             about_open: false,
             help_entry: None,
             pending_destructive: None,
@@ -4065,6 +4233,9 @@ impl LauncherApp {
         // 要的"贴回哪儿"只有这一帧问得出来。每次呼出都问一遍，不只隐藏→显示的边沿：
         // 弹窗／设置页／大字窗开着时失焦不关窗（FR-WIN-04），那种状态下前台已经不是我们。
         remember_previous_window(self.self_hwnd);
+        // 批次 B6（FR-ACT-07）：同一时刻抓参数快照（`{%c}` / `{%wd}` / `{%wt}` / `{%wc}`）。
+        // 与上一行同样必须在动窗口之前——`{%wt}` 验收的就是"呼出之前那个窗口的标题"。
+        self.capture_summon_snapshot();
         let iconic = self.is_iconic();
         if !self.visible || iconic {
             if iconic && self.visible {
@@ -4082,6 +4253,121 @@ impl LauncherApp {
             self.on_show();
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// 批次 B6（FR-ACT-07）：每次呼出抓一份现场。三条规矩与 [`remember_previous_window`] 对齐：
+    /// · 剪贴板每次重读——`{%c}` 的语义就是"按下热键那一刻的剪贴板"；
+    /// · 前台为空 ⇒ 窗口三格清空（宁可不填，不拿上一次的冒充）；
+    /// · 前台是自己 ⇒ 保留上一次那一个（重复呼出 / 托盘点自己 / 大字窗还回来）。
+    /// 标题与剪贴板原文都不进日志（FR-SYS-03），只记长度与类名。
+    fn capture_summon_snapshot(&mut self) {
+        self.summon.clipboard = read_clipboard_text().unwrap_or_default();
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.0.is_null() {
+            self.summon.window_id.clear();
+            self.summon.window_title.clear();
+            self.summon.window_class.clear();
+            return;
+        }
+        if self.self_hwnd.is_some_and(|me| me.0 == fg.0) {
+            return;
+        }
+        self.summon.window_id = (fg.0 as usize).to_string();
+        self.summon.window_title = window_title(fg);
+        self.summon.window_class = window_class_name(fg);
+        eprintln!(
+            "参数标记：呼出快照 = 前台 0x{:x}（类名 {}；标题不落日志）、剪贴板 {} 字",
+            fg.0 as usize,
+            self.summon.window_class,
+            self.summon.clipboard.chars().count()
+        );
+    }
+
+    /// 批次 B6（FR-ACT-07）：这一条要不要先问参数。`true` = 已弹框，调用方别再启动。
+    ///
+    /// 判据全在 [`source::params::needs_prompt`] 里（写着 `{%p}`，或者一个标记都没写但
+    /// `ParamType≠none` 要追加参数），这里只负责扣下现场。
+    fn param_prompt_if_needed(
+        &mut self,
+        entry: &LaunchItem,
+        uid: &str,
+        from_list: bool,
+        alias_word: String,
+        from_custom: bool,
+    ) -> bool {
+        if !source::params::needs_prompt(&entry.path, &entry.arguments, entry.param_type) {
+            return false;
+        }
+        eprintln!(
+            "参数标记：条目「{}」要先填参数 ⇒ 弹参数框（{uid}）",
+            entry.name
+        );
+        self.param_prompt = Some(ParamPrompt {
+            entry: entry.clone(),
+            uid: uid.to_string(),
+            text: String::new(),
+            from_list,
+            alias_word,
+            from_custom,
+        });
+        self.param_enter_armed = true;
+        true
+    }
+
+    /// 批次 B6：把条目里的标记换成真实值。返回（展开后的副本, 是否做过替换）。
+    ///
+    /// **做过替换 ⇒ 日志必须走脱敏路径**：填进去的是剪贴板原文 / 窗口标题 / 用户参数。
+    /// 工作目录不展开（Delphi 也只处理命令行两格）：里面的标记原样交给系统，看得见比静默吞掉好。
+    ///
+    /// 2026-10-28 真机④：这里原先在「一个标记都没写」时直接短路返回，`expand_command` 里
+    /// 那条「没标记就按编码接在命令行后面」的分支因此永远走不到——参数框提示写着「这段会按
+    /// 编码接在命令行后面」，实际只启动了 `--base`。判据改成比一比展开前后变没变，接不接
+    /// 由 `expand_command` 自己定。
+    fn expand_for_launch(&self, entry: &LaunchItem, param: &str) -> (LaunchItem, bool) {
+        let ty = entry.param_type;
+        if ty == source::params::ParamType::None {
+            return (entry.clone(), false);
+        }
+        let (path, arguments) =
+            source::params::expand_command(&entry.path, &entry.arguments, ty, &self.summon, param);
+        let changed = path != entry.path || arguments != entry.arguments;
+        let mut out = entry.clone();
+        out.path = path;
+        out.arguments = arguments;
+        (out, changed)
+    }
+
+    /// 批次 B6（FR-ACT-07）：参数框按「确定」那一帧——展开、启动、记账，三件事与列表直接
+    /// 启动那一按同一口径（成功才累计统计；`launch_and_hide_masked` 保证日志不落真实参数）。
+    fn confirm_param_prompt(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.param_prompt.take() else {
+            return;
+        };
+        let param = p.text.trim().to_string();
+        let (entry, expanded) = self.expand_for_launch(&p.entry, &param);
+        if expanded {
+            eprintln!(
+                "参数标记：「{}」展开完成（参数 {} 字，原文不落日志）",
+                p.entry.name,
+                param.chars().count()
+            );
+        }
+        // 历史只记非空的参数（空值没有复用价值）；写盘失败不影响启动。
+        if !param.is_empty() && self.param_history.touch(&param) {
+            if self.param_history_blocked {
+                eprintln!("参数历史：文件坏且留证没成功 ⇒ 这次不写盘（只在内存里记一条）");
+            } else {
+                source::application::save_param_history(&self.param_history);
+            }
+        }
+        self.remember_history(self.query.clone());
+        let started = self.launch_and_hide_masked(ctx, &entry, &p.uid);
+        if started && p.from_list {
+            self.mark_used(&p.uid, &p.alias_word);
+        }
+        if started && p.from_custom {
+            self.record_usage(source::usage::Bucket::Custom);
+        }
     }
 
     /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观
@@ -6384,6 +6670,33 @@ impl LauncherApp {
                                 ui.ctx().request_repaint();
                             }
                             ui.separator();
+                            // 批次 B6（FR-ACT-07）：清空参数历史。与上面那条同口径——只清表、不备份。
+                            ui.label(egui::RichText::new("清空参数历史").strong());
+                            if self.param_history.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "现在一条都没存：带参项的参数框里填过值之后，这里才会有东西可以清。",
+                                    )
+                                    .weak()
+                                    .small(),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "现在存着 {} 条（上限 {}；顺序是新的在前，复用的只加计数、不挪位置）。\n参数框下面那列「最近用过的参数」就是它；清空后你得重新一个一个敲。\n这一条同样不写备份：清的就是你亲手敲过的原文。",
+                                        self.param_history.len(),
+                                        source::params::HISTORY_LIMIT
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                                if ui.button("清空参数历史…").clicked() {
+                                    self.pending_destructive = Some(Destructive::ClearParamHistory);
+                                    eprintln!("设置页：点了「清空参数历史」，等确认");
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                            ui.separator();
                             // 批次 F7（FR-CFG-08）：恢复默认。
                             ui.label(egui::RichText::new("恢复默认").strong());
                             ui.label(
@@ -6689,7 +7002,7 @@ impl LauncherApp {
     /// 收窗等于把没保存的内容丢了；统计只认真正入库的条目。
     fn test_dialog_entry(&mut self, ctx: &egui::Context) {
         // 先把要用的值抠出来：下面要借 `&mut self` 弹 Toast，不能同时握着 `self.dialog` 的借用。
-        let Some((kind, path, args, wd, name)) = self.dialog.as_ref().map(|dg| {
+        let Some((kind, path, args, wd, name, ty)) = self.dialog.as_ref().map(|dg| {
             let wd = dg.working_dir.trim();
             (
                 dg.kind,
@@ -6697,6 +7010,7 @@ impl LauncherApp {
                 dg.arguments.clone(),
                 (!wd.is_empty()).then(|| wd.to_string()),
                 dg.name.clone(),
+                dg.param_type,
             )
         }) else {
             return;
@@ -6710,11 +7024,22 @@ impl LauncherApp {
             self.internal_toast(ctx, "⚠ 命令行为空，没东西可测", false);
             return;
         }
+        // 批次 B6（FR-ACT-07）：带参项按"呼出那一刻的现场"展开标记再试跑。
+        // 弹窗里没法再套一层参数框 ⇒ `{%p}` 按空串代入；这比把字面量 `{%p}` 交给程序强，
+        // 后者只会换回一个"找不到文件"。日志本来就只记名称（"名称/路径/参数不落日志"），
+        // 展开后的真实值（剪贴板 / 窗口标题）不会进 launcher.log。
+        let asked = source::params::needs_prompt(&path, &args, ty);
+        let (path, args) = if ty == source::params::ParamType::None {
+            (path, args)
+        } else {
+            source::params::expand_command(&path, &args, ty, &self.summon, "")
+        };
         let name = if name.trim().is_empty() { path.clone() } else { name };
         match shell_execute(&path, &args, wd.as_deref()) {
             Ok(_) => {
                 eprintln!("弹窗测试执行：已启动（名称/路径/参数不落日志）");
-                self.internal_toast(ctx, &format!("✓ 已测试启动「{name}」"), true);
+                let note = if asked { "（标记已按当前现场展开，{%p} 为空）" } else { "" };
+                self.internal_toast(ctx, &format!("✓ 已测试启动「{name}」{note}"), true);
             }
             Err(e) => {
                 eprintln!("弹窗测试执行失败：{e}");
@@ -6759,7 +7084,7 @@ impl LauncherApp {
             Ok(_) => match masked_uid {
                 None => eprintln!("launch: {} {}", entry.path, entry.arguments),
                 Some(uid) => eprintln!(
-                    "launch(custom): 已启动「{}」（{uid}，填入的路径/参数含查询词，不落日志）",
+                    "launch(custom): 已启动「{}」（{uid}，填入的路径/参数含用户内容，不落日志）",
                     entry.name
                 ),
             },
@@ -7499,18 +7824,28 @@ impl LauncherApp {
                     uid,
                     masked,
                 } => {
-                    let started = if *masked {
-                        self.launch_and_hide_masked(ctx, entry, uid)
-                    } else {
-                        self.launch_and_hide(ctx, entry)
-                    };
-                    if started {
-                        self.mark_used(uid, &alias_word);
-                        PanelOutcome::Gone
-                    } else {
-                        // 启动失败：`launch_with_log` 已经把窗口留在原地给了原因。
-                        // 面板不撤——撤了查询框里剩的就是过滤词，那一屏结果会被过滤词误导。
+                    // 批次 B6（FR-ACT-07）：要参数的那一档在这里也先弹框。面板已经出栈，
+                    // 取消之后回到搜索结果页（面板存的原查询不再放回），这与"面板里启动失败"
+                    // 那一格刻意不同：那里是没得选，这里是用户自己撤的。
+                    // `from_list = true`：面板里这条的非参数路径成功就 `mark_used`（见下方分支），
+                    // 填完参数之后同样要记——不然同一条命令"要不要填参数"决定它算不算用过。
+                    if self.param_prompt_if_needed(entry, uid, true, alias_word.clone(), false) {
                         PanelOutcome::Stay
+                    } else {
+                        let (entry, expanded) = self.expand_for_launch(entry, "");
+                        let started = if *masked || expanded {
+                            self.launch_and_hide_masked(ctx, &entry, uid)
+                        } else {
+                            self.launch_and_hide(ctx, &entry)
+                        };
+                        if started {
+                            self.mark_used(uid, &alias_word);
+                            PanelOutcome::Gone
+                        } else {
+                            // 启动失败：`launch_with_log` 已经把窗口留在原地给了原因。
+                            // 面板不撤——撤了查询框里剩的就是过滤词，那一屏结果会被过滤词误导。
+                            PanelOutcome::Stay
+                        }
                     }
                 }
                 PanelOpen::Path => {
@@ -7556,7 +7891,25 @@ impl LauncherApp {
                     PanelOutcome::Stay
                 }
             },
-            actions::ActionId::RunAs => {
+            actions::ActionId::RunAs => 'run_as: {
+                // 批次 B6（FR-ACT-07）：提权这一格先没法问参数，也绝不能把字面量 `{%p}`
+                // 带着 UAC 送给系统 ⇒ 明说，让用户改走「打开」（那条会弹参数框）。
+                if let PanelOpen::Entry { entry, .. } = &open {
+                    if source::params::needs_prompt(
+                        &entry.path,
+                        &entry.arguments,
+                        entry.param_type,
+                    ) {
+                        eprintln!("操作面板：这条要先填参数，提权版不支持 ⇒ 请改用「打开」");
+                        self.toast = Some((
+                            "这条带参数标记：请用「打开」填参数后再运行".to_string(),
+                            Instant::now() + TOAST_TTL,
+                            TOAST_ERR,
+                        ));
+                        ctx.request_repaint_after(TOAST_TTL);
+                        break 'run_as PanelOutcome::Stay;
+                    }
+                }
                 let dir = match &open {
                     PanelOpen::Entry { entry, .. } => entry.working_dir.as_deref(),
                     PanelOpen::Path | PanelOpen::Batch | PanelOpen::Value => None,
@@ -8078,12 +8431,15 @@ impl LauncherApp {
     }
 
     /// 列表区此刻吃不吃键盘。三处共用同一个判据（列表按键与滚轮、搜索页顶栏的拖窗缝、
-    /// 列表右侧那块拖窗手柄）：弹窗/确认框/关于页/帮助页任一开着 ⇒ 让位，
+    /// 列表右侧那块拖窗手柄）：弹窗/参数框/确认框/关于页/帮助页任一开着 ⇒ 让位，
     /// Enter 归"确定"按钮、拖动手柄整块撤掉。
     /// 批次 C3 之前这三处各抄了一遍同样的六个条件，加一档确认框就得记着改三处——
     /// 漏一处的症状是"开着确认框还能用 ↑↓ 移动选中"。
+    /// 批次 B6 补 `param_prompt`（2026-10-28 真机①）：漏了它时回车在参数框里按一次会
+    /// "确认并启动"＋"列表再启动选中行"各跑一遍，后者又开出一个空参数框（幽灵框）。
     fn keys_live(&self) -> bool {
         self.dialog.is_none()
+            && self.param_prompt.is_none()
             && self.confirm.is_none()
             && self.batch_confirm.is_none()
             && self.internal_confirm.is_none()
@@ -8421,6 +8777,7 @@ impl eframe::App for LauncherApp {
             // keep_open 豁免（bf07e45 登记的待办，对话框上线后补上）：
             // Modal（添加/编辑框、删除确认框）或设置页开着时失焦不关到托盘，否则半成品表单/正在看的设置随窗口一起消失；已武装的定时器一并撤销。
             if self.dialog.is_some()
+                || self.param_prompt.is_some()
                 || self.confirm.is_some()
                 || self.batch_confirm.is_some()
                 || self.internal_confirm.is_some()
@@ -8582,6 +8939,7 @@ impl eframe::App for LauncherApp {
         if self.visible
             && !recording
             && self.dialog.is_none()
+            && self.param_prompt.is_none()
             && self.confirm.is_none()
             && self.batch_confirm.is_none()
             && self.internal_confirm.is_none()
@@ -10431,8 +10789,12 @@ impl eframe::App for LauncherApp {
                                 }
                                 // FR-SRC-19：置顶项名称前加 📌 角标（免鼠标可辨）。
                                 // 批次 E4：标记项再加一层 `✓` 前缀（与 📌 同一手法，不另开列宽）。
+                                // 批次 B6：带参项在名称前加 `*`（最近名字，先于 📌/✓）。
                                 let marked = is_marked(&self.marked, &item.path);
-                                let mut shown = if item.pinned { format!("📌 {}", item.name) } else { item.name.clone() };
+                                let mut shown = format!("{}{}", param_row_mark(item), item.name);
+                                if item.pinned {
+                                    shown = format!("📌 {shown}");
+                                }
                                 if marked {
                                     shown = format!("✓ {shown}");
                                 }
@@ -10679,6 +11041,14 @@ impl eframe::App for LauncherApp {
             // `Ctrl+Shift+O` 要先吃：`consume_key(COMMAND, ·)` 对多余的 Shift 是放行的
             //（与 Shift+Tab / Shift+空格同一个坑）。
             let prompt_open = self.dialog.as_ref().is_some_and(|d| d.fill_prompt.is_some());
+            // 批次 B6：「标记但编码=无参数」的追问露着时，Enter 不再是"确定"——
+            // 那一屏是在问他"还要不要存"，再按一次回车就替他答了。
+            // 条件里再查一遍 `marker_warn_needed`：用户把编码改成非「无参数」之后，
+            // 这条追问就过期了，不该继续扣着回车。
+            let marker_warn_now = self
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.marker_warn && d.marker_warn_needed());
             let (want_file, want_dir, want_test) = if prompt_open {
                 (false, false, false)
             } else {
@@ -10700,6 +11070,7 @@ impl eframe::App for LauncherApp {
             };
             let mut test_request = want_test;
             let mut prompt_answer: Option<bool> = None;
+            let mut marker_warn_off = false;
 
             let modal_resp =
                 egui::Modal::new(egui::Id::new("shortcut_dialog")).show(ui.ctx(), |ui| {
@@ -10723,6 +11094,7 @@ impl eframe::App for LauncherApp {
                             // 把"回车"当确定会连询问一起跳过（用户以为还没答）。
                             if !armed
                                 && !prompt_open
+                                && !marker_warn_now
                                 && !egui::Popup::is_any_open(ui.ctx())
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter))
                             {
@@ -10794,6 +11166,41 @@ impl eframe::App for LauncherApp {
                                     );
                                 });
                                 row(ui, "参数", &mut dg.arguments, "");
+                                // 批次 B6（FR-ACT-07）：编码四档。紧贴「参数」——它决定的正是
+                                // "参数怎么代进去"。`无参数` 时标记不展开也不弹框（Delphi 同口径）。
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([label_w, 20.0], egui::Label::new("编码"));
+                                    let mut idx = source::params::ParamType::ALL
+                                        .iter()
+                                        .position(|t| *t == dg.param_type)
+                                        .unwrap_or(0);
+                                    egui::ComboBox::from_id_salt("param_type_combo")
+                                        .selected_text(dg.param_type.label())
+                                        .show_index(
+                                            ui,
+                                            &mut idx,
+                                            source::params::ParamType::ALL.len(),
+                                            |i| {
+                                                source::params::ParamType::ALL[i]
+                                                    .label()
+                                                    .to_string()
+                                            },
+                                        );
+                                    dg.param_type = source::params::ParamType::ALL[idx];
+                                    ui.label(
+                                        egui::RichText::new(dg.param_type.hint()).weak().small(),
+                                    );
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add_sized([label_w, 18.0], egui::Label::new(""));
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "标记：{%p} 你填的参数 · {%c} 呼出那一刻的剪贴板 · {%wd} 前台窗口句柄 · {%wt} 它的标题 · {%wc} 它的类名（编码=无参数时都不替换）",
+                                        )
+                                        .weak()
+                                        .small(),
+                                    );
+                                });
                                 row(ui, "工作目录", &mut dg.working_dir, "");
                                 row(
                                     ui,
@@ -10854,6 +11261,30 @@ impl eframe::App for LauncherApp {
                                     }
                                 });
                             }
+                            // 批次 B6（FR-ACT-07）：有标记但编码=无参数 ⇒ 保存前问一句。
+                            // 「仍然保存」把这一按再交回 Confirm（此时弹窗上已带 `marker_warn`，
+                            // 外层不再追问）；「返回修改」只收提示，框和内容都不动。
+                            if self
+                                .dialog
+                                .as_ref()
+                                .is_some_and(|d| d.marker_warn && d.marker_warn_needed())
+                            {
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "命令行/参数里有 {%…} 标记，但编码是「无参数」：这些标记会原样交给程序，不会被替换。仍然保存吗？",
+                                        )
+                                        .strong(),
+                                    );
+                                    if ui.button("仍然保存").clicked() {
+                                        result = DlgResult::Confirm;
+                                    }
+                                    if ui.button("返回修改").clicked() {
+                                        marker_warn_off = true;
+                                    }
+                                });
+                            }
                             // 按钮贴底：窗口被拉高后不会孤零零吊在表单下面。
                             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                                 ui.horizontal(|ui| {
@@ -10876,9 +11307,36 @@ impl eframe::App for LauncherApp {
 
             match modal_resp.inner {
                 DlgResult::Confirm => {
-                    if let Some(dg) = self.dialog.take() {
+                    // 批次 B6（FR-ACT-07）：有标记但编码=无参数 ⇒ 先在这一帧把追问露出来，
+                    // 不提交。「仍然保存」会把同一按再交回来，那时 `marker_warn` 已置位就不再追问。
+                    let warn_now = self
+                        .dialog
+                        .as_ref()
+                        .is_some_and(|d| d.marker_warn_needed() && !d.marker_warn);
+                    if warn_now {
+                        if let Some(dg) = self.dialog.as_mut() {
+                            dg.marker_warn = true;
+                        }
+                        eprintln!("弹窗：命令行/参数含参数标记、编码是「无参数」⇒ 保存前追问一次");
+                        ui.ctx().request_repaint();
+                    } else if let Some(dg) = self.dialog.take() {
                         let item = dg.to_item();
-                        if item.path.is_empty() {
+                        // FR-ACT-07「名称不得含 `,`」：Delphi 版清单是 `F|编码|别名|名称|命令行`
+                        // 这种逗号/竖线定界的行格式，名字里带逗号在那边会被拆成两列。我们存 JSON
+                        // 本不需要这条，但需求书把它列为规则，照做——两份清单互相导时不至于分岔。
+                        if item.name.contains(',') {
+                            eprintln!("弹窗：名称含英文逗号 ⇒ 不提交（改名后再存）");
+                            self.toast = Some((
+                                format!(
+                                    "名称里不能有英文逗号：「{}」请改一下（分类、参数各有自己的格子）",
+                                    item.name
+                                ),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_ERR,
+                            ));
+                            self.dialog = Some(dg);
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                        } else if item.path.is_empty() {
                             self.dialog = Some(dg); // 目标为空，保持打开不提交
                         } else {
                             // FR-SRC-19：编辑/提交不得丢置顶与使用统计。
@@ -10956,14 +11414,19 @@ impl eframe::App for LauncherApp {
 
             // 批次 D4：三个辅助动作的落点。选文件/选目录会开阻塞的系统对话框，模态闭包里
             // 正握着 `self.dialog` 的可变借用 ⇒ 一律挪到闭包返回之后再做。
+            if marker_warn_off {
+                if let Some(dg) = self.dialog.as_mut() {
+                    dg.marker_warn = false;
+                }
+                ui.ctx().request_repaint();
+            }
             if let Some(dir) = pick_request {
                 self.dialog_pick(ui.ctx(), dir);
             }
             if test_request {
                 self.test_dialog_entry(ui.ctx());
             }
-            if let Some(replace) = prompt_answer {
-                if let Some(dg) = self.dialog.as_mut() {
+            if let Some(replace) = prompt_answer {                if let Some(dg) = self.dialog.as_mut() {
                     if let Some(p) = dg.fill_prompt.take() {
                         apply_fill(dg, &p.fill, replace);
                         eprintln!(
@@ -10978,6 +11441,116 @@ impl eframe::App for LauncherApp {
             // 对话框本帧关闭（确定成功/取消/空目标外全路径）→ 焦点还给搜索框。
             if self.dialog.is_none() {
                 self.focus_query = true;
+            }
+        }
+
+        // ---- 批次 B6（FR-ACT-07）：参数框 ----
+        // 只在条目写着 `{%p}`（或 `ParamType≠none` 且没有任何标记）时出现；「确定」那一帧
+        // 才展开并启动（见 [`Self::confirm_param_prompt`]）。
+        if self.param_prompt.is_some() {
+            enum ParamResult {
+                Keep,
+                Confirm,
+                Cancel,
+            }
+            let mut result = ParamResult::Keep;
+            let mut picked: Option<String> = None;
+            let history: Vec<String> = self.param_history.texts().map(str::to_string).collect();
+            let _ = egui::Modal::new(egui::Id::new("param_prompt")).show(ui.ctx(), |ui| {
+                let opening = self.param_enter_armed;
+                self.param_enter_armed = false;
+                // Enter＝确定（开框那一帧不算，与添加/编辑框同一条）。
+                if !opening
+                    && !egui::Popup::is_any_open(ui.ctx())
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    result = ParamResult::Confirm;
+                }
+                // 模态是居中的胶囊，宽度由内容决定；窗口只有 640 宽时要主动收窄（与帮助页同口径）。
+                ui.set_max_width((ui.ctx().content_rect().width() - 64.0).clamp(240.0, 520.0));
+                let (name, ty, has_p) = self
+                    .param_prompt
+                    .as_ref()
+                    .map(|p| {
+                        (
+                            p.entry.name.clone(),
+                            p.entry.param_type,
+                            source::params::has_param_marker(&p.entry.path)
+                                || source::params::has_param_marker(&p.entry.arguments),
+                        )
+                    })
+                    .unwrap_or_default();
+                ui.heading(format!("参数：{name}"));
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "回车运行、Esc 取消。编码：{}（{}）",
+                        ty.label(),
+                        ty.hint()
+                    ))
+                    .weak()
+                    .small(),
+                );
+                // 没有 `{%p}` 但它仍要参数（「编码≠无参数 + 一个标记都没有」那一档）：
+                // 填的值是接在命令行尾/并进参数里的，提一句省得他找 `{%p}` 在哪。
+                let param_hint = if has_p {
+                    "要填进 {%p} 的值"
+                } else {
+                    "这条没有 {%p}：这段会按编码接在命令行后面"
+                };
+                let resp = {
+                    let p = self.param_prompt.as_mut().unwrap();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut p.text)
+                            .hint_text(param_hint)
+                            .desired_width(f32::INFINITY),
+                    )
+                };
+                if opening {
+                    resp.request_focus();
+                }
+                if !history.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("最近用过的参数（点一条填进框里）")
+                            .weak()
+                            .small(),
+                    );
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for h in &history {
+                                if ui.selectable_label(false, h).clicked() {
+                                    picked = Some(h.clone());
+                                }
+                            }
+                        });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("确定 (Enter)").clicked() {
+                        result = ParamResult::Confirm;
+                    }
+                    if ui.button("取消 (Esc)").clicked() {
+                        result = ParamResult::Cancel;
+                    }
+                });
+            });
+            if let Some(h) = picked {
+                if let Some(p) = self.param_prompt.as_mut() {
+                    p.text = h;
+                }
+                ui.ctx().request_repaint();
+            }
+            match result {
+                ParamResult::Confirm => self.confirm_param_prompt(ui.ctx()),
+                ParamResult::Cancel => {
+                    self.param_prompt = None;
+                    self.focus_query = true;
+                    eprintln!("参数框：取消，未启动（参数原文不落日志）");
+                    ui.ctx().request_repaint();
+                }
+                ParamResult::Keep => {}
             }
         }
 
@@ -11171,6 +11744,11 @@ impl eframe::App for LauncherApp {
                             "清除 (Enter)",
                             "把 usage.json 清成空表：合计、近 30 天柱状与「按功能次数」全部归零。条目上的累计次数与最近使用时间不动（那是排序用的，清它去「重置学习排序」）。这一条不写备份。",
                         ),
+                        Destructive::ClearParamHistory => (
+                            "清空参数历史？",
+                            "清空 (Enter)",
+                            "把 param_history.json 清成空表：带参项的参数框下面那列「最近用过的参数」会变空。这一条不写备份。",
+                        ),
                     };
                     ui.heading(title);
                     ui.separator();
@@ -11302,6 +11880,35 @@ impl eframe::App for LauncherApp {
                                 ));
                                 eprintln!(
                                     "设置页：清除使用统计 → {n} 次 / {days} 天已清（usage.json 写成空表，不备份；条目 use_count 未动）"
+                                );
+                            }
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                        }
+                        Destructive::ClearParamHistory => {
+                            let n = self.param_history.len();
+                            self.param_history.clear();
+                            if self.param_history_blocked {
+                                // 与 `confirm_param_prompt` 的写盘同一道闸：坏文件还挡在原位，
+                                // 清空的写盘正好会把唯一证据覆盖掉 ⇒ 只在内存里清。
+                                self.toast = Some((
+                                    format!(
+                                        "⚠ 内存里 {n} 条已清，但那份坏文件没动（留证没成功 ⇒ 本次启动不写 param_history.json）"
+                                    ),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_ERR,
+                                ));
+                                eprintln!(
+                                    "高级页：清空参数历史 → 内存里 {n} 条已清；坏文件留证没成功 ⇒ 不写盘"
+                                );
+                            } else {
+                                source::application::save_param_history(&self.param_history);
+                                self.toast = Some((
+                                    format!("✓ 已清空参数历史（{n} 条）"),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_OK,
+                                ));
+                                eprintln!(
+                                    "高级页：清空参数历史 → {n} 条已清（param_history.json 写成空表，不备份）"
                                 );
                             }
                             ui.ctx().request_repaint_after(TOAST_TTL);
@@ -11619,28 +12226,43 @@ impl eframe::App for LauncherApp {
         // 运行选中的程序并关闭到托盘（FR-ACT + 用户要求：Enter/点击运行后窗口自动关）。
         // FR-SRC-19：清单项成功启动才累计使用统计（launch_and_hide 失败分支提前 return，走不到这里）。
         if let Some(entry) = launch {
-            // FR-QRY-10（批次 C3）：提交了就记一条，**不等启动结果**——AHK `Knowledge.Record`
-            // 也是先记账再 `_SafeRun`。理由在用户那侧：启动失败时他要的是改两个字再试一次，
-            // 框里那串正是得留着的东西；而记完不会挡任何事（不写学习统计、不改清单）。
-            // 空查询（呼出后直接点列表）由 `push_history` 自己跳过。
-            self.remember_history(self.query.clone());
             // 自定义命令的 uid 取原条目（`entry` 是填过 `{query}` 的副本，派生 uid 已变）。
             let uid = launch_uid.clone().unwrap_or_else(|| entry.uid());
-            let started = if launch_masked {
-                self.launch_and_hide_masked(ui.ctx(), &entry, &uid)
-            } else {
-                self.launch_and_hide(ui.ctx(), &entry)
-            };
-            if started && launch_from_list {
-                // FR-SRC-19 补全「提交即学别名」（口径与门槛见 learn_alias）。
-                self.mark_used(&uid, &commit_word(&self.query, launch_via_digit));
-            }
             // 批次 D8：自定义命令源（`{query}`）的条目不在清单里，`mark_used` 会在
             // "这条不在清单里就返回"那一步跳过 ⇒ 它的使用次数得在这儿单独记。
             // 判据用 `launch_uid` 是否被设过：三个分派点（数字键 / 回车 / 点击）只有
             // `HeadRow::Custom` 那一支会设它；清单行走的是 `entry.uid()` 现算。
-            if started && launch_uid.is_some() {
-                self.record_usage(source::usage::Bucket::Custom);
+            let from_custom = launch_uid.is_some();
+            let alias_word = commit_word(&self.query, launch_via_digit);
+            // 批次 B6（FR-ACT-07）：要参数的那一档**先弹框**，确认那一帧才启动
+            //（`confirm_param_prompt` 里再记账）。搜索历史也顺延到确认那一帧——
+            // Esc 取消掉的那一按不该算"提交过"。
+            if !self.param_prompt_if_needed(
+                &entry,
+                &uid,
+                launch_from_list,
+                alias_word.clone(),
+                from_custom,
+            ) {
+                // FR-QRY-10（批次 C3）：提交了就记一条，**不等启动结果**——AHK `Knowledge.Record`
+                // 也是先记账再 `_SafeRun`。理由在用户那侧：启动失败时他要的是改两个字再试一次，
+                // 框里那串正是得留着的东西；而记完不会挡任何事（不写学习统计、不改清单）。
+                // 空查询（呼出后直接点列表）由 `push_history` 自己跳过。
+                self.remember_history(self.query.clone());
+                // 批次 B6：写了标记的条目先展开（`{%c}` / `{%wt}` …），展开过就走脱敏日志。
+                let (entry, expanded) = self.expand_for_launch(&entry, "");
+                let started = if expanded || launch_masked {
+                    self.launch_and_hide_masked(ui.ctx(), &entry, &uid)
+                } else {
+                    self.launch_and_hide(ui.ctx(), &entry)
+                };
+                if started && launch_from_list {
+                    // FR-SRC-19 补全「提交即学别名」（口径与门槛见 learn_alias）。
+                    self.mark_used(&uid, &alias_word);
+                }
+                if started && from_custom {
+                    self.record_usage(source::usage::Bucket::Custom);
+                }
             }
         }
 
@@ -11796,6 +12418,12 @@ impl eframe::App for LauncherApp {
                 eprintln!("删除确认：按 Esc 取消，未删除");
                 self.confirm = None;
                 self.focus_query = true;
+                ui.ctx().request_repaint();
+            } else if self.param_prompt.is_some() {
+                // 批次 B6：只收参数框，查询与选中都不动（用户可能想换个参数再来一次）。
+                self.param_prompt = None;
+                self.focus_query = true;
+                eprintln!("参数框：按 Esc 取消，未启动（参数原文不落日志）");
                 ui.ctx().request_repaint();
             } else if self.dialog.as_ref().is_some_and(|d| d.fill_prompt.is_some()) {
                 // 批次 D4：替换询问那一屏，Esc 只收询问、不关弹窗——这里按 Esc 的意思是
@@ -12165,6 +12793,51 @@ mod nav_tests {
         assert_eq!(got.chars().count(), 10);
         assert!(got.ends_with('…'), "截断了要看得出来：{got}");
         assert!(got.starts_with(r"C:\工"));
+    }
+
+    /// 批次 B6（FR-ACT-07）：编辑弹窗把「编码」带进带出。用户改的是那个下拉，
+    /// 提交时必须落回 `LaunchItem.param_type`——`to_item` 漏这一格的话，
+    /// 界面上改完、存盘回来还是「无参数」，光看界面看不出来。
+    #[test]
+    fn dialog_round_trips_param_type() {
+        let mut it = LaunchItem {
+            name: "百度".to_string(),
+            path: "https://www.baidu.com/s?wd=".to_string(),
+            ..Default::default()
+        };
+        it.param_type = source::params::ParamType::UrlQuery;
+        let dg = DialogState::from_item(&it);
+        assert_eq!(dg.param_type, source::params::ParamType::UrlQuery);
+        assert_eq!(dg.to_item().param_type, source::params::ParamType::UrlQuery);
+    }
+
+    /// 批次 B6：「有标记但编码=无参数」只在**真的不会展开**时追问。
+    #[test]
+    fn marker_warning_only_for_literal_markers_without_encoding() {
+        let mut dg = DialogState::blank();
+        dg.path = "notepad.exe".to_string();
+        dg.arguments = "{%c}".to_string();
+        assert!(dg.marker_warn_needed(), "有标记 + 编码=无参数 ⇒ 要追问");
+        dg.param_type = source::params::ParamType::NoEncoding;
+        assert!(!dg.marker_warn_needed(), "编码非空会真的替换 ⇒ 不追问");
+        dg.param_type = source::params::ParamType::None;
+        dg.arguments.clear();
+        assert!(!dg.marker_warn_needed(), "没有标记 ⇒ 不追问");
+    }
+
+    /// 批次 B6：列表行的 `*` 只标"会替换参数"的那一档（编码非空）。
+    /// 编码为空时标记根本不展开，标 `*` 反而是误导。
+    #[test]
+    fn row_mark_follows_param_type_not_markers() {
+        let mut it = LaunchItem {
+            name: "x".to_string(),
+            path: "p".to_string(),
+            ..Default::default()
+        };
+        it.arguments = "{%c}".to_string();
+        assert_eq!(param_row_mark(&it), "");
+        it.param_type = source::params::ParamType::Utf8Query;
+        assert_eq!(param_row_mark(&it), "* ");
     }
 
     /// 批次 D4（FR-CFG-06）：两条最容易走样的规则钉在这里——①只有"已填了别的值"才问；
