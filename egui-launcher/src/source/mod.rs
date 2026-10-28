@@ -27,6 +27,7 @@ pub mod manage;
 pub mod pathcheck;
 pub mod system;
 pub mod terminal;
+pub mod usage;
 pub mod websearch;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};

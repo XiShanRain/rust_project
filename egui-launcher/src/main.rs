@@ -408,13 +408,18 @@ enum SettingsTab {
     /// 批次 D5（FR-ACT-09）：快捷项批量管理——勾选批量删、失效项校验、绝对 ↔ 相对互转。第 8 页。
     /// 与「高级」同为低频维护，但它是"对整张清单动刀"，单开一页免得混进设置开关里。
     Manage,
+    /// 批次 D8（FR-SYS-06）：使用统计——合计 / 近 30 天柱状 / 按功能次数 / 按条目前 10。第 9 页。
+    /// 排在最后：它是只读看板（唯一的写动作是「清除统计」），与上面那些真要动配置的页放一起
+    /// 反而让分类栏显得杂乱。
+    Usage,
 }
 
 impl SettingsTab {
     /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级
-    /// 8=批量管理）；越界返回 None，由调用方落回通用。批次 D7 起第 5 页由「外观」改为
-    /// 「文件搜索」，原第 5/6 页顺延——`-Preferences 5/6` 的旧语义随之变，与设置页分类栏一起改口径。
+    /// 8=批量管理 9=使用统计）；越界返回 None，由调用方落回通用。批次 D7 起第 5 页由「外观」
+    /// 改为「文件搜索」，原第 5/6 页顺延——`-Preferences 5/6` 的旧语义随之变，与设置页分类栏一起改口径。
     /// 【批次 D5：第 8 页追加在末尾，1–7 的语义与 `-Preferences` 参数一格不动。】
+    /// 【批次 D8：第 9 页同样追加在末尾，1–8 一格不动。】
     fn from_page(page: u32) -> Option<Self> {
         match page {
             1 => Some(Self::General),
@@ -425,6 +430,7 @@ impl SettingsTab {
             6 => Some(Self::Appearance),
             7 => Some(Self::Advanced),
             8 => Some(Self::Manage),
+            9 => Some(Self::Usage),
             _ => None,
         }
     }
@@ -441,6 +447,9 @@ enum Destructive {
     /// FR-QRY-10（批次 C3）：把 search_history.json 清成空表，上限那一格不动。
     /// 这一个**不写备份**——另两个清的是统计，这张表清的是用户敲过的原文。
     ClearHistory,
+    /// FR-SYS-06（批次 D8）：把 usage.json 清成空表。条目上的 `use_count` 不动（那是另一本账）。
+    /// 与 [`Self::ClearHistory`] 一样不写备份——它清的是统计，留一份副本正好是「清除」二字的反面。
+    ClearUsage,
 }
 
 /// 批次 D5（FR-ACT-09）：批量管理页的两种确认（`Some`＝确认框开着）。
@@ -920,6 +929,13 @@ struct LauncherApp {
     /// `search_history.json` 坏了且留证没成功 ⇒ 本次启动不写它（写一次就覆盖掉唯一证据）。
     /// 只管历史这一份文件：设置与清单另有各自的门槛，见 `writes_blocked`。
     history_blocked: bool,
+    // ---- 批次 D8：FR-SYS-06 使用统计（`usage.json`）----
+    /// 按天、按功能桶的计数。**只记次数不记内容**（形态见 [`source::usage`]）。
+    /// 记账点在 `record_usage`：清单项与系统命令走 `mark_used`，其余四类走各自执行点。
+    usage: source::usage::UsageStats,
+    /// `usage.json` 坏了且留证没成功 ⇒ 本次启动不写它（与 `history_blocked` 同一条门槛，
+    /// 各管各的文件）。
+    usage_blocked: bool,
 }
 
 fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths: Vec<String>) {
@@ -2807,6 +2823,7 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     // 两颗都是"窗口内绑了就必须进表"的口径：`RegisterHotKey` 一吞，窗口里那颗键就此失聪。
     (HKF_CONTROL, 0x42),             // Ctrl+B 设置页·批量管理（批次 D5）
     (HKF_CONTROL, 0x52),             // Ctrl+R 批量管理·重新校验路径（批次 D5）
+    (HKF_CONTROL, 0x54),             // Ctrl+T 设置页·使用统计（批次 D8）
     (HKF_CONTROL | HKF_SHIFT, 0x44), // Ctrl+Shift+D 删除选中项
     (HKF_CONTROL | HKF_SHIFT, 0x4E), // Ctrl+Shift+N 新建快捷项
     (HKF_CONTROL | HKF_SHIFT, 0x50), // Ctrl+Shift+P 置顶 / 取消置顶
@@ -3535,6 +3552,9 @@ impl LauncherApp {
         // 批次 C3（FR-QRY-10）：搜索历史。**文件不在＝空表，并且不写盘**——用户还没执行过任何东西，
         // 这时候在盘上落一个 `[]` 是程序自己造的文件，不是用户要的（与清单那条"只有真没有才播种"同一口径）。
         let (history, broken_history) = source::application::load_history();
+        // 批次 D8（FR-SYS-06）：使用统计。文件不在＝空表且**不写盘**——用户还没执行过任何东西，
+        // 这时候落一个空 usage.json 是程序自己造的文件（与历史那条同一口径）。
+        let (usage, broken_usage) = source::application::load_usage();
         // §4.2.1 出厂命令集的补齐：老清单（settings 里的轮次落后）启动时补一次缺，补完记账。
         // 只加不删、已有条目一律不动；记账之后删掉的条目不会自己回来（找回用设置页那个按钮）。
         let mut prefs = settings;
@@ -3549,9 +3569,18 @@ impl LauncherApp {
         // 历史那份是第三个文件，门禁也各管各的：它没留住证只挡它自己的写，
         // 不连带挡设置与清单（那是另外两份文件、另外两回事）；反过来也一样。
         let history_blocked = matches!(broken_history, Some(Corrupted::Lost));
-        // 给用户看的那一句把三份并进来：坏在哪个文件上他就得知道哪个，别说漏了让他以为没事。
-        let lost = if history_blocked {
-            lost_cfg.into_iter().chain(["search_history.json"]).collect()
+        // 批次 D8：统计是第四份文件，门禁同样各管各的（它没留住证只挡它自己的写）。
+        let usage_blocked = matches!(broken_usage, Some(Corrupted::Lost));
+        // 给用户看的那一句把四份并进来：坏在哪个文件上他就得知道哪个，别说漏了让他以为没事。
+        let lost = if history_blocked || usage_blocked {
+            let mut v: Vec<&str> = lost_cfg;
+            if history_blocked {
+                v.push("search_history.json");
+            }
+            if usage_blocked {
+                v.push("usage.json");
+            }
+            v
         } else {
             lost_cfg
         };
@@ -3559,6 +3588,7 @@ impl LauncherApp {
             ("settings.json", &broken_settings, "出厂默认"),
             ("user_items.json", &broken_list, "空清单"),
             ("search_history.json", &broken_history, "空历史"),
+            ("usage.json", &broken_usage, "空统计"),
         ] {
             match c {
                 Some(Corrupted::Kept(p)) => eprintln!(
@@ -3603,6 +3633,14 @@ impl LauncherApp {
             (Some(s), Some(h)) => Some(format!("{s}；搜索历史也坏了，已改名留底：{h}")),
             (None, Some(h)) => Some(format!(
                 "⚠ 搜索历史坏了，已改名留底：{h}，本次按空历史启动（原文件没有被覆盖）"
+            )),
+            (n, None) => n,
+        };
+        // 批次 D8：统计那份坏了的说法单独追加，同样不改上面那几条已对过屏幕的臂。
+        let notice = match (notice, kept(&broken_usage)) {
+            (Some(s), Some(u)) => Some(format!("{s}；使用统计也坏了，已改名留底：{u}")),
+            (None, Some(u)) => Some(format!(
+                "⚠ 使用统计坏了，已改名留底：{u}，本次按空统计启动（原文件没有被覆盖）"
             )),
             (n, None) => n,
         };
@@ -3806,6 +3844,8 @@ impl LauncherApp {
             history,
             history_browse: source::application::HistoryBrowse::default(),
             history_blocked,
+            usage,
+            usage_blocked,
         };
         // 立即为已有项起图标加载器（source_path 为空的种子会被 extract 自然跳过）。
         let source_paths: Vec<String> = seed
@@ -4045,14 +4085,14 @@ impl LauncherApp {
     }
 
     /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观
-    /// 7=高级 8=批量管理）。
+    /// 7=高级 8=批量管理 9=使用统计）。
     fn open_settings_page(&mut self, page: u32) {
         self.settings_open = true;
         self.settings_tab = match SettingsTab::from_page(page) {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级 8=批量管理），落回通用"
+                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级 8=批量管理 9=使用统计），落回通用"
                 );
                 SettingsTab::General
             }
@@ -4922,6 +4962,205 @@ impl LauncherApp {
         }
     }
 
+    /// 批次 D8（FR-SYS-06）：设置页第 9 页「使用统计」。
+    ///
+    /// 三段数据两种来源，刻意不混：
+    /// - 合计 / 近 30 天 / 按功能次数 ← `usage.json`（本批新增的按天账本）；
+    /// - 按条目前 10 ← 清单里现成的 `use_count`（只喂排序、以前从不给用户看）。
+    /// 两者不互相推导：条目删掉之后它贡献过的次数仍留在 `usage.json` 里——"使用统计"
+    /// 记的是功能被用了多少次，不是"现在清单里还剩哪些条目"。
+    fn usage_ui(&mut self, ui: &mut egui::Ui) {
+        use source::usage::Bucket;
+
+        ui.label(egui::RichText::new("使用统计").strong());
+        ui.label(
+            egui::RichText::new(
+                "只记次数：哪一类功能、哪天、几次。查询词、条目名、路径都不会进 usage.json，也不会进 launcher.log。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(4.0);
+
+        let today = source::application::today_iso();
+        // 保留期落到一个具体日期给用户看：只写"400 天"看不出这条线现在在哪儿。
+        let oldest_kept =
+            source::usage::add_days(&today, -(source::usage::KEEP_DAYS - 1)).unwrap_or_default();
+        ui.label(
+            egui::RichText::new(format!(
+                "保留 {} 天：当前最早保留到 {oldest_kept}，更早的记录在每次记账时裁掉（裁的是「今天往前 {} 天」，不是「留最新 {} 条」）。",
+                source::usage::KEEP_DAYS,
+                source::usage::KEEP_DAYS,
+                source::usage::KEEP_DAYS
+            ))
+            .weak()
+            .small(),
+        );
+        ui.add_space(2.0);
+
+        let total = self.usage.total();
+        let days = self.usage.days_recorded();
+        let first = self.usage.first_day().unwrap_or("—").to_string();
+        if total == 0 {
+            ui.label(egui::RichText::new("还没有任何记录：执行一次清单项、算式、网页搜索或文件行之后，这里就有数了。").weak());
+        } else {
+            ui.label(format!("合计 {total} 次 · 有记录 {days} 天 · 最早 {first}"));
+        }
+        ui.separator();
+
+        // ---- 近 30 天柱状 ----
+        ui.label(egui::RichText::new("近 30 天").strong());
+        let window = self.usage.last_days(&today, 30);
+        let max = window.iter().map(|(_, n)| *n).max().unwrap_or(0).max(1);
+        let width = ui.available_width().max(160.0);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 72.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        let baseline = ui.visuals().widgets.noninteractive.bg_stroke.color;
+        let bar_color = ui.visuals().selection.bg_fill;
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), rect.bottom() - 0.5),
+                egui::pos2(rect.right(), rect.bottom() - 0.5),
+            ],
+            egui::Stroke::new(1.0, baseline),
+        );
+        let n = window.len().max(1) as f32;
+        let gap = 2.0f32;
+        let bar_w = ((rect.width() - gap * (n - 1.0)) / n).max(1.0);
+        for (i, (_, count)) in window.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            let h = ((rect.height() - 6.0) * (*count as f32 / max as f32)).max(2.0);
+            let x = rect.left() + i as f32 * (bar_w + gap);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x, rect.bottom() - h),
+                    egui::pos2(x + bar_w, rect.bottom()),
+                ),
+                egui::CornerRadius::ZERO,
+                bar_color,
+            );
+        }
+        // 悬停哪一格说哪一天：零次的日子也要能问（柱高为 0，只能按列命中）。
+        if let Some(p) = resp.clone().hover_pos() {
+            let idx = (((p.x - rect.left()) / (bar_w + gap)).floor() as isize)
+                .clamp(0, window.len() as isize - 1) as usize;
+            if let Some((day, count)) = window.get(idx) {
+                resp.on_hover_text(format!("{day}：{count} 次"));
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(window.first().map(|(d, _)| d.as_str()).unwrap_or("—"))
+                    .weak()
+                    .small(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(format!("今天 {today}")).weak().small());
+            });
+        });
+        ui.separator();
+
+        // ---- 按功能次数 + 占比 ----
+        ui.label(egui::RichText::new("按功能次数").strong());
+        let denom = total.max(1) as f32;
+        for b in Bucket::ALL {
+            let count = self.usage.bucket_total(b);
+            let share = count as f32 / denom * 100.0;
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [84.0, 18.0],
+                    egui::Label::new(b.label()).truncate(),
+                );
+                ui.add_sized(
+                    [64.0, 18.0],
+                    egui::Label::new(format!("{count} 次")).truncate(),
+                );
+                let (bar, _) =
+                    ui.allocate_exact_size(egui::vec2(120.0, 8.0), egui::Sense::hover());
+                let p = ui.painter_at(bar);
+                p.rect_filled(bar, egui::CornerRadius::ZERO, ui.visuals().faint_bg_color);
+                if count > 0 {
+                    p.rect_filled(
+                        egui::Rect::from_min_max(
+                            bar.min,
+                            egui::pos2(
+                                bar.left() + bar.width() * (count as f32 / denom),
+                                bar.bottom(),
+                            ),
+                        ),
+                        egui::CornerRadius::ZERO,
+                        ui.visuals().selection.bg_fill,
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!("{share:.1}%"))
+                        .weak()
+                        .small(),
+                );
+            });
+        }
+        let unknown = self.usage.unknown_total();
+        if unknown > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "其他（本版本认不出的桶）{unknown} 次——它算进合计，但不参与上面的分桶"
+                ))
+                .weak()
+                .small(),
+            );
+        }
+        ui.separator();
+
+        // ---- 按条目前 10（现成 use_count，只喂排序、从不给用户看的那一格）----
+        ui.label(egui::RichText::new("按条目前 10").strong());
+        let mut top: Vec<(String, u32)> = self
+            .items
+            .iter()
+            .filter(|i| i.use_count > 0)
+            .map(|i| (i.name.clone(), i.use_count))
+            .collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if top.is_empty() {
+            ui.label(egui::RichText::new("还没有成功启动过清单里的任何条目。").weak());
+        } else {
+            for (rank, (name, count)) in top.iter().take(10).enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [28.0, 18.0],
+                        egui::Label::new(egui::RichText::new(format!("{}.", rank + 1)).weak()),
+                    );
+                    ui.add_sized([240.0, 18.0], egui::Label::new(name.as_str()).truncate())
+                        .on_hover_text(name.as_str());
+                    ui.label(egui::RichText::new(format!("{count} 次")).weak().small());
+                });
+            }
+            ui.label(
+                egui::RichText::new("这一格统计的是清单条目本身（删掉条目这里就没了），与上面按功能的账本各算各的。")
+                    .weak()
+                    .small(),
+            );
+        }
+        ui.separator();
+
+        // ---- 清除 ----
+        ui.label(egui::RichText::new("清除统计").strong());
+        ui.label(
+            egui::RichText::new(
+                "把 usage.json 清成空表：合计、近 30 天柱状与「按功能次数」全部归零。\n条目上的累计次数与最近使用时间不动——那是排序用的另一本账，要清它去「高级」页的「重置学习排序」。这一条不写备份。",
+            )
+            .weak()
+            .small(),
+        );
+        if ui.button("清除统计…").clicked() {
+            self.pending_destructive = Some(Destructive::ClearUsage);
+            eprintln!("设置页：点了「清除统计」，等确认");
+            ui.ctx().request_repaint();
+        }
+    }
+
+
     /// 设置页（2026-10-17 用户要求，参考 AHK 版设置窗口的左侧分类栏；只立当下有真实选项的分类，
     /// 不做无功能的占位开关）。入口：托盘「设置…」/ `Ctrl+,`；Esc 或「返回搜索」回搜索页。
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -4978,6 +5217,7 @@ impl LauncherApp {
                     ("外观", SettingsTab::Appearance),
                     ("高级", SettingsTab::Advanced),
                     ("批量管理", SettingsTab::Manage),
+                    ("使用统计", SettingsTab::Usage),
                 ] {
                     if ui.selectable_label(self.settings_tab == tab, label).clicked() {
                         // 批次 D5：进「批量管理」页时强制重跑一轮路径四态——这一页的状态列就是
@@ -6253,6 +6493,7 @@ impl LauncherApp {
                             }
                         }
                         SettingsTab::Manage => self.manage_ui(ui),
+                        SettingsTab::Usage => self.usage_ui(ui),
                     });
                 }
             );
@@ -7789,6 +8030,13 @@ impl LauncherApp {
         };
         self.items[pos].use_count = self.items[pos].use_count.saturating_add(1);
         self.items[pos].last_used_ms = now_ms();
+        // 批次 D8：功能桶按条目的类型分——内置动作（`internal:`）自成一桶，
+        // 其余（应用/命令/网址/文件夹/文件）都算「清单项」。
+        let bucket = if self.items[pos].kind == ItemKind::Internal {
+            source::usage::Bucket::Internal
+        } else {
+            source::usage::Bucket::Item
+        };
         if !alias_word.is_empty() && learn_alias(&mut self.items[pos], alias_word) {
             // FR-SYS-03 隐私口径：别名字段本身就是"用户敲过的词的集合"——把 `keyword` 打进日志，
             // 等于把刚学到的那个词（以及历史上所有被学进去的查询原文）原样抄进一份能存好几天、
@@ -7799,6 +8047,34 @@ impl LauncherApp {
             );
         }
         self.save_items();
+        // 批次 D8（FR-SYS-06）：同一次"用过了"顺手记进使用统计。口径与 `use_count` 一致
+        // ——**真的启动了才走到这里**（四个调用点都在成功分支上）。
+        self.record_usage(bucket);
+    }
+
+    /// 批次 D8（FR-SYS-06）：记一次使用统计。
+    ///
+    /// - 日期取**本地今天**（`today_iso`，来源就是日志那条日期锚），顺手按 400 天裁一次；
+    /// - 记的只有"哪一类功能、哪天、几次"三样——桶名是固定常量、日期是日历，
+    ///   **任何用户原文都不会进这个文件**（单测 `json_carries_only_dates_buckets_and_counts` 钉着）；
+    /// - 日志也只报桶名与次数（FR-SYS-03 同一口径）。
+    fn record_usage(&mut self, bucket: source::usage::Bucket) {
+        let today = source::application::today_iso();
+        let n = self.usage.record(&today, bucket);
+        self.usage.trim(&today, source::usage::KEEP_DAYS);
+        if self.usage_blocked {
+            eprintln!(
+                "使用统计：{} 今日第 {n} 次（usage.json 坏且留证没成功 ⇒ 本次不写它）",
+                bucket.label()
+            );
+            return;
+        }
+        source::application::save_usage(&self.usage);
+        eprintln!(
+            "使用统计：+1 {}（今日 {n} 次，累计 {} 次）",
+            bucket.label(),
+            self.usage.total()
+        );
     }
 
     /// 列表区此刻吃不吃键盘。三处共用同一个判据（列表按键与滚轮、搜索页顶栏的拖窗缝、
@@ -8366,6 +8642,10 @@ impl eframe::App for LauncherApp {
             // 开着时它也生效（在「外观」页想看一眼失效项，不必先回搜索页）。
             let hit_ctrl_b =
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B));
+            // 批次 D8（FR-SYS-06）：`Ctrl+T` 直达设置页「使用统计」。与 `Ctrl+B` 同一层、
+            // 同一口径（设置页开着时也生效）。
+            let hit_ctrl_t =
+                ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T));
             if hit_comma || hit_f2 {
                 self.settings_open = !self.settings_open;
                 self.focus_query = true;
@@ -8390,6 +8670,14 @@ impl eframe::App for LauncherApp {
                 self.menu_open = false;
                 self.refresh_path_states(true);
                 eprintln!("快捷键 Ctrl+B：设置页「批量管理」");
+                ui.ctx().request_repaint();
+            } else if hit_ctrl_t {
+                // 批次 D8：直达「使用统计」。与 Ctrl+B 同形态——设置页开着时也跳。
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::Usage;
+                self.focus_query = true;
+                self.menu_open = false;
+                eprintln!("快捷键 Ctrl+T：设置页「使用统计」");
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
                 // ---- 批次 B8（FR-ACT-10 附录 A）：F3 编辑 · F4 打开配置文件 · Ctrl+C 复制这一行 ----
@@ -10878,6 +11166,11 @@ impl eframe::App for LauncherApp {
                             "清空 (Enter)",
                             "把 search_history.json 清成空表：Ctrl+↑ 从空表翻起，你敲过的那些串不再能回填。历史上限那一格不动。这一条不写备份（另两个按钮先备份，是因为它们清的是统计；这张表要清的是原文）。",
                         ),
+                        Destructive::ClearUsage => (
+                            "清除使用统计？",
+                            "清除 (Enter)",
+                            "把 usage.json 清成空表：合计、近 30 天柱状与「按功能次数」全部归零。条目上的累计次数与最近使用时间不动（那是排序用的，清它去「重置学习排序」）。这一条不写备份。",
+                        ),
                     };
                     ui.heading(title);
                     ui.separator();
@@ -10979,6 +11272,36 @@ impl eframe::App for LauncherApp {
                                 ));
                                 eprintln!(
                                     "高级页：清空搜索历史 → {n} 条已清（search_history.json 写成空表，不备份）"
+                                );
+                            }
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                        }
+                        Destructive::ClearUsage => {
+                            let n = self.usage.total();
+                            let days = self.usage.days_recorded();
+                            self.usage.clear();
+                            if self.usage_blocked {
+                                // 与 `record_usage` 同一道闸：坏文件还挡在原位，清空的写盘
+                                // 正好会把唯一证据覆盖掉 ⇒ 只在内存里清。
+                                self.toast = Some((
+                                    format!(
+                                        "⚠ 内存里已清（{n} 次 / {days} 天），但那份坏文件没动（留证没成功 ⇒ 本次启动不写 usage.json）"
+                                    ),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_ERR,
+                                ));
+                                eprintln!(
+                                    "设置页：清除使用统计 → 内存里已清（{n} 次 / {days} 天）；坏文件留证没成功 ⇒ 不写盘"
+                                );
+                            } else {
+                                source::application::save_usage(&self.usage);
+                                self.toast = Some((
+                                    format!("✓ 已清除使用统计（{n} 次 / {days} 天）"),
+                                    Instant::now() + TOAST_TTL,
+                                    TOAST_OK,
+                                ));
+                                eprintln!(
+                                    "设置页：清除使用统计 → {n} 次 / {days} 天已清（usage.json 写成空表，不备份；条目 use_count 未动）"
                                 );
                             }
                             ui.ctx().request_repaint_after(TOAST_TTL);
@@ -11312,13 +11635,23 @@ impl eframe::App for LauncherApp {
                 // FR-SRC-19 补全「提交即学别名」（口径与门槛见 learn_alias）。
                 self.mark_used(&uid, &commit_word(&self.query, launch_via_digit));
             }
+            // 批次 D8：自定义命令源（`{query}`）的条目不在清单里，`mark_used` 会在
+            // "这条不在清单里就返回"那一步跳过 ⇒ 它的使用次数得在这儿单独记。
+            // 判据用 `launch_uid` 是否被设过：三个分派点（数字键 / 回车 / 点击）只有
+            // `HeadRow::Custom` 那一支会设它；清单行走的是 `entry.uid()` 现算。
+            if started && launch_uid.is_some() {
+                self.record_usage(source::usage::Bucket::Custom);
+            }
         }
 
         // FR-SRC-11：搜索行的「执行」＝用默认浏览器打开 + 关到托盘。与上两段互斥：
         // 头段一次只会产生其中一个动作（计算器复制 / 搜索打开 / 条目启动）。
         if let Some(hit) = open_hit {
             self.remember_history(self.query.clone());
-            self.open_search_hit(ui.ctx(), &hit);
+            // 批次 D8：真打开了才记一次（与 `mark_used` 的"成功才累计"同一口径）。
+            if self.open_search_hit(ui.ctx(), &hit) {
+                self.record_usage(source::usage::Bucket::Web);
+            }
         }
 
         // 批次 X：文件行的三个动作（打开 / 在资源管理器中定位 / 复制路径）。与上面三段互斥：
@@ -11326,12 +11659,16 @@ impl eframe::App for LauncherApp {
         if let Some(hit) = open_file {
             // 批次 C3：这一条最该进历史——他能敲到这里，说明这串路径是现打的。
             self.remember_history(self.query.clone());
-            self.open_file_hit(ui.ctx(), &hit);
+            if self.open_file_hit(ui.ctx(), &hit) {
+                self.record_usage(source::usage::Bucket::File);
+            }
         }
         if let Some(hit) = open_term {
             // 批次 C3：`>` 那条命令同样不进清单（没有 uid 可学），历史上却是他最想找回的一串。
             self.remember_history(self.query.clone());
-            self.run_terminal_hit(ui.ctx(), &hit);
+            if self.run_terminal_hit(ui.ctx(), &hit) {
+                self.record_usage(source::usage::Bucket::Terminal);
+            }
         }
         if let Some(path) = select_path {
             self.select_in_explorer(ui.ctx(), &path);
@@ -11377,6 +11714,8 @@ impl eframe::App for LauncherApp {
                         "计算器：结果已复制（{} 个字符，表达式原文不落日志）→ 关闭到托盘",
                         text.chars().count()
                     );
+                    // 批次 D8：复制成功才算用了一次（与另外三类执行同一口径）。
+                    self.record_usage(source::usage::Bucket::Calc);
                     // FR-UIX-09：主窗随即关到托盘，所以回执只能靠 HUD 送到窗口外。
                     let msg = format!("✓ 已复制 {text}");
                     self.toast = Some((msg.clone(), Instant::now() + TOAST_TTL, TOAST_OK));
@@ -11908,9 +12247,10 @@ mod nav_tests {
 
     /// 批次 D7：插入「文件搜索」第 5 页后外观/高级顺延，`-Preferences 5/6` 语义随之变。
     /// 批次 D5：第 8 页「批量管理」追加在末尾，1–7 一格不动。
-    /// 这条钉住 1..=8 的整张映射——只测旧值漂没漂是不够的，页号是线性协议，两端都得钉。
+    /// 批次 D8：第 9 页「使用统计」同样追加在末尾，1–8 一格不动。
+    /// 这条钉住 1..=9 的整张映射——只测旧值漂没漂是不够的，页号是线性协议，两端都得钉。
     #[test]
-    fn settings_tab_page_mapping_covers_one_through_eight() {
+    fn settings_tab_page_mapping_covers_one_through_nine() {
         assert_eq!(SettingsTab::from_page(1), Some(SettingsTab::General));
         assert_eq!(SettingsTab::from_page(2), Some(SettingsTab::Features));
         assert_eq!(SettingsTab::from_page(3), Some(SettingsTab::Hotkeys));
@@ -11923,7 +12263,12 @@ mod nav_tests {
             Some(SettingsTab::Manage),
             "批次 D5：第 8 页是「批量管理」"
         );
-        assert_eq!(SettingsTab::from_page(9), None, "越界要给 None，调用方落回通用");
+        assert_eq!(
+            SettingsTab::from_page(9),
+            Some(SettingsTab::Usage),
+            "批次 D8：第 9 页是「使用统计」"
+        );
+        assert_eq!(SettingsTab::from_page(10), None, "越界要给 None，调用方落回通用");
         assert_eq!(SettingsTab::from_page(0), None);
     }
 

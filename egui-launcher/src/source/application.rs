@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
+use super::usage::UsageStats;
 use super::websearch;
 use crate::source::{DataSource, SearchCtx, SourceId};
 use pinyin::ToPinyin;
@@ -1757,6 +1758,49 @@ fn save_history_at(path: &Path, entries: &[String]) {
         Ok(json) => write_atomic(path, &json, "search_history.json"),
         Err(e) => eprintln!("source: 序列化搜索历史失败: {e}"),
     }
+}
+
+// ---- FR-SYS-06 批次 D8：使用统计（`usage.json`）----
+
+/// 统计文件与清单同目录（同一个便携判定，句法照 [`history_path`]）。
+///
+/// **为什么不塞进 `settings.json`**：这张表每执行一次就写一遍，而 settings.json 是用户
+/// 会自己在编辑器里打开、手改、期望别的东西别碰的表——同一份文件里两种写入节奏互相覆盖
+/// （与搜索历史分开存是同一条理由，见 [`history_path`]）。
+fn usage_path() -> PathBuf {
+    user_list_path().with_file_name("usage.json")
+}
+
+/// 读一份使用统计。三条下场沿用 [`load_json`] 那条判据（与清单、偏好、历史共用）：
+/// 不在 ⇒ 空表；语法坏 / 顶层不是对象 / 字段类型不对 ⇒ 先留证再按空表启动，
+/// **且调用方拿到 `Lost` 时本轮不许回写**（照 `history_blocked` 的同一条门）。
+fn load_usage_at(path: &Path) -> (UsageStats, Option<Corrupted>) {
+    load_or_quarantine(path)
+}
+
+pub fn load_usage() -> (UsageStats, Option<Corrupted>) {
+    load_usage_at(&usage_path())
+}
+
+pub fn save_usage(stats: &UsageStats) {
+    save_usage_at(&usage_path(), stats);
+}
+
+/// 路径参数化的那一份（与 [`save_history_at`] 同一句法）。
+fn save_usage_at(path: &Path, stats: &UsageStats) {
+    match serde_json::to_vec_pretty(stats) {
+        Ok(json) => write_atomic(path, &json, "usage.json"),
+        Err(e) => eprintln!("source: 序列化使用统计失败: {e}"),
+    }
+}
+
+/// 今天的本地日期 `YYYY-MM-DD`——统计桶的键。来源就是日志那条日期锚
+/// [`local_now_stamp`]，不另起一条取时间的路（那条已经为 `GetLocalTime` 打开过 feature）。
+pub fn today_iso() -> String {
+    local_now_stamp()
+        .get(..10)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// 记一条历史：去重（**不分大小写**）后放到最前，超出 `limit` 的从尾部丢掉。
@@ -5688,6 +5732,64 @@ mod config_tests {
         assert!(
             matches!(load_history_at(&p).1, Some(Corrupted::Kept(_))),
             "顶层不是数组同样判坏（历史与清单、偏好共用这一条判据）"
+        );
+    }
+
+    /// 批次 D8：`usage.json` 的读写。两条 E2 不变量在这儿同样成立——
+    /// **纯读不动盘**（首次运行不造文件）、**坏文件先留证再按空表启动**。
+    #[test]
+    fn usage_file_starts_empty_without_touching_disk_and_round_trips() {
+        use crate::source::usage::{Bucket, UsageStats};
+
+        let dir = temp_dir("d8-file");
+        let p = dir.join("usage.json");
+
+        let (s, fault) = load_usage_at(&p);
+        assert_eq!(s, UsageStats::default(), "首次运行＝空表");
+        assert!(fault.is_none());
+        assert!(!p.exists(), "纯读不许造出一个空文件");
+
+        let mut s = UsageStats::default();
+        s.record("2026-10-28", Bucket::Item);
+        s.record("2026-10-28", Bucket::Web);
+        save_usage_at(&p, &s);
+        let (back, fault2) = load_usage_at(&p);
+        assert!(fault2.is_none());
+        assert_eq!(back, s, "读写一轮原样回来");
+        assert!(
+            !std::fs::read(&p).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]),
+            "无 BOM 与偏好同口径"
+        );
+
+        let mut empty = UsageStats::default();
+        empty.clear();
+        save_usage_at(&p, &empty);
+        let (cleared, fault3) = load_usage_at(&p);
+        assert!(fault3.is_none());
+        assert_eq!(cleared.total(), 0, "空表是合法内容，不是坏文件");
+    }
+
+    #[test]
+    fn a_broken_usage_file_quarantines_instead_of_being_written_over() {
+        let dir = temp_dir("d8-bad");
+        let p = dir.join("usage.json");
+        write(&p, r#"{"days": "not-an-object"}"#);
+        let (s, fault) = load_usage_at(&p);
+        assert_eq!(s.total(), 0);
+        let Some(Corrupted::Kept(kept)) = &fault else {
+            panic!("第一次留证该成功，实得 {fault:?}")
+        };
+        assert!(kept.exists() && !p.exists(), "证据在 {kept:?}，原位置要腾出来");
+        assert_eq!(
+            std::fs::read(kept).unwrap(),
+            br#"{"days": "not-an-object"}"#,
+            "留的是原文，不是我们重排过的东西"
+        );
+
+        write(&p, "[1, 2]");
+        assert!(
+            matches!(load_usage_at(&p).1, Some(Corrupted::Kept(_))),
+            "顶层不是对象同样判坏（与清单、偏好、历史共用这一条判据）"
         );
     }
 
