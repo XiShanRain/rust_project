@@ -706,6 +706,12 @@ struct LauncherApp {
     dialog_enter_armed: bool,     // 弹窗当帧吞掉 Enter，防"打开框的那次回车"当帧又触发对话框的确定
     settings_open: bool,          // 设置页（整页模式，替代搜索页；2026-10-17 用户要求）
     settings_tab: SettingsTab,    // 设置页当前分类
+    /// 批次 D7 修正（2026-10-28 真机）：设置页「文件搜索」页两串输入框的编辑缓冲。
+    /// 输入框的文本源必须**跨帧**活着：每帧从 `prefs` 克隆一份交出去，键进来的那一帧写进克隆，
+    /// 下一帧又被新的克隆盖回去 ⇒ 真机表现就是"打不进字"（当时 5 条目录 + 8 条排除行全中）。
+    /// `None`＝这一页没在编辑；进页时按 prefs 取一份，离开页/关设置页时回写并丢掉。
+    file_folders_edit: Option<Vec<String>>,
+    file_exclude_edit: Option<Vec<String>>,
     prefs: source::application::AppSettings, // 用户偏好（settings.json，目前只有 space_to_run）
     // ---- 批次 F1：FR-UIX-01 主题（`prefs.theme` 是入口名，这里是解析后的生效形态）----
     /// 本帧渲染读的那一套尺寸 / 颜色。换主题时由 [`LauncherApp::sync_theme`] 一次性替换。
@@ -3611,6 +3617,8 @@ impl LauncherApp {
             win_drag: None,
             settings_open,
             settings_tab,
+            file_folders_edit: None,
+            file_exclude_edit: None,
             prefs,
             theme,
             theme_applied: None,
@@ -4489,9 +4497,60 @@ impl LauncherApp {
         }
     }
 
+    /// 批次 D7 修正（2026-10-28 真机「打不进字」）：把「文件搜索」页**目录清单**的编辑缓冲
+    /// 回写 prefs。有改动才落盘、才报日志 —— 「点别处但没改过」不该白写一次盘、白扫一轮索引。
+    fn commit_file_folders_edit(&mut self) -> bool {
+        let Some(buf) = self.file_folders_edit.as_ref() else {
+            return false;
+        };
+        if *buf == self.prefs.file_folders {
+            return false;
+        }
+        self.prefs.file_folders = buf.clone();
+        source::application::save_settings(&self.prefs);
+        eprintln!(
+            "设置页：文件扫描目录已改（现 {} 个条目，路径不落日志）",
+            self.prefs.file_folders.len()
+        );
+        true
+    }
+
+    /// 「文件搜索」页**排除表**的同一条回写路径（与目录清单分开提交：两者各自失焦）。
+    fn commit_file_exclude_edit(&mut self) -> bool {
+        let Some(buf) = self.file_exclude_edit.as_ref() else {
+            return false;
+        };
+        if *buf == self.prefs.file_exclude {
+            return false;
+        }
+        self.prefs.file_exclude = buf.clone();
+        source::application::save_settings(&self.prefs);
+        eprintln!(
+            "设置页：文件排除表已改（现 {} 个条目）",
+            self.prefs.file_exclude.len()
+        );
+        true
+    }
+
+    /// 离开「文件搜索」页（换分类 / 关设置页）时收尾：先把"没失焦就走了"的编辑回写掉，
+    /// 再丢缓冲 —— 下次进页按 prefs 重新取（`-Preferences 5` 从别处改过的值也能看到）。
+    fn finish_file_scope_edits(&mut self) {
+        if self.file_folders_edit.is_none() && self.file_exclude_edit.is_none() {
+            return;
+        }
+        self.commit_file_folders_edit();
+        self.commit_file_exclude_edit();
+        self.file_folders_edit = None;
+        self.file_exclude_edit = None;
+    }
+
     /// 设置页（2026-10-17 用户要求，参考 AHK 版设置窗口的左侧分类栏；只立当下有真实选项的分类，
     /// 不做无功能的占位开关）。入口：托盘「设置…」/ `Ctrl+,`；Esc 或「返回搜索」回搜索页。
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        // 换到别的分类 ⇒ 这一页的编辑缓冲作废（回写后丢掉，见 [`finish_file_scope_edits`]）。
+        if self.settings_tab != SettingsTab::FileSearch {
+            self.finish_file_scope_edits();
+        }
         // 顶栏空白也是拖动手柄（2026-10-18 用户：「顶部输入框右侧点击空白不能拖动，顶部的不是菜单栏吗？」）。
         // 右边界必须取"整行可用宽度"，不能用 `head_row.response.rect.max.x`：横向行的 response 矩形
         // 只覆盖**已用宽度**（返回按钮 + 标题 ≈ 110px），用它算出来的手柄宽度是负数、被 drag_handle
@@ -5288,43 +5347,50 @@ impl LauncherApp {
                             // `apply_settings` 把新范围喂给文件源，`set_scope` 比对不同才重扫
                             // ⇒ 「保存即重扫」是自动的，这一页不用自己碰 sources。
                             ui.label(egui::RichText::new("扫描目录").strong());
-                            let mut folders = self.prefs.file_folders.clone();
+                            // 编辑缓冲必须跨帧（见 `file_folders_edit` 字段注释）。
+                            if self.file_folders_edit.is_none() {
+                                self.file_folders_edit = Some(self.prefs.file_folders.clone());
+                            }
                             let mut commit_folders = false;
                             let mut remove_row: Option<usize> = None;
-                            for (i, f) in folders.iter_mut().enumerate() {
-                                ui.horizontal(|ui| {
-                                    let resp = ui
-                                        .add(
-                                            egui::TextEdit::singleline(f)
-                                                .hint_text("%USERPROFILE%\\Documents 或 D:\\data")
-                                                .desired_width(ui.available_width() - 44.0),
-                                        )
-                                        .on_hover_text("支持 %环境变量%；目录不存在时这一行不参与扫描");
-                                    // 路径是打字输入：提交在失焦那刻，不是每个键一写盘一重扫。
-                                    if resp.changed() && resp.lost_focus() {
-                                        *f = f.trim().to_string();
-                                        commit_folders = true;
-                                    }
-                                    if ui.button("删除").clicked() {
-                                        remove_row = Some(i);
-                                    }
-                                });
+                            {
+                                let folders = self.file_folders_edit.as_mut().expect("上面刚填过");
+                                for (i, f) in folders.iter_mut().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let resp = ui
+                                            .add(
+                                                egui::TextEdit::singleline(f)
+                                                    .hint_text(
+                                                        "%USERPROFILE%\\Documents 或 D:\\data",
+                                                    )
+                                                    .desired_width(ui.available_width() - 44.0),
+                                            )
+                                            .on_hover_text(
+                                                "支持 %环境变量%；目录不存在时这一行不参与扫描",
+                                            );
+                                        // 路径是打字输入：提交在失焦那刻，不是每个键一写盘一重扫。
+                                        // 判据只用 `lost_focus`——`changed()` 只在那帧真有编辑时为真，
+                                        // 而失焦落在后来的点击帧，`changed() && lost_focus()` 几乎
+                                        // 不可能同帧成立（2026-10-28 真机：那一版等于永不提交）。
+                                        if resp.lost_focus() {
+                                            *f = f.trim().to_string();
+                                            commit_folders = true;
+                                        }
+                                        if ui.button("删除").clicked() {
+                                            remove_row = Some(i);
+                                        }
+                                    });
+                                }
+                                if let Some(i) = remove_row {
+                                    folders.remove(i);
+                                    commit_folders = true;
+                                }
+                                if ui.button("添加目录").clicked() {
+                                    folders.push(String::new());
+                                    commit_folders = true;
+                                }
                             }
-                            if let Some(i) = remove_row {
-                                folders.remove(i);
-                                commit_folders = true;
-                            }
-                            if ui.button("添加目录").clicked() {
-                                folders.push(String::new());
-                                commit_folders = true;
-                            }
-                            if commit_folders {
-                                self.prefs.file_folders = folders;
-                                source::application::save_settings(&self.prefs);
-                                eprintln!(
-                                    "设置页：文件扫描目录已改（现 {} 个条目，路径不落日志）",
-                                    self.prefs.file_folders.len()
-                                );
+                            if commit_folders && self.commit_file_folders_edit() {
                                 ui.ctx().request_repaint();
                             }
                             ui.label(
@@ -5337,48 +5403,48 @@ impl LauncherApp {
                             );
                             ui.separator();
                             ui.label(egui::RichText::new("排除的目录名").strong());
-                            let mut exclude = self.prefs.file_exclude.clone();
+                            // 与目录清单同一条跨帧缓冲（见 `file_exclude_edit` 字段注释）。
+                            if self.file_exclude_edit.is_none() {
+                                self.file_exclude_edit = Some(self.prefs.file_exclude.clone());
+                            }
                             let mut commit_exclude = false;
                             let mut remove_ex: Option<usize> = None;
-                            for (i, x) in exclude.iter_mut().enumerate() {
+                            {
+                                let exclude = self.file_exclude_edit.as_mut().expect("上面刚填过");
+                                for (i, x) in exclude.iter_mut().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let resp = ui.add(
+                                            egui::TextEdit::singleline(x)
+                                                .hint_text("node_modules")
+                                                .desired_width(ui.available_width() - 44.0),
+                                        );
+                                        // 按目录名整段跳过（大小写不敏感），连它下面的文件一起不进索引。
+                                        if resp.lost_focus() {
+                                            *x = x.trim().to_string();
+                                            commit_exclude = true;
+                                        }
+                                        if ui.button("删除").clicked() {
+                                            remove_ex = Some(i);
+                                        }
+                                    });
+                                }
+                                if let Some(i) = remove_ex {
+                                    exclude.remove(i);
+                                    commit_exclude = true;
+                                }
                                 ui.horizontal(|ui| {
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(x)
-                                            .hint_text("node_modules")
-                                            .desired_width(ui.available_width() - 44.0),
-                                    );
-                                    // 按目录名整段跳过（大小写不敏感），连它下面的文件一起不进索引。
-                                    if resp.changed() && resp.lost_focus() {
-                                        *x = x.trim().to_string();
+                                    if ui.button("添加目录名").clicked() {
+                                        exclude.push(String::new());
                                         commit_exclude = true;
                                     }
-                                    if ui.button("删除").clicked() {
-                                        remove_ex = Some(i);
+                                    if ui.button("恢复默认排除").clicked() {
+                                        *exclude =
+                                            source::filesearch::default_scope_exclude();
+                                        commit_exclude = true;
                                     }
                                 });
                             }
-                            if let Some(i) = remove_ex {
-                                exclude.remove(i);
-                                commit_exclude = true;
-                            }
-                            ui.horizontal(|ui| {
-                                if ui.button("添加目录名").clicked() {
-                                    exclude.push(String::new());
-                                    commit_exclude = true;
-                                }
-                                if ui.button("恢复默认排除").clicked() {
-                                    exclude =
-                                        source::filesearch::default_scope_exclude();
-                                    commit_exclude = true;
-                                }
-                            });
-                            if commit_exclude {
-                                self.prefs.file_exclude = exclude;
-                                source::application::save_settings(&self.prefs);
-                                eprintln!(
-                                    "设置页：文件排除表已改（现 {} 个条目）",
-                                    self.prefs.file_exclude.len()
-                                );
+                            if commit_exclude && self.commit_file_exclude_edit() {
                                 ui.ctx().request_repaint();
                             }
                             ui.label(
@@ -8794,6 +8860,8 @@ impl eframe::App for LauncherApp {
                 self.settings_ui(ui);
                 return;
             }
+            // 不在设置页 ⇒ 「文件搜索」页的编辑缓冲收尾（把没失焦就走的编辑回写掉再丢掉）。
+            self.finish_file_scope_edits();
             // 状态栏要钉在面板底边，列表可视区按它让出一块；先在加任何控件之前量下整块内容区。
             let content_rect = ui.max_rect();
             let search_id = search_field_id();

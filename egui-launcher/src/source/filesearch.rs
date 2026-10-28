@@ -255,6 +255,10 @@ pub struct FileSource {
     scope: ScanScope,
     /// 有范围改动还没扫到的那笔账。
     scope_pending: bool,
+    /// 在途那一轮**派出时**的范围快照。日志里的「范围＝清单 N 个目录…」必须读它，不能读
+    /// `scope`：在途期间改了范围时 `scope` 已是新值，拿它给旧索引贴标签会写出
+    /// 「清单 6 个目录 / 1109 条」这种把两轮数据混在一行的谎（2026-10-28 真机抓到的）。
+    in_flight_scope: Option<ScanScope>,
 }
 
 impl Default for FileSource {
@@ -271,6 +275,7 @@ impl Default for FileSource {
             hits_cache: None,
             scope: ScanScope::default(),
             scope_pending: false,
+            in_flight_scope: None,
         }
     }
 }
@@ -311,6 +316,7 @@ impl FileSource {
             }
         }
         self.rebuild_in_flight = true;
+        self.in_flight_scope = Some(self.scope.clone());
         spawn_rebuild(self.tx.clone(), self.scope.clone());
     }
 
@@ -423,6 +429,11 @@ impl DataSource for FileSource {
                     self.index = entries;
                     self.indexed_at = Some(Instant::now());
                     self.rebuild_in_flight = false;
+                    // 先取走这一轮的派出快照，再处理补扫账（补扫会把 `in_flight_scope` 换成新的）。
+                    let built = self
+                        .in_flight_scope
+                        .take()
+                        .unwrap_or_else(|| self.scope.clone());
                     // 新索引配旧缓存就是"用上一轮的命中回答这一轮的查询"⇒ 一起清掉。
                     self.hits_cache = None;
                     // 这轮是在途时改的范围 ⇒ 它带回的是旧范围的索引，补一轮按新范围扫。
@@ -430,9 +441,9 @@ impl DataSource for FileSource {
                         self.scope_pending = false;
                         self.refresh_index(true);
                     }
-                    let dirs = self.scope.folders.len();
-                    let depth = self.scope.depth;
-                    let cap = self.scope.max_entries;
+                    let dirs = built.folders.len();
+                    let depth = built.depth;
+                    let cap = built.max_entries;
                     eprintln!(
                         "文件索引：本轮建成 {n} 条（范围＝清单 {dirs} 个目录，深度 {depth}，上限 {cap} 条）"
                     );
@@ -1290,6 +1301,11 @@ mod tests {
         assert!(src.rebuild_in_flight, "保存即重扫");
         assert!(!src.scope_pending, "派出的这轮已经是新范围，不欠账");
         assert_eq!(src.scope, changed);
+        assert_eq!(
+            src.in_flight_scope.as_ref(),
+            Some(&changed),
+            "日志的「范围＝清单 N 个目录」读这一份快照，不读活动 scope"
+        );
 
         // 在途时改值 ⇒ 只记账，派不出去（闸门挡着）；旧范围的回报到达那帧补派新范围。
         src.rebuild_in_flight = true;
@@ -1297,11 +1313,17 @@ mod tests {
             depth: 1,
             ..ScanScope::default()
         };
-        src.scope = older;
+        src.scope = older.clone();
+        src.in_flight_scope = Some(older.clone());
         src.scope_pending = false;
         src.set_scope(changed.clone());
         assert!(src.scope_pending, "在途那轮是旧范围 ⇒ 欠一笔待扫账");
         assert_eq!(src.scope, changed);
+        assert_eq!(
+            src.in_flight_scope.as_ref(),
+            Some(&older),
+            "在途那轮的快照不随活动 scope 走——否则回报会贴上新范围的标签"
+        );
 
         let tx = src.tx.clone();
         tx.send(FileUpdate::Index(vec![FileEntry {
@@ -1314,6 +1336,11 @@ mod tests {
         assert!(!src.scope_pending, "回报采纳后待扫账清零");
         assert!(src.rebuild_in_flight, "补派的新一轮在途");
         assert_eq!(src.index.len(), 1);
+        assert_eq!(
+            src.in_flight_scope.as_ref(),
+            Some(&changed),
+            "补派那轮的快照换成新范围"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

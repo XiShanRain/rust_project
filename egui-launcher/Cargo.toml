@@ -20,6 +20,9 @@ raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pinyin = "0.11.0"
+# FR-QRY-09 通配符 / 正则：`*`→`.*`、`?`→`.` 后交给 regex（Delphi `TRegExpr` 同口径）。
+# 只在查询含 `*`/`?` 时编译一次，且编译结果每轮查询复用；将来的 Exclude 过滤也走这一条（计划 §562）。
+regex = "1"
 
 # 与 Cargo.lock 里 accesskit_windows / gpu-allocator / wgpu-hal 已用的主版本一致，不引入第二个 windows 大版本。
 [target.'cfg(windows)'.dependencies.windows]

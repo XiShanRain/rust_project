@@ -143,12 +143,77 @@ pub fn parse(raw: &str) -> Parsed {
     }
 }
 
+/// FR-QRY-09 通配符 / 正则查询。口径照 Delphi `FilterKeyWord`（`untShortCutMan.pas:958-1018`）：
+/// `*`→`.*`、`?`→`.`，**其余字符原样交给正则**（所以用户也能写 `^` `$` `\d`）；
+/// 编译失败 ⇒ 返回 `None`，整轮退回七档普通匹配（需求书：不报错、不中断）。
+///
+/// 每轮查询只编译一次，且**按查询原文缓存**（[`wild_pattern`]）——`plan()` 每帧都会调 `search`，
+/// 逐帧 `compile` 是白烧 CPU（开发计划 §562 依赖表明写"不可每帧 compile"）。
+struct WildPattern {
+    re: regex::Regex,
+    /// 模式原串的字符数，只喂长度惩罚（Delphi 用 `Length(KeyWord)`，同一口径）。
+    pat_chars: usize,
+}
+
+impl WildPattern {
+    fn compile(full: &str) -> Option<WildPattern> {
+        if !full.contains('*') && !full.contains('?') {
+            return None;
+        }
+        // 先把用户自己敲的 `.*` 藏起来再替换 `*`，否则 `a.*` 会被替换两次成 `a..*`
+        // （Delphi 用 `~!@#` 占位，这里用不可能出现在查询里的控制字符）。
+        const GUARD: &str = "\u{1}";
+        let s = full.replace(".*", GUARD);
+        let s = s.replace('*', ".*");
+        let s = s.replace(GUARD, ".*");
+        let s = s.replace('?', ".");
+        let re = regex::Regex::new(&s).ok()?;
+        Some(WildPattern {
+            re,
+            pat_chars: full.chars().count(),
+        })
+    }
+
+    /// 命中 ⇒ `(包含档, 60 − 起点惩罚 − 长度惩罚)`；不命中 ⇒ `(0, 0.0)`。
+    /// **不因起点为 0 拔到前缀 / 完全相等**：`*.exe` 的 `.*` 贪心会从 0 起匹配，
+    /// 拔档会把"后缀过滤"误判成"整串完全相等"，顶掉真正的精确命中。
+    fn score(&self, k: &Key) -> (u8, f32) {
+        match self.re.find(&k.lower) {
+            Some(m) => {
+                let start = k.lower[..m.start()].chars().count();
+                let s = 60.0 - (start.min(20) as f32) * 0.25
+                    - length_penalty(k.chars, self.pat_chars);
+                (T_CONTAINS, s)
+            }
+            None => (0, 0.0),
+        }
+    }
+}
+
+/// 查询原文 → 已编译的模式（`None` ＝不是通配符查询，或语法非法——两义在打分上同路）。
+/// 只按原文比较，命不中才重编：同一段查询在一次击键之间会被每帧重算好几遍。
+fn wild_pattern<'a>(
+    cache: &'a mut Option<(String, Option<WildPattern>)>,
+    full: &str,
+) -> Option<&'a WildPattern> {
+    let fresh = matches!(cache, Some((q, _)) if q == full);
+    if !fresh {
+        *cache = Some((full.to_string(), WildPattern::compile(full)));
+    }
+    match cache {
+        Some((_, w)) => w.as_ref(),
+        None => None,
+    }
+}
+
 /// 清单键表缓存（FR-QRY-06）。用内容指纹判断是否需要重算，而不是指望每个改动清单的地方
 /// 都记得通知我——漏一处就是永久性错序；指纹只覆盖成键用到的字段（名称、别名）。
 #[derive(Default)]
 pub struct MatchIndex {
     fingerprint: u64,
     keys: Vec<MatchKeys>,
+    /// FR-QRY-09：通配符查询的编译缓存，键是**整串查询原文**。
+    wild_cache: Option<(String, Option<WildPattern>)>,
 }
 
 impl MatchIndex {
@@ -184,7 +249,6 @@ impl MatchIndex {
     ) -> Vec<usize> {
         let p = parse(raw);
         self.ensure(items);
-        let keys = &self.keys;
 
         // 空输入：不分桶，只让置顶/常用浮顶；三键全平的项保持清单原序（sort_by 稳定）。
         // 不截断——这是「浏览整张清单」，不是搜索结果；截 50 会把用户已有的项静默藏掉。
@@ -194,9 +258,13 @@ impl MatchIndex {
             return v;
         }
 
+        // FR-QRY-09：编译结果按查询原文缓存在索引里（`plan()` 每帧都会重算一遍）。
+        // `None` 有两义——不是通配符查询，或语法非法（后者同样走七档普通匹配，正是需求书要的回退）。
+        let wild = wild_pattern(&mut self.wild_cache, &p.full);
+        let keys = &self.keys;
         let mut hits: Vec<(u8, f32, usize)> = Vec::new();
         for (idx, k) in keys.iter().enumerate() {
-            if let Some((tier, score)) = score_item(&p, k) {
+            if let Some((tier, score)) = score_item(&p, k, wild) {
                 hits.push((tier, score, idx));
             }
         }
@@ -244,14 +312,15 @@ pub fn learn_heat(item: &LaunchItem, now_ms: i64) -> f32 {
 pub const HEAT_HALF_LIFE_DAYS: f32 = 7.0;
 
 /// 一个条目对整次查询的打分：名称与别名取优（别名是刻意设置的触发码，等同名称参与匹配）。
-fn score_item(p: &Parsed, keys: &MatchKeys) -> Option<(u8, f32)> {
+/// `wild` 有值 ⇒ 通配符 / 正则模式（整串一个模式，不走多词与子序列那几档）。
+fn score_item(p: &Parsed, keys: &MatchKeys, wild: Option<&WildPattern>) -> Option<(u8, f32)> {
     let mut best: Option<(u8, f32)> = None;
     for k in [&keys.name]
         .into_iter()
         .flatten()
         .chain(keys.aliases.iter())
     {
-        let hit = score_key(p, k);
+        let hit = score_key(p, k, wild);
         if hit.1 > 0.0 && best.is_none_or(|b| hit > b) {
             best = Some(hit);
         }
@@ -350,7 +419,11 @@ pub fn space_executes(
 
 /// 单串规则与多词规则取优：`"visual studio"` 既应命中整段包含（60 档），
 /// 也应在整串不成立时靠逐词全命中（45 档）兜住。
-fn score_key(p: &Parsed, k: &Key) -> (u8, f32) {
+fn score_key(p: &Parsed, k: &Key, wild: Option<&WildPattern>) -> (u8, f32) {
+    // 通配符 / 正则模式与七档互斥：整串就是一个模式，不再拆词、不再走子序列。
+    if let Some(w) = wild {
+        return w.score(k);
+    }
     let whole = score_word(&p.full, k);
     if p.words.len() <= 1 {
         return whole;
@@ -468,7 +541,8 @@ mod tests {
     fn hit(items: &[LaunchItem], q: &str) -> (u8, f32) {
         let p = parse(q);
         let k = MatchKeys::build(&items[0]);
-        score_item(&p, &k).unwrap_or((0, 0.0))
+        let wild = WildPattern::compile(&p.full);
+        score_item(&p, &k, wild.as_ref()).unwrap_or((0, 0.0))
     }
 
     #[test]
@@ -722,6 +796,125 @@ mod tests {
             order_at(&items, "", LearnRank::Decay, NOW),
             ["乙", "丙", "甲"]
         );
+    }
+
+    // ---- FR-QRY-09 通配符 / 正则 ----
+
+    #[test]
+    fn wildcard_star_and_question_mark_match_like_delphi() {
+        let one = |name: &str| vec![item(name, "", "a", false, 0, 0)];
+        // `*` = 任意串（含空串）
+        assert_eq!(order(&one("xcalc"), "*calc"), ["xcalc"]);
+        assert_eq!(order(&one("calcx"), "calc*"), ["calcx"]);
+        // `?` = 恰好一个字符，不吃 0 个也不吃 2 个
+        assert_eq!(hit(&one("calc"), "c?lc").0, T_CONTAINS);
+        assert_eq!(hit(&one("calc"), "c??lc"), (0, 0.0), "`?` 只顶一个字");
+        // 两者可混用
+        assert_eq!(order(&one("notepad"), "*te?ad"), ["notepad"]);
+    }
+
+    #[test]
+    fn wildcard_hits_stay_in_the_contains_band() {
+        let one = |name: &str| vec![item(name, "", "a", false, 0, 0)];
+        // 同一份数据：普通查询是完全相等档，带 `*` 之后一律落在包含档
+        assert_eq!(hit(&one("calc"), "calc"), (T_EXACT, 100.0));
+        assert_eq!(hit(&one("calc"), "*calc"), (T_CONTAINS, 60.0));
+        // 长度惩罚按「条目字数 − 模式字数」算：5 vs 8 ⇒ 60 − 0.3
+        let (tier, s) = hit(&one("calc.exe"), "*calc");
+        assert_eq!(tier, T_CONTAINS);
+        assert!((s - 59.7).abs() < 1e-5, "实得 {s}");
+        // 从第 0 字起命中也不许拔档：`*.exe` 的 `.*` 贪心必然从 0 起，
+        // 一拔成"完全相等"就把真正的精确命中顶掉了。
+        assert_eq!(hit(&one("calc"), "calc*").0, T_CONTAINS);
+        assert_eq!(hit(&one("calc.exe"), "*.exe").0, T_CONTAINS);
+    }
+
+    #[test]
+    fn wildcard_keeps_earlier_matches_ahead() {
+        // 同为包含档、学习键全平：起点越前越靠前（`xcalc` 在第 1 字、`abcalc` 在第 2 字）
+        let items = vec![
+            item("abcalc", "", "a", false, 0, 0),
+            item("xcalc", "", "b", false, 0, 0),
+        ];
+        assert_eq!(order(&items, "*calc"), ["xcalc", "abcalc"]);
+    }
+
+    #[test]
+    fn wildcard_disables_the_fuzzy_tiers() {
+        let one = |name: &str| vec![item(name, "", "a", false, 0, 0)];
+        // 普通查询：`cltr` 靠子序列命中 calculator
+        assert_eq!(hit(&one("calculator"), "cltr").0, T_SUBSEQ);
+        // 带 `*` ⇒ 整串是一个正则，不再走子序列
+        assert!(order(&one("calculator"), "cltr*").is_empty());
+        // 多词全命中那一档同样让位（正则按整串匹配，"visual code" 不匹配中间夹词的名字）
+        assert_eq!(hit(&one("Visual Studio Code"), "visual code").0, T_WORDS);
+        assert!(order(&one("Visual Studio Code"), "visual code*").is_empty());
+    }
+
+    #[test]
+    fn wildcard_queries_are_case_insensitive_and_see_aliases() {
+        // 整串在 parse 里先小写、条目键也是小写 ⇒ 大写查询照样命中（Delphi 同顺序：
+        // `LowerCase(KeyWord)` 之后才做 `*`/`?` 替换）。
+        let items = vec![item("计算器", "calc", "p", false, 0, 0)];
+        assert_eq!(order(&items, "*ALC"), ["计算器"], "别名参与通配符匹配");
+        assert_eq!(hit(&items, "CAL*"), (T_CONTAINS, 60.0));
+        // 这条小写化连带吃掉大写类转义（`\D` ⇒ `\d`）。**Delphi 也这样**（同一个位置先小写），
+        // 属于有意保留的口径：改成保留大小写就不是 Delphi 的查询语言了。
+        let digit = vec![item("7.exe", "", "a", false, 0, 0)];
+        assert_eq!(hit(&digit, r"\D?").0, T_CONTAINS);
+    }
+
+    #[test]
+    fn wildcard_keeps_regex_syntax_outside_the_wildcards() {
+        let one = |name: &str| vec![item(name, "", "a", false, 0, 0)];
+        // 锚点 / 字符类 / 分组原样交给正则，只有 `*` `?` 被改写
+        assert_eq!(hit(&one("calc"), "^c?lc").0, T_CONTAINS);
+        assert_eq!(hit(&one("calc"), "[a-z]alc*").0, T_CONTAINS);
+        assert_eq!(hit(&one("notepad"), "(calc|notepad)*").0, T_CONTAINS);
+        // 用户自己敲的 `.*` 不许被二次替换成 `..*`：`a.*` 在最短的两字串上也要命中
+        // （占位符就是为这一条存在的；没有它，"ab" 上 `a..*` 要求 ≥3 字 ⇒ 漏掉）。
+        assert_eq!(hit(&one("ab"), "a.*").0, T_CONTAINS);
+    }
+
+    #[test]
+    fn invalid_pattern_falls_back_to_plain_matching_without_panicking() {
+        let items = vec![
+            item("calc", "", "a", false, 0, 0),
+            item("*[", "", "b", false, 0, 0),
+        ];
+        // `*[` 展开成 `.*[` ⇒ 正则语法错 ⇒ 编译返回 None ⇒ 整轮退回七档普通匹配。
+        // 回退之后 `*[` 只是一个普通串，所以命中的是名字里真有这两字的条目，
+        // 而"calc"没有 —— 这个结果只有在真的走了回退时才可能出现。
+        assert_eq!(order(&items, "*["), ["*["]);
+        // 回退不留状态：同一张清单上的普通查询照旧
+        assert_eq!(order(&items, "calc"), ["calc"]);
+    }
+
+    #[test]
+    fn a_lone_star_matches_everything_in_the_contains_band() {
+        let items = vec![
+            item("甲", "", "a", false, 0, 0),
+            item("b", "", "c", false, 0, 0),
+        ];
+        assert_eq!(order(&items, "*"), ["甲", "b"], "`.*` 命中所有非空键");
+        assert_eq!(hit(&items, "*"), (T_CONTAINS, 60.0));
+    }
+
+    #[test]
+    fn wildcard_cache_does_not_leak_between_queries() {
+        let items = vec![
+            item("calc", "", "a", false, 0, 0),
+            item("notepad", "", "b", false, 0, 0),
+        ];
+        let mut ix = MatchIndex::default();
+        let a = ix.search("*calc", &items, LearnRank::Count, NOW);
+        let b = ix.search("*note", &items, LearnRank::Count, NOW);
+        let a2 = ix.search("*calc", &items, LearnRank::Count, NOW);
+        assert_eq!(a, vec![0]);
+        assert_eq!(b, vec![1], "换了查询就得换模式，不许沿用上一条");
+        assert_eq!(a, a2, "回到同一段查询时复用同一条模式");
+        // 非通配符查询同样要刷新缓存：否则上一轮的模式会接着生效
+        assert_eq!(ix.search("note", &items, LearnRank::Count, NOW), vec![1]);
     }
 
     // ---- FR-QRY-07 截断与稳定性 ----

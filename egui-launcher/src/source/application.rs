@@ -2504,11 +2504,17 @@ pub fn default_keyword(name: &str) -> String {
 /// 这次用这个词真的启动成功了，就把它攒成该条目的别名，下次直接敲它就命中。
 ///
 /// 门槛比 Delphi 严：Delphi 无条件学，单字也学，于是 `j` 这类一词能让所有含 j 的查询
-/// 都吃到 30 档噪声。这里要求 ≥2 字符、不等于名称、且尚未出现在别名里；只攒查询**首词**
+/// 都吃到 30 档噪声。这里要求 ≥2 字符、不等于名称、尚未出现在别名里、且不含通配符
+/// `*` / `?`（FR-QRY-09：那是查询语法，不是触发词）；只攒查询**首词**
 /// （FR-QRY-01 的 keyword 那半，后面的参数词不是触发码）。返回是否改变 ⇒ 调用方据此决定写盘。
 pub fn learn_alias(item: &mut LaunchItem, word: &str) -> bool {
     let w = word.trim().to_lowercase();
     if w.chars().count() < 2 || w == item.name.to_lowercase() {
+        return false;
+    }
+    // FR-QRY-09：`*` / `?` 是通配符查询的语法，不是触发词——学进别名表只会留下
+    // 一条普通查询永远匹配不上、却仍参与 Tab 补全与去重的垃圾。
+    if w.contains('*') || w.contains('?') {
         return false;
     }
     // 这个词本来就在名称里（`设置`→「Windows 设置」、`task`→「Task Scheduler」）⇒ 学下来
@@ -4139,6 +4145,22 @@ mod dedup_tests {
         };
         assert!(learn_alias(&mut bare, "np"));
         assert_eq!(bare.keyword, "np", "原本无别名时直接落第一个词");
+    }
+
+    /// FR-QRY-09：通配符是**查询语法**，不是触发词。学进别名表会留下一条普通查询
+    /// 永远匹配不上、却仍参与 Tab 补全与去重的垃圾。
+    #[test]
+    fn learn_alias_refuses_wildcard_patterns() {
+        let mut it = LaunchItem {
+            name: "计算器".to_string(),
+            keyword: String::new(),
+            ..Default::default()
+        };
+        assert!(!learn_alias(&mut it, "*calc"), "含 `*` 不攒");
+        assert!(!learn_alias(&mut it, "c?lc"), "含 `?` 不攒");
+        assert_eq!(it.keyword, "", "别名表一字不动");
+        assert!(learn_alias(&mut it, "calc"), "普通触发词照旧能学");
+        assert_eq!(it.keyword, "calc");
     }
 
     /// FR-WIN-11 开机自启的归属判据（安全规则的可测部分）：target 与参数**两个都得对**，

@@ -162,6 +162,22 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: None,
     },
     CheatEntry {
+        key: "*calc",
+        title: "通配符 / 正则",
+        summary: "`*` 任意串、`?` 单个字；其余字符按正则解释",
+        detail: "查询里出现 `*` 或 `?` 时整串当成一个正则：`*` → `.*`、`?` → `.`，\
+                 其余字符原样交给正则引擎（所以 `^` `$` `\\d` `[a-z]` 也能用）。\n\
+                 例：`*calc` 找名字里含 calc 的；`c?lc` 要求中间恰好一个字；`*.exe` 只看可执行文件。\n\
+                 一律按小写比较（Delphi 版同一口径），因此 `\\D` 这类大写类转义会变成 `\\d`。\n\
+                 正则写错（如 `*[`）不报错也不中断，整轮退回普通匹配。\n\
+                 通配符查询不再走拼音首字母 / 子序列那几档，也不拆多词——整串就是一个模式。\n\
+                 注意 `?` 放在第 0 个字符是「速查表」的入口，要匹配单字请把它放到后面（`c?lc`）。",
+        tags: "wildcard regex 通配符 正则 星号 问号 模式 pattern",
+        group: Group::Syntax,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
         key: "@维护 磁盘",
         title: "分类筛选",
         summary: "`@分类 词` 只列这一类；多个分类取并集",
