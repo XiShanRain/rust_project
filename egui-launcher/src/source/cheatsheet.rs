@@ -58,7 +58,8 @@ pub struct CheatEntry {
     pub group: Group,
     /// 依赖哪个数据源：该源关掉时这一条整条不出现。`None` ＝ 与数据源无关。
     pub source: Option<SourceId>,
-    /// 帮助页上「打开设置页」跳到第几页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级）。
+    /// 帮助页上「打开设置页」跳到第几页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级
+    /// 8=批量管理）。
     pub settings_page: Option<u32>,
 }
 
@@ -761,7 +762,7 @@ pub const ENTRIES: &[CheatEntry] = &[
     CheatEntry {
         key: "Ctrl+, / F2",
         title: "打开 / 返回设置页",
-        summary: "六页：通用 / 功能 / 热键 / 数据源 / 外观 / 高级",
+        summary: "八页：通用 / 功能 / 热键 / 数据源 / 文件搜索 / 外观 / 高级 / 批量管理",
         detail: "打开设置页；已开着时按它返回搜索页（与 Esc 的「设置页返回搜索」同一档）。\n\
                  `F2` 是批次 B8（2026-10-26，需求书附录 A）加的别名，两颗键走同一段代码；\n\
                  设置页已经开着时它也有效（与 `F1` 同为「整窗口级」，取键在分页之前）。",
@@ -782,6 +783,32 @@ pub const ENTRIES: &[CheatEntry] = &[
         group: Group::Keys,
         source: None,
         settings_page: None,
+    },
+    CheatEntry {
+        key: "Ctrl+B",
+        title: "批量管理",
+        summary: "设置页第 8 页：勾选批量删、只选失效项、绝对 ↔ 相对路径互转",
+        detail: "直接打开设置页「批量管理」（左侧分类栏最后一项，从设置页点进去也一样）。\n\
+                 勾选条目后可以：转为相对写法（`%LAUNCHER_DIR%\\…`，只转本程序目录下的行）、还原成绝对路径、\n\
+                 从清单里删除。删除只动 `user_items.json`，不碰磁盘文件；转换只改命令行那一格，参数与工作目录不动。\n\
+                 状态列沿用主界面的四态：「只选失效项」只勾 `Not found`，`Offline`（拔掉的 U 盘 / 断线的共享）不算失效。\n\
+                 两种批量动作都要先确认，确认框上写清条数。需求书原文的便携写法是 `.\\`，本仓用 `%LAUNCHER_DIR%`\n\
+                 代替（`.\\` 认的是进程当前目录，而本程序从不 SetCurrentDirectory，同一份清单会时灵时不灵）。",
+        tags: "key 批量 batch 管理 manage 删除 相对路径 绝对路径 失效",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(8),
+    },
+    CheatEntry {
+        key: "Ctrl+R",
+        title: "批量管理·重新校验",
+        summary: "只在设置页「批量管理」里有效",
+        detail: "重跑一遍路径四态检查，状态列立刻刷新（走进这一页时也会自动跑一轮）。\n\
+                 上一轮还没回来时不攒线程：断开的网络盘会让检查挂很久，这时按它只提示稍等。",
+        tags: "key 校验 check 刷新 路径 失效",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(8),
     },
     CheatEntry {
         key: "呼出键 / 补字符键",
@@ -977,8 +1004,9 @@ mod tests {
                 // 批次 F1 加了第 5 页「外观」，上界跟着走（现量：SettingsTab::from_page 认 1..=5）。
                 // 【2026-10-24 批次 F7：加了第 6 页「高级」，上界改为 1..=6。】
                 // 【2026-10-27 批次 D7：插入第 5 页「文件搜索」，外观/高级顺延为 6/7，上界 1..=7。】
+                // 【2026-10-28 批次 D5：追加第 8 页「批量管理」，上界 1..=8。】
                 assert!(
-                    (1..=7).contains(&page),
+                    (1..=8).contains(&page),
                     "「{}」指向不存在的设置页 {page}",
                     e.title
                 );

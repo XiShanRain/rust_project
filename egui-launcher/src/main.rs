@@ -405,12 +405,16 @@ enum SettingsTab {
     /// 批次 F7（D3 + D6）：重置学习排序 / 恢复默认 / 隐藏的条目。~~第 6 页~~【批次 D7 起第 7 页】。
     /// 这一页只有破坏性动作与低频维护项，所以排在最后。
     Advanced,
+    /// 批次 D5（FR-ACT-09）：快捷项批量管理——勾选批量删、失效项校验、绝对 ↔ 相对互转。第 8 页。
+    /// 与「高级」同为低频维护，但它是"对整张清单动刀"，单开一页免得混进设置开关里。
+    Manage,
 }
 
 impl SettingsTab {
-    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级）；
-    /// 越界返回 None，由调用方落回通用。批次 D7 起第 5 页由「外观」改为「文件搜索」，
-    /// 原第 5/6 页顺延——`-Preferences 5/6` 的旧语义随之变，与设置页分类栏一起改口径。
+    /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级
+    /// 8=批量管理）；越界返回 None，由调用方落回通用。批次 D7 起第 5 页由「外观」改为
+    /// 「文件搜索」，原第 5/6 页顺延——`-Preferences 5/6` 的旧语义随之变，与设置页分类栏一起改口径。
+    /// 【批次 D5：第 8 页追加在末尾，1–7 的语义与 `-Preferences` 参数一格不动。】
     fn from_page(page: u32) -> Option<Self> {
         match page {
             1 => Some(Self::General),
@@ -420,6 +424,7 @@ impl SettingsTab {
             5 => Some(Self::FileSearch),
             6 => Some(Self::Appearance),
             7 => Some(Self::Advanced),
+            8 => Some(Self::Manage),
             _ => None,
         }
     }
@@ -436,6 +441,21 @@ enum Destructive {
     /// FR-QRY-10（批次 C3）：把 search_history.json 清成空表，上限那一格不动。
     /// 这一个**不写备份**——另两个清的是统计，这张表清的是用户敲过的原文。
     ClearHistory,
+}
+
+/// 批次 D5（FR-ACT-09）：批量管理页的两种确认（`Some`＝确认框开着）。
+///
+/// 转换把**算好的计划**一起存进来：确认框开着的那一帧清单不许再动，落地时按存下来的那份执行，
+/// 报出来的条数就是用户刚才看到的那一份（与 F7 两个破坏性动作"只问不做"的形态同一条口径）。
+enum ManageConfirm {
+    Convert {
+        to_relative: bool,
+        changes: Vec<(String, String)>,
+        skipped: usize,
+    },
+    Delete {
+        uids: Vec<String>,
+    },
 }
 
 // FR-SRC-23【2026-10-17 修订】：无匹配 Enter 已从「直接运行兜底」改为弹 AddDialog 预填入库，
@@ -780,6 +800,11 @@ struct LauncherApp {
     /// 批次 F7：设置页「高级」页的破坏性动作确认（Some=确认框开着）。
     /// 按键分支与 Esc 链都要先看它，否则开着确认框还能触发别的快捷键。
     pending_destructive: Option<Destructive>,
+    /// 批次 D5（FR-ACT-09）：「批量管理」页勾选的条目 uid（派生值，不落盘）。
+    /// 转换会改路径 ⇒ uid 跟着变，所以每次转换/删除之后都要清空这份勾选。
+    manage_checked: std::collections::BTreeSet<String>,
+    /// 批次 D5：「批量管理」页的确认框（转换 / 删除，Some=开着）。
+    manage_confirm: Option<ManageConfirm>,
     /// 批次 F6：顶栏 ☰ 主菜单是否开着（2026-10-24 用户点名「换成一个三条杠的菜单，点击显示
     /// 新建按钮和其他设置按钮」）。用裸 bool 而不是 egui 的 memory：快捷键 Ctrl+M 也要能开它，
     /// `egui::Popup::open_bool` 正好吃这一个所有权，关闭（点击/Esc）由 Popup 写回 `false`。
@@ -1486,6 +1511,19 @@ fn path_state_color(state: source::pathcheck::PathState) -> egui::Color32 {
         source::pathcheck::PathState::NotFound => TOAST_ERR,
         _ => egui::Color32::GRAY,
     }
+}
+
+/// 批次 D5：批量管理页的行内路径按字符截断（含省略号）。
+///
+/// 不用 `Label::truncate`：那一套靠布局决定刀口，宽窄一变"哪几行被省略"就跟着变；
+/// 这里要的是"一屏扫下来都一样长"的稳定观感，完整路径走悬停提示。
+fn shorten_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    let mut out: String = path.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 // ---- FR-SRC-10 / FR-SRC-11 结果行并入列表的行模型（批次 S / T）----
@@ -2765,6 +2803,10 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_CONTROL, 0x4D),             // Ctrl+M ☰ 主菜单（批次 F6：新建按钮换成菜单后给它配的键）
     (HKF_CONTROL, 0x4E),             // Ctrl+N 循环下一项（2026-10-22 从「新建」改为导航）
     (HKF_CONTROL, 0x50),             // Ctrl+P 循环上一项（2026-10-22 从「置顶」改为导航）
+    // 批次 D5（FR-ACT-09）：`Ctrl+B` 进设置页「批量管理」、`Ctrl+R` 在该页重新校验路径。
+    // 两颗都是"窗口内绑了就必须进表"的口径：`RegisterHotKey` 一吞，窗口里那颗键就此失聪。
+    (HKF_CONTROL, 0x42),             // Ctrl+B 设置页·批量管理（批次 D5）
+    (HKF_CONTROL, 0x52),             // Ctrl+R 批量管理·重新校验路径（批次 D5）
     (HKF_CONTROL | HKF_SHIFT, 0x44), // Ctrl+Shift+D 删除选中项
     (HKF_CONTROL | HKF_SHIFT, 0x4E), // Ctrl+Shift+N 新建快捷项
     (HKF_CONTROL | HKF_SHIFT, 0x50), // Ctrl+Shift+P 置顶 / 取消置顶
@@ -3713,6 +3755,8 @@ impl LauncherApp {
             about_open: false,
             help_entry: None,
             pending_destructive: None,
+            manage_checked: std::collections::BTreeSet::new(),
+            manage_confirm: None,
             menu_open: false,
             win_drag: None,
             settings_open,
@@ -4000,14 +4044,15 @@ impl LauncherApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级）。
+    /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观
+    /// 7=高级 8=批量管理）。
     fn open_settings_page(&mut self, page: u32) {
         self.settings_open = true;
         self.settings_tab = match SettingsTab::from_page(page) {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级），落回通用"
+                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级 8=批量管理），落回通用"
                 );
                 SettingsTab::General
             }
@@ -4644,12 +4689,250 @@ impl LauncherApp {
         self.file_exclude_edit = None;
     }
 
+    /// 批次 D5（FR-ACT-09）：设置页第 8 页「批量管理」。
+    ///
+    /// 三件事：勾选批量删（只删清单条目，不动磁盘文件）、失效项校验（复用 FR-SRC-06 的四态）
+    /// 生成勾选清单、exe 目录内的绝对路径 ↔ `%LAUNCHER_DIR%` 批量互转（先确认、报条数）。
+    /// 转换只改 `path` 一格——参数与工作目录说的是"这条命令怎么跑"，换台机器不该跟着变。
+    ///
+    /// 两处与需求书原文的偏差登记在这里：原文的便携写法是 `.\`，本仓写成 `%LAUNCHER_DIR%`
+    /// （`.\` 认的是进程当前目录，而本程序从不 `SetCurrentDirectory`，同一份清单会时灵时不灵，
+    /// 详见 `src/source/manage.rs` 顶部）；反向转换两种写法都认。
+    fn manage_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("批量管理").strong());
+        ui.label(
+            egui::RichText::new(
+                "勾选任意条目 → 转换路径或删除。删除只从清单里移除，不删磁盘文件。\n\
+                 状态列沿用主界面那套四态：`-`＝不检查（网址 / 内置动作 / 含 {query}），\
+                 `Offline`＝盘或网络位置不可达（拔掉的 U 盘、断线的共享），它不等于「文件找不到」，\
+                 「只选失效项」也不会勾它。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(4.0);
+
+        // Ctrl+R：重跑一遍四态检查。这一页的状态列就是现场，等三秒的兜底间隔不够用。
+        // 确认框开着时不取键：那会儿 Enter/Esc 归它，重跑一轮只会让确认框里的计划与现实脱节。
+        let hit_recheck = self.manage_confirm.is_none()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::R));
+        let mut select_all = false;
+        let mut clear_sel = false;
+        let mut select_broken = false;
+        let mut recheck = hit_recheck;
+        ui.horizontal(|ui| {
+            if ui.button("全选").clicked() {
+                select_all = true;
+            }
+            if ui.add_enabled(!self.manage_checked.is_empty(), egui::Button::new("清空选择")).clicked() {
+                clear_sel = true;
+            }
+            if ui
+                .button("只选失效项")
+                .on_hover_text("只勾「Not found」的行；Offline 不算——那是介质不在，条目本身没写错")
+                .clicked()
+            {
+                select_broken = true;
+            }
+            if ui
+                .button("重新校验 (Ctrl+R)")
+                .on_hover_text("重跑一遍四态检查；断开的网络盘可能要等几秒")
+                .clicked()
+            {
+                recheck = true;
+            }
+            ui.label(
+                egui::RichText::new(format!("已勾选 {} 条", self.manage_checked.len()))
+                    .weak()
+                    .small(),
+            );
+        });
+
+        if select_all {
+            for it in &self.items {
+                self.manage_checked.insert(it.uid());
+            }
+        }
+        if clear_sel {
+            self.manage_checked.clear();
+        }
+        if select_broken {
+            let mut hit = 0usize;
+            for it in &self.items {
+                let uid = it.uid();
+                if self.path_states.get(&uid) == Some(&source::pathcheck::PathState::NotFound) {
+                    self.manage_checked.insert(uid);
+                    hit += 1;
+                }
+            }
+            if hit == 0 {
+                self.toast = Some((
+                    "没有查到失效项（Offline 不算失效）".to_string(),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_OK,
+                ));
+                ui.ctx().request_repaint_after(TOAST_TTL);
+            }
+            eprintln!("批量管理：只选失效项 → 勾上 {hit} 条");
+        }
+        if recheck {
+            if self.path_in_flight {
+                // 上一轮还没回来（UNC 断线能把检查线程挂很久）：不攒线程，也不假装在跑。
+                self.toast = Some((
+                    "上一轮校验还没回来，稍等".to_string(),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_ERR,
+                ));
+                ui.ctx().request_repaint_after(TOAST_TTL);
+            } else {
+                self.refresh_path_states(true);
+                eprintln!("批量管理：重新校验路径（{} 条）", self.items.len());
+            }
+        }
+
+        if self.items.is_empty() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("清单是空的：先在主界面按 Ctrl+Shift+N 新建，或 Ctrl+I 批量导入。")
+                    .weak()
+                    .small(),
+            );
+            return;
+        }
+
+        // 快照出行（uid + 显示用字段 + 四态）。下面循环里只动局部变量，回填放循环之后——
+        // 边迭代 `self.items` 边改 `self.manage_checked` 借不过去。
+        let rows: Vec<(String, String, String, source::pathcheck::PathState)> = self
+            .items
+            .iter()
+            .map(|it| {
+                let uid = it.uid();
+                let state = self.path_states.get(&uid).copied().unwrap_or_default();
+                (uid, it.name.clone(), it.path.clone(), state)
+            })
+            .collect();
+        let mut toggles: Vec<(String, bool)> = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt("manage_rows")
+            .max_height(260.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (uid, name, path, state) in &rows {
+                    ui.horizontal(|ui| {
+                        let mut on = self.manage_checked.contains(uid);
+                        if ui.checkbox(&mut on, "").changed() {
+                            toggles.push((uid.clone(), on));
+                        }
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(64.0, 18.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(state.label())
+                                        .small()
+                                        .color(path_state_color(*state)),
+                                );
+                            },
+                        );
+                        ui.label(name.as_str());
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(shorten_path(path, 64)).weak().small(),
+                        ))
+                        .on_hover_text(path.as_str());
+                    });
+                }
+            });
+        for (uid, on) in toggles {
+            if on {
+                self.manage_checked.insert(uid);
+            } else {
+                self.manage_checked.remove(&uid);
+            }
+        }
+
+        ui.separator();
+        let checked_n = self.manage_checked.len();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.display().to_string()))
+            .unwrap_or_default();
+        let mut convert: Option<bool> = None;
+        let mut ask_delete = false;
+        ui.horizontal(|ui| {
+            let some = checked_n > 0;
+            if ui
+                .add_enabled(some, egui::Button::new("转为相对路径…"))
+                .on_hover_text(format!(
+                    "把 {exe_dir} 下的绝对路径改写成 {}\\…；参数与工作目录不动",
+                    source::manage::LAUNCHER_DIR
+                ))
+                .clicked()
+            {
+                convert = Some(true);
+            }
+            if ui
+                .add_enabled(some, egui::Button::new("转为绝对路径…"))
+                .on_hover_text("把 %LAUNCHER_DIR%\\… 或 .\\… 还原成当前程序目录下的绝对路径")
+                .clicked()
+            {
+                convert = Some(false);
+            }
+            if ui
+                .add_enabled(some, egui::Button::new(format!("删除选中…（{checked_n}）")))
+                .on_hover_text("只从清单里移除这些条目，不删磁盘文件")
+                .clicked()
+            {
+                ask_delete = true;
+            }
+            ui.label(
+                egui::RichText::new(format!("共 {} 条", self.items.len()))
+                    .weak()
+                    .small(),
+            );
+        });
+
+        if let Some(to_relative) = convert {
+            let plan =
+                source::manage::plan(&self.items, &self.manage_checked, &exe_dir, to_relative);
+            if plan.changed() == 0 {
+                self.toast = Some((
+                    format!(
+                        "选中的 {checked_n} 条都不适用{}",
+                        if to_relative { "（不在本程序目录下或已是相对路径）" } else { "（不是相对路径写法）" }
+                    ),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_ERR,
+                ));
+                ui.ctx().request_repaint_after(TOAST_TTL);
+                eprintln!("批量管理：转换请求落空（{checked_n} 条全部跳过）");
+            } else {
+                self.manage_confirm = Some(ManageConfirm::Convert {
+                    to_relative,
+                    changes: plan.changes,
+                    skipped: plan.skipped,
+                });
+                ui.ctx().request_repaint();
+            }
+        }
+        if ask_delete {
+            self.manage_confirm = Some(ManageConfirm::Delete {
+                uids: self.manage_checked.iter().cloned().collect(),
+            });
+            ui.ctx().request_repaint();
+        }
+    }
+
     /// 设置页（2026-10-17 用户要求，参考 AHK 版设置窗口的左侧分类栏；只立当下有真实选项的分类，
     /// 不做无功能的占位开关）。入口：托盘「设置…」/ `Ctrl+,`；Esc 或「返回搜索」回搜索页。
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         // 换到别的分类 ⇒ 这一页的编辑缓冲作废（回写后丢掉，见 [`finish_file_scope_edits`]）。
         if self.settings_tab != SettingsTab::FileSearch {
             self.finish_file_scope_edits();
+        }
+        // 批次 D5：不在「批量管理」页就把勾选丢掉。uid 派生自路径，别处（IPC 导入、编辑弹窗）
+        // 改过清单之后旧 uid 会变成幽灵——留着它们，转换与删除的条数就对不上了。
+        if self.settings_tab != SettingsTab::Manage {
+            self.manage_checked.clear();
         }
         // 顶栏空白也是拖动手柄（2026-10-18 用户：「顶部输入框右侧点击空白不能拖动，顶部的不是菜单栏吗？」）。
         // 右边界必须取"整行可用宽度"，不能用 `head_row.response.rect.max.x`：横向行的 response 矩形
@@ -4660,6 +4943,7 @@ impl LauncherApp {
         let head_row = ui.horizontal(|ui| {
             if ui.button("← 返回搜索 (Esc)").clicked() {
                 self.settings_open = false;
+                self.manage_checked.clear();
                 self.focus_query = true;
             }
             heading_right = ui.heading("设置").rect.max.x;
@@ -4693,8 +4977,14 @@ impl LauncherApp {
                     ("文件搜索", SettingsTab::FileSearch),
                     ("外观", SettingsTab::Appearance),
                     ("高级", SettingsTab::Advanced),
+                    ("批量管理", SettingsTab::Manage),
                 ] {
                     if ui.selectable_label(self.settings_tab == tab, label).clicked() {
+                        // 批次 D5：进「批量管理」页时强制重跑一轮路径四态——这一页的状态列就是
+                        // 要看的现场，等 3 秒的兜底间隔会让人对着旧结论勾"失效项"。
+                        if tab == SettingsTab::Manage && self.settings_tab != tab {
+                            self.refresh_path_states(true);
+                        }
                         self.settings_tab = tab;
                     }
                 }
@@ -5149,7 +5439,7 @@ impl LauncherApp {
                             });
                             ui.label(
                                 egui::RichText::new(
-                                    "点「录制新热键」后直接按下想要的组合，不需要再点确认：注册成功立刻生效并写进 settings.json；被系统或其它程序占用会照实报错，并自动回到原来那一组（你原来的设置不会被冲掉）。\n可录的键：字母、数字、空格、回车、反引号 ` 和 F1–F24。非 F 键必须带 Ctrl、Alt 或 Win，因为裸 A、Shift+A 都只是打字，挂成全局键等于一路拦你输入。\n裸键只放开 ` 这一个（批次 R，2026-10-20 按你的要求加的）：代价是设成它以后全系统都打不出 ` 了，所以请照下面「补字符热键」那张卡片配一个出口；Shift+` 打出的 ~ 不受影响（本机实测）。录制期间程序会先把当前全局热键临时注销——不然裸 ` 被系统整条吞掉，本程序一个按键都收不到，永远录不成；退出录制（落定 / Esc / 取消按钮 / 关窗 / 隐藏到托盘）立刻装回去，另有一个 30 秒兜底定时器防止卡在注销状态。\nWin 组合键在这里录不了：egui 在 Windows 上不把 Win 当作修饰键传上来（你按 Ctrl 时它给的 command 位就是 Ctrl 的副本）。想要 Win+X，用它下面那张补字符卡片上的复选框。\n本程序自己的组合（Ctrl+N/E/D/I/J/K、Ctrl+Shift+N/D/P、Ctrl+数字、Alt+数字）会先在本地挡一道。全局占用只能靠\"试注册\"发现——Windows 没有枚举别人热键的 API，所以\"没报错\"只代表这一刻系统允许它注册上，不代表全机没人想用这个键。\n还有一点要知道：全局热键是被系统整条吞掉的，设成 Ctrl+A、Ctrl+C 这类常用编辑键，别的程序里那个动作就跟着没了（本程序没绑它们，所以不会在这里拦你，得自己避）。",
+                                    "点「录制新热键」后直接按下想要的组合，不需要再点确认：注册成功立刻生效并写进 settings.json；被系统或其它程序占用会照实报错，并自动回到原来那一组（你原来的设置不会被冲掉）。\n可录的键：字母、数字、空格、回车、反引号 ` 和 F1–F24。非 F 键必须带 Ctrl、Alt 或 Win，因为裸 A、Shift+A 都只是打字，挂成全局键等于一路拦你输入。\n裸键只放开 ` 这一个（批次 R，2026-10-20 按你的要求加的）：代价是设成它以后全系统都打不出 ` 了，所以请照下面「补字符热键」那张卡片配一个出口；Shift+` 打出的 ~ 不受影响（本机实测）。录制期间程序会先把当前全局热键临时注销——不然裸 ` 被系统整条吞掉，本程序一个按键都收不到，永远录不成；退出录制（落定 / Esc / 取消按钮 / 关窗 / 隐藏到托盘）立刻装回去，另有一个 30 秒兜底定时器防止卡在注销状态。\nWin 组合键在这里录不了：egui 在 Windows 上不把 Win 当作修饰键传上来（你按 Ctrl 时它给的 command 位就是 Ctrl 的副本）。想要 Win+X，用它下面那张补字符卡片上的复选框。\n本程序自己的组合（Ctrl+N/E/D/I/J/K/M/L/B/R、Ctrl+Shift+N/D/P、Ctrl+数字、Alt+数字、F1–F4、Alt+Enter）会先在本地挡一道；这张名单不穷尽，以真被挡下来的那一刻的提示为准。全局占用只能靠\"试注册\"发现——Windows 没有枚举别人热键的 API，所以\"没报错\"只代表这一刻系统允许它注册上，不代表全机没人想用这个键。\n还有一点要知道：全局热键是被系统整条吞掉的，设成 Ctrl+A、Ctrl+C 这类常用编辑键，别的程序里那个动作就跟着没了（本程序没绑它们，所以不会在这里拦你，得自己避）。",
                                 )
                                 .weak()
                                 .small(),
@@ -5962,6 +6252,7 @@ impl LauncherApp {
                                 }
                             }
                         }
+                        SettingsTab::Manage => self.manage_ui(ui),
                     });
                 }
             );
@@ -8019,6 +8310,7 @@ impl eframe::App for LauncherApp {
             && self.batch_confirm.is_none()
             && self.internal_confirm.is_none()
             && self.pending_destructive.is_none()
+            && self.manage_confirm.is_none()
             && !self.about_open
             && self.help_entry.is_none()
         {
@@ -8070,6 +8362,10 @@ impl eframe::App for LauncherApp {
             }
             let hit_comma =
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma));
+            // 批次 D5（FR-ACT-09）：`Ctrl+B` 直达设置页「批量管理」。与 F2 同一层取键——设置页
+            // 开着时它也生效（在「外观」页想看一眼失效项，不必先回搜索页）。
+            let hit_ctrl_b =
+                ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B));
             if hit_comma || hit_f2 {
                 self.settings_open = !self.settings_open;
                 self.focus_query = true;
@@ -8085,6 +8381,15 @@ impl eframe::App for LauncherApp {
                         "返回搜索"
                     }
                 );
+                ui.ctx().request_repaint();
+            } else if hit_ctrl_b {
+                // 批次 D5：直达「批量管理」。不进 `!settings_open` 那一档：设置页开着时跳页也要灵。
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::Manage;
+                self.focus_query = true;
+                self.menu_open = false;
+                self.refresh_path_states(true);
+                eprintln!("快捷键 Ctrl+B：设置页「批量管理」");
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
                 // ---- 批次 B8（FR-ACT-10 附录 A）：F3 编辑 · F4 打开配置文件 · Ctrl+C 复制这一行 ----
@@ -9264,7 +9569,7 @@ impl eframe::App for LauncherApp {
                             "文件搜索已关闭——按 Ctrl+, 进设置，在「数据源」页把「文件搜索」打开后再试。",
                         );
                     }
-                    if ui.button("＋ 新建快捷项").clicked() {
+                    if ui.button("＋ 新建快捷项 (Ctrl+Shift+N)").clicked() {
                         self.dialog = Some(DialogState::blank());
                     }
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -9274,7 +9579,7 @@ impl eframe::App for LauncherApp {
                 } else {
                     ui.label(format!("未找到「{}」——按 Enter 或点下方按钮弹出新增窗口", self.query.trim()));
                     // FR-SRC-23（2026-10-17 修订）：无匹配 Enter 不再直接运行，而是弹出预填当前输入的 AddDialog，确定即入库。
-                    if ui.button("＋ 添加为快捷项").clicked() {
+                    if ui.button("＋ 添加为快捷项 (Ctrl+Shift+N)").clicked() {
                         let dq = DialogState::from_input(&self.query);
                         self.dialog = Some(dq);
                     }
@@ -10167,7 +10472,7 @@ impl eframe::App for LauncherApp {
                                     let internal = dg.kind == ItemKind::Internal;
                                     ui.add_enabled_ui(!internal, |ui| {
                                         if ui
-                                            .button("选文件…")
+                                            .button("选文件… (Ctrl+O)")
                                             .on_hover_text(
                                                 "Ctrl+O：命令行＝所选文件，别名/名称按文件名去扩展名",
                                             )
@@ -10176,7 +10481,7 @@ impl eframe::App for LauncherApp {
                                             pick_request = Some(false);
                                         }
                                         if ui
-                                            .button("选目录…")
+                                            .button("选目录… (Ctrl+Shift+O)")
                                             .on_hover_text(
                                                 "Ctrl+Shift+O：命令行＝所选目录，别名/名称按目录末段",
                                             )
@@ -10185,7 +10490,7 @@ impl eframe::App for LauncherApp {
                                             pick_request = Some(true);
                                         }
                                         if ui
-                                            .button("测试执行")
+                                            .button("测试执行 (Ctrl+Enter)")
                                             .on_hover_text(
                                                 "Ctrl+Enter：照当前表单启动一次；窗口不收、不记使用统计",
                                             )
@@ -10264,10 +10569,10 @@ impl eframe::App for LauncherApp {
                             // 按钮贴底：窗口被拉高后不会孤零零吊在表单下面。
                             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                                 ui.horizontal(|ui| {
-                                    if ui.button("确定").clicked() {
+                                    if ui.button("确定 (Enter)").clicked() {
                                         result = DlgResult::Confirm;
                                     }
-                                    if ui.button("取消").clicked() {
+                                    if ui.button("取消 (Esc)").clicked() {
                                         result = DlgResult::Cancel;
                                     }
                                 });
@@ -10689,6 +10994,153 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        // ---- 批次 D5（FR-ACT-09）：「批量管理」页的两种确认（转换 / 删除）----
+        // 与 F7 那两个破坏性动作同形态：这一帧只问，按「确定」那一帧才落盘；Esc 由下方全局分段链处理。
+        // 计划在点按钮那一刻就算好存进来了，所以这里不必重算——报出去的条数就是确认框上那一份。
+        if let Some(pending) = self.manage_confirm.take() {
+            enum ManageResult {
+                Keep,
+                Yes,
+                No,
+            }
+            let (title, confirm_label, warning) = match &pending {
+                ManageConfirm::Convert {
+                    to_relative,
+                    changes,
+                    skipped,
+                } => {
+                    let exe_dir = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                        .unwrap_or_default();
+                    let how = if *to_relative {
+                        format!(
+                            "把命令行写法改成 `{}\\…`（本程序目录：{exe_dir}）",
+                            source::manage::LAUNCHER_DIR
+                        )
+                    } else {
+                        format!("把 `{}\\…` 还原成 {exe_dir} 下的绝对路径", source::manage::LAUNCHER_DIR)
+                    };
+                    (
+                        format!(
+                            "把 {} 条路径改成{}？",
+                            changes.len(),
+                            if *to_relative { "相对写法" } else { "绝对路径" }
+                        ),
+                        "转换 (Enter)".to_string(),
+                        format!(
+                            "{how}。\n另有 {skipped} 条选中但不动：网址 / 内置动作 / 含 {{query}} / 不在本程序目录下 / 已经是目标形态。\n只改命令行这一格（路径），参数、工作目录、别名、置顶与学习统计都原样保留；提交后立刻写盘。"
+                        ),
+                    )
+                }
+                ManageConfirm::Delete { uids } => (
+                    format!("从清单里删除这 {} 条？", uids.len()),
+                    format!("删除 {} 条 (Enter)", uids.len()),
+                    "只把它们从 user_items.json 里移除，不碰磁盘上的文件。\n提交即写盘；要找回只能手工编辑清单或重新导入。"
+                        .to_string(),
+                ),
+            };
+            let modal = egui::Modal::new(egui::Id::new("manage_confirm")).show(
+                ui.ctx(),
+                |ui| {
+                    ui.heading(title);
+                    ui.separator();
+                    ui.label(egui::RichText::new(warning).weak().small());
+                    let mut result = ManageResult::Keep;
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        result = ManageResult::Yes;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(confirm_label).clicked() {
+                            result = ManageResult::Yes;
+                        }
+                        if ui.button("取消 (Esc)").clicked() {
+                            result = ManageResult::No;
+                        }
+                    });
+                    result
+                },
+            );
+            match modal.inner {
+                ManageResult::Yes => match pending {
+                    ManageConfirm::Convert {
+                        to_relative,
+                        changes,
+                        skipped,
+                    } => {
+                        let mut applied = 0usize;
+                        for (uid, new_path) in &changes {
+                            if let Some(pos) = self.items.iter().position(|it| it.uid() == *uid) {
+                                self.items[pos].path = new_path.clone();
+                                applied += 1;
+                            }
+                        }
+                        if applied > 0 {
+                            self.save_items();
+                            self.selected = 0;
+                            self.manage_checked.clear();
+                            self.refresh_path_states(true);
+                            self.toast = Some((
+                                format!(
+                                    "✓ {applied} 条改为{}（{} 条跳过）",
+                                    if to_relative { "相对写法" } else { "绝对路径" },
+                                    skipped
+                                ),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_OK,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                            eprintln!(
+                                "批量管理：转{} → {applied} 条，跳过 {skipped}（路径不落日志）",
+                                if to_relative { "相对写法" } else { "绝对路径" }
+                            );
+                        } else {
+                            // 计划落好之后清单又被别处改过（IPC 导入 / 编辑）。宁可报"没改成"，
+                            // 也不把"改了多少"说成一个自己没验证过的数。
+                            self.toast = Some((
+                                "⚠ 清单已变，这次一条也没改成".to_string(),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_ERR,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                            eprintln!("批量管理：转换落空（计划里的条目已不在清单，未写盘）");
+                        }
+                    }
+                    ManageConfirm::Delete { uids } => {
+                        let before = self.items.len();
+                        self.items.retain(|it| !uids.contains(&it.uid()));
+                        let removed = before - self.items.len();
+                        if removed > 0 {
+                            self.selected = 0;
+                            self.save_items();
+                            self.manage_checked.clear();
+                            self.refresh_path_states(true);
+                            self.toast = Some((
+                                format!("✓ 已从清单删除 {removed} 条（未删磁盘文件）"),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_OK,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                            eprintln!("批量管理：删除 → {removed} 条条目（不删磁盘文件，uid 不落日志）");
+                        } else {
+                            self.toast = Some((
+                                "⚠ 清单已变，这次一条也没删".to_string(),
+                                Instant::now() + TOAST_TTL,
+                                TOAST_ERR,
+                            ));
+                            ui.ctx().request_repaint_after(TOAST_TTL);
+                            eprintln!("批量管理：删除落空（计划里的条目已不在清单）");
+                        }
+                    }
+                },
+                ManageResult::No => {
+                    eprintln!("批量管理确认：按「取消」，未执行");
+                    ui.ctx().request_repaint();
+                }
+                ManageResult::Keep => self.manage_confirm = Some(pending),
+            }
+        }
+
         // ---- 批次 A2：危险内置动作的执行确认（关机 / 重启 / 注销 / 清空回收站）----
         // 与删除确认同形态：这一帧只问，按「执行」那一帧才真的做；Esc 由下方全局分段链处理。
         // 别在这里再调 `should_close()`：它不消费按键，Esc 会同一帧被处理两遍——
@@ -10978,6 +11430,11 @@ impl eframe::App for LauncherApp {
                 self.pending_destructive = None;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
+            } else if self.manage_confirm.is_some() {
+                // 批次 D5：批量管理的确认框。只收框，设置页与勾选都留着（用户想改选再试）。
+                eprintln!("批量管理确认：按 Esc 取消，未执行");
+                self.manage_confirm = None;
+                ui.ctx().request_repaint();
             } else if self.internal_confirm.is_some() {
                 eprintln!("内部确认：按 Esc 取消，未执行");
                 self.internal_confirm = None;
@@ -11015,6 +11472,7 @@ impl eframe::App for LauncherApp {
                 ui.ctx().request_repaint();
             } else if self.settings_open {
                 self.settings_open = false;
+                self.manage_checked.clear();
                 self.focus_query = true;
                 ui.ctx().request_repaint();
             } else if self.panel.is_some() {
@@ -11358,6 +11816,18 @@ mod nav_tests {
     // 录制路径不许产出 Win 位，运行期没人读它"。批次 R 把这个前提推翻了（补字符卡片上的复选框
     // 就在运行期读它），所以改成靠上面那条 glob 带进来。
 
+    /// 批次 D5：行内路径截断按字符算——按字节切会在多字节字符中间下刀，
+    /// 而且"多少字"对用户来说就是字符数，不是字节数。
+    #[test]
+    fn shorten_path_cuts_on_char_boundaries() {
+        assert_eq!(shorten_path(r"C:\a.exe", 64), r"C:\a.exe");
+        let long = format!(r"C:\{}\x.exe", "工具".repeat(40));
+        let got = shorten_path(&long, 10);
+        assert_eq!(got.chars().count(), 10);
+        assert!(got.ends_with('…'), "截断了要看得出来：{got}");
+        assert!(got.starts_with(r"C:\工"));
+    }
+
     /// 批次 D4（FR-CFG-06）：两条最容易走样的规则钉在这里——①只有"已填了别的值"才问；
     /// ②答「保留」时只保别名/名称，命令行那三格照换（它们是"这条命令到底是什么"）。
     fn d4_fill(path: &str, keyword: &str, name: &str, kind: ItemKind) -> source::import::ImportFill {
@@ -11437,9 +11907,10 @@ mod nav_tests {
     }
 
     /// 批次 D7：插入「文件搜索」第 5 页后外观/高级顺延，`-Preferences 5/6` 语义随之变。
-    /// 这条钉住 1..=7 的整张映射——只测旧值漂没漂是不够的，页号是线性协议，两端都得钉。
+    /// 批次 D5：第 8 页「批量管理」追加在末尾，1–7 一格不动。
+    /// 这条钉住 1..=8 的整张映射——只测旧值漂没漂是不够的，页号是线性协议，两端都得钉。
     #[test]
-    fn settings_tab_page_mapping_covers_one_through_seven() {
+    fn settings_tab_page_mapping_covers_one_through_eight() {
         assert_eq!(SettingsTab::from_page(1), Some(SettingsTab::General));
         assert_eq!(SettingsTab::from_page(2), Some(SettingsTab::Features));
         assert_eq!(SettingsTab::from_page(3), Some(SettingsTab::Hotkeys));
@@ -11447,7 +11918,12 @@ mod nav_tests {
         assert_eq!(SettingsTab::from_page(5), Some(SettingsTab::FileSearch));
         assert_eq!(SettingsTab::from_page(6), Some(SettingsTab::Appearance));
         assert_eq!(SettingsTab::from_page(7), Some(SettingsTab::Advanced));
-        assert_eq!(SettingsTab::from_page(8), None, "越界要给 None，调用方落回通用");
+        assert_eq!(
+            SettingsTab::from_page(8),
+            Some(SettingsTab::Manage),
+            "批次 D5：第 8 页是「批量管理」"
+        );
+        assert_eq!(SettingsTab::from_page(9), None, "越界要给 None，调用方落回通用");
         assert_eq!(SettingsTab::from_page(0), None);
     }
 
@@ -12445,7 +12921,9 @@ mod nav_tests {
         assert!(!HotkeySpec::DEFAULT.conflicts_local(LOCAL_TAKEN));
         // 反向也要钉住：这张表只挡"本程序真绑了的键"，不挡一切眼熟的编辑键。
         // Ctrl+A/Ctrl+Z 之类在本程序里没绑（表里当初多写过四条，全是凭印象），系统空着就该让人用。
-        for vk in [0x41u32, 0x42, 0x48, 0x5A] {
+        // 【批次 D5】`0x42`（Ctrl+B）原本在这份"没绑"名单里；本批把它绑成"进设置页「批量管理」"
+        // 之后从名单里挪走，改成下面的正向断言（与批次 F6 的 Ctrl+M 同一条路径）。
+        for vk in [0x41u32, 0x48, 0x5A] {
             assert!(
                 !HotkeySpec {
                     mods: HKF_CONTROL | HKF_NOREPEAT,
@@ -12453,6 +12931,19 @@ mod nav_tests {
                 }
                 .conflicts_local(LOCAL_TAKEN),
                 "Ctrl+{} 本程序没绑，不该出现在表里",
+                char::from_u32(vk).unwrap()
+            );
+        }
+        // 批次 D5（FR-ACT-09）：窗口内绑了就进表，否则用户能把它录成全局键 ⇒ `RegisterHotKey`
+        // 整条吞掉 ⇒ 窗口里那颗键静默失效（与批次 B8 的 Ctrl+C 同型代价）。
+        for vk in [0x42u32, 0x52] {
+            assert!(
+                HotkeySpec {
+                    mods: HKF_CONTROL | HKF_NOREPEAT,
+                    vk
+                }
+                .conflicts_local(LOCAL_TAKEN),
+                "Ctrl+{} 批次 D5 已绑定，必须被本地表挡住",
                 char::from_u32(vk).unwrap()
             );
         }

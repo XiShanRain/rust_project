@@ -92,9 +92,10 @@ mod tests {
     #[test]
     fn preferences_reads_next_number() {
         assert_eq!(parse_strs(&["-Preferences", "2"]).preferences, Some(2));
+        // 【批次 D5】这里原来拿 8 当"越界"样例，第 8 页「批量管理」落地后 8 是合法页 ⇒ 改 9。
         assert_eq!(
-            parse_strs(&["-Preferences", "8"]).preferences,
-            Some(8),
+            parse_strs(&["-Preferences", "9"]).preferences,
+            Some(9),
             "越界页码由调用方落回"
         );
     }
