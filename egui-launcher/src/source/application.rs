@@ -23,6 +23,7 @@ use std::thread;
 use super::params;
 use super::usage::UsageStats;
 use super::websearch;
+use crate::dbltap::DblTap;
 use crate::source::{DataSource, SearchCtx, SourceId};
 use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
@@ -465,6 +466,8 @@ fn settings_from_map(
     take_field!(map, s, "", learn_rank, LearnRank);
     take_field!(map, s, "", toggle_hotkey, HotkeySpec);
     take_field!(map, s, "", typeback_hotkey, Option<HotkeySpec>);
+    take_field!(map, s, "", extra_hotkey, Option<HotkeySpec>);
+    take_field!(map, s, "", dbl_tap, DblTap);
     take_field!(map, s, "", secondary_action, SecondaryAction);
     take_field!(map, s, "", secondary_hotkey, HotkeySpec);
     take_field!(
@@ -474,6 +477,11 @@ fn settings_from_map(
         web_engines,
         Vec<crate::source::websearch::WebEngine>
     );
+    // 【2026-10-29 批次 G1 补漏】`web_fallback` 是批次 D2 加的，**当时漏了这一行**：
+    // 症状是设置页选完兜底引擎、写进 settings.json 之后，下次启动读盘又回到出厂三连
+    //（这一格永远保持 `Default`），而 `every_settings_field_is_read_from_a_full_file`
+    // 当时也没点名它，所以 368 条全绿。本条与那条测试一起补上。
+    take_field!(map, s, "", web_fallback, Vec<String>);
     take_field!(map, s, "", seed_round, u32);
     take_field!(map, s, "", sources_off, Vec<String>);
     take_field!(map, s, "", hidden, Vec<String>);
@@ -742,6 +750,25 @@ pub struct AppSettings {
     #[serde(default)]
     pub typeback_hotkey: Option<HotkeySpec>,
 
+    /// 副呼出热键（批次 G1：需求书 FR-WIN-02 的「次热键」`Alt+R`，AHK 版
+    /// `AppSettings.ahk:255` 的 `SecondaryHotkey`）。与 [`AppSettings::toggle_hotkey`]
+    /// **做同一件事**——按下去切换显示/隐藏，只是换了一颗键。`None` = 不用这个键。
+    ///
+    /// 与 [`AppSettings::secondary_hotkey`] **不是一回事**：那一格是"窗口内次级动作键"
+    /// （`Ctrl+Enter`），只在搜索页有焦点时生效、不注册给系统。名字里的 `extra` 就是为了一行看穿这点。
+    ///
+    /// 兜底值必须显式指定（同 [`AppSettings::secondary_hotkey`] 那条理由）：
+    /// `#[serde(default)]` 只会调 `HotkeySpec::default()`，那是**呼出**键 `Ctrl+Alt+Space`
+    /// ⇒ 旧配置文件读出来会得到"副呼出键 = 主呼出键"，同组注册必失败（1409），
+    /// 而且用户会看到"被别的程序占用"——占用者是我们自己。
+    #[serde(default = "extra_hotkey_default")]
+    pub extra_hotkey: Option<HotkeySpec>,
+
+    /// 双击呼出用哪颗修饰键（批次 G1：需求书 FR-WIN-03，出厂关）。
+    /// 连按两下 `Ctrl` / `Shift` 当一次呼出，语义与判据全在 [`crate::dbltap`]。
+    #[serde(default)]
+    pub dbl_tap: DblTap,
+
     /// 次级动作的形态（批次 E3-丙，2026-10-26 用户正文「快捷键版和面板版两个都做，设置中加一个
     /// 配置，默认快捷键版，用户可以更改配置选择"面板版"」）。见 [`SecondaryAction`]。
     #[serde(default)]
@@ -907,6 +934,8 @@ impl Default for AppSettings {
             learn_rank: LearnRank::default(),
             toggle_hotkey: HotkeySpec::default(),
             typeback_hotkey: None,
+            extra_hotkey: Some(HotkeySpec::EXTRA_DEFAULT),
+            dbl_tap: DblTap::default(),
             secondary_action: SecondaryAction::default(),
             secondary_hotkey: HotkeySpec::SECONDARY_DEFAULT,
             web_engines: crate::source::websearch::builtin_engines(),
@@ -1065,6 +1094,8 @@ pub const VK_0: u32 = 0x30;
 pub const VK_9: u32 = 0x39;
 pub const VK_A: u32 = 0x41;
 pub const VK_Z: u32 = 0x5A;
+/// 批次 G1：副呼出热键的出厂键 `Alt+R` 里的 `R`。
+pub const VK_R: u32 = 0x52;
 pub const VK_F1: u32 = 0x70;
 pub const VK_F24: u32 = 0x87;
 pub const VK_DELETE: u32 = 0x2E;
@@ -1103,6 +1134,15 @@ impl HotkeySpec {
     pub const SECONDARY_DEFAULT: Self = Self {
         mods: HKF_CONTROL | HKF_NOREPEAT,
         vk: VK_RETURN,
+    };
+
+    /// 批次 G1（FR-WIN-02 的「次热键」）：副呼出热键的出厂值 = `Alt+R`（AHK 版
+    /// `AppSettings.ahk:255` 的 `SecondaryHotkey "!r"`）。
+    /// **与 [`Self::SECONDARY_DEFAULT`] 不是一回事**：那一格是窗口内次级动作（`Ctrl+Enter`），
+    /// 这一格是**第二个全局呼出键**，按下去与主呼出键做同一件事。
+    pub const EXTRA_DEFAULT: Self = Self {
+        mods: HKF_ALT | HKF_NOREPEAT,
+        vk: VK_R,
     };
 
     /// 去掉 [`HKF_NOREPEAT`]：它是行为位，不是键名的一部分，比对与展示都要剥掉它。
@@ -1192,6 +1232,29 @@ impl HotkeySpec {
         Ok(())
     }
 
+    /// 副呼出热键（[`AppSettings::extra_hotkey`]，批次 G1）专用的判据：先过 [`check`](Self::check)，
+    /// 再补两条只有这一格才有的规矩。与 [`check_typeback`](Self::check_typeback) 同型，理由也一样：
+    /// 这两条是纯判据，放在调用点就只能靠真机试注册才看得见。
+    pub fn check_extra(
+        &self,
+        toggle: &HotkeySpec,
+        typeback: Option<&HotkeySpec>,
+    ) -> Result<(), &'static str> {
+        self.check()?;
+        if self.mods_named() == 0 {
+            return Err("副呼出热键必须带修饰键：裸键会把那一颗键从全系统吞掉");
+        }
+        if (self.mods_named(), self.vk) == (toggle.mods_named(), toggle.vk) {
+            return Err("副呼出热键不能和呼出热键是同一组：系统只会把它当成呼出键");
+        }
+        if let Some(tb) = typeback {
+            if (self.mods_named(), self.vk) == (tb.mods_named(), tb.vk) {
+                return Err("副呼出热键不能和补字符热键同一组：同组时系统只认先注册的那一个");
+            }
+        }
+        Ok(())
+    }
+
     /// 撞上本程序自己的键表（新建 / 编辑 / 删除 / 导航 / 数字行…）。
     pub fn conflicts_local(&self, table: &[(u32, u32)]) -> bool {
         let mine = (self.mods_named(), self.vk);
@@ -1246,6 +1309,12 @@ impl Default for HotkeySpec {
 /// 只会调 `Default::default()`（= 呼出键 Ctrl+Alt+Space），两者不是同一个值。
 fn secondary_hotkey_default() -> HotkeySpec {
     HotkeySpec::SECONDARY_DEFAULT
+}
+
+/// `AppSettings::extra_hotkey` 的 serde 兜底（批次 G1）。同一个坑：`#[serde(default)]`
+/// 会给 `None`（＝旧配置读出来副呼出键没了），而工厂值 `Alt+R` 是需求书 FR-WIN-02 点名的次热键。
+fn extra_hotkey_default() -> Option<HotkeySpec> {
+    Some(HotkeySpec::EXTRA_DEFAULT)
 }
 
 /// VK → 展示名。范围外的码原样写成 `VK#xNN`，让日志里看得见"没映射到"而不是显示空白。
@@ -2437,11 +2506,15 @@ pub fn reset_learning(items: &mut [LaunchItem]) -> usize {
 
 /// 批次 F7（FR-CFG-08）：恢复默认**只重置偏好里的口径类字段**，用户资产一概不动。
 ///
-/// 保留：`toggle_hotkey` / `typeback_hotkey` / `secondary_hotkey`（热键三格——按哪颗键是用户的
-/// 手感，不该被"恢复默认"改掉）、`web_engines`（自定义引擎）、
+/// 保留：`toggle_hotkey` / `typeback_hotkey` / `extra_hotkey` / `secondary_hotkey`（热键四格——
+/// 按哪颗键是用户的手感，不该被"恢复默认"改掉）、`dbl_tap`（双击呼出用哪颗修饰键，同一条理由）、
+/// `web_engines`（自定义引擎）、
 /// `hidden` 与 `hidden_stash`（被隐藏的条目及其快照）、`seed_round`（已补种到第几轮——重置它会让下一轮启动
 /// 把用户删掉的出厂条目整批复活）。`user_items.json` 里的自定义命令、置顶、学习统计、
 /// 分类标签也不经过这里。
+///
+/// 【2026-10-29 批次 G1：原写「热键三格」，新增 `extra_hotkey` 与 `dbl_tap` 之后是四格 + 一档。
+/// 下面这个函数体**没有** `*_hotkey` / `dbl_tap` 的赋值行就是"保留"的实现，别当成漏写。】
 pub fn restore_defaults(s: &mut AppSettings) {
     s.space_to_run = SpaceRun::default();
     s.tab_mode = TabMode::default();
@@ -4948,6 +5021,47 @@ mod hotkey_tests {
         assert!(bad.contains("只收"), "实得：{bad}");
     }
 
+    /// 批次 G1：副呼出热键的判据。形状与 `check_typeback` 同一套，多出来的是
+    /// "不许与补字符键同组"这条反向检查——同线程同 vk+修饰只能注册一次。
+    #[test]
+    fn extra_hotkey_must_be_modified_and_distinct() {
+        let bt = |mods, code| HotkeySpec { mods, vk: code };
+        let toggle = HotkeySpec::DEFAULT;
+        let typeback = HotkeySpec {
+            mods: HKF_WIN | HKF_NOREPEAT,
+            vk: VK_OEM_3,
+        };
+        // 出厂值自己必须是合法的一格（否则用户一次都没改过就报错）。
+        assert!(
+            HotkeySpec::EXTRA_DEFAULT
+                .check_extra(&toggle, Some(&typeback))
+                .is_ok(),
+            "Alt+R 必须过判据"
+        );
+        // 裸键：全系统都会被吞掉，与补字符键那条同一个理由。
+        let bare = bt(0, VK_OEM_3)
+            .check_extra(&toggle, Some(&typeback))
+            .unwrap_err();
+        assert!(bare.contains("必须带修饰键"), "实得：{bare}");
+        // 与主呼出键同组（比对剥 NOREPEAT）。
+        let same_toggle = bt(HKF_CONTROL | HKF_ALT, VK_SPACE)
+            .check_extra(&toggle, Some(&typeback))
+            .unwrap_err();
+        assert!(same_toggle.contains("呼出热键"), "实得：{same_toggle}");
+        // 与补字符键同组。
+        let same_typeback = bt(HKF_WIN, VK_OEM_3)
+            .check_extra(&toggle, Some(&typeback))
+            .unwrap_err();
+        assert!(same_typeback.contains("补字符"), "实得：{same_typeback}");
+        // 没启用补字符键时那条检查不生效（`None` = 这一格空着）。
+        assert!(bt(HKF_WIN, VK_OEM_3).check_extra(&toggle, None).is_ok());
+        // 先过 check()：单带 Shift 仍然挡。
+        let shift_only = bt(HKF_SHIFT, VK_R)
+            .check_extra(&toggle, Some(&typeback))
+            .unwrap_err();
+        assert!(shift_only.contains("Shift"), "实得：{shift_only}");
+    }
+
     #[test]
     fn local_conflict_table_matches_on_mods_ignoring_norepeat() {
         // 判据表里存的 mods 带不带 NOREPEAT 都必须认得出来（注册端恒带、录制端不带）。
@@ -5067,6 +5181,14 @@ mod hotkey_tests {
             HotkeySpec::SECONDARY_DEFAULT,
             "缺字段按 FR-ACT-01 原文的 Ctrl+Enter"
         );
+        // 批次 G1：老文件里没有这两格 ⇒ 副呼出键必须是 Alt+R（不是 None，也不是呼出键），
+        // 双击呼出必须是关。
+        assert_eq!(
+            s.extra_hotkey,
+            Some(HotkeySpec::EXTRA_DEFAULT),
+            "缺字段按 FR-WIN-02 的次热键 Alt+R"
+        );
+        assert_eq!(s.dbl_tap, DblTap::Off, "缺字段 = 不用双击呼出");
 
         let custom = AppSettings {
             toggle_hotkey: HotkeySpec {
@@ -5077,6 +5199,8 @@ mod hotkey_tests {
                 mods: HKF_WIN | HKF_NOREPEAT,
                 vk: VK_OEM_3,
             }),
+            extra_hotkey: Some(HotkeySpec::EXTRA_DEFAULT),
+            dbl_tap: DblTap::Ctrl,
             ..AppSettings::default()
         };
         let json = serde_json::to_string(&custom).unwrap();
@@ -5092,6 +5216,18 @@ mod hotkey_tests {
         let back: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.toggle_hotkey, custom.toggle_hotkey);
         assert_eq!(back.typeback_hotkey, custom.typeback_hotkey);
+        // 批次 G1：副呼出键是 `Option`（`None` = 不用），写法与补字符键同一形态；
+        // 双击档位落盘用稳定名。
+        assert!(
+            json.contains("\"extra_hotkey\":{\"mods\":16385,\"vk\":82}"),
+            "Alt+R = HKF_ALT 1 | HKF_NOREPEAT 16384 = 16385，vk 82，实得：{json}"
+        );
+        assert!(
+            json.contains(r#""dbl_tap":"ctrl""#),
+            "双击档位写成稳定名 ctrl，实得：{json}"
+        );
+        assert_eq!(back.extra_hotkey, custom.extra_hotkey);
+        assert_eq!(back.dbl_tap, custom.dbl_tap);
         // 次级动作形态落盘用稳定名（批次 E3-丙）。
         assert!(
             json.contains(r#""secondary_action":"shortcut""#),
@@ -5327,6 +5463,12 @@ mod config_tests {
             vk: VK_SPACE,
         };
         x.typeback_hotkey = Some(HotkeySpec::DEFAULT);
+        // 批次 G1 的两格。
+        x.extra_hotkey = Some(HotkeySpec {
+            mods: HKF_WIN | HKF_CONTROL | HKF_NOREPEAT,
+            vk: 0x77, // F8
+        });
+        x.dbl_tap = DblTap::Shift;
         // 批次 E3 加的两格当时只进了 `settings_field_defaults_when_absent_and_round_trips`，
         // 而那条走的是 serde 派生（`from_slice`），**不经过 `take_field!` 这张表**——
         // 表里漏一行时的症状是"这两格永远回默认"，那条测试一点感觉都没有。
@@ -5337,6 +5479,9 @@ mod config_tests {
             vk: 0x78, // F9：录制端不会拒的组合，免得测试值本身是个反例
         };
         x.web_engines.truncate(2);
+        // 批次 D2 加的兜底序列——**当时漏了 take_field! 那一行**（批次 G1 补漏）。
+        // 这条断言同时是 D2 的回归护栏：缺行时这一格读回来是出厂三连，长度对不上。
+        x.web_fallback = vec!["bd".to_string()];
         x.seed_round = 7;
         x.sources_off = vec!["files".to_string(), "system".to_string()];
         x.hidden = vec!["custom:command|a.exe|".to_string()];
@@ -5386,7 +5531,17 @@ mod config_tests {
             },
             "secondary_hotkey"
         );
+        assert_eq!(
+            got.extra_hotkey,
+            Some(HotkeySpec {
+                mods: HKF_WIN | HKF_CONTROL | HKF_NOREPEAT,
+                vk: 0x77
+            }),
+            "extra_hotkey（批次 G1）"
+        );
+        assert_eq!(got.dbl_tap, DblTap::Shift, "dbl_tap（批次 G1）");
         assert_eq!(got.web_engines.len(), 2, "web_engines");
+        assert_eq!(got.web_fallback, vec!["bd".to_string()], "web_fallback");
         assert_eq!(got.seed_round, 7, "seed_round");
         assert_eq!(got.sources_off.len(), 2, "sources_off");
         assert_eq!(got.hidden.len(), 1, "hidden");

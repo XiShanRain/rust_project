@@ -905,6 +905,34 @@ pub const ENTRIES: &[CheatEntry] = &[
         source: None,
         settings_page: Some(3),
     },
+    CheatEntry {
+        key: "Alt+R",
+        title: "副呼出热键",
+        summary: "第二颗呼出键，效果与主呼出键相同；设置页可改、可清除",
+        detail: "出厂 Alt+R（AHK 版的「次热键」）。设置页「热键」页可录制新组合，也可以清除——\
+                 清掉之后就只剩主呼出键。\n\
+                 与主呼出键同一套规矩：必须带修饰键、不能和主呼出键或补字符键是同一组；\
+                 注册成功才写进 settings.json，失败会照实报错并把原来那颗装回去。",
+        tags: "key hotkey 热键 呼出 副 次 extra",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(3),
+    },
+    CheatEntry {
+        key: "双击 Ctrl / 双击 Shift",
+        title: "双击呼出",
+        summary: "连按两下同一个修饰键切一次显隐（默认关闭）",
+        detail: "设置页「热键」页三档：关闭 / 双击 Ctrl / 双击 Shift，出厂是关闭。\n\
+                 判定口径照 AHK 版：两下之间 400ms 以内才算双击；单次按住超过 300ms 不算\
+                 （那是 Ctrl+C 这类组合键的起手）；两次抬起间隔小于 25ms 的当远控软件 /\
+                 自动化的同步抖动丢掉。左右 Ctrl / Shift 都算，两下可以是不同的那一边。\n\
+                 开启时本程序会挂一个「只旁听、不拦键」的键盘钩子：所有按键照常送到你正在用的\
+                 程序，它只负责数那两下。Shift+CapsLock 这类组合照常工作。",
+        tags: "key 双击 呼出 double tap ctrl shift",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(3),
+    },
     // ---------- 窗口 ----------
     CheatEntry {
         key: "左键拖空白",

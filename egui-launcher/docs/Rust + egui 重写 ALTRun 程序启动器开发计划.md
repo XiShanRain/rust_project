@@ -712,7 +712,7 @@ egui-launcher/
 
 | 编号 | 缺口 | AHK 版 | 规模 | 备注 |
 | --- | --- | --- | --- | --- |
-| G1 | 双击 Ctrl/Shift 呼出 + 副热键 | `DoubleTap = ""\|ctrl\|shift`，400 ms 窗口；副热键 `Alt+R` | M | 本项目只有一条呼出键 + 一条补字符键 |
+| G1 | 双击 Ctrl/Shift 呼出 + 副热键（**已完成**，2026-10-29） | `DoubleTap = ""\|ctrl\|shift`，400 ms 窗口；副热键 `Alt+R` | M | 本项目只有一条呼出键 + 一条补字符键。**落地**：① 新模块 `src/dbltap.rs`（纯函数，`DblTap::{Off,Ctrl,Shift}` + `tap_decision` + `TapTracker`，12 单测逐格复现 AHK `App.ahk:459-490` 判定表；另加需求书要求的 25ms 最小间隔）；② Win32 层 `WH_KEYBOARD_LL` 只旁听、装热键线程、仅非"关闭"档才装，判到双击走 `HOTKEY_TX` 同一漏斗，取键期不认；③ 第三槽 `extra_hotkey`（出厂 `Alt+R` = `HotkeySpec::EXTRA_DEFAULT`，`Option` 存、可清除），`HOTKEY_EXTRA = 3`，`WM_HOTKEY` 与主键同分支；④ 取键期连副键一起摘/装回；三格互不同组（`check_extra` + 两条反向判据），手改配置撞组时启动路径跳过注册；⑤ 设置页「热键」页新增两张卡（副呼出 = 录制/恢复默认/清除；双击 = 三档单选）+ 键表两行；⑥ 「恢复出厂」不碰这两格；⑦ 速查表 65 → **67** 条；⑧ 顺带修掉 D2 遗留缺陷（`web_fallback` 漏在 `take_field!` 表外 ⇒ 兜底搜索顺序每次读盘被静默改回出厂）。`cargo test` **398/398**、零警告；真机矩阵见发布说明第六十七节（**尚未跑**） |
 | G2 | CapsLock 改键 | 按 CapsLock 切中英文 / 按住切换，提权走计划任务 | M | 平台敏感，提权那半不建议照搬 |
 | G3 | 选中内容动作面板 | 全局热键伪造 `Ctrl+C` 取选区 → 按 text/url/file 给动作集 | **L** | 会写用户剪贴板 |
 | G4 | 开机自启改注册表 | 现与 AHK 同为写 `Startup\*.lnk` | S | **已在待裁定清单里**（发布说明第十二节） |

@@ -59,16 +59,19 @@ use windows::Win32::UI::Shell::{
     SIGDN_FILESYSPATH, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ChangeWindowMessageFilterEx, CreateWindowExW,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallNextHookEx, ChangeWindowMessageFilterEx,
+    CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_BROADCAST,
-    HWND_MESSAGE, IsIconic, IsWindow, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
+    GetWindowThreadProcessId, HHOOK, HWND_BROADCAST,
+    HWND_MESSAGE, IsIconic, IsWindow, KBDLLHOOKSTRUCT, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow,
-    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW,
+    SetTimer, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
 };
 
 /// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
@@ -76,9 +79,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const HOTKEY_TOGGLE: i32 = 1;
 /// 补字符热键（批次 R，2026-10-20 用户追加需求）：按下它把被裸键吞掉的那个字符投给焦点窗口。
 const HOTKEY_TYPEBACK: i32 = 2;
+/// 副呼出热键（批次 G1，FR-WIN-02 的「次热键」）：与 `HOTKEY_TOGGLE` **做同一件事**，
+/// 只是换了一颗键（出厂 `Alt+R`）。单独占一个 id 是因为 `WM_HOTKEY` 的 `wparam` 只带 id。
+const HOTKEY_EXTRA: i32 = 3;
 
 mod actions;
 mod cli;
+mod dbltap;
 mod hud;
 mod large_type;
 mod matching;
@@ -100,6 +107,10 @@ use source::application::{
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// 批次 G1（FR-WIN-03）：双击 Ctrl / Shift 的判定是纯函数（`src/dbltap.rs`），
+// 钩子装卸、时间戳与"切一次显隐"的投递在这里。
+use dbltap::{DblTap, TapDecision, TapTracker};
 
 // 批次 A10：行模型与列表计划搬进了数据源层；这里保留旧名，五千行 UI 代码一个字不用改。
 use source::{SearchPlan as Plan, SourceRow as HeadRow};
@@ -1073,6 +1084,13 @@ struct LauncherApp {
     /// 这里只用来保证边沿检测不重复发消息——兜底定时器可能已经把真值改回 false 了，
     /// 那种情况下多发一条 resume 是无害的（`resume_hotkey` 幂等）。
     keypick_suspended: bool,
+    // ---- 批次 G1：FR-WIN-02 的"次热键"（第二个全局呼出键，出厂 `Alt+R`）----
+    /// 系统里此刻真正装着的副呼出键（显示口径）。`None` = 用户清掉了，或注册失败。
+    extra_active: Option<HotkeySpec>,
+    /// 已投递、还没拿到回执的副呼出组合（这段时间禁用"应用/清除"，与另两格同一口径）。
+    extra_awaiting: Option<HotkeySpec>,
+    /// 副呼出的键框正在等一次按键（三格互斥，见 `take_keypick`）。
+    extra_recording: bool,
     // ---- 批次 E3-丙：次级动作键（`Ctrl+Enter` 一类窗口内热键）----
     /// 设置页「次级动作」卡片的键框正在等一次按键。这颗键**不注册给系统**（不占别人的键、
     /// 也不进热键线程），所以不需要 `*_awaiting` / `*_active` 那一套回执；录制完直接落配置。
@@ -3029,6 +3047,12 @@ const WM_APP_RESUME_HOTKEY: u32 = WM_APP + 3;
 /// 「清除补字符热键」。注销也得在热键线程做（`UnregisterHotKey` 按 hwnd 找登记，hwnd 归属
 /// 那条老规矩对注销同样成立），所以 UI 侧同样只能投消息。
 const WM_APP_CLEAR_TYPEBACK: u32 = WM_APP + 4;
+/// 「清除副呼出热键」（批次 G1）。与上面那条同一个理由：注销只能在热键线程做。
+const WM_APP_CLEAR_EXTRA: u32 = WM_APP + 5;
+/// 「双击呼出换档」（批次 G1）。`wparam` = [`dbltap::DblTap::code`]（0 关 / 1 Ctrl / 2 Shift）。
+/// 为什么这件事也要投消息：低级键盘钩子`WH_KEYBOARD_LL` 的回调**跑在装钩子的那条线程**
+/// （系统往它的消息队列里投），所以钩子只能在热键线程装、也只能在热键线程卸。
+const WM_APP_SET_DOUBLE_TAP: u32 = WM_APP + 6;
 /// 暂停的兜底定时器 id 与时长：注销状态一旦漏掉恢复（比如窗口隐藏后 eframe 不再跑 `ui()`，
 /// UI 侧那条边沿检测就永远不执行），全局呼出会一直不可用。定时器挂在消息窗上，
 /// 由热键线程自己的消息循环驱动 ⇒ 与窗口可见与否无关，这条兜底才是真兜底。
@@ -3041,6 +3065,8 @@ const HOTKEY_SUSPEND_TIMEOUT: u32 = 30_000;
 enum HotkeySlot {
     Toggle,
     Typeback,
+    /// 批次 G1：副呼出键（`extra_hotkey`）。
+    Extra,
 }
 
 impl HotkeySlot {
@@ -3048,6 +3074,7 @@ impl HotkeySlot {
         match self {
             Self::Toggle => HOTKEY_TOGGLE,
             Self::Typeback => HOTKEY_TYPEBACK,
+            Self::Extra => HOTKEY_EXTRA,
         }
     }
 
@@ -3056,6 +3083,7 @@ impl HotkeySlot {
         match self {
             Self::Toggle => "全局呼出热键",
             Self::Typeback => "补字符热键",
+            Self::Extra => "副呼出热键",
         }
     }
 
@@ -3064,6 +3092,7 @@ impl HotkeySlot {
         match self {
             Self::Toggle => &HOTKEY_ACTIVE,
             Self::Typeback => &TYPEBACK_ACTIVE,
+            Self::Extra => &EXTRA_ACTIVE,
         }
     }
 }
@@ -3077,6 +3106,16 @@ static HOTKEY_REQUEST: Mutex<Option<(HotkeySlot, HotkeySpec)>> = Mutex::new(None
 static HOTKEY_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
 /// 补字符热键的同一份口径（`None` = 没启用，或启用但注册失败）。
 static TYPEBACK_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
+/// 副呼出键的同一份口径（批次 G1；`None` = 不用，或用了但注册失败）。
+static EXTRA_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
+/// 此刻装着的低级键盘钩子句柄（0 = 没装）。`HHOOK` 是裸指针、不 `Sync`，存数值。
+/// 只有热键线程读写它（装/卸都在 `set_tap_hook` 里，而它只在热键线程被调用）。
+static TAP_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// 双击判定状态。**只有 `keyboard_hook_proc` 与 `set_tap_hook` 在锁它**，两者都跑在热键线程
+/// ⇒ 没有真正的并发等待；写成 `Mutex` 只是因为 `static` 要的是 `Sync`，而 `TapTracker` 有可变状态。
+static TAP_TRACKER: Mutex<TapTracker> = Mutex::new(TapTracker::new(DblTap::Off));
+/// 判定要的是"毫秒数"，钩子回调里每次 `Instant::now()` 差一个共同零点即可。
+static TAP_EPOCH: OnceLock<Instant> = OnceLock::new();
 /// 回执队列而不是单格：批次 R 之后一次启动就可能同时产出两条（主热键退回 + 补字符注册失败），
 /// 单格会互相覆盖，UI 就看不见其中一条。
 static HOTKEY_RESULT: Mutex<Vec<HotkeyOutcome>> = Mutex::new(Vec::new());
@@ -3421,6 +3460,12 @@ fn suspend_hotkey(hwnd: HWND) {
     unsafe {
         if !HOTKEY_SUSPENDED.swap(true, Ordering::Relaxed) {
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
+            // 批次 G1：副呼出键一起摘。理由同主热键——不摘的话录副呼出时按下它自己那颗键
+            // （`Alt+R` 就在出厂值上）会被系统整条吞掉，框里永远收不到一次按键。
+            if hotkey_lock(&EXTRA_ACTIVE).is_some() {
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_EXTRA);
+                eprintln!("hotkey: 取键期间临时注销副呼出键（退出取键时装回）");
+            }
             match *hotkey_lock(&HOTKEY_ACTIVE) {
                 Some(k) => eprintln!(
                     "hotkey: 取键期间临时注销 {}（退出取键或 {}ms 后装回）",
@@ -3449,6 +3494,31 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
         if !HOTKEY_SUSPENDED.swap(false, Ordering::Relaxed) {
             return;
         }
+        // 批次 G1：副呼出键跟着装回。放在主热键那格之前——主热键可能是空的（启动即失败过），
+        // 那时候也得把副呼出装回去，不能被下面那条 `else { return }` 连累。
+        if let Some(e) = *hotkey_lock(&EXTRA_ACTIVE) {
+            match apply_hotkey(hwnd, HotkeySlot::Extra, e) {
+                Ok(()) => {
+                    eprintln!("hotkey: 退出取键（{why}）⇒ 已装回副呼出键 {}", e.display())
+                }
+                Err(err) => {
+                    *hotkey_lock(&EXTRA_ACTIVE) = None;
+                    hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
+                        slot: HotkeySlot::Extra,
+                        tried: e,
+                        err,
+                        now_active: None,
+                    });
+                    eprintln!(
+                        "hotkey: 退出取键（{why}）时装回副呼出键 {} 失败（{err}）",
+                        e.display()
+                    );
+                    if let Some(ctx) = CTX.get() {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
         let Some(k) = *hotkey_lock(&HOTKEY_ACTIVE) else {
             eprintln!("hotkey: 退出取键（{why}），本来就没有装着的全局键");
             return;
@@ -3472,6 +3542,135 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
                 }
             }
         }
+    }
+}
+
+// ---- 批次 G1：双击 Ctrl / Shift 呼出（FR-WIN-03）----
+
+fn tap_lock() -> std::sync::MutexGuard<'static, TapTracker> {
+    // 与 `hotkey_lock` 同一条理由：这把锁只装几个 Copy 小值，临界区内不回调任何代码；
+    // 钩子回调里更不能 panic（那条路径上没有谁来接住它）。
+    TAP_TRACKER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 钩子回调里用的毫秒数（进程内单调）。判定只比较两次调用的差，零点在哪无所谓。
+fn tap_now_ms() -> u32 {
+    TAP_EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u32
+}
+
+/// `WH_KEYBOARD_LL` 的回调。**跑在装钩子的那条线程**（系统把事件投给那条线程的消息队列），
+/// 而系统对它有硬超时（回得太慢会被静默摘钩）⇒ 这里只做三件事：取 vk、喂状态机、
+/// 判到"双击"时走既有的 `HOTKEY_TX` 漏斗。
+///
+/// **绝不在回调里写日志**：那等于把用户的每一次按键都过一遍磁盘。
+/// **也不滤 `LLKHF_INJECTED`**：远控软件与自动化测试发的都是注入键，滤掉就等于把
+/// FR-WIN-03「忽略远控软件的同步抖动」反过来实现（抖动由 25ms 最小间隔那条挡）。
+unsafe extern "system" fn keyboard_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        // 负数 = 系统要求原样往下传，此时 `lparam` 不是 `KBDLLHOOKSTRUCT`。
+        if code < 0 || lparam.0 == 0 {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let is_up = match wparam.0 as u32 {
+            WM_KEYDOWN | WM_SYSKEYDOWN => false,
+            WM_KEYUP | WM_SYSKEYUP => true,
+            _ => return CallNextHookEx(None, code, wparam, lparam),
+        };
+        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let decision = {
+            let mut t = tap_lock();
+            t.on_key(kb.vkCode, is_up, tap_now_ms())
+        };
+        // 取键期（设置页正在录主/副热键）不认双击：那会儿用户按 Ctrl 是在**录组合键**，
+        // 连着按两下不该把窗口藏起来把录制打断。`HOTKEY_SUSPENDED` 也就跑在本线程，读它免费。
+        if decision == TapDecision::Show && !HOTKEY_SUSPENDED.load(Ordering::Relaxed) {
+            // 与主热键**同一条路**（AHK 版双击也是 `SearchWindow.Toggle()`）：
+            // 一边是 `HOTKEY_TX` 的"切一次显隐"，一边要唤醒可能已经隐藏的 UI。
+            if let Some(tx) = HOTKEY_TX.get() {
+                let _ = tx.send(());
+            }
+            if let Some(ctx) = CTX.get() {
+                ctx.request_repaint();
+            }
+        }
+        // 一律放行：这是"旁听"钩子，吞掉任何键都等于把 Ctrl / Shift 从系统里抢走。
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+/// 装 / 卸低级键盘钩子，并把判定状态重置到 `mode`。**只能在热键线程调**。
+///
+/// 只在 `mode != Off` 时装：不装就一个按键事件都看不见，关闭档的代价为零。
+/// 换档但钩子已在时只重置状态、不重装——半下没抬的那颗键因此不可能跨档配对。
+fn set_tap_hook(mode: DblTap) {
+    unsafe {
+        let raw = TAP_HOOK.load(Ordering::Relaxed);
+        if !mode.needs_hook() {
+            if raw != 0 {
+                match UnhookWindowsHookEx(HHOOK(raw as *mut _)) {
+                    Ok(()) => eprintln!("dbltap: 已卸下键盘钩子（双击呼出改为「关闭」）"),
+                    Err(e) => eprintln!("dbltap: 卸下键盘钩子失败：{e}"),
+                }
+                TAP_HOOK.store(0, Ordering::Relaxed);
+            }
+            tap_lock().set_mode(DblTap::Off);
+            return;
+        }
+        tap_lock().set_mode(mode);
+        if raw != 0 {
+            eprintln!(
+                "dbltap: 双击档改为「{}」（钩子已在，判定状态已重置）",
+                mode.label()
+            );
+            return;
+        }
+        let module = match GetModuleHandleW(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("dbltap: GetModuleHandleW 失败：{e} ⇒ 双击呼出不可用");
+                return;
+            }
+        };
+        // `dwThreadId = 0` 的全局钩子必须给 hMod（否则 ERROR_HOOK_NEEDS_HMOD），
+        // 给的就是本 exe 的模块句柄——低级钩子的回调在本进程里跑，所以模块要一直活着。
+        match SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(keyboard_hook_proc),
+            Some(HINSTANCE(module.0)),
+            0,
+        ) {
+            Ok(h) => {
+                TAP_HOOK.store(h.0 as usize, Ordering::Relaxed);
+                eprintln!(
+                    "dbltap: 已装键盘钩子（{}；连按两下切一次显隐）",
+                    mode.label()
+                );
+            }
+            Err(e) => eprintln!("dbltap: 装键盘钩子失败（{e}）⇒ 双击呼出本次不可用"),
+        }
+    }
+}
+
+/// UI → 热键线程：换双击档。消息窗还没建好时丢弃（用户再点一次会重投）。
+fn post_double_tap(mode: DblTap) {
+    let raw = HOTKEY_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        eprintln!("dbltap: 消息窗还没建立，本次换档作废");
+        return;
+    }
+    if let Err(e) = unsafe {
+        PostMessageW(
+            Some(HWND(raw as *mut _)),
+            WM_APP_SET_DOUBLE_TAP,
+            WPARAM(mode.code() as usize),
+            LPARAM(0),
+        )
+    } {
+        eprintln!("dbltap: 换档消息投递失败：{e}");
     }
 }
 
@@ -3563,7 +3762,9 @@ unsafe extern "system" fn hotkey_wndproc(
             // 批次 R 起系统里最多装着两个键，`wparam` 就是注册时那个 id ⇒ 必须按 id 分派，
             // 否则按下补字符键会把窗口弹出来（用户要的是打一个字符）。
             match wparam.0 as i32 {
-                HOTKEY_TOGGLE => {
+                // 批次 G1：「副呼出热键」与主呼出键是同一件事（AHK 版把两个键绑在同一个
+                // `SearchWindow.Toggle()` 上），所以走同一个分支。
+                HOTKEY_TOGGLE | HOTKEY_EXTRA => {
                     if let Some(tx) = HOTKEY_TX.get() {
                         let _ = tx.send(());
                     }
@@ -3595,6 +3796,21 @@ unsafe extern "system" fn hotkey_wndproc(
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TYPEBACK);
             *hotkey_lock(&TYPEBACK_ACTIVE) = None;
             eprintln!("typeback: 已注销补字符热键（设置页「清除」）");
+            return LRESULT(0);
+        }
+        // 批次 G1：清除副呼出键 / 换双击档。两件都只能在本线程做——
+        // 前者是 `UnregisterHotKey` 的 hwnd 归属，后者是低级钩子的线程归属。
+        if msg == WM_APP_CLEAR_EXTRA {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_EXTRA);
+            *hotkey_lock(&EXTRA_ACTIVE) = None;
+            eprintln!("hotkey: 已注销副呼出热键（设置页「清除」）");
+            return LRESULT(0);
+        }
+        if msg == WM_APP_SET_DOUBLE_TAP {
+            match DblTap::from_code(wparam.0 as u32) {
+                Some(mode) => set_tap_hook(mode),
+                None => eprintln!("dbltap: 收到不认识的档位码 {}", wparam.0),
+            }
             return LRESULT(0);
         }
         // FR-WIN-02（批次 Q）：换键。注册/注销只在本线程发生（hwnd 归属），UI 线程只投消息。
@@ -3700,7 +3916,13 @@ unsafe extern "system" fn hotkey_wndproc(
     }
 }
 
-fn spawn_hotkey_thread(tx: mpsc::Sender<()>, configured: HotkeySpec, typeback: Option<HotkeySpec>) {
+fn spawn_hotkey_thread(
+    tx: mpsc::Sender<()>,
+    configured: HotkeySpec,
+    typeback: Option<HotkeySpec>,
+    extra: Option<HotkeySpec>,
+    dbl_tap: DblTap,
+) {
     HOTKEY_TX.set(tx).ok();
     thread::spawn(move || unsafe {
         let module = GetModuleHandleW(None).expect("GetModuleHandleW");
@@ -3818,6 +4040,56 @@ fn spawn_hotkey_thread(tx: mpsc::Sender<()>, configured: HotkeySpec, typeback: O
         }
         // FR-WIN-11：本实例若以管理员运行，普通权限的次进程（再双击 exe、资源管理器「发送到」）
         // 发来的 WM_COPYDATA 会被 UIPI 静默丢弃 ⇒ 只对该消息窗放行 WM_COPYDATA 这一条，
+        // 批次 G1：副呼出热键（`Alt+R`）。与主热键同一件事，但没有"出厂值可退"这一说——
+        // 退了就是又一颗呼出键；失败照实报一条回执（`now_active: None`）。
+        // 与已装着的两颗撞组时**不试注册**：同线程同 vk+修饰只能注册一次，撞出来的是 1409，
+        // 而 1409 在本程序里的含义是"被别的程序占用"——占用者其实是我们自己（手改
+        // `settings.json` 才做得出这种配置）。跳过时只记一行，日志里看得见。
+        if let Some(extra) = extra {
+            let clash = |other: Option<HotkeySpec>| {
+                other.is_some_and(|k| (k.mods_named(), k.vk) == (extra.mods_named(), extra.vk))
+            };
+            let toggle_now = *hotkey_lock(&HOTKEY_ACTIVE);
+            let typeback_now = *hotkey_lock(&TYPEBACK_ACTIVE);
+            if clash(toggle_now) || clash(typeback_now) {
+                eprintln!(
+                    "hotkey: 副呼出热键 {} 与已装着的那颗同组（多半是手改过 settings.json）⇒ 本次跳过，不改配置",
+                    extra.display()
+                );
+            } else {
+                match apply_hotkey(hwnd, HotkeySlot::Extra, extra) {
+                    Ok(()) => {
+                        *hotkey_lock(&EXTRA_ACTIVE) = Some(extra);
+                        eprintln!(
+                            "hotkey: 副呼出热键 {} registered（与主呼出键同效）",
+                            extra.display()
+                        );
+                    }
+                    Err(err) => {
+                        hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
+                            slot: HotkeySlot::Extra,
+                            tried: extra,
+                            err,
+                            now_active: None,
+                        });
+                        eprintln!(
+                            "hotkey: 副呼出热键 {} 注册失败（{err}={}）⇒ 本次不可用，主呼出键不受影响",
+                            extra.display(),
+                            if err == ERROR_HOTKEY_ALREADY_REGISTERED {
+                                "已被占用"
+                            } else {
+                                "其它原因"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        // 批次 G1：双击呼出。钩子必须在**本线程**装（回调跑在装钩子的线程），
+        // 而本线程此刻正好要进 `GetMessageW` 循环 ⇒ 时机就是这里。关闭档不装。
+        set_tap_hook(dbl_tap);
+        // FR-WIN-11：本实例若以管理员运行，普通权限的次进程（再双击 exe、资源管理器「发送到」）
+        // 发来的 WM_COPYDATA 会被 UIPI 静默丢弃 ⇒ 只对该消息窗放行 WM_COPYDATA 这一条，
         // 不放开其它消息、不改完整性级别（放行范围＝这个 hwnd 的消息队列）。
         match ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, None) {
             Ok(()) => {
@@ -3832,6 +4104,9 @@ fn spawn_hotkey_thread(tx: mpsc::Sender<()>, configured: HotkeySpec, typeback: O
         }
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TYPEBACK);
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_EXTRA);
+        // 钩子不摘的话会一直挂在一条已经退出的线程上（系统只在进程结束时收拾）。
+        set_tap_hook(DblTap::Off);
         let _ = KillTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER);
         let _ = DestroyWindow(hwnd);
     });
@@ -4124,6 +4399,7 @@ impl LauncherApp {
         // 所以这三样初值先取出来，不做整串 clone。
         let hotkey_active = prefs.toggle_hotkey;
         let typeback_active = prefs.typeback_hotkey;
+        let extra_active = prefs.extra_hotkey;
         let typeback_draft = prefs.typeback_hotkey.map(|s| HotkeySpec {
             mods: s.mods_named(),
             vk: s.vk,
@@ -4211,6 +4487,10 @@ impl LauncherApp {
             typeback_awaiting: None,
             typeback_armed: false,
             keypick_suspended: false,
+            // 批次 G1：副呼出键同一套口径（先按配置显示，首帧按 EXTRA_ACTIVE 校正）。
+            extra_active,
+            extra_awaiting: None,
+            extra_recording: false,
             secondary_recording: false,
             marked: Vec::new(),
             batch_confirm: None,
@@ -4917,6 +5197,18 @@ impl LauncherApp {
                         }
                         self.hotkey_note(&format!("✓ 补字符热键已设为 {}", on.display()), true);
                     }
+                    HotkeySlot::Extra => {
+                        self.extra_active = Some(on);
+                        self.extra_awaiting = None;
+                        if self.prefs.extra_hotkey != Some(on) {
+                            self.prefs.extra_hotkey = Some(on);
+                            source::application::save_settings(&self.prefs);
+                        }
+                        self.hotkey_note(
+                            &format!("✓ 副呼出热键已设为 {}", on.display()),
+                            true,
+                        );
+                    }
                 },
                 HotkeyOutcome::Rejected {
                     slot,
@@ -4955,6 +5247,20 @@ impl LauncherApp {
                                 false,
                             );
                         }
+                        HotkeySlot::Extra => {
+                            self.extra_awaiting = None;
+                            // 与主热键那格不同，这里 `now_active` 就是真值：副呼出没有"出厂值可退"，
+                            // 线程侧换键失败时已经把原来那颗装回去了（装不回去才是 None）。
+                            self.extra_active = now_active;
+                            let tail = match now_active {
+                                Some(k) => format!("，当前仍是 {}", k.display()),
+                                None => " ⇒ 现在只剩主呼出键".to_string(),
+                            };
+                            self.hotkey_note(
+                                &format!("⚠ 副呼出热键 {} {why}{tail}", tried.display()),
+                                false,
+                            );
+                        }
                     }
                 }
                 HotkeyOutcome::StartupFallback {
@@ -4990,6 +5296,8 @@ impl LauncherApp {
             // 补字符这一格反过来：`None` 也是有效信息（没启用，或启用但注册失败被回执说过了），
             // 所以直接照抄，不做 `if let Some`。
             self.typeback_active = *hotkey_lock(&TYPEBACK_ACTIVE);
+            // 批次 G1：副呼出同理，`None` 也是有效信息（清掉了 / 撞组被跳过 / 注册失败）。
+            self.extra_active = *hotkey_lock(&EXTRA_ACTIVE);
         }
 
         // ③ 取键，④ 边沿通知。
@@ -5000,11 +5308,18 @@ impl LauncherApp {
     /// 取键态下吃掉本帧按键并分派给两个入口之一。互斥是结构自带的：`take_record_press` 会把
     /// 整帧的 Key 事件清空，一帧只可能有一个框拿到键，所以先判谁在等就够了。
     fn take_keypick(&mut self, ui: &mut egui::Ui) {
-        if !self.hotkey_recording && !self.typeback_armed && !self.secondary_recording {
+        if !self.hotkey_recording
+            && !self.typeback_armed
+            && !self.secondary_recording
+            && !self.extra_recording
+        {
             return;
         }
         // 换键请求还悬着（回执未到）时不接受第二次取键，否则会覆盖 REQUEST 槽里的组合。
-        if self.hotkey_awaiting.is_some() || self.typeback_awaiting.is_some() {
+        if self.hotkey_awaiting.is_some()
+            || self.typeback_awaiting.is_some()
+            || self.extra_awaiting.is_some()
+        {
             return;
         }
         let Some((key, m)) = take_record_press(ui) else {
@@ -5082,6 +5397,33 @@ impl LauncherApp {
             }
             return;
         }
+        if self.extra_recording {
+            match key {
+                egui::Key::Escape | egui::Key::Tab => {
+                    self.extra_recording = false;
+                    eprintln!(
+                        "设置页：副呼出键录制取消（按 {}），当前仍是 {}",
+                        if key == egui::Key::Escape { "Esc" } else { "Tab" },
+                        match self.extra_active {
+                            Some(k) => k.display().to_string(),
+                            None => "无".to_string(),
+                        }
+                    );
+                }
+                egui::Key::Backspace | egui::Key::Delete => {
+                    self.extra_recording = false;
+                    eprintln!("设置页：副呼出键收到 Backspace/Delete ⇒ 恢复出厂组合");
+                    self.request_extra(HotkeySpec::EXTRA_DEFAULT);
+                }
+                other => {
+                    let Some(spec) = spec_from_press(other, m) else {
+                        return; // 方向键之类：继续等，不提示（另两格同一口径）
+                    };
+                    self.extra_recording = !self.request_extra(spec);
+                }
+            }
+            return;
+        }
         match key {
             egui::Key::Escape | egui::Key::Tab => {
                 self.hotkey_recording = false;
@@ -5122,7 +5464,9 @@ impl LauncherApp {
     /// 调用点两处：`hotkey_frame` 末尾（正常路径）与 `on_hide`——窗口一隐藏 eframe 就不再跑
     /// `ui()`，边沿检测等不到下一帧，全局呼出会一直停在注销状态（真等不到还有兜底定时器）。
     fn sync_keypick_suspend(&mut self) {
-        let picking = self.hotkey_recording || self.typeback_armed;
+        // 批次 G1：副呼出的录制也进暂停态（`suspend_hotkey` 会把主/副两颗都摘掉）。
+        // `secondary_recording` 不在内：那颗键不注册给系统，摘了也没有意义。
+        let picking = self.hotkey_recording || self.typeback_armed || self.extra_recording;
         if picking == self.keypick_suspended {
             return;
         }
@@ -5174,6 +5518,17 @@ impl LauncherApp {
                 return false;
             }
         }
+        // 批次 G1：第三格同理。反向几条（另两格撞副呼出）在各自的 request_* 里。
+        if let Some(ex) = self.extra_active {
+            if (ex.mods_named(), ex.vk) == (spec.mods_named(), spec.vk) {
+                self.hotkey_note(
+                    &format!("⚠ {show} 正被副呼出热键占着，请先改掉或清除它"),
+                    false,
+                );
+                eprintln!("设置页：热键 {show} 与副呼出热键同组，未采纳");
+                return false;
+            }
+        }
         if spec == self.hotkey_active {
             self.hotkey_note(&format!("ℹ {show} 就是当前热键，未改动"), true);
             eprintln!("设置页：热键 {show} 与当前一致，未改动");
@@ -5201,6 +5556,17 @@ impl LauncherApp {
             self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
             eprintln!("设置页：补字符热键 {show} 与本程序键表冲突，未采纳");
             return false;
+        }
+        // 批次 G1：`check_typeback` 管不到第三格，这里补上（同线程同组只能注册一次）。
+        if let Some(ex) = self.extra_active {
+            if (ex.mods_named(), ex.vk) == (spec.mods_named(), spec.vk) {
+                self.hotkey_note(
+                    &format!("⚠ 补字符热键 {show} 正被副呼出热键占着，请先改掉或清除它"),
+                    false,
+                );
+                eprintln!("设置页：补字符热键 {show} 与副呼出热键同组，未采纳");
+                return false;
+            }
         }
         if self.typeback_active == Some(spec) {
             self.hotkey_note(&format!("ℹ {show} 就是当前补字符热键，未改动"), true);
@@ -5232,6 +5598,48 @@ impl LauncherApp {
         }
         eprintln!("设置页：补字符热键已清除（注销 + settings.json 置空）");
         self.hotkey_note("✓ 已清除补字符热键", true);
+    }
+
+    /// 批次 G1：副呼出热键的"应用"。判据在 `check_extra` 里（带修饰键 + 不许与另两格同组），
+    /// 其余与主热键同一口径：键表预检、同值不动、**只有注册成功才写盘**。
+    fn request_extra(&mut self, spec: HotkeySpec) -> bool {
+        let show = spec.display();
+        if let Err(msg) = spec.check_extra(&self.hotkey_active, self.typeback_active.as_ref()) {
+            self.hotkey_note(&format!("⚠ 副呼出热键 {show}：{msg}"), false);
+            eprintln!("设置页：副呼出热键 {show} 未采纳（{msg}）");
+            return false;
+        }
+        if spec.conflicts_local(LOCAL_TAKEN) {
+            self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
+            eprintln!("设置页：副呼出热键 {show} 与本程序键表冲突，未采纳");
+            return false;
+        }
+        if self.extra_active == Some(spec) {
+            self.hotkey_note(&format!("ℹ {show} 就是当前副呼出热键，未改动"), true);
+            eprintln!("设置页：副呼出热键 {show} 与当前一致，未改动");
+            return false;
+        }
+        if !post_hotkey_request(HotkeySlot::Extra, spec) {
+            self.hotkey_note("⚠ 热键线程还没就绪，请再录一次", false);
+            return false;
+        }
+        self.extra_awaiting = Some(spec);
+        eprintln!("设置页：副呼出热键请求已投递 → {show}（等注册结果）");
+        true
+    }
+
+    /// 批次 G1：「清除」副呼出键 = 只剩主呼出键（与 `clear_typeback` 同形态、不发回执）。
+    fn clear_extra(&mut self) {
+        post_hotkey_signal(WM_APP_CLEAR_EXTRA, "清除副呼出热键");
+        *hotkey_lock(&EXTRA_ACTIVE) = None;
+        self.extra_active = None;
+        self.extra_awaiting = None;
+        self.extra_recording = false;
+        if self.prefs.extra_hotkey.take().is_some() {
+            source::application::save_settings(&self.prefs);
+        }
+        eprintln!("设置页：副呼出热键已清除（注销 + settings.json 置空）");
+        self.hotkey_note("✓ 已清除副呼出热键", true);
     }
 
     /// 热键相关的一条回执提示：统一走 Toast（沿用各操作的 TTL 与配色）。
@@ -6566,6 +6974,94 @@ impl LauncherApp {
                                 .small(),
                             );
                             ui.separator();
+                            // 批次 G1（FR-WIN-02 / 开发计划 §8.7）：第二颗呼出键。形态照上面那张，
+                            // 差别只有"没有出厂值可退"——它出厂就是 Alt+R，清除之后是真的没有。
+                            ui.label(egui::RichText::new("副呼出热键（第二颗呼出键）").strong());
+                            ui.horizontal(|ui| {
+                                let shown = if self.extra_recording {
+                                    "按下新组合…（Esc / Tab 取消，Backspace / Delete 恢复默认）"
+                                        .to_string()
+                                } else if let Some(w) = self.extra_awaiting {
+                                    format!("{} 注册中…", w.display())
+                                } else {
+                                    match self.extra_active {
+                                        Some(k) => k.display().to_string(),
+                                        None => "（未启用）".to_string(),
+                                    }
+                                };
+                                ui.label(egui::RichText::new(shown).monospace());
+                                if ui
+                                    .button(if self.extra_recording {
+                                        "取消录制"
+                                    } else {
+                                        "录制新热键"
+                                    })
+                                    .clicked()
+                                {
+                                    self.extra_recording = !self.extra_recording;
+                                    eprintln!(
+                                        "设置页：副呼出键录制 {}（当前 {}）",
+                                        if self.extra_recording { "开始" } else { "取消" },
+                                        match self.extra_active {
+                                            Some(k) => k.display().to_string(),
+                                            None => "未启用".to_string(),
+                                        }
+                                    );
+                                }
+                                let busy =
+                                    self.extra_recording || self.extra_awaiting.is_some();
+                                ui.add_enabled_ui(!busy, |ui| {
+                                    if ui.button("恢复默认").clicked() {
+                                        self.request_extra(HotkeySpec::EXTRA_DEFAULT);
+                                    }
+                                    if ui.button("清除").clicked() {
+                                        if self.extra_active.is_none()
+                                            && self.prefs.extra_hotkey.is_none()
+                                        {
+                                            self.hotkey_note("ℹ 本来就没有副呼出热键", true);
+                                        } else {
+                                            self.clear_extra();
+                                        }
+                                    }
+                                });
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "出厂是 Alt+R，与你上面那颗主热键一样：按一下就呼出 / 隐藏（AHK 版的「次热键」就是这个）。\n和主热键同一套规矩：必须带修饰键、不能和主热键或补字符热键是同一组；注册成功才写 settings.json，失败会照实报错并把原来那颗装回去。「清除」之后只剩主呼出键，想再要回来点「恢复默认」。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
+                            // 批次 G1（FR-WIN-03）：双击修饰键呼出。AHK `App.ahk` 的同名功能：
+                            // 400ms 窗口、300ms 长按阈值；另按需求书加了 25ms 最小间隔挡远控抖动。
+                            ui.label(egui::RichText::new("双击呼出（连按两下同一个修饰键）").strong());
+                            let mut tap_mode = self.prefs.dbl_tap;
+                            ui.horizontal(|ui| {
+                                for m in DblTap::ALL {
+                                    ui.selectable_value(&mut tap_mode, m, m.label());
+                                }
+                            });
+                            if tap_mode != self.prefs.dbl_tap {
+                                self.prefs.dbl_tap = tap_mode;
+                                source::application::save_settings(&self.prefs);
+                                // 钩子只活在热键线程里（低级键盘钩子的回调跑在装它的线程上），
+                                // 所以这里只投消息，换档与重置判定状态都在那边做。
+                                post_double_tap(tap_mode);
+                                eprintln!(
+                                    "设置页：双击呼出 → {}（已写 settings.json，钩子已换档）",
+                                    tap_mode.as_str()
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "连按两下同一个修饰键切一次显隐（左右 Ctrl / Shift 都算，两下可以是不同的那一边）。\n判定口径：两下之间 400ms 以内才算双击；单次按住超过 300ms 不算（那是组合键的起手，例如 Ctrl+C）；两次抬起间隔小于 25ms 的当成远控软件 / 自动化的同步抖动丢掉。Shift+CapsLock 这类按下修饰键再按别的键照常工作，不会被当成双击。\n默认关闭。开启时本程序会挂一个「只旁听、不拦键」的键盘钩子：所有按键照常送到你正在用的程序，它只负责数那两下。"
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
                             // 批次 R：补字符热键。控件形态照 Delphi 版 frmConfig 的
                             // 「[键框] + ☐Windows / ☑Alt / ☐Ctrl / ☐Shift」（用户 2026-10-20 点名并给了
                             // 截图），分工也一样：左边那个框只管主键，修饰键全走复选框。
@@ -6752,6 +7248,11 @@ impl LauncherApp {
                             );
                             ui.separator();
                             let toggle_key = self.hotkey_active.display();
+                            let extra_key = self
+                                .extra_active
+                                .map(|k| k.display())
+                                .unwrap_or_else(|| "（副呼出未启用）".to_string());
+                            let tap_key = self.prefs.dbl_tap.label();
                             let typeback_key = self
                                 .typeback_active
                                 .map(|t| t.display())
@@ -6760,6 +7261,8 @@ impl LauncherApp {
                             egui::Grid::new("hotkeys_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                                 for (key, desc) in [
                                     (toggle_key.as_str(), "全局呼出 / 隐藏（上一张卡片可改）"),
+                                    (extra_key.as_str(), "副呼出：第二颗呼出键，效果同上（上一张卡片可改、可清除；批次 G1）"),
+                                    (tap_key, "双击呼出：连按两下 Ctrl 或 Shift 切一次显隐（上一张卡片可改；默认关闭）"),
                                     (secondary_key.as_str(), "次级动作：快捷键版直接做一条（文件行定位 / 网页行复制网址 / 文本行粘贴到原窗口），面板版等于 →（上一张卡片可改）"),
                                     (typeback_key.as_str(), "补字符：把呼出键吞掉的那个字符打回焦点窗口（上一张卡片可改）"),
                                     ("↑ / ↓", "选择条目"),
@@ -7538,9 +8041,10 @@ impl LauncherApp {
         // 批次 R：窗口一隐藏，eframe 就不再跑 `ui()` ⇒ `hotkey_frame` 末尾那条边沿检测等不到
         // 下一帧。取键态若还开着，全局呼出会一直停在"临时注销"状态（按了没反应），所以在这里
         // 就地退出取键并把键装回。放在这个函数最前面是因为它下面有一条 `return`。
-        if self.hotkey_recording || self.typeback_armed {
+        if self.hotkey_recording || self.typeback_armed || self.extra_recording {
             self.hotkey_recording = false;
             self.typeback_armed = false;
+            self.extra_recording = false;
             eprintln!("设置页：窗口隐藏 ⇒ 退出取键（录制/选键状态不跨隐藏保留）");
             self.sync_keypick_suspend();
         }
@@ -9581,7 +10085,7 @@ impl eframe::App for LauncherApp {
         // 让"取键时不响应快捷键"这件事读得出来的那道显式保险）。
         // 批次 E3-丙的次级动作键框同理：它录的恰好也是窗口内热键，不挡就会"按什么键都先执行一次"。
         let recording =
-            self.hotkey_recording || self.typeback_armed || self.secondary_recording;
+            self.hotkey_recording || self.typeback_armed || self.secondary_recording || self.extra_recording;
 
         let mut launch: Option<LaunchItem> = None;
         let mut launch_from_list = false;
@@ -13440,6 +13944,8 @@ fn main() -> eframe::Result {
         hotkey_tx,
         configured.toggle_hotkey,
         configured.typeback_hotkey,
+        configured.extra_hotkey,
+        configured.dbl_tap,
     );
 
     // 批次 F1 的主题在这里解析一次：默认窗口高度要按主题行高算（一屏正好 10 行），
