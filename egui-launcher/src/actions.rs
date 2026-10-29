@@ -451,7 +451,7 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
         let (label, sub) = if t.pinned {
             ("取消置顶", "回到按学习排序的位置")
         } else {
-            ("置顶", "恒排在结果前列（📌）")
+            ("置顶", "恒排在结果前列（图标右上角角标）")
         };
         out.push(Action {
             id: ActionId::TogglePin,

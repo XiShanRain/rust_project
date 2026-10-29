@@ -90,7 +90,17 @@ impl Hud {
 
     /// 弹出一条提示。颜色取主题键，尺寸按文本排版结果算（宽 ≤ 520），位置优先贴主窗下方。
     /// 必须在主窗 `ui()` 里调用——要读主窗的 `outer_rect`，也要用主窗的字体排版。
-    pub fn notify(&mut self, ctx: &egui::Context, text: String, theme: &Theme, hold: Duration) {
+    ///
+    /// `fallback` 是「主窗没开时该落到哪块屏」的工作区（物理像素），由调用方按 FR-WIN-09 的
+    /// `show_on` 算好传进来——HUD 自己不认识那个设置。链路见 [`pick_work`]。
+    pub fn notify(
+        &mut self,
+        ctx: &egui::Context,
+        text: String,
+        theme: &Theme,
+        hold: Duration,
+        fallback: Option<egui::Rect>,
+    ) {
         let ppp = ctx.pixels_per_point();
         let host = ctx.input(|i| i.viewport().outer_rect);
 
@@ -106,16 +116,18 @@ impl Hud {
                 .filter(|(_, at)| at.elapsed() < REUSE_SCREEN)
                 .map(|(r, _)| r)
         };
-        let work_phys = host_pt
-            .and_then(monitor_work_at)
-            .or(last)
-            .or_else(|| win_cursor().and_then(monitor_work_at))
-            .unwrap_or_else(|| {
-                let size = ctx
-                    .input(|i| i.viewport().monitor_size)
-                    .unwrap_or(egui::vec2(1280.0, 720.0));
-                egui::Rect::from_min_size(egui::Pos2::ZERO, size * ppp)
-            });
+        let work_phys = pick_work(
+            host_pt.and_then(monitor_work_at),
+            last,
+            fallback,
+            win_cursor().and_then(monitor_work_at),
+        )
+        .unwrap_or_else(|| {
+            let size = ctx
+                .input(|i| i.viewport().monitor_size)
+                .unwrap_or(egui::vec2(1280.0, 720.0));
+            egui::Rect::from_min_size(egui::Pos2::ZERO, size * ppp)
+        });
         let work = egui::Rect::from_min_max(
             egui::pos2(work_phys.min.x / ppp, work_phys.min.y / ppp),
             egui::pos2(work_phys.max.x / ppp, work_phys.max.y / ppp),
@@ -301,6 +313,17 @@ pub(crate) fn monitor_work_at(pt: (i32, i32)) -> Option<egui::Rect> {
     ))
 }
 
+/// 无主窗时按哪块屏摆：主窗所在屏 → 3 秒内上一次用过的屏（「隐藏后沿用同一屏」）
+/// → `show_on` 指定的屏（FR-WIN-09）→ 鼠标所在屏。四个候选取第一个有值的。
+fn pick_work(
+    host: Option<egui::Rect>,
+    last: Option<egui::Rect>,
+    fallback: Option<egui::Rect>,
+    cursor: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    host.or(last).or(fallback).or(cursor)
+}
+
 /// 宽度取文本自然宽，最多 520，且不超出工作区。
 fn hud_width(natural: f32, work_w: f32) -> f32 {
     (natural + 2.0 * PAD + 2.0)
@@ -382,5 +405,19 @@ mod tests {
     #[test]
     fn width_respects_narrow_screen() {
         assert_eq!(hud_width(900.0, 400.0), 400.0 - 2.0 * SCREEN_MARGIN);
+    }
+
+    #[test]
+    fn work_precedence_host_then_last_then_show_on_then_cursor() {
+        let a = host(0.0, 0.0, 1920.0, 1040.0);
+        let b = host(1920.0, 0.0, 1920.0, 1040.0);
+        let c = host(-1920.0, 0.0, 1920.0, 1040.0);
+        let d = host(0.0, -1080.0, 1920.0, 1040.0);
+        assert_eq!(pick_work(Some(a), Some(b), Some(c), Some(d)), Some(a));
+        assert_eq!(pick_work(None, Some(b), Some(c), Some(d)), Some(b));
+        // 主窗没开、3 秒也过了 ⇒ 用 `show_on` 指定的屏，而不是鼠标屏。
+        assert_eq!(pick_work(None, None, Some(c), Some(d)), Some(c));
+        assert_eq!(pick_work(None, None, None, Some(d)), Some(d));
+        assert_eq!(pick_work(None, None, None, None), None);
     }
 }

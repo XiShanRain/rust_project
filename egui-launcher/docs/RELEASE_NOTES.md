@@ -1376,6 +1376,49 @@ AHK 版的 `Ctrl+L` 是「看不清就把这串字放大」，Delphi 版没有�
 
 ---
 
+### 六十五、批次 F3 剩余：`show_on` 三档（鼠标屏 / 主屏 / 活动窗口屏）＋ 落点改存工作区千分比（2026-10-29，用户正文「2. 继续下一计划」）
+
+| 项 | 内容 |
+| --- | --- |
+| 本轮要结的账 | FR-WIN-09 此前只做了半截：`appearance` 里只有一个绝对坐标 `last_pos`，窗口落在哪块屏完全靠手工拖动；FR-UIX-09 的偏差 ⑥ 也一直挂着「HUD 还不知道 `show_on`」。本轮补 `ShowOn = Mouse / Primary / Active` 三档、落点改存**工作区千分比**、老绝对坐标启动时一次性折算，并把 HUD 选屏接到同一套策略上。语义照参考实现抄，不自创：X 分摊「工作区宽 − 窗宽」、**Y 分摊整块工作区高**；每次呼出都重摆，`remember_position` 关着就用默认 500 / 200。 |
+| 数据层（`src/source/application.rs`） | `ShowOn` 带 `as_str`（落盘值 `mouse` / `primary` / `active`）与 `label`（「鼠标所在屏」「主屏」「活动窗口所在屏」）。`Appearance` 新增 `show_on: ShowOn` 与 `pos_rel: Option<[u16; 2]>`，常量 `POS_REL_DEFAULT = [500, 200]`。老的 `last_pos` **字段留着但不写**，只当读取用的遗留，折算完就清空（旧 `settings.json` 里仍带着这个键，留着反序列化最省事）。`Default` 与 `restore_defaults` 一并更新；新增单测 `show_on_defaults_to_the_mouse_screen_and_no_remembered_ratio`。 |
+| 几何纯函数（`src/main.rs`） | `place_in_work(work, size, rel)` 把千分比换算成左上角；`relative_in_work(work, size, pos)` 是它的逆，比例越界或读到 0 时回落 500 / 200，并夹在 0..=1000。`previous_window_center()`：句柄为 0 或窗口已最小化（`IsIconic`）时返回 `None`——最小化的窗口报的是假坐标，不能拿它选屏。`work_for(show_on)`：Primary 直接取 `(0, 0)` 那块（主屏左上角就是虚拟原点），Active 取前窗中心、取不到退光标，Mouse 取光标，三者统一交给 `hud::monitor_work_at`。`work_at_window(hwnd)` 给拖动场景用。四条单测：默认比例居中偏上、比例往返、超大窗口夹紧、负原点工作区。 |
+| 接线（呼出 / 隐藏 / 启动 / 设置页） | `show_now` 是热键、托盘、IPC 三条入口的唯一漏斗，落点排在 `ShowWindow(SW_RESTORE)` **之后**（还原会把最小化窗口挪回系统记的位置，先摆会被覆盖）。`on_hide` 改成存千分比，读坐标前先判 `IsIconic`，与旧值相同就不写盘。启动时 `migrate_legacy_position`：有 `last_pos` 就按当时的窗口尺寸与所在屏折算成千分比、清空旧字段、写盘；设置文件损坏被隔离的那次（`writes_blocked`）只记日志不写盘。`run()` 里那段 `with_position(last_pos)` 删掉，改由 `LauncherApp::new` 末尾统一「先迁移、再首次摆位」。设置页「外观」页新增「呼出落点」下拉，改完立刻按新档位重摆一次窗，当场看得见效果。 |
+| HUD 选屏（偏差 ⑥ 关闭） | `hud::notify` 多收一个 `fallback: Option<egui::Rect>`，优先级链抽成 `pick_work(host, last, fallback, cursor)`：宿主窗口 → 3 秒内的上一次 → 按 `show_on` 算出的那块 → 光标屏。两处 `notify` 调用点都传 `work_for(self.prefs.appearance.show_on)`——HUD 本身不认识设置，屏由调用方给。单测 `work_precedence_host_then_last_then_show_on_then_cursor`。 |
+| 快捷键与速查表 | **没有新增快捷键**：本轮只多一个设置页下拉，按「设置页开关类不另配键」的成规不动；速查表仍 65 条，`grep` 过一遍没有需要改写的条目。 |
+| 验证 | `cargo check --all-targets` **零警告**；`cargo test` **374 / 374**（368 + 新增 6 条：四条几何、一条 HUD 优先级、一条外观默认值）；`cargo build --target-dir target/f3` **零警告**（约 3m12s）。**未跑 `cargo fmt`**（成规）。 |
+| 真机七条（沙箱 `target/f3-verify/`；主屏工作区 (0,0)-(1920,1032)、副屏 (1920,0)-(3840,1032)、窗口 490×486） | ① 启动即折算：旧 `last_pos = [1289, 464]` ⇒ 「旧位置字段（绝对坐标）已折算为工作区 901/1000、450/1000」，紧跟「落点 mouse（901/450，记住的位置）→ (1288, 464)」，与原位置差 1px（取整）；② `remember_position = false` 配 `show_on = primary` ⇒ 「落点 primary（500/200，默认落点）→ (715, 206)」，存着的比例被忽略；③ 光标放副屏、`show_on = mouse` ⇒ (2635, 206)，即 1920 + (1920 − 490) × 50%；④ 光标**仍在副屏**、`show_on = primary` ⇒ (715, 206)，取的是主屏那块而不是光标那块；⑤ 第二实例发命令行让在跑的沙箱呼出 ⇒ 同样 (2635, 206)，走 `show_now` 这条漏斗；⑥ 启动时 `show_on = active` 且没有前窗 ⇒ (2635, 206)，即「前窗取不到就退光标屏」；⑦ 把窗口挪到 (300, 400) → 失焦自动隐藏 → 「记住位置（工作区 210/1000、388/1000）」→ 再呼出 ⇒ 「落点 primary（210/388，记住的位置）→ (300, 400)」。第 ⑦ 条顺带验了 Y 的分母：1032 × 38.8% = 400，若按「工作区高 − 窗高」算只会得到 212。 |
+| 用户环境复原 | 只停沙箱自己的实例（按可执行文件路径挑 PID），**用户的实例全程未动**；沙箱数据是用户 `target/debug` 的副本，跑完核对用户 `settings.json` 仍是 `last_pos [1289, 464]`、没有 `show_on` 键；`%LOCALAPPDATA%\egui-launcher` 与 `target/debug` 全程未写；光标放回主屏 (733, 724)。日志只记档位名、千分比与坐标，没有窗口标题与用户内容。 |
+| 四格审计 | 工作区三份文档报 **5 条**；`git show HEAD:./docs/…` 重建副本报的也是**同 5 条、同一身份**（`RELEASE_NOTES.md` 1075 / 1076 / 1098 的未闭合反引号串、需求书 453 的同族一条、开发计划 674 的 `~~` 个数为奇数；三处正文都在本节插入点之前，行号没漂）⇒ **本节引入 0 条**，五条全是既有缺陷，不动它们。本节落笔后重跑仍是这 5 条（填入本行时已复跑两次：工作区一次、HEAD 副本一次）。 |
+| 还剩什么没验证（别读成全清） | ① HUD 那条「按 `show_on` 选屏」真机没走到——沙箱里 HUD 只命中宿主与上一次两个分支；② 设置页那个下拉**没用人手点过**，七条全靠改 `settings.json` 驱动；③ 真实热键呼出没跑（沙箱走 IPC 与启动两条入口），虽然同走 `show_now`，但没有独立证据；④ `active` 只验到「取不到前窗就退光标屏」这半边，「真的指到呼出前那个窗口」没有证据；⑤ 第 ⑦ 条的位移是 `SetWindowPos` 注入的，不是真人拖拽，`on_hide` 里那条 `IsIconic` 守卫只有代码阅读证据。 |
+| 文档回记 | 需求书 FR-WIN-09 行补落地注记、FR-UIX-09 偏差 ⑥ 标记关闭；开发计划 §8.6 的 F3 行按交付改写；本节。 |
+| 提交 | **未提交**。工作区：`src/hud.rs`、`src/main.rs`、`src/source/application.rs` 三个源码文件 ＋ 三份文档。commit / push 等用户正文原话，不动 git。 |
+
+---
+
+### 六十六、批次 F4：图标精修（规格语法五路 / AND 遮罩 / 缓存换键 + LRU 1500 / 置顶角标）（2026-10-29，用户正文「2. 继续下一计划」＋选项面板裁定：下一批＝F4 图标精修）
+
+| 项 | 内容 |
+| --- | --- |
+| 本轮要结的账 | 开发计划 §8.6 的 F4 行点名四件事：LRU 1500（超限剪到 80%）、AND 遮罩、图标规格语法（`res:dll,-id` / `ext:.pdf` / `thumb:`）、置顶角标；`src/source/icon.rs` 的头注释自陈前两件没做，角标一直是名称前挂一个 `📌`。四件一起收，另把「出厂条目里一大半没有图标源」这条半成品一并补上。 |
+| 数据层纯函数（`src/source/icon.rs`） | `IconSpec` 六态（裸路径 / `Res` / `Ext` / `Url` / `Folder` / `Thumb`）＋ `parse_spec`（前缀大小写不敏感，畸形前缀回落裸路径，不静默吞掉用户手敲的内容）；`cache_key` 照 AHK `_CacheKey` 的口径分组——`exe` / `lnk` / `ico` / `url` / `appref-ms` / `msc` / `cpl` / `scr` 与无扩展名按整条路径，其余按扩展名共用一张纹理；`log_label` 只出文件名或类别，**日志里绝不出目录**；`evict_keys` 按「最近使用时刻升序、同刻按键名」淘汰到 1200 条。常量 `ICON_CACHE_MAX = 1500` / `ICON_CACHE_KEEP = 1200` 与 AHK 的 `MaxIcons` 同值。 |
+| 取图标五路（Win32 层） | `res:` 走 `PrivateExtractIconsW`（负数＝资源 id，非负＝序号）；`ext:` / `url:` / `folder:` 走 `SHGetFileInfoW` ＋ `SHGFI_USEFILEATTRIBUTES`（文件不必存在，只按扩展名或属性给图）；`thumb:` 走 `SHCreateItemFromParsingName` ＋ `IShellItemImageFactory::GetImage`，取不到缩略图退普通文件图标；裸路径走 `SHGetFileInfoW`（真文件，可能带自定义图标）；取到的 `HICON` 一律 `DestroyIcon`。COM 只在 `thumb:` 那条里按需 `CoInitializeEx(APARTMENTTHREADED)`，`hr` 是 `Ok` 才 `CoUninitialize`，不替进程改套间。 |
+| AND 遮罩（零回归接法） | 管线仍是「`HICON` → 32bpp DIB Section → `DrawIconEx(DI_NORMAL)` → 去预乘」。只有去预乘阶段发现整幅 alpha 全 0（老式无 alpha 图标）时，才 `GetIconInfo` 取 `hbmMask`、`GetDIBits` 读掩码，按「白＝透明、黑＝不透明」补 alpha；遮罩也拿不到才整幅不透明。**有 alpha 的图标走的还是原来那条路，像素与 F4 之前逐字节相同**；两个位图都 `DeleteObject`。 |
+| 缓存换键 ＋ LRU（`src/main.rs`） | 纹理缓存从「整条 `source_path` 当键」换成 `cache_key` 分组键，36 个设置页与一堆 `.pdf` 因此共用一张纹理。三张表分工：`icons`（已缓存）／`icon_pending`（在飞）／`icon_failed`（取过、失败，不再重试）。所有补图标入口（启动、批量导入、重载配置、批量面板、`after_unhide`、扫描回执、添加弹窗、行渲染）收敛到 `spawn_missing_icons` 一个漏斗；行渲染每帧再兜一次可见行，因此被 LRU 淘汰的图标会自动重取，不会永久留空。`IconEntry.last_use` 用 `Cell<u64>`，行渲染只有 `&self` 也能刷新时刻。修剪时打一行「icon cache: 超上限 …」日志。 |
+| 置顶角标 | 名称前的 `📌` 全部撤掉，改在图标槽右上角画一个橙色三角（`egui::Shape::convex_polygon`，边长按槽宽 45% 夹在 6–14 px）。没有图标的行（例如取不到图标的条目）角标照画在空槽右上角。五处文案同步改口：动作表面板、快捷键回执 Toast、右键菜单副标题、速查表、`application.rs` 字段注释。`Ctrl+Shift+P` 的键位与语义不变。 |
+| 出厂图标回填（`SEED_ROUND` 3 → 4） | `InternalAction::icon_spec()` 给 22 个内置动作各配一条规格（设置页＝`res:imageres.dll,-114`、重新加载＝`-5311`、重建索引＝`-8`、关于＝`-81`、打开日志＝`-102`、退出＝`-98`、锁屏＝`-59`、电源四件＝`shell32.dll,-28`、注销＝`-45`、清空回收站＝`shell32.dll,-32`、关显示器＝`DisplaySwitch.exe`、音量媒体＝`SndVol.exe`）；36 个 `ms-settings:` 设置页共用一条 `SETTINGS_PAGE_ICON`。新函数 `apply_factory_icons` 只补**空**字段，随种子轮回填到老清单。单测 `settings_pages_share_one_icon_key` 锁住「36 页只产生一个缓存键」。 |
+| 顺带修掉的**既有缺陷**（真机抓到四条，全在种子与路径数据里） | ① **文件夹 / 网址条目恒无图标**：`source_path` 为空、`cache_key` 给 `None`，这类行永远空槽（103 条出厂清单里有 9 条）。新增 `icon_spec_of`：空的文件夹给 `folder:`、空网址给 `url:`，应用 / 命令 / 文件 / 内置动作空着就是不臆造。② **PowerShell 行恒无图标**：种子写成 `WindowsPowerShell/v1.0/powershell.exe`，`PathBuf` 拼出混用分隔符的 `…\System32\WindowsPowerShell/v1.0/powershell.exe`，`SHGetFileInfoW` 对这种路径直接返回 0。种子改正斜杠，另在取图标层加 `normalize_path`：盘符绝对路径里的 `/` 一律当 `\`，**老清单里已存下的那条也能救**；`https://…` 与相对命令名原样不动。③ **资源管理器 / 注册表编辑器恒无图标**：`system32()` 把这两个拼到 `…\System32\` 下，而它们住在 `%WINDIR%` 根目录。改成「System32 下有这个文件才用 System32，否则看 `%WINDIR%\` 根，两处都没有再退回 System32 形状」。④ **画图仍无图标**：Win11 的画图已是商店应用，盘上没有 `mspaint.exe`，`system32()` 两处都找不到。**不臆造资源 id**，先登记为已知限制。 |
+| 快捷键与速查表 | **没有新增快捷键**：置顶沿用 `Ctrl+Shift+P`，本轮只改它的可见表现；速查表条数不变（65），只改了「置顶」那条的摘要。 |
+| 验证 | `cargo check --all-targets` **零警告**；`cargo test` **386 / 386**（F3 收尾时 374，本批 +12：`icon.rs` 七条纯函数、`system.rs` 一条「36 页共用一个键」、`main.rs` 一条「文件夹 / 网址兜通用图标」、`application.rs` 三条 `system32` 回退）；`cargo build --target-dir target/f4` **零警告**（约 3m19s）。**未跑 `cargo fmt`**（成规）。 |
+| 真机六条（沙箱 `target/f4-sandbox/`，全新出厂清单 103 条） | ① 首屏十行：计算器 / 记事本 / 命令提示符 / PowerShell / 任务管理器 / 控制面板 各自出真图标，此电脑与回收站出文件夹图标，Windows 设置出浏览器图标，画图仍空（该机没有 `mspaint.exe`，见上表第四条）。② 搜索「资源」⇒ 资源管理器出 Explorer 的文件夹图标；搜索「注册」⇒ 注册表编辑器出注册表图标——这两条以前恒空，是本轮 `system32()` 回退生效的直接证据。③ 搜索「设置」「蓝牙」⇒ 「启动器设置」与「Win-蓝牙」共用同一张 `imageres.dll,-114` 齿轮纹理。④ 置顶：选中行按 `Ctrl+Shift+P` ⇒ 名称前不再有 `📌`、图标右上角出橙色三角，Toast 文案为「✓ 已置顶「…」（图标右上角角标，重启仍在）」；对**没有图标**的画图行按同一颗键，角标照样画在空槽右上角。⑤ 重启沙箱后再搜「画图」，角标仍在 ⇒ 落盘有效。⑥ `thumb:`：把画图条目的图标源改成 `thumb:C:\Windows\Web\Wallpaper\Windows\img0.jpg` ⇒ 行上出真实壁纸缩略图；同一轮日志「icon loader: 42/42 图标提取成功」。 |
+| 用户环境复原 | 只 `taskkill` 沙箱自己的实例（同一时刻用户没有在跑的启动器），**全程没有动用户 `target/debug` 与 `%LOCALAPPDATA%\egui-launcher`**；沙箱数据全在 `target/f4-sandbox/` 里现生成。日志只记文件名与计数，没有目录、窗口标题与用户内容。 |
+| 四格审计 | 三份文档跑 `target/markup-audit.sh` 报 **5 条**，与 `git show HEAD:./docs/…` 重建副本（`target/f4-head-copy/`）报的**同 5 条、同一身份**（`RELEASE_NOTES.md` 1075 / 1076 / 1098 的未闭合反引号串、需求书 453 的同族一条、开发计划 674 的 `~~` 个数为奇数；三处正文都在本节插入点之前，行号没漂）⇒ **本节引入 0 条**。**这条不是一次过的**：开发计划 F4 行首次落笔漏了收尾的 `】`，审计当场报 `704  括号不配对：【=1 】=0`，补上后复跑才回到 5 条——记在这里，免得下一轮把"5 条"读成"顺笔就拿到的"。 |
+| 还剩什么没验证（别读成全清） | ① **LRU 修剪真机没触发**：沙箱只有 42 个缓存键，离 1500 很远；淘汰逻辑只有单测。② 「36 页共用一张纹理」真机只看到两三条同款齿轮，没数满 36（单测锁的是 `cache_key` 相同）。③ 添加 / 编辑弹窗里那个「图标源」框**没有用人手点过**，本轮全部走种子与直接改 JSON。④ 深浅主题切换下图标观感、`res:` 负 id 在高 DPI 下的清晰度没逐档看。⑤ **老用户清单里已经存下的两条错误路径（资源管理器 / 注册表编辑器的 `…\System32\…`）不会被自动改写**——只有新装、恢复默认或手改图标源才会拿到修好的值；PowerShell 那条因为 `normalize_path` 在取图标层兜住，老清单也能出图标。 |
+| 文档回记 | 需求书 FR-SRC-03 行补落地注记（规格扩成五路 ＋ AND 遮罩 ＋ 分组缓存键 ＋ LRU 实际启用，指向本节）；开发计划 §8.6 的 F4 行与 §8.10「打磨档」列表里的 F4 条目按交付改写（旧文本划删保留）。**原计划的「正文里 `📌` 的表述改口」这一项撤掉**：落笔前 `grep -c` 过三份文档，工作区与 HEAD 副本都是 0 条 —— 文档正文从来没有写过 `📌`（那个字形只出现在代码与界面文案里），FR-SRC-19 原文就是「置顶项图标带角标」，没有需要改的表述。 | 
+| 提交 | **未提交**。`git status` 实测工作区 10 个文件：7 个源码 `src/source/icon.rs`、`src/main.rs`、`src/source/system.rs`、`src/source/application.rs`、`src/actions.rs`、`src/source/cheatsheet.rs`（本批）＋ `src/hud.rs`（F3 那批，本批没动）＋ 三份文档（F3 与 F4 两节的改动都在里面）。commit / push 等用户正文原话，不动 git。 |
+
+---
+
 
 | 项目 | 内容 |
 | --- | --- |

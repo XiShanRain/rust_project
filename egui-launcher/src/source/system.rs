@@ -12,7 +12,9 @@
 //! Windows 工具与 ms-settings 页仍然是普通 `Command` / `Url` 条目——它们本来就该由
 //! ShellExecute 打开。
 
-use crate::source::application::{ItemKind, LaunchItem, command_seed, seed_keyword, url_seed};
+use crate::source::application::{
+    ItemKind, LaunchItem, command_seed, seed_keyword, system32, url_seed,
+};
 
 /// 内置动作的路径前缀。改它等于把所有已播种条目的路径换掉（`uid` 也一起变），只能增不能改。
 pub const SCHEME: &str = "internal:";
@@ -121,7 +123,45 @@ impl InternalAction {
             Self::Shutdown | Self::Restart | Self::Logoff | Self::EmptyRecycleBin
         )
     }
+
+    /// 批次 F4：图标规格（写进条目的 `source_path`，语法见 [`crate::source::icon`]）。
+    ///
+    /// 资源 id 全部照抄 AHK 版 `Src\Providers\SystemProvider.ahk` 的 `add(...)` 第三参；
+    /// 音量/媒体那七条在 AHK 是 `SndVol.exe`，这里沿用同一个文件当图标源。
+    pub fn icon_spec(self) -> String {
+        match self {
+            // AHK: `res:imageres.dll,-114`（Preferences 与每一页共用）
+            Self::Settings(_) => "res:imageres.dll,-114".to_string(),
+            // AHK: Reload `-5311` / RebuildIndex `-8`
+            Self::Reload => "res:imageres.dll,-5311".to_string(),
+            Self::RebuildAppIndex | Self::RebuildFileIndex => "res:imageres.dll,-8".to_string(),
+            // AHK: About 用程序自己的图标文件，取其内置回退 `-81`
+            Self::About => "res:imageres.dll,-81".to_string(),
+            Self::OpenLog => "res:imageres.dll,-102".to_string(),
+            Self::Quit => "res:imageres.dll,-98".to_string(),
+            Self::Lock => "res:imageres.dll,-59".to_string(),
+            // AHK: Sleep / Hibernate / Shutdown / Restart 都是 `res:shell32.dll,-28`
+            Self::Sleep | Self::Hibernate | Self::Shutdown | Self::Restart => {
+                "res:shell32.dll,-28".to_string()
+            }
+            Self::Logoff => "res:imageres.dll,-45".to_string(),
+            Self::EmptyRecycleBin => "res:shell32.dll,-32".to_string(),
+            // AHK: MonitorOff 用 `System32\DisplaySwitch.exe`，音量与媒体七条用 `SndVol.exe`
+            Self::MonitorOff => system32("DisplaySwitch.exe"),
+            Self::VolumeMute
+            | Self::VolumeUp
+            | Self::VolumeDown
+            | Self::MediaPlayPause
+            | Self::MediaNext
+            | Self::MediaPrev
+            | Self::MediaStop => system32("SndVol.exe"),
+        }
+    }
 }
+
+/// 36 个 ms-settings 页共用的图标：AHK 用「设置」应用本身（`shell:AppsFolder\…`），
+/// 这里退成 `imageres.dll` 里的设置图标——同一个图，但不依赖 AppID 解析成不成功。
+const SETTINGS_PAGE_ICON: &str = "res:imageres.dll,-114";
 
 fn action_seed(name: &str, action: InternalAction, explicit: &str) -> LaunchItem {
     LaunchItem {
@@ -129,7 +169,7 @@ fn action_seed(name: &str, action: InternalAction, explicit: &str) -> LaunchItem
         path: action.path(),
         arguments: String::new(),
         working_dir: None,
-        source_path: String::new(),
+        source_path: action.icon_spec(),
         kind: ItemKind::Internal,
         keyword: seed_keyword(name, explicit),
         ..Default::default()
@@ -310,7 +350,9 @@ pub fn system_seeds() -> Vec<LaunchItem> {
     ));
 
     for (name, uri, explicit) in SETTINGS_PAGES {
-        seeds.push(url_seed(name, uri, explicit));
+        let mut it = url_seed(name, uri, explicit);
+        it.source_path = SETTINGS_PAGE_ICON.to_string();
+        seeds.push(it);
     }
 
     // ---- 音量与媒体 ----
@@ -582,8 +624,29 @@ mod tests {
                     s.path
                 );
                 assert!(s.path.starts_with(SCHEME));
-                assert!(s.source_path.is_empty(), "内置动作没有图标源");
+                // 批次 F4：内置动作从这一轮起都带图标源（资源 id 照抄 AHK 版映射）。
+                assert!(
+                    crate::source::icon::parse_spec(&s.source_path).is_some(),
+                    "内置动作必须有图标源：{}",
+                    s.name
+                );
             }
         }
+    }
+
+    /// 批次 F4：36 个设置页共用一条 `res:` 规格 ⇒ 共用一个纹理缓存键（AHK 同口径）。
+    #[test]
+    fn settings_pages_share_one_icon_key() {
+        let seeds = system_seeds();
+        let pages: Vec<&LaunchItem> = seeds
+            .iter()
+            .filter(|s| s.path.starts_with("ms-settings:"))
+            .collect();
+        assert_eq!(pages.len(), 36);
+        let keys: std::collections::HashSet<String> = pages
+            .iter()
+            .filter_map(|s| crate::source::icon::cache_key(&s.source_path))
+            .collect();
+        assert_eq!(keys.len(), 1, "36 页只该有一个缓存键，实得 {keys:?}");
     }
 }

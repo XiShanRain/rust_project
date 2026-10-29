@@ -98,7 +98,7 @@ pub struct LaunchItem {
     /// 别名（FR-SRC-22）：搜索时除 `name` 外也匹配它；`#[serde(default)]` 让旧清单缺字段仍可解析。
     #[serde(default)]
     pub keyword: String,
-    /// FR-SRC-19 置顶：true=恒排在结果前列（📌），随清单落盘、重启仍在。
+    /// FR-SRC-19 置顶：true=恒排在结果前列（图标右上角角标），随清单落盘、重启仍在。
     #[serde(default)]
     pub pinned: bool,
     /// FR-SRC-19 学习排序：成功启动累计次数（只作用于排名，不加匹配总分）。
@@ -1505,6 +1505,41 @@ impl Scope {
     }
 }
 
+/// 批次 F3（FR-WIN-09 `show_on`）：呼出时把窗口落在哪块屏上。
+///
+/// 只在多显示器下看得出差别；单屏时三档等价。与 AHK 的 `Appearance["ShowOn"]` 同名同值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowOn {
+    /// 默认：鼠标指针所在屏。
+    #[default]
+    Mouse,
+    /// 主屏。
+    Primary,
+    /// 呼出前那个窗口所在的屏；没有「呼出前窗口」时退回鼠标所在屏（与 AHK 同一条兜底）。
+    Active,
+}
+
+impl ShowOn {
+    /// 落盘用的值名（与 AHK 的 `Mouse` / `Primary` / `Active` 一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mouse => "mouse",
+            Self::Primary => "primary",
+            Self::Active => "active",
+        }
+    }
+
+    /// 设置页单选的显示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mouse => "鼠标所在屏",
+            Self::Primary => "主屏",
+            Self::Active => "活动窗口所在屏",
+        }
+    }
+}
+
 /// 批次 F8（FR-UIX-02）：`settings.json` 的 `appearance` 段。
 ///
 /// 需求书那句「宽度 / 行数 / 位置 / 淡入淡出属 `appearance` 不属主题」是这一格的来由：
@@ -1518,8 +1553,14 @@ pub struct Appearance {
     pub width: f32,
     /// 记住上次窗口位置（FR-UIX-03 的 `RememberPosition`）。
     pub remember_position: bool,
-    /// 上次隐藏时的窗口左上角（屏幕坐标；多显示器在主屏左侧时为负）。
-    /// 启动时要先问系统这个点还在不在显示器上，不在就落回默认位置。
+    /// 呼出时落在哪块屏上（FR-WIN-09 的 `show_on`，默认鼠标所在屏）。
+    pub show_on: ShowOn,
+    /// 窗口左上角在**工作区里的千分比**（0–1000；`[500, 200]` ＝ 水平居中、离顶 20%）。
+    /// 与 AHK 的 `Appearance.Position` 同口径：存比例而不是绝对坐标，换分辨率、拔插显示器后
+    /// 仍落在"差不多的地方"。`None` ⇒ 用默认 `[500, 200]`。
+    pub pos_rel: Option<[u16; 2]>,
+    /// 批次 F8 的旧字段（绝对屏幕坐标）。**只读不写**：启动时一次性折算进 [`Self::pos_rel`]
+    /// 并清空，留着这一格只为读得懂老 `settings.json`。
     pub last_pos: Option<[i32; 2]>,
     /// 底部状态栏（FR-UIX-08 的 `status_bar`，默认开）。
     pub status_bar: bool,
@@ -1531,11 +1572,16 @@ pub const WINDOW_WIDTH_MIN: f32 = 360.0;
 pub const WINDOW_WIDTH_MAX: f32 = 900.0;
 const WINDOW_WIDTH_DEFAULT: f32 = 500.0;
 
+/// 没记住位置时的落点：水平居中、离工作区顶 20%（FR-WIN-09 原文的默认值）。
+pub const POS_REL_DEFAULT: [u16; 2] = [500, 200];
+
 impl Default for Appearance {
     fn default() -> Self {
         Self {
             width: WINDOW_WIDTH_DEFAULT,
             remember_position: true,
+            show_on: ShowOn::default(),
+            pos_rel: None,
             last_pos: None,
             status_bar: true,
             fade: false,
@@ -1957,18 +2003,26 @@ pub fn recall_history(
 /// 2026-10-23：1 → 2。FR-SRC-17 的系统命令五组（自身 / 电源与会话 / Windows 工具 /
 /// ms-settings 页 / 音量与媒体）随这一轮补进老清单。
 /// 2026-10-24：2 → 3。批次 G1 的分类标签随这一轮回填到老条目（[`apply_factory_tags`]）。
-pub const SEED_ROUND: u32 = 3;
+/// 2026-10-29：3 → 4。批次 F4 的内置动作图标随这一轮回填到老条目（[`apply_factory_icons`]）。
+pub const SEED_ROUND: u32 = 4;
 
-/// `%WINDIR%\System32\<exe>`：出厂条目的图标源（启动仍用简洁命令名）。
+/// 出厂条目的图标源（启动仍用简洁命令名）：`%WINDIR%\System32\<exe>`；
+/// System32 下没有这个文件时再看 `%WINDIR%\<exe>`——`explorer.exe` / `regedit.exe` 这类
+/// 系统程序就住在 Windows 根目录，2026-10-29 真机看到那两条恒无图标。
+/// 两处都没有（例如 Win11 的 `mspaint.exe` 已是商店应用）就照旧给 System32 路径，由取图标那层失败留空。
 pub(crate) fn system32(exe: &str) -> String {
     let windir = std::env::var_os("WINDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    windir
-        .join("System32")
-        .join(exe)
-        .to_string_lossy()
-        .into_owned()
+    let sys = windir.join("System32").join(exe);
+    if sys.is_file() {
+        return sys.to_string_lossy().into_owned();
+    }
+    let root = windir.join(exe);
+    if root.is_file() {
+        return root.to_string_lossy().into_owned();
+    }
+    sys.to_string_lossy().into_owned()
 }
 
 /// 名称拼音首字母 + 需求书点名要的关键字（空白分词，别名表本来就支持多键）。
@@ -2084,7 +2138,7 @@ pub fn builtin_seeds() -> Vec<LaunchItem> {
             "PowerShell",
             "powershell.exe",
             "",
-            "WindowsPowerShell/v1.0/powershell.exe",
+            r"WindowsPowerShell\v1.0\powershell.exe",
             "",
         ),
         command_seed("任务管理器", "taskmgr.exe", "", "Taskmgr.exe", ""),
@@ -2160,6 +2214,30 @@ pub fn apply_factory_tags(items: &mut [LaunchItem]) -> usize {
         if it.tags.is_empty() {
             if let Some(tags) = tags_by_uid.get(&it.uid()) {
                 it.tags = tags.clone();
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+/// 批次 F4 一次性回填：老清单里按 uid 认得出厂条目的，把出厂图标规格补上
+/// （**`source_path` 为空才补**）。
+///
+/// 与 [`apply_factory_tags`] 同一个口径、同一次 seed_round 进位里调用：
+/// 之后用户自己清掉图标源不会被下一次启动补回来。用户条目 uid 对不上任何出厂种子 ⇒ 不受影响。
+/// 返回补了几条，幂等（第二轮恒 0）。
+pub fn apply_factory_icons(items: &mut [LaunchItem]) -> usize {
+    let icon_by_uid: std::collections::HashMap<String, String> = builtin_seeds()
+        .into_iter()
+        .filter(|s| !s.source_path.is_empty())
+        .map(|s| (s.uid(), s.source_path))
+        .collect();
+    let mut changed = 0;
+    for it in items.iter_mut() {
+        if it.source_path.is_empty() {
+            if let Some(spec) = icon_by_uid.get(&it.uid()) {
+                it.source_path = spec.clone();
                 changed += 1;
             }
         }
@@ -3822,6 +3900,9 @@ mod dedup_tests {
         s.history_size = 3;
         s.appearance.width = 820.0;
         s.appearance.remember_position = false;
+        // 批次 F3：落点与千分比位置也是策略字段，恢复默认时一起回厂。
+        s.appearance.show_on = ShowOn::Active;
+        s.appearance.pos_rel = Some([900, 900]);
         s.appearance.last_pos = Some([100, 200]);
         s.appearance.status_bar = false;
         s.appearance.fade = true;
@@ -3889,6 +3970,27 @@ mod dedup_tests {
         assert_eq!(s.appearance, Appearance::default());
         assert!(s.appearance.status_bar, "状态栏默认开");
         assert!(!s.appearance.fade, "淡入默认关（FR-UIX-07）");
+    }
+
+    /// 批次 F3（FR-WIN-09）：落点默认鼠标所在屏、位置空 ⇒ 用 `[500, 200]`。
+    #[test]
+    fn show_on_defaults_to_the_mouse_screen_and_no_remembered_ratio() {
+        let a = Appearance::default();
+        assert_eq!(a.show_on, ShowOn::Mouse);
+        assert_eq!(a.pos_rel, None);
+        assert_eq!(
+            POS_REL_DEFAULT,
+            [500, 200],
+            "需求书 FR-WIN-09 原文的默认位置"
+        );
+        for (v, s) in [
+            (ShowOn::Mouse, "mouse"),
+            (ShowOn::Primary, "primary"),
+            (ShowOn::Active, "active"),
+        ] {
+            assert_eq!(v.as_str(), s);
+            assert!(!v.label().is_empty());
+        }
     }
 
     /// 批次 F7（FR-CFG-08）：备份名带编号，同一秒内第二份也不覆盖；源文件不在就不造。
@@ -5993,3 +6095,42 @@ mod config_tests {
     }
 }
 
+
+/// 2026-10-29 真机抓到的那条：`system32("explorer.exe")` / `system32("regedit.exe")` 指到
+/// 一个不存在的位置 ⇒ 那两条出厂条目恒无图标。真值：这两个程序住在 `%WINDIR%` 根目录。
+#[cfg(test)]
+mod system_exe_tests {
+    use super::system32;
+
+    #[test]
+    fn system32_still_wins_when_the_file_is_really_there() {
+        let p = system32("cmd.exe");
+        assert!(
+            p.to_ascii_lowercase().ends_with(r"\system32\cmd.exe"),
+            "System32 下有的就该用 System32：{p}"
+        );
+    }
+
+    #[test]
+    fn windows_root_is_the_fallback_for_explorer_and_regedit() {
+        for exe in ["explorer.exe", "regedit.exe"] {
+            let p = system32(exe).to_ascii_lowercase();
+            assert!(
+                p.ends_with(&format!(r"\windows\{exe}")),
+                "{exe} 实际在 %WINDIR% 根目录，不该拼成 System32：{p}"
+            );
+            assert!(
+                std::path::Path::new(&p).is_file(),
+                "回退出来的路径必须真实存在：{p}"
+            );
+        }
+    }
+
+    /// 两处都没有时保持旧行为（给 System32 路径），由取图标那层失败留空——
+    /// Win11 的 `mspaint.exe` 已是商店应用，机器上没有这个文件。
+    #[test]
+    fn a_file_that_is_nowhere_keeps_the_system32_shape() {
+        let p = system32("definitely-not-a-real-program-xyz.exe").to_ascii_lowercase();
+        assert!(p.ends_with(r"\system32\definitely-not-a-real-program-xyz.exe"), "{p}");
+    }
+}

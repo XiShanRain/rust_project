@@ -848,6 +848,92 @@ fn win_size(hwnd: HWND) -> Option<(i32, i32)> {
         .map(|_| (r.right - r.left, r.bottom - r.top))
 }
 
+/// 批次 F3（FR-WIN-09）：工作区千分比 → 窗口左上角（物理像素）。
+/// 与 AHK `SearchWindow.Place`（`SearchWindow.ahk:691-701`）逐式对译：X 按"可用宽度"摊、
+/// Y 按"整块高度"摊，然后各自夹回工作区内。
+fn place_in_work(work: egui::Rect, size: (i32, i32), rel: [u16; 2]) -> (i32, i32) {
+    let (l, t, r, b) = (
+        work.min.x.round() as i32,
+        work.min.y.round() as i32,
+        work.max.x.round() as i32,
+        work.max.y.round() as i32,
+    );
+    let (w, h) = size;
+    let fx = rel[0].min(1000) as f32 / 1000.0;
+    let fy = rel[1].min(1000) as f32 / 1000.0;
+    let x = l + ((r - l - w) as f32 * fx).round() as i32;
+    let y = t + ((b - t) as f32 * fy).round() as i32;
+    (x.clamp(l, (r - w).max(l)), y.clamp(t, (b - h).max(t)))
+}
+
+/// [`place_in_work`] 的反函数：窗口左上角 → 工作区千分比（AHK `RelativePosition` 同式）。
+fn relative_in_work(work: egui::Rect, size: (i32, i32), pos: (i32, i32)) -> [u16; 2] {
+    let (l, t, r, b) = (
+        work.min.x.round() as i32,
+        work.min.y.round() as i32,
+        work.max.x.round() as i32,
+        work.max.y.round() as i32,
+    );
+    let (w, _h) = size;
+    let fx = if r - l > w {
+        ((pos.0 - l) as f32 * 1000.0 / (r - l - w) as f32).round()
+    } else {
+        // 窗口比工作区还宽：没有可摊的余量，记成"居中"，下次摆出来仍是对齐左缘。
+        500.0
+    };
+    let fy = if b - t > 0 {
+        ((pos.1 - t) as f32 * 1000.0 / (b - t) as f32).round()
+    } else {
+        200.0
+    };
+    [
+        fx.clamp(0.0, 1000.0) as u16,
+        fy.clamp(0.0, 1000.0) as u16,
+    ]
+}
+
+/// 「呼出前那个窗口」的中心点。最小化的窗口 `GetWindowRect` 给的是屏幕外的假坐标，
+/// 这里直接当没有（AHK 的 `WorkAreaOfWindow` 同样读不对最小化窗口）。
+fn previous_window_center() -> Option<(i32, i32)> {
+    let raw = PREVIOUS_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return None;
+    }
+    let hwnd = HWND(raw as *mut _);
+    if unsafe { IsIconic(hwnd).as_bool() } {
+        return None;
+    }
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut r) }.ok()?;
+    if r.right <= r.left || r.bottom <= r.top {
+        return None;
+    }
+    Some(((r.left + r.right) / 2, (r.top + r.bottom) / 2))
+}
+
+/// 批次 F3（FR-WIN-09）：按 `show_on` 选一块屏的工作区（物理像素）。
+/// `Primary` 用坐标 `(0, 0)`——Windows 约定主屏左上角恒为虚拟坐标原点。
+/// `Active` 没有「呼出前窗口」（最小化 / 已关闭 / 启动那一刻）时退回鼠标所在屏，与 AHK 同。
+fn work_for(show_on: source::application::ShowOn) -> Option<egui::Rect> {
+    use source::application::ShowOn;
+    let pt = match show_on {
+        ShowOn::Primary => (0, 0),
+        ShowOn::Active => previous_window_center().or_else(win_cursor)?,
+        ShowOn::Mouse => win_cursor()?,
+    };
+    hud::monitor_work_at(pt)
+}
+
+/// 窗口中心点所在屏的工作区——隐藏时把当前位置折算成千分比要用它。
+fn work_at_window(hwnd: HWND) -> Option<egui::Rect> {
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut r) }.ok()?;
+    if r.right <= r.left || r.bottom <= r.top {
+        return None;
+    }
+    hud::monitor_work_at(((r.left + r.right) / 2, (r.top + r.bottom) / 2))
+}
+
 struct LauncherApp {
     query: String,
     items: Vec<LaunchItem>,      // 当前显示项 = 内置种子 + 用户清单（去重后）
@@ -910,9 +996,17 @@ struct LauncherApp {
     /// 设置页下拉的选项（`System` + 内置 + 用户主题）。只在启动 / 呼出 / 换主题时重读，
     /// 避免「外观」页每帧都去扫一遍 `Themes\` 目录。
     theme_choices: Vec<String>,
-    icon_rx: mpsc::Receiver<(String, Vec<u8>, u32, u32)>,
-    icon_tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, // 常驻，可 clone 给每批新项再起加载器
-    icons: std::collections::HashMap<String, egui::TextureHandle>, // source_path → 纹理
+    /// 回执：缓存键 + `None`＝这条取不到图标（失败键不再重试）。
+    icon_rx: mpsc::Receiver<(String, Option<(Vec<u8>, u32, u32)>)>,
+    icon_tx: mpsc::Sender<(String, Option<(Vec<u8>, u32, u32)>)>, // 常驻，可 clone 给每批新项再起加载器
+    /// 纹理缓存：`icon::cache_key` → 纹理 + 最近一次被画出的序号（LRU）。
+    icons: std::collections::HashMap<String, IconEntry>,
+    /// 已派给加载线程、还没回执的键（防同一键重复起线程）。
+    icon_pending: std::collections::HashSet<String>,
+    /// 提取失败过的键——失败不重试，否则可见行每帧都会重开线程。
+    icon_failed: std::collections::HashSet<String>,
+    /// 行渲染的单调序号：每帧 +1，写进 `IconEntry.last_use` 做 LRU 排序。
+    icon_tick: std::cell::Cell<u64>,
     // ---- 批次 U：FR-SRC-06 路径四态（后台线程算、主线程按 uid 缓存）----
     path_tx: mpsc::Sender<Vec<(String, source::pathcheck::PathState)>>,
     path_rx: mpsc::Receiver<Vec<(String, source::pathcheck::PathState)>>,
@@ -1009,13 +1103,55 @@ struct LauncherApp {
     usage_blocked: bool,
 }
 
-fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths: Vec<String>) {
+/// 一条待取图标的作业：缓存键 + 图标规格（条目 `source_path` 原文）。
+type IconJob = (String, String);
+
+/// 缓存里的一条纹理。`last_use` 用 `Cell`，是为了行渲染只有 `&self` 时也能刷新 LRU 时刻。
+struct IconEntry {
+    texture: egui::TextureHandle,
+    last_use: std::cell::Cell<u64>,
+}
+
+/// 条目实际要取的图标规格。`source_path` 为空时按类别兜一个通用图标：
+/// 文件夹 ⇒ `folder:`，网址 ⇒ `url:`（需求书 FR-SRC-03 只管"有图标"，没规定出厂条目必须自带规格）。
+/// 其余类别（应用 / 命令 / 文件 / 内置动作）空着就是没有，不臆造。
+fn icon_spec_of(it: &source::application::LaunchItem) -> &str {
+    if !it.source_path.is_empty() {
+        return &it.source_path;
+    }
+    match it.kind {
+        source::application::ItemKind::Folder => "folder:",
+        source::application::ItemKind::Url => "url:",
+        _ => "",
+    }
+}
+
+/// 从条目里收「键 + 规格」，按缓存键去重、保序。规格为空 ⇒ `cache_key` 给 None，跳过。
+fn icon_jobs(items: &[source::application::LaunchItem]) -> Vec<IconJob> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for it in items {
+        let spec = icon_spec_of(it);
+        if let Some(key) = source::icon::cache_key(spec) {
+            if seen.insert(key.clone()) {
+                out.push((key, spec.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn spawn_icon_loader(
+    tx: mpsc::Sender<(String, Option<(Vec<u8>, u32, u32)>)>,
+    jobs: Vec<IconJob>,
+) {
     thread::spawn(move || {
         let mut ok = 0usize;
-        let total = source_paths.len();
+        let total = jobs.len();
         let mut first_logged = false;
-        for source_path in source_paths {
-            if let Some((rgba, w, h)) = source::icon::extract(&source_path) {
+        for (key, spec) in jobs {
+            let hit = source::icon::extract(&spec);
+            if let Some((rgba, w, h)) = &hit {
                 if !first_logged {
                     let nonzero = rgba.iter().filter(|&&v| v != 0).count();
                     eprintln!(
@@ -1024,14 +1160,14 @@ fn spawn_icon_loader(tx: mpsc::Sender<(String, Vec<u8>, u32, u32)>, source_paths
                         h,
                         nonzero,
                         rgba.len(),
-                        source_path.rsplit('\\').next().unwrap_or("?")
+                        source::icon::log_label(&spec)
                     );
                     first_logged = true;
                 }
                 ok += 1;
-                if tx.send((source_path, rgba, w, h)).is_err() {
-                    break;
-                }
+            }
+            if tx.send((key, hit)).is_err() {
+                break;
             }
         }
         eprintln!("icon loader: {ok}/{total} 图标提取成功");
@@ -1663,6 +1799,25 @@ fn row_badge(ui: &mut egui::Ui, idx: usize, verb: &str) {
         }
         None => ui.add_space(14.0),
     }
+}
+
+/// 批次 F4：置顶角标——在图标槽右上角画一个琥珀色小三角。
+///
+/// 2026-10-29 之前是名称前加 `📌 `，前缀会把名称挤偏、也让「名称→执行」的列位置随置顶状态跳动；
+/// 角标贴在图标上，宽度不变。没有图标（空槽）时三角照样画在那个空槽的右上角。
+fn paint_pin_badge(ui: &egui::Ui, slot: egui::Rect) {
+    let side = (slot.width() * 0.45).clamp(6.0, 14.0);
+    let (r, t) = (slot.right(), slot.top());
+    let pts = vec![
+        egui::pos2(r - side, t),
+        egui::pos2(r, t),
+        egui::pos2(r, t + side),
+    ];
+    ui.painter().add(egui::Shape::convex_polygon(
+        pts,
+        egui::Color32::from_rgb(255, 176, 32),
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(140)),
+    ));
 }
 
 /// 批次 B6（FR-ACT-07）：带参项在列表行上的 `*` 前缀（继承 Delphi 的 `*` 前缀语义）。
@@ -3899,6 +4054,18 @@ impl LauncherApp {
                     eprintln!("source: 出厂分类回填 {tagged} 条（已写清单）");
                 }
             }
+            // 批次 F4：同一轮把内置动作的图标规格回填到老条目（uid 对得上且 `source_path` 为空才补）。
+            let iconized = source::application::apply_factory_icons(&mut items);
+            if iconized > 0 {
+                if writes_blocked {
+                    eprintln!(
+                        "source: 出厂图标回填 {iconized} 条（坏文件留证没成功 ⇒ 这次不写清单）"
+                    );
+                } else {
+                    source::application::save_user_items(&items);
+                    eprintln!("source: 出厂图标回填 {iconized} 条（已写清单）");
+                }
+            }
         }
         // 2026-10-23 一次性改名：老清单里的「设置·X」→「Win·X」/「启动器·X」，
         // 总入口「设置」→「Windows 设置」（用户反馈敲「设置」出来四十行）。
@@ -3973,6 +4140,9 @@ impl LauncherApp {
             apps_rx,
             icon_tx: icon_tx.clone(),
             icons: std::collections::HashMap::new(),
+            icon_pending: std::collections::HashSet::new(),
+            icon_failed: std::collections::HashSet::new(),
+            icon_tick: std::cell::Cell::new(0),
             path_tx,
             path_rx,
             path_states: std::collections::HashMap::new(),
@@ -4050,14 +4220,9 @@ impl LauncherApp {
             usage,
             usage_blocked,
         };
-        // 立即为已有项起图标加载器（source_path 为空的种子会被 extract 自然跳过）。
-        let source_paths: Vec<String> = seed
-            .items
-            .iter()
-            .map(|i| i.source_path.clone())
-            .filter(|p| !p.is_empty())
-            .collect();
-        spawn_icon_loader(icon_tx, source_paths);
+        // 立即为已有项起图标加载器（`source_path` 为空 ⇒ `cache_key` 给 None，自然跳过）。
+        let jobs = icon_jobs(&seed.items);
+        seed.spawn_missing_icons(jobs);
         // FR-SRC-06：启动就先在后台算一轮四态，首屏列表（很快会呼出）拿到的是缓存而不是
         // 现场 I/O；之后呼出与每 3 秒各刷新一次（`refresh_path_states`）。
         seed.refresh_path_states(true);
@@ -4082,6 +4247,12 @@ impl LauncherApp {
         if let Some(ctx) = CTX.get() {
             let (theme, choices) = (seed.theme.clone(), seed.theme_choices.clone());
             seed.use_theme(ctx, theme, choices);
+        }
+        // 批次 F3（FR-WIN-09）：老 `last_pos` 先折算成千分比，再按 `show_on` 做首次落点。
+        // 顺序不能反——先摆位后折算，摆出来的默认位置会被一并记成"用户记住的位置"。
+        seed.migrate_legacy_position(writes_blocked);
+        if let Some(hwnd) = seed.self_hwnd {
+            seed.place_on_summon(hwnd);
         }
         seed
     }
@@ -4284,10 +4455,92 @@ impl LauncherApp {
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 };
+                // 批次 F3（FR-WIN-09）：每次呼出都重摆一次落点（AHK `SearchWindow.ahk:589`
+                // 同样在 `_Show` 里每次调 `Place`）。放在 `SW_RESTORE` 之后：最小化态下
+                // `SetWindowPos` 改的是「还原后的坐标」，先摆会被 `ShowWindow` 覆盖回去。
+                self.place_on_summon(hwnd);
             }
             self.on_show();
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// 批次 F3（FR-WIN-09）：按 `show_on` 选屏、按工作区千分比摆窗口。
+    ///
+    /// 「记住位置」关掉时永远回默认 `[500, 200]`（水平居中、离顶 20%）——AHK `Place` 那一路
+    /// 也是把空 position 当默认值，拖动只在这一次显示期间有效；打开时才读 `pos_rel`。
+    fn place_on_summon(&self, hwnd: HWND) {
+        let appearance = &self.prefs.appearance;
+        let rel = if appearance.remember_position {
+            appearance.pos_rel.unwrap_or(source::application::POS_REL_DEFAULT)
+        } else {
+            source::application::POS_REL_DEFAULT
+        };
+        let (Some(size), Some(work)) = (win_size(hwnd), work_for(appearance.show_on)) else {
+            eprintln!("窗口：落点算不出来（读不到窗口尺寸或工作区）⇒ 保持原位");
+            return;
+        };
+        let (x, y) = place_in_work(work, size, rel);
+        let moved = win_origin(hwnd).is_none_or(|(ox, oy)| (ox, oy) != (x, y));
+        if moved {
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+        // 与 F8 那条同口径：只记坐标与档位，不记任何用户内容。
+        eprintln!(
+            "窗口：落点 {}（{}/{}{}）→ ({x}, {y})",
+            appearance.show_on.as_str(),
+            rel[0],
+            rel[1],
+            if appearance.remember_position && appearance.pos_rel.is_some() {
+                "，记住的位置"
+            } else {
+                "，默认落点"
+            }
+        );
+    }
+
+    /// 批次 F3（FR-WIN-09）：批次 F8 的 `last_pos` 是绝对坐标，按新口径折算成工作区千分比。
+    ///
+    /// 只做一次：折算完清空 `last_pos` 并落盘，之后 `settings.json` 里就只剩 `pos_rel`。
+    /// `settings.json` 坏到留证没成功时不折算也不写盘（那一轮对它是只读的），下次启动再来。
+    fn migrate_legacy_position(&mut self, writes_blocked: bool) {
+        let Some(old) = self.prefs.appearance.last_pos else {
+            return;
+        };
+        if writes_blocked {
+            eprintln!("窗口：settings.json 本轮只读 ⇒ 旧位置字段留到下次启动折算");
+            return;
+        }
+        let converted = self.self_hwnd.and_then(|hwnd| {
+            if !self.prefs.appearance.remember_position || !pos_on_screen(old) {
+                return None;
+            }
+            let size = win_size(hwnd)?;
+            let work = hud::monitor_work_at((old[0], old[1]))?;
+            Some(relative_in_work(work, size, (old[0], old[1])))
+        });
+        if let Some(rel) = converted {
+            self.prefs.appearance.pos_rel = Some(rel);
+        }
+        self.prefs.appearance.last_pos = None;
+        source::application::save_settings(&self.prefs);
+        match converted {
+            Some(rel) => eprintln!(
+                "窗口：旧位置字段（绝对坐标）已折算为工作区 {}/1000、{}/1000",
+                rel[0], rel[1]
+            ),
+            None => eprintln!("窗口：旧位置字段作废（不再记住或已不在任何显示器上）"),
+        }
     }
 
     /// 批次 B6（FR-ACT-07）：每次呼出抓一份现场。三条规矩与 [`remember_previous_window`] 对齐：
@@ -4443,20 +4696,12 @@ impl LauncherApp {
         {
             source::application::save_settings(&self.prefs);
         }
-        let mut missing: Vec<String> = incoming
-            .iter()
-            .map(|i| i.source_path.clone())
-            .filter(|p| !p.is_empty() && !self.icons.contains_key(p.as_str()))
-            .collect();
+        let jobs = icon_jobs(&incoming);
         self.items = dedup_items([std::mem::take(&mut self.items), incoming].concat());
         self.carry_stats(&old);
         let added = self.items.len().saturating_sub(before);
         let skipped = paths.len().saturating_sub(added);
-        missing.sort();
-        missing.dedup();
-        if !missing.is_empty() {
-            spawn_icon_loader(self.icon_tx.clone(), missing);
-        }
+        self.spawn_missing_icons(jobs);
         self.save_items();
         let skipped_text = if skipped > 0 {
             format!("，{skipped} 条重复已跳过")
@@ -6537,7 +6782,7 @@ impl LauncherApp {
                                     ("Delete", "删除选中项（仅输入为空时；弹确认框）"),
                                     ("Ctrl+Shift+D", "删除选中项（不受输入限制；弹确认框）"),
                                     ("Ctrl+D", "打开选中项所在目录（文件行：在资源管理器里定位这个文件）"),
-                                    ("Ctrl+Shift+P", "置顶 / 取消置顶选中项（📌）"),
+                                    ("Ctrl+Shift+P", "置顶 / 取消置顶选中项（图标右上角角标）"),
                                     ("Ctrl+F", "进入文件模式：在当前输入前补一个 ' 触发符；已在文件模式时只提示，不叠第二个前缀"),
                                     ("?", "打开速查表：全部语法与快捷键都在那一页（`? 词` 过滤，Enter 看某一条的帮助页）"),
                                     ("D:\\proj\\ 、 \\\\srv\\share\\", "文件模式第一式：直接打路径浏览那一层（尾部分隔符＝列整个目录；不带则是「目录 + 过滤词」）"),
@@ -6845,6 +7090,29 @@ impl LauncherApp {
                                 eprintln!(
                                     "设置页：remember_position = {remember}（已写 settings.json）"
                                 );
+                            }
+                            // 批次 F3（FR-WIN-09 ShowOn）：只在多显示器下看得出差别，单屏三档等价。
+                            // 选中即刻重摆一次（挪到别的屏就是反馈），下次呼出照样按新档位落点。
+                            ui.label("呼出落点");
+                            let mut show_on = self.prefs.appearance.show_on;
+                            egui::ComboBox::from_id_salt("show_on")
+                                .selected_text(show_on.label())
+                                .show_ui(ui, |ui| {
+                                    use source::application::ShowOn;
+                                    for opt in [ShowOn::Mouse, ShowOn::Primary, ShowOn::Active] {
+                                        ui.selectable_value(&mut show_on, opt, opt.label());
+                                    }
+                                });
+                            if show_on != self.prefs.appearance.show_on {
+                                self.prefs.appearance.show_on = show_on;
+                                source::application::save_settings(&self.prefs);
+                                eprintln!(
+                                    "设置页：show_on = {}（已写 settings.json）",
+                                    show_on.as_str()
+                                );
+                                if let Some(hwnd) = self.self_hwnd {
+                                    self.place_on_summon(hwnd);
+                                }
                             }
                             let mut bar = self.prefs.appearance.status_bar;
                             if ui
@@ -7211,13 +7479,28 @@ impl LauncherApp {
         // 批次 F8（FR-UIX-03 RememberPosition）：拖窗走的是 `SetWindowPos`，隐藏这一刻
         // `GetWindowRect` 读到的就是终值。与上次存的不同才写盘——每次隐藏都写会把
         // settings.json 的 mtime 刷得像心跳。
+        // 批次 F3（FR-WIN-09）：存的是**在工作区里的千分比**（AHK `_OnMoved` 同口径），
+        // 换分辨率 / 拔插显示器之后仍落在差不多的地方；窗口中心所在的那块屏的工作区为准。
         if self.prefs.appearance.remember_position {
-            if let Some(pos) = self.self_hwnd.and_then(win_origin) {
-                let pos = [pos.0, pos.1];
-                if self.prefs.appearance.last_pos != Some(pos) {
-                    self.prefs.appearance.last_pos = Some(pos);
+            let rel = self.self_hwnd.and_then(|hwnd| {
+                // 最小化态的 `GetWindowRect` 给的是屏幕外的假坐标（-32000 那一带），
+                // 折成千分比会记成 [0, 0]，下次呼出就贴到左上角去了。
+                if unsafe { IsIconic(hwnd).as_bool() } {
+                    return None;
+                }
+                let size = win_size(hwnd)?;
+                let pos = win_origin(hwnd)?;
+                let work = work_at_window(hwnd)?;
+                Some(relative_in_work(work, size, pos))
+            });
+            if let Some(rel) = rel {
+                if self.prefs.appearance.pos_rel != Some(rel) {
+                    self.prefs.appearance.pos_rel = Some(rel);
                     source::application::save_settings(&self.prefs);
-                    eprintln!("窗口：记住位置 ({}, {})", pos[0], pos[1]);
+                    eprintln!(
+                        "窗口：记住位置（工作区 {}/1000、{}/1000）",
+                        rel[0], rel[1]
+                    );
                 }
             }
         }
@@ -7735,17 +8018,8 @@ impl LauncherApp {
             self.items = dedup_items(items);
             let dropped = source::application::drop_hidden(&mut self.items, &self.prefs.hidden);
             self.selected = 0;
-            let need: Vec<String> = self
-                .items
-                .iter()
-                .filter(|i| {
-                    !i.source_path.is_empty() && !self.icons.contains_key(i.source_path.as_str())
-                })
-                .map(|i| i.source_path.clone())
-                .collect();
-            if !need.is_empty() {
-                spawn_icon_loader(self.icon_tx.clone(), need);
-            }
+            let jobs = icon_jobs(&self.items);
+            self.spawn_missing_icons(jobs);
             eprintln!(
                 "internal: 重新加载配置 → 清单 {} 条（hidden 剔掉 {dropped} 条）",
                 self.items.len()
@@ -8090,6 +8364,7 @@ impl LauncherApp {
                     format!("✓ 已粘贴 {chars} 个字符到原来的窗口"),
                     &self.theme,
                     hud::HOLD_FOREGROUND,
+                    work_for(self.prefs.appearance.show_on),
                 );
                 self.collapse_after_run(ctx);
                 PanelOutcome::Gone
@@ -8659,14 +8934,8 @@ impl LauncherApp {
                         dedup_items([std::mem::take(&mut self.items), added.clone()].concat());
                     self.carry_stats(&old);
                     let grew = self.items.len().saturating_sub(before);
-                    let sources: Vec<String> = added
-                        .iter()
-                        .map(|i| i.source_path.clone())
-                        .filter(|p| !p.is_empty() && !self.icons.contains_key(p.as_str()))
-                        .collect();
-                    if !sources.is_empty() {
-                        spawn_icon_loader(self.icon_tx.clone(), sources);
-                    }
+                    let jobs = icon_jobs(&added);
+                    self.spawn_missing_icons(jobs);
                     self.save_items();
                     eprintln!(
                         "批量面板：全部加入命令 — 新增 {grew} 条，跳过 {skipped} 条已存在（名称不落日志）"
@@ -8891,22 +9160,39 @@ impl LauncherApp {
         }
     }
 
+    /// 批次 F4：把一批作业里「还没纹理、没在飞、也没失败过」的派给加载线程。
+    /// 所有补图标的地方都走这一个口子，`pending` / `failed` 两张表才有一致的含义。
+    fn spawn_missing_icons(&mut self, jobs: Vec<IconJob>) {
+        let missing: Vec<IconJob> = jobs
+            .into_iter()
+            .filter(|(k, _)| {
+                !self.icons.contains_key(k)
+                    && !self.icon_pending.contains(k)
+                    && !self.icon_failed.contains(k)
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        for (k, _) in &missing {
+            self.icon_pending.insert(k.clone());
+        }
+        spawn_icon_loader(self.icon_tx.clone(), missing);
+    }
+
     /// 批次 F7：从「高级」页恢复一条隐藏条目之后的收尾——两份落盘、补取图标、刷新路径态。
     /// 恢复出来的条目来自隐藏快照（老记录没有快照时才按出厂种子重建），
     /// 图标纹理与路径四态都还没有缓存。
     fn after_unhide(&mut self, ctx: &egui::Context, uid: &str) {
         self.save_items();
         source::application::save_settings(&self.prefs);
-        let icon_src = self
+        let jobs = self
             .items
             .iter()
             .find(|i| i.uid() == uid)
-            .map(|i| i.source_path.clone())
-            .filter(|p| !p.is_empty())
-            .filter(|p| !self.icons.contains_key(p.as_str()));
-        if let Some(p) = icon_src {
-            spawn_icon_loader(self.icon_tx.clone(), vec![p]);
-        }
+            .map(|i| icon_jobs(std::slice::from_ref(i)))
+            .unwrap_or_default();
+        self.spawn_missing_icons(jobs);
         self.refresh_path_states(true);
         ctx.request_repaint();
     }
@@ -9217,13 +9503,47 @@ impl eframe::App for LauncherApp {
             }
         }
 
-        while let Ok((source_path, rgba, w, h)) = self.icon_rx.try_recv() {
-            let texture = ui.ctx().load_texture(
-                &source_path,
-                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba),
-                egui::TextureOptions::default(),
-            );
-            self.icons.insert(source_path, texture);
+        // 批次 F4：回执是「缓存键 + 可选像素」。取不到的键记进 failed，免得可见行每帧重开线程。
+        while let Ok((key, hit)) = self.icon_rx.try_recv() {
+            self.icon_pending.remove(&key);
+            match hit {
+                Some((rgba, w, h)) => {
+                    let texture = ui.ctx().load_texture(
+                        &key,
+                        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba),
+                        egui::TextureOptions::default(),
+                    );
+                    let entry = IconEntry {
+                        texture,
+                        last_use: std::cell::Cell::new(self.icon_tick.get()),
+                    };
+                    self.icons.insert(key, entry);
+                }
+                None => {
+                    self.icon_failed.insert(key);
+                }
+            }
+        }
+        // 批次 F4：LRU 修剪（AHK `MaxIcons` 同口径：超 1500 剪到 1200）。
+        // 被剪掉的键不进 failed，可见行下一帧会重新要一次。
+        if self.icons.len() > source::icon::ICON_CACHE_MAX {
+            let last_use: std::collections::HashMap<String, u64> = self
+                .icons
+                .iter()
+                .map(|(k, v)| (k.clone(), v.last_use.get()))
+                .collect();
+            let doomed = source::icon::evict_keys(&last_use);
+            if !doomed.is_empty() {
+                for k in &doomed {
+                    self.icons.remove(k);
+                }
+                eprintln!(
+                    "icon cache: 超上限 {} 条，淘汰最久没用的 {} 条（剩 {}）",
+                    last_use.len(),
+                    doomed.len(),
+                    self.icons.len()
+                );
+            }
         }
 
         // 「批量导入全部」结果到达：合并去重 → 落 user_items.json → 为未加载过的图标源补起加载器。
@@ -9243,15 +9563,8 @@ impl eframe::App for LauncherApp {
             // dedup 保留的先出现项仍持旧对象（学习统计天然在）；若重复项出现在后位被剔前，
             // 统一回填一次兜底。
             self.carry_stats(&old);
-            let missing: Vec<String> = self
-                .items
-                .iter()
-                .map(|i| i.source_path.clone())
-                .filter(|p| !p.is_empty() && !self.icons.contains_key(p.as_str()))
-                .collect();
-            if !missing.is_empty() {
-                spawn_icon_loader(self.icon_tx.clone(), missing);
-            }
+            let jobs = icon_jobs(&self.items);
+            self.spawn_missing_icons(jobs);
             self.save_items();
             items_changed = true;
         }
@@ -9998,7 +10311,7 @@ impl eframe::App for LauncherApp {
                                 let shown = self.items[pos].name.clone();
                                 self.save_items();
                                 let text = if on {
-                                    format!("✓ 已置顶「{shown}」📌（重启仍在）")
+                                    format!("✓ 已置顶「{shown}」（图标右上角角标，重启仍在）")
                                 } else {
                                     format!("✓ 已取消置顶「{shown}」")
                                 };
@@ -10955,7 +11268,7 @@ impl eframe::App for LauncherApp {
                                         } else {
                                             "文件（FR-SRC-14）"
                                         });
-                                        // 批次 E4：标记的落款用标题前缀 `✓`（与置顶的 📌 同一手法），
+                                        // 批次 E4：标记的落款用标题前缀 `✓`（不另开列宽），
                                         // 不另开列宽——行号徽标与图标在标记前后保持同一 x 坐标。
                                         let shown = if is_marked(&self.marked, &hit.path) {
                                             format!("✓ {}", hit.title)
@@ -11176,6 +11489,23 @@ impl eframe::App for LauncherApp {
                                 }
                             }
                         }
+                        // 批次 F4：可见行缺图标（含被 LRU 淘汰掉的）就地补一次，
+                        // 不指望别的事件来兜；`spawn_missing_icons` 会把已在飞/已失败过的滤掉。
+                        let tick = {
+                            let t = self.icon_tick.get() + 1;
+                            self.icon_tick.set(t);
+                            t
+                        };
+                        let visible_jobs: Vec<IconJob> = results
+                            .iter()
+                            .filter_map(|&hit| {
+                                let it = &self.items[hit];
+                                let spec = icon_spec_of(it);
+                                let key = source::icon::cache_key(spec)?;
+                                Some((key, spec.to_string()))
+                            })
+                            .collect();
+                        self.spawn_missing_icons(visible_jobs);
                         for (rank, &hit) in results.iter().enumerate() {
                             let idx = rank + head_len;
                             let item = &self.items[hit];
@@ -11184,19 +11514,34 @@ impl eframe::App for LauncherApp {
                                 // 行号徽标（2026-10-18 用户要求：数字键没有可见对应物）：
                                 // 前 10 行标 1-9/0，第 11 行起留白——那里没有按键，标了反而误导。
                                 row_badge(ui, idx, "执行");
-                                if let Some(texture) = self.icons.get(&item.source_path) {
-                                    ui.image(egui::load::SizedTexture::new(texture.id(), egui::vec2(icon, icon)));
-                                } else {
-                                    ui.add_space(icon);
+                                // 批次 F4：图标按缓存键取（一堆 .pdf 共用一张纹理），
+                                // 画出来的同时把 LRU 时刻刷新成本帧的 tick。
+                                let slot = match source::icon::cache_key(icon_spec_of(item))
+                                    .as_ref()
+                                    .and_then(|k| self.icons.get(k))
+                                {
+                                    Some(entry) => {
+                                        entry.last_use.set(tick);
+                                        ui.image(egui::load::SizedTexture::new(
+                                            entry.texture.id(),
+                                            egui::vec2(icon, icon),
+                                        ))
+                                    }
+                                    None => ui.allocate_exact_size(
+                                        egui::vec2(icon, icon),
+                                        egui::Sense::hover(),
+                                    )
+                                    .1,
+                                };
+                                // FR-SRC-19：置顶项在图标右上角画角标（2026-10-29 批次 F4
+                                // 从「名称前 📌」改来——前缀会把名称挤偏，角标贴图标不占字宽）。
+                                if item.pinned {
+                                    paint_pin_badge(ui, slot.rect);
                                 }
-                                // FR-SRC-19：置顶项名称前加 📌 角标（免鼠标可辨）。
-                                // 批次 E4：标记项再加一层 `✓` 前缀（与 📌 同一手法，不另开列宽）。
-                                // 批次 B6：带参项在名称前加 `*`（最近名字，先于 📌/✓）。
+                                // 批次 E4：标记项用名称前 `✓` 前缀，不另开列宽。
+                                // 批次 B6：带参项在名称前加 `*`（最近名字，先于 ✓）。
                                 let marked = is_marked(&self.marked, &item.path);
                                 let mut shown = format!("{}{}", param_row_mark(item), item.name);
-                                if item.pinned {
-                                    shown = format!("📌 {shown}");
-                                }
                                 if marked {
                                     shown = format!("✓ {shown}");
                                 }
@@ -11792,14 +12137,8 @@ impl eframe::App for LauncherApp {
                                 ));
                             }
                             self.carry_stats(&old);
-                            if !item.source_path.is_empty()
-                                && !self.icons.contains_key(item.source_path.as_str())
-                            {
-                                spawn_icon_loader(
-                                    self.icon_tx.clone(),
-                                    vec![item.source_path.clone()],
-                                );
-                            }
+                            let jobs = icon_jobs(std::slice::from_ref(&item));
+                            self.spawn_missing_icons(jobs);
                             self.save_items();
                             // 入库/保存后清空搜索框，呼出即见全清单（FR-SRC-20 添加流一致）。
                             self.clear_query_next_frame = true;
@@ -12743,8 +13082,13 @@ impl eframe::App for LauncherApp {
                     // FR-UIX-09：主窗随即关到托盘，所以回执只能靠 HUD 送到窗口外。
                     let msg = format!("✓ 已复制 {text}");
                     self.toast = Some((msg.clone(), Instant::now() + TOAST_TTL, TOAST_OK));
-                    self.hud
-                        .notify(ui.ctx(), msg, &self.theme, hud::HOLD_FOREGROUND);
+                    self.hud.notify(
+                        ui.ctx(),
+                        msg,
+                        &self.theme,
+                        hud::HOLD_FOREGROUND,
+                        work_for(self.prefs.appearance.show_on),
+                    );
                     self.clear_query_next_frame = true;
                     self.selected = 0;
                     self.visible = false;
@@ -13119,27 +13463,16 @@ fn main() -> eframe::Result {
         create_new.instance_descriptor.backends = eframe::wgpu::Backends::GL;
     }
 
-    let mut viewport = egui::ViewportBuilder::default()
+    let viewport = egui::ViewportBuilder::default()
         .with_inner_size([start_width, start_height])
         .with_title("")
         .with_decorations(false)
         .with_always_on_top()
         .with_transparent(true)
         .with_visible(start_visible);
-    // 批次 F8（FR-UIX-03 RememberPosition）：上次的位置还要在显示器上才用。
-    // 拔掉副屏、改分辨率之后，旧坐标可能整块落在不存在的区域——那样窗口会"启动成功但看不见"。
-    if configured.appearance.remember_position {
-        match configured.appearance.last_pos {
-            Some([x, y]) if pos_on_screen([x, y]) => {
-                viewport = viewport.with_position([x as f32, y as f32]);
-                eprintln!("窗口：使用上次位置 ({x}, {y})");
-            }
-            Some([x, y]) => {
-                eprintln!("窗口：上次位置 ({x}, {y}) 已不在任何显示器上 ⇒ 落回系统默认位置");
-            }
-            None => {}
-        }
-    }
+    // 批次 F8（FR-UIX-03 RememberPosition）的位置改由批次 F3 接管：`settings.json` 里存的是
+    // 工作区千分比，得等窗口真的存在才能按 `show_on` 选屏摆位（见 `LauncherApp::new` 末尾
+    // 的首次落点）。这里不再给 `with_position`——先用系统默认位置建窗，首帧前就被摆好。
 
     let options = eframe::NativeOptions {
         viewport,
@@ -15080,5 +15413,106 @@ mod nav_tests {
         // ③ 压根没记下架（这次呼出的前台是空的）⇒ 说的是"没记下"，不是"关掉了"。
         let e = paste_text_into_previous_window("42").unwrap_err();
         assert!(e.contains("没记下"), "{e}");
+    }
+
+    fn work_rect(l: f32, t: f32, r: f32, b: f32) -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(r, b))
+    }
+
+    /// 批次 F3（FR-WIN-09）：默认档 `[500, 200]` ＝ 水平居中、离工作区顶 20%。
+    /// 要害在 Y 那条**不做**「减去窗口高」（AHK `Place` 就是这么写的：X 摊剩余宽、Y 摊整块高），
+    /// 写成 `(height - win_h) * fy` 的话 200 会落到 76，肉眼就是"贴在顶上"。
+    #[test]
+    fn default_ratio_is_centered_horizontally_and_a_fifth_down() {
+        let w = work_rect(0.0, 0.0, 1920.0, 1040.0);
+        let (x, y) = place_in_work(w, (500, 658), source::application::POS_REL_DEFAULT);
+        assert_eq!(x, 710, "（1920-500）×0.5");
+        assert_eq!(y, 208, "1040×0.2，不扣窗口高");
+    }
+
+    /// 摆好再折回来要回到同一组千分比（±1 是两次取整的余量）。
+    #[test]
+    fn place_and_relative_round_trip() {
+        let w = work_rect(-1920.0, 0.0, 0.0, 1040.0);
+        let size = (500, 658);
+        for fx in [0u16, 1, 250, 500, 750, 999, 1000] {
+            // Y 的上限是「还能整个塞进工作区」那条（(1040-658)/1040 ≈ 367‰）；再大就会被夹住，
+            // 夹住之后折回来当然对不上——那属于「超界」而不是往返失真。
+            for fy in [0u16, 100, 200, 300, 367] {
+                let rel = [fx, fy];
+                let pos = place_in_work(w, size, rel);
+                let back = relative_in_work(w, size, pos);
+                assert!(
+                    back[0].abs_diff(fx) <= 1 && back[1].abs_diff(fy) <= 1,
+                    "{rel:?} → {pos:?} → {back:?}"
+                );
+            }
+        }
+    }
+
+    /// 窗口比工作区还宽 / 还高时夹到左缘上缘，不把窗口推出屏幕；折回来记成居中。
+    #[test]
+    fn oversized_window_is_clamped_and_recorded_as_centered() {
+        let w = work_rect(0.0, 0.0, 400.0, 300.0);
+        let size = (500, 658);
+        assert_eq!(place_in_work(w, size, [1000, 1000]), (0, 0));
+        assert_eq!(relative_in_work(w, size, (0, 0)), [500, 0]);
+    }
+
+    /// 主屏在右边、副屏在左边（负坐标）时同样按那块屏的工作区摊。
+    #[test]
+    fn negative_origin_work_area_is_honoured() {
+        let w = work_rect(-1920.0, 0.0, 0.0, 1040.0);
+        let (x, y) = place_in_work(w, (500, 658), [0, 1000]);
+        assert_eq!(x, -1920);
+        assert_eq!(y, 1040 - 658, "贴底要夹到工作区底边减窗口高");
+    }
+
+    /// F4：文件夹 / 网址条目没写图标源时按类别兜通用图标（AHK `IconCache` 同口径），
+    /// 其余类别空着就是没有；显式写了规格的照原文用，不被类别兜底顶掉。
+    #[test]
+    fn folder_and_url_items_fall_back_to_a_generic_icon() {
+        let folder = LaunchItem {
+            name: "此电脑".into(),
+            kind: ItemKind::Folder,
+            path: "shell:MyComputerFolder".into(),
+            ..Default::default()
+        };
+        assert_eq!(icon_spec_of(&folder), "folder:");
+        let url = LaunchItem {
+            kind: ItemKind::Url,
+            path: "ms-settings:".into(),
+            ..Default::default()
+        };
+        assert_eq!(icon_spec_of(&url), "url:");
+        let cmd = LaunchItem {
+            kind: ItemKind::Command,
+            ..Default::default()
+        };
+        assert_eq!(icon_spec_of(&cmd), "");
+        let explicit = LaunchItem {
+            kind: ItemKind::Folder,
+            source_path: "ext:.txt".into(),
+            ..Default::default()
+        };
+        assert_eq!(icon_spec_of(&explicit), "ext:.txt");
+
+        // 二十个文件夹 + 二十个网址只该派两个取图标任务（同一张纹理）。
+        let many: Vec<LaunchItem> = (0..20)
+            .flat_map(|_| {
+                [
+                    LaunchItem {
+                        kind: ItemKind::Folder,
+                        ..Default::default()
+                    },
+                    LaunchItem {
+                        kind: ItemKind::Url,
+                        ..Default::default()
+                    },
+                ]
+            })
+            .collect();
+        let specs: Vec<String> = icon_jobs(&many).into_iter().map(|(_, s)| s).collect();
+        assert_eq!(specs, vec!["folder:".to_string(), "url:".to_string()]);
     }
 }

@@ -629,7 +629,7 @@ pub const ENTRIES: &[CheatEntry] = &[
     CheatEntry {
         key: "Ctrl+Shift+P",
         title: "置顶 / 取消置顶",
-        summary: "置顶项名称前带 📌",
+        summary: "置顶项图标右上角带角标",
         detail: "切换选中项的置顶状态，并给一句 Toast 回执，立即落盘。\n\
                  置顶只压过「同一匹配档位内」的次序，不会让更精确的命中让位。\n\
                  右键菜单里也有同一件事。",
