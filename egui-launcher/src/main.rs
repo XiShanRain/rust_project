@@ -64,7 +64,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, HWND_BROADCAST,
     HWND_MESSAGE, IsIconic, IsWindow, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_RESTORE,
+    RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE,
+    SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow,
     SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW,
@@ -2464,7 +2465,29 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// 批次 A9：Store/MSIX 条目（路径形如 `shell:AppsFolder\<AUMID>`）是唯一的例外——
 /// 它改走 `IApplicationActivationManager`，理由见 `application::activate_uwp`。
 fn shell_execute(file: &str, params: &str, dir: Option<&str>) -> windows::core::Result<()> {
-    shell_execute_verb(file, None, params, dir)
+    shell_execute_verb(file, None, params, dir, SW_SHOWNORMAL.0)
+}
+
+/// 批次 B7（FR-ACT-08）：运行标志改的就是这一格 `nShow` —— Delphi 也把 `ShowCmd` 交给
+/// `ShellExecute` 的最后一个参数（`untShortCutMan.pas:341`），两条路径同一个位置。
+fn shell_execute_show(
+    file: &str,
+    params: &str,
+    dir: Option<&str>,
+    nshow: i32,
+) -> windows::core::Result<()> {
+    shell_execute_verb(file, None, params, dir, nshow)
+}
+
+/// [`source::runflags::ShowFlag`] → `nShow`。四档都取 Win32 具名常量，不手抄数字：
+/// 最大化是 3、最小化是 2，抄反了界面上一眼看不出，只会"按了却变成另一种"。
+fn nshow(flag: source::runflags::ShowFlag) -> i32 {
+    match flag {
+        source::runflags::ShowFlag::Normal => SW_SHOWNORMAL.0,
+        source::runflags::ShowFlag::Maximized => SW_SHOWMAXIMIZED.0,
+        source::runflags::ShowFlag::Minimized => SW_SHOWMINIMIZED.0,
+        source::runflags::ShowFlag::Hidden => SW_HIDE.0,
+    }
 }
 
 /// [`shell_execute`] 的带动词版本（批次 P1，FR-ACT-04）。动词有两处用到：
@@ -2479,6 +2502,7 @@ fn shell_execute_verb(
     verb: Option<&str>,
     params: &str,
     dir: Option<&str>,
+    nshow: i32,
 ) -> windows::core::Result<()> {
     // 清单里的路径可能是 `%VAR%` 形态（出厂「启动器目录」用的是 `%LAUNCHER_DIR%`，
     // 要跟着 exe 搬家）——ShellExecuteExW 不替我们展开，所以在这里统一走一次。
@@ -2502,14 +2526,14 @@ fn shell_execute_verb(
     sei.lpFile = PCWSTR(wfile.as_ptr());
     sei.lpParameters = PCWSTR(wparams.as_ptr());
     sei.lpDirectory = PCWSTR(wdir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()));
-    sei.nShow = SW_SHOWNORMAL.0;
+    sei.nShow = nshow;
     unsafe { ShellExecuteExW(&mut sei) }
 }
 
 /// FR-ACT-04「以管理员运行」。参数与「打开」同一条通道，只多一个 `runas` 动词。
 /// 工作目录跟着条目的 `working_dir` 走（与不提权那一档对齐，不额外加限制）。
 fn shell_execute_runas(file: &str, params: &str, dir: Option<&str>) -> windows::core::Result<()> {
-    shell_execute_verb(file, Some("runas"), params, dir)
+    shell_execute_verb(file, Some("runas"), params, dir, SW_SHOWNORMAL.0)
 }
 
 /// FR-ACT-04「打开方式…」。走系统自己的 `OpenAs_RunDLL`，不自己列候选程序。
@@ -2540,7 +2564,7 @@ fn show_properties(path: &str) -> bool {
     if by_api {
         return true;
     }
-    shell_execute_verb(path, Some("properties"), "", None).is_ok()
+    shell_execute_verb(path, Some("properties"), "", None, SW_SHOWNORMAL.0).is_ok()
 }
 
 /// FR-ACT-04「移入回收站」。用 Windows 自己的删除（`SHFileOperationW` + `FOF_ALLOWUNDO`），
@@ -7024,6 +7048,19 @@ impl LauncherApp {
             self.internal_toast(ctx, "⚠ 命令行为空，没东西可测", false);
             return;
         }
+        // 批次 B7（FR-ACT-08）：测试执行与真启动同口径——标志先剥、窗口状态照样生效。
+        // 顺序必须在标记展开之前：编码非空却没有标记时，参数是拼在"命令尾"的，
+        // 留着 `@+` 的话会拼到标志后面去，变成 `notepad.exe@+ 值`。
+        let (path, show_flag) = if kind == ItemKind::Url {
+            (path, source::runflags::ShowFlag::Normal)
+        } else {
+            let (stripped, flag) = source::runflags::split(&path);
+            (stripped.to_string(), flag)
+        };
+        if path.is_empty() {
+            self.internal_toast(ctx, "⚠ 运行标志后面没有命令，没东西可测", false);
+            return;
+        }
         // 批次 B6（FR-ACT-07）：带参项按"呼出那一刻的现场"展开标记再试跑。
         // 弹窗里没法再套一层参数框 ⇒ `{%p}` 按空串代入；这比把字面量 `{%p}` 交给程序强，
         // 后者只会换回一个"找不到文件"。日志本来就只记名称（"名称/路径/参数不落日志"），
@@ -7035,7 +7072,7 @@ impl LauncherApp {
             source::params::expand_command(&path, &args, ty, &self.summon, "")
         };
         let name = if name.trim().is_empty() { path.clone() } else { name };
-        match shell_execute(&path, &args, wd.as_deref()) {
+        match shell_execute_show(&path, &args, wd.as_deref(), nshow(show_flag)) {
             Ok(_) => {
                 eprintln!("弹窗测试执行：已启动（名称/路径/参数不落日志）");
                 let note = if asked { "（标记已按当前现场展开，{%p} 为空）" } else { "" };
@@ -7080,9 +7117,30 @@ impl LauncherApp {
         if entry.kind == ItemKind::Internal {
             return self.run_internal(ctx, entry);
         }
-        match shell_execute(&entry.path, &entry.arguments, entry.working_dir.as_deref()) {
+        // 批次 B7（FR-ACT-08）：`@+` / `@-` / `@` 改的是"这条命令拉起来的那个窗口"。
+        // URL 档不认：浏览器自己开窗，剥掉尾巴上的 `@` 只会把网址啃坏。
+        let (file, flag) = match entry.kind {
+            ItemKind::Url => (entry.path.as_str(), source::runflags::ShowFlag::Normal),
+            _ => source::runflags::split(&entry.path),
+        };
+        // 整条命令只写了一个 `@` ⇒ 剥完没东西可启动。不交给 ShellExecute 换一个
+        // "找不到文件"的系统错误，直接说清楚是标志后面缺命令。
+        if file.is_empty() {
+            eprintln!(
+                "launch: 运行标志后面没有命令，未启动（{}）",
+                entry.kind.label()
+            );
+            self.internal_toast(ctx, "⚠ 运行标志后面没有命令", false);
+            return false;
+        }
+        match shell_execute_show(
+            file,
+            &entry.arguments,
+            entry.working_dir.as_deref(),
+            nshow(flag),
+        ) {
             Ok(_) => match masked_uid {
-                None => eprintln!("launch: {} {}", entry.path, entry.arguments),
+                None => eprintln!("launch: {} {}", file, entry.arguments),
                 Some(uid) => eprintln!(
                     "launch(custom): 已启动「{}」（{uid}，填入的路径/参数含用户内容，不落日志）",
                     entry.name
@@ -7091,7 +7149,7 @@ impl LauncherApp {
             Err(e) => {
                 // M1 验收：启动失败不崩溃、不隐藏——窗口留在原地显示 Toast，TOAST_TTL 后自动消失。
                 match masked_uid {
-                    None => eprintln!("launch failed: {}: {e}", entry.path),
+                    None => eprintln!("launch failed: {}: {e}", file),
                     Some(uid) => eprintln!("launch(custom) failed: 「{}」{uid}: {e}", entry.name),
                 }
                 self.toast = Some((

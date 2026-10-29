@@ -133,6 +133,20 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: None,
     },
     CheatEntry {
+        key: "@+ @- @",
+        title: "运行标志",
+        summary: "命令行首/尾加一个标志，改目标窗口打开时的状态",
+        detail: "`@+` 最大化 · `@-` 最小化 · `@` 隐藏（后台起、不弹窗）。\n\
+                 写在命令行**尾**（`notepad.exe@`，需求书原文）或**首**（`@notepad.exe`，Delphi 写法）都认；\
+                 一条命令只认一个，两头都写着时前导那个说了算。\n\
+                 只在本程序启动这一条路上生效；网址不认（浏览器自己开窗）。\n\
+                 目标程序自己不认系统给的初始显示状态时这一档没效果——记事本、cmd 这类认。",
+        tags: "run flag 运行标志 最大化 最小化 隐藏 后台 @+ @-",
+        group: Group::Syntax,
+        source: None,
+        settings_page: None,
+    },
+    CheatEntry {
         key: "1+2",
         title: "计算器",
         summary: "能求成一个数时头段加一行",

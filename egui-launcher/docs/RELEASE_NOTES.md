@@ -1310,6 +1310,28 @@ AHK 版的 `Ctrl+L` 是「看不清就把这串字放大」，Delphi 版没有�
 
 ---
 
+### 六十二、批次 B7：运行标志 `@+` / `@-` / `@`（FR-ACT-08，2026-10-29，用户正文「1. 已经提交并推送 2. 继续下一计划」＋选项面板裁定：下一批＝B7 运行标志）
+
+| 项 | 内容 |
+| --- | --- |
+| 本批要结的格子 | FR-ACT-08 P2「运行标志」：命令行加一个标志，改目标窗口打开时的状态——`@+` 最大化、`@-` 最小化、`@` 隐藏。开发计划 §8.2 B7 记的规模是 S。 |
+| 参考实现取证（Delphi V1.46.7） | 判断在 `untShortCutMan.pas:171-185`：`if Pos(SHOW_MAX_FLAG, cmdobj.Command) = 1 then …`，同段注释原文「去掉前面的 @/@+/@-」；值最终交给 `ShellExecute` 的最后一个参数（`:341`），也就是 Win32 的 `nCmdShow`。标志常量在 `untALTRunOption.pas:33-35`（`SHOW_MAX_FLAG='@+'` / `SHOW_MIN_FLAG='@-'` / `SHOW_HIDE_FLAG='@'`）。Delphi 只认**前导**，一条只处理一个（`else if` 链）。 |
+| 规格冲突：位置（前导还是尾部） | 需求书 FR-ACT-08 写的是「命令行尾」并给了 `notepad.exe@`；Delphi 实码只认前导。两者都是原文，**不挑一个删掉**：两头都认，先看前导、没有再看到尾部；一条只剥一个；两端都写着时前导说了算、尾部那个原样留在路径里——宁可让"找不到文件"把写错的形态暴露出来，也不替用户猜。这条歧义在需求书里按「划线保留旧写法 + 落地注记」登记，没有静默改原文。 |
+| 甲·纯函数层（`src/source/runflags.rs`，新文件） | `ShowFlag` 四档（`Normal` / `Maximized` / `Minimized` / `Hidden`，默认 `Normal`）+ `split(&str) -> (&str, ShowFlag)`，零 I/O、不碰 Windows API，可直接单测。8 条单测：无标志原样返回、尾部三档（按需求书原文）、前导三档（按 Delphi）、长标志优先（`@+` 不能被 `@` 吞成"隐藏 + 一个 `+`"）、一条只剥一个且前导优先（`"@+notepad.exe@"` ⇒ `("notepad.exe@", Maximized)`）、只写一个标志时剥完为空、`@` 在中间不算标志（含 `user@example.com` 这种邮箱）、标志两侧的空白跟着标志走。 |
+| 乙·启动接线（`src/main.rs`） | 两处接在同一个漏斗上：① `launch_with_log`（`main.rs:7120` 起）——回车、操作面板「打开」、参数框确认都从这里出去，一处接线三处生效；② 弹窗「测试执行」（`main.rs:7051` 起）与之同口径。`nshow()`（`main.rs:2484`）把四档翻成 Win32 具名常量，`shell_execute_verb` 多收一格 `nshow: i32` 直接写进 `sei.nShow`；`shell_execute_runas` 与「属性」回落仍传 `SW_SHOWNORMAL.0`——提权与属性对话框不给改显示状态。**剥标志的位置有意排在标记展开之前**：编码非空却没有标记时（§六十 那条"参数拼在命令尾"的分支），留着 `@+` 会拼成 `notepad.exe@+ 值`。 |
+| 三条有意偏差 | ① **网址不认**（`Kind::Url`）：浏览器自己开窗，剥掉网址尾巴上的 `@` 只会把它啃坏；② **剥完为空不启动**（整条只写了一个 `@`）：Toast 直说「⚠ 运行标志后面没有命令」，日志只记 `entry.kind.label()`，不交给 ShellExecute 换一个"找不到文件"的系统错误框；③ **批量动作不认**（B5「全部打开」等按路径直传给 `shell_execute`）：那些动作的语义是"对这个路径做事"，不是"按条目声明的窗口状态启动"。单行四条路（回车 / 面板「打开」/ 参数框确认 / 测试执行）全认。 |
+| 继承 Delphi 的一处代价 | 目标程序自己不认系统给的初始显示状态（`nCmdShow`）时这一档静默无效——记事本、cmd 这类认；与参考实现同一行为，不另造检测。 |
+| 丙·速查表 +1 | `src/source/cheatsheet.rs:137` 新增「运行标志」（键 `@+ @- @`，语法组）：三个标志、首尾都认、一条只剥一个、网址除外、`nCmdShow` 那条代价都写进 detail。条目数 63 ⇒ **64**（`ENTRIES` 没有硬编长度断言，不必改计数）。 |
+| 验证（自动部分） | `cargo test --target-dir target/b7` **363/363**（本批 +8，全部来自 `runflags`，其余未动）；`cargo check --all-targets --target-dir target/b7` 零警告；`cargo build --target-dir target/b7` 通过，exe `2026-10-29 07:59:58.511`，`find src -name '*.rs' -newer` 无输出 ⇒ 测的就是含本批代码的那版二进制。**未跑 `cargo fmt`**（成规）。 |
+| 真机（一条没跑） | 用户实例在跑（会话级命名互斥体），沙箱 exe 只会转发 `Activate` 后自行退出 ⇒ 按"绝不关用户实例"本轮未起沙箱。**本轮结论只到"代码闭环 + 自动检查全绿"，不是"功能已验证"。** |
+| 待点测（四条 + 一格） | ① `notepad.exe@+` ⇒ 记事本最大化；② `notepad.exe@-` ⇒ 最小化到任务栏；③ `notepad.exe@` ⇒ 不出现窗口，任务管理器里能查到进程；④ 前导形态 `@+notepad.exe` 与尾部同果。顺带一格：整条只写 `@` 的条目按回车 ⇒ Toast 报"运行标志后面没有命令"，主窗口不隐藏、不弹系统错误框。 |
+| 隐私 | 日志只落剥离后的命令与参数（与既有 `launch:` 行同口径）；剥出来的是用户原文里本来就有的字符，不新增记录面。为空那条只记 `kind.label()`，不记原文。 |
+| 用户环境复原 | 全程只写 `target/b7`；用户数据目录 `%LOCALAPPDATA%\egui-launcher` 与 `target/debug` 未写；未起、未停任何用户进程。 |
+| 文档回记 | 需求书 FR-ACT-08 行（划线保留"命令行尾"原文 + 落地注记）与验收行 714 补注；开发计划 §8.2 B7 行 + §8.10 打磨档；本节。 |
+| 提交 | **未提交**。改动：新文件 `src/source/runflags.rs`、`src/source/mod.rs`（一行 `pub mod`）、`src/main.rs`（`nshow` / `shell_execute_show` / `shell_execute_verb` 多收一格 / `launch_with_log` / `test_dialog_entry`）、`src/source/cheatsheet.rs`（+1 条）、三份文档。 |
+
+---
+
 
 | 项目 | 内容 |
 | --- | --- |

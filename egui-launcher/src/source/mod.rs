@@ -26,6 +26,7 @@ pub mod import;
 pub mod manage;
 pub mod params;
 pub mod pathcheck;
+pub mod runflags;
 pub mod system;
 pub mod terminal;
 pub mod usage;
