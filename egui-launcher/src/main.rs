@@ -1002,6 +1002,9 @@ struct LauncherApp {
     theme: theme::Theme,
     /// 上一次真正装进 egui 的解析结果；与本次相同就不再碰 `ctx`（避免每帧重设样式）。
     theme_applied: Option<theme::Theme>,
+    /// 批次 F2：主题文件里那个 `opacity` 原值。`theme.opacity` 存的是**生效值**
+    ///（可能被外观页覆盖），拖覆盖值时要从这个原值重算。
+    theme_opacity: u8,
     /// 上一次装进 egui 的字体名。字体没变就只换样式，不重建字形缓存。
     theme_font: Option<String>,
     /// 设置页下拉的选项（`System` + 内置 + 用户主题）。只在启动 / 呼出 / 换主题时重读，
@@ -4504,6 +4507,7 @@ impl LauncherApp {
             prefs,
             theme,
             theme_applied: None,
+            theme_opacity: 255,
             theme_font: None,
             theme_choices,
             icon_rx,
@@ -4600,8 +4604,14 @@ impl LauncherApp {
 
     /// 装一套已解析好的主题。[`Self::sync_theme`] 与启动路径共用，避免
     /// `new()` 里为了首帧和末尾各读一遍 `Themes\`。
-    fn use_theme(&mut self, ctx: &egui::Context, theme: theme::Theme, choices: Vec<String>) {
+    fn use_theme(&mut self, ctx: &egui::Context, mut theme: theme::Theme, choices: Vec<String>) {
         self.theme_choices = choices;
+        // 批次 F2（FR-UIX-06）：主题里那个 `opacity` 是默认来源，外观页的覆盖值压过它。
+        // 先记下原值（拖覆盖值时要重算），再把生效值写进主题——`central_frame` 每帧都从
+        // `self.theme` 取底色，所以生效值就是这一格。
+        self.theme_opacity = theme.opacity;
+        let effective_opacity = self.prefs.appearance.effective_opacity(theme.opacity);
+        theme.opacity = effective_opacity;
         if self.theme_applied.as_ref() == Some(&theme) {
             self.theme = theme;
             return;
@@ -4611,13 +4621,14 @@ impl LauncherApp {
             self.theme_font = Some(theme.font_name.clone());
         }
         eprintln!(
-            "主题：{}（字体 {}，底色 {:02X}{:02X}{:02X}，不透明度 {}）",
+            "主题：{}（字体 {}，底色 {:02X}{:02X}{:02X}，不透明度 {}（主题 {}））",
             theme.name,
             theme.font_name,
             theme.background.r(),
             theme.background.g(),
             theme.background.b(),
-            theme.opacity
+            effective_opacity,
+            self.theme_opacity
         );
         theme.apply(ctx);
         // 2026-10-24 用户裁定：换主题后窗口高度要按新几何重算，保持一屏正好 10 行。
@@ -4637,6 +4648,32 @@ impl LauncherApp {
         if !first_apply {
             self.resize_to_list(ctx, height, "换主题");
         }
+        ctx.request_repaint();
+    }
+
+    /// 批次 F2（FR-UIX-06）：外观页拖完不透明度后把生效值套进当前主题。
+    ///
+    /// 不重读主题文件、不重算窗口高度：生效值只影响 `central_frame` 底色的 alpha，
+    /// 而框架每帧都从 `self.theme` 现取，下一帧就看得出来。`theme_applied` 一起改，
+    /// 免得下一次 `sync_theme`（呼出时）把同一套主题当成"变了"再重算一遍高度。
+    fn apply_opacity_override(&mut self, ctx: &egui::Context) {
+        let effective = self.prefs.appearance.effective_opacity(self.theme_opacity);
+        if self.theme.opacity == effective {
+            return;
+        }
+        self.theme.opacity = effective;
+        if let Some(applied) = self.theme_applied.as_mut() {
+            applied.opacity = effective;
+        }
+        eprintln!(
+            "不透明度：{}（主题 {}，外观页 {}）",
+            effective,
+            self.theme_opacity,
+            match self.prefs.appearance.opacity {
+                Some(v) => v.to_string(),
+                None => "跟随主题".to_string(),
+            }
+        );
         ctx.request_repaint();
     }
 
@@ -7841,6 +7878,73 @@ impl LauncherApp {
                                 .weak()
                                 .small(),
                             );
+                            // 批次 F2（FR-UIX-06）：不透明度。滑块的起点永远是**当前生效值**
+                            //（跟随主题时就是主题 JSON 里那个数），拖一下才变成外观页覆盖值。
+                            ui.add_space(6.0);
+                            let mut op = self.theme.opacity;
+                            let or = ui.add(
+                                egui::Slider::new(
+                                    &mut op,
+                                    source::application::OPACITY_MIN
+                                        ..=source::application::OPACITY_MAX,
+                                )
+                                .text("不透明度"),
+                            );
+                            if or.changed() {
+                                self.prefs.appearance.opacity = Some(op);
+                                self.apply_opacity_override(ui.ctx());
+                            }
+                            // 与宽度滑块同一口径：拖的过程不写盘，松手（或键盘调完）才落一次。
+                            if or.drag_stopped()
+                                || (or.changed() && !ui.input(|i| i.pointer.primary_down()))
+                            {
+                                source::application::save_settings(&self.prefs);
+                                // 记生效值 + 来源：`opacity` 是 `Option`，`None` 时
+                                // `unwrap_or_default()` 会打出「不透明度 = 0」，与窗口上的数正好相反。
+                                eprintln!(
+                                    "设置页：不透明度 → 生效 {}（外观页 {}，已写 settings.json）",
+                                    self.theme.opacity,
+                                    match self.prefs.appearance.opacity {
+                                        Some(v) => v.to_string(),
+                                        None => "跟随主题".to_string(),
+                                    }
+                                );
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if self.prefs.appearance.opacity.is_some() {
+                                    if ui
+                                        .button(format!(
+                                            "跟随主题（{}）",
+                                            self.theme_opacity
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.prefs.appearance.opacity = None;
+                                        self.apply_opacity_override(ui.ctx());
+                                        source::application::save_settings(&self.prefs);
+                                        eprintln!(
+                                            "设置页：不透明度回「跟随主题」（生效 {}，已写 settings.json）",
+                                            self.theme.opacity
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "当前是外观页覆盖值；主题里那个数仍在，点按钮就交还给主题。",
+                                        )
+                                        .weak()
+                                        .small(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "当前跟随主题（{}）。改主题 JSON 的 opacity，或拖上面的滑块。",
+                                            self.theme_opacity
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                }
+                            });
                             ui.add_space(8.0);
                             ui.separator();
                             // 批次 F1（FR-UIX-01）：主题选择。改成即时生效——不重启、不丢焦点。
@@ -7919,8 +8023,19 @@ impl LauncherApp {
                                 t.shortcut_font_size
                             ));
                             ui.label(format!(
-                                "行高 {} ｜ 图标 {} ｜ 内边距 {} ｜ 选中圆角 {} ｜ 不透明度 {}（{}/255）",
-                                t.row_height, t.icon_size, t.padding, t.selected_radius, t.opacity, t.opacity
+                                "行高 {} ｜ 图标 {} ｜ 内边距 {} ｜ 选中圆角 {} ｜ 不透明度 {}（{}/255 ≈ {}%，{}）",
+                                t.row_height,
+                                t.icon_size,
+                                t.padding,
+                                t.selected_radius,
+                                t.opacity,
+                                t.opacity,
+                                (t.opacity as f32 / 255.0 * 100.0).round(),
+                                if self.prefs.appearance.opacity.is_some() {
+                                    "外观页覆盖"
+                                } else {
+                                    "跟随主题"
+                                }
                             ));
                             // 批次 F6：这两个数字只有在「跟随主题」档下才真的决定列表行，
                             // 不写这一句就会被读成"改了主题 JSON 行高却没变＝主题坏了"。
@@ -7936,7 +8051,7 @@ impl LauncherApp {
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "颜色与其余尺寸请直接改主题 JSON（24 个键见需求书 6.2）；颜色写 RRGGBB，写错的键保留继承值并在日志里留一行。",
+                                    "颜色与其余尺寸请直接改主题 JSON（24 个键见需求书 6.2）；颜色写 RRGGBB，写错的键保留继承值并在日志里留一行。其中 opacity 也可以先用上面的滑块覆盖，点「跟随主题」就交还给主题。",
                                 )
                                 .weak()
                                 .small(),

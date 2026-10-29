@@ -1635,6 +1635,12 @@ pub struct Appearance {
     pub status_bar: bool,
     /// 显示时淡入（FR-UIX-07；原文就定的默认关）。
     pub fade: bool,
+    /// 批次 F2（FR-UIX-06）：窗口不透明度覆盖。`None` = 跟随主题（主题 JSON 那个 `opacity`）。
+    ///
+    /// 需求书 FR-UIX-02 把 `opacity` 归在主题的 24 个键里，所以这里**不是第二真值**：
+    /// 主题仍是默认来源，这一格只在用户不动主题文件时提供一个能拖的入口；点「跟随主题」
+    /// 就回到 `None`，主题里那个数立刻重新生效。范围见 [`OPACITY_MIN`] / [`OPACITY_MAX`]。
+    pub opacity: Option<u8>,
 }
 
 pub const WINDOW_WIDTH_MIN: f32 = 360.0;
@@ -1654,6 +1660,22 @@ impl Default for Appearance {
             last_pos: None,
             status_bar: true,
             fade: false,
+            opacity: None,
+        }
+    }
+}
+
+/// 不透明度的下界。再低就看不清字了（100/255 ≈ 39%），而这是个"看得见才用得上"的窗口。
+pub const OPACITY_MIN: u8 = 100;
+pub const OPACITY_MAX: u8 = 255;
+
+impl Appearance {
+    /// 窗口底色的生效 alpha：有覆盖就用覆盖值（先夹一次，手改 `settings.json` 的 0 不能原样进窗口），
+    /// 没有就原样返回主题里那个数。夹取只夹覆盖值——主题自己的 `opacity` 由主题加载层负责。
+    pub fn effective_opacity(&self, theme_opacity: u8) -> u8 {
+        match self.opacity {
+            Some(v) => v.clamp(OPACITY_MIN, OPACITY_MAX),
+            None => theme_opacity,
         }
     }
 }
@@ -3979,6 +4001,8 @@ mod dedup_tests {
         s.appearance.last_pos = Some([100, 200]);
         s.appearance.status_bar = false;
         s.appearance.fade = true;
+        // 批次 F2：不透明度覆盖也是口径（它压过主题里的那个数），恢复默认要一起回厂。
+        s.appearance.opacity = Some(180);
         s.hidden = vec!["custom:app|c:\\x.exe|".into()];
         s.hidden_stash = vec![LaunchItem {
             name: "藏着".into(),
@@ -4043,6 +4067,37 @@ mod dedup_tests {
         assert_eq!(s.appearance, Appearance::default());
         assert!(s.appearance.status_bar, "状态栏默认开");
         assert!(!s.appearance.fade, "淡入默认关（FR-UIX-07）");
+        assert_eq!(
+            s.appearance.opacity, None,
+            "不透明度默认跟随主题（批次 F2：老配置没有这一格时主题里的数说了算）"
+        );
+    }
+
+    /// 批次 F2（FR-UIX-06）：覆盖值优先、`None` 交给主题、越界夹回 100–255。
+    #[test]
+    fn effective_opacity_prefers_the_override_and_clamps_it() {
+        let follow = Appearance::default();
+        assert_eq!(
+            follow.effective_opacity(200),
+            200,
+            "None ＝跟随主题：主题写 200 就用 200"
+        );
+        let mut over = Appearance::default();
+        over.opacity = Some(180);
+        assert_eq!(over.effective_opacity(255), 180, "覆盖值压过主题");
+        assert_eq!(over.effective_opacity(120), 180, "覆盖值也压过更低主题值");
+        over.opacity = Some(0);
+        assert_eq!(
+            over.effective_opacity(255),
+            OPACITY_MIN,
+            "手改 settings.json 写成 0 不能原样进窗口"
+        );
+        over.opacity = Some(255);
+        assert_eq!(over.effective_opacity(100), OPACITY_MAX, "上界原样");
+        assert!(
+            OPACITY_MIN >= 100 && OPACITY_MAX == 255,
+            "下界别再往下调：再淡就看不清字了"
+        );
     }
 
     /// 批次 F3（FR-WIN-09）：落点默认鼠标所在屏、位置空 ⇒ 用 `[500, 200]`。
@@ -5508,6 +5563,8 @@ mod config_tests {
             width: 720.0,
             status_bar: false,
             fade: true,
+            // 批次 F2：特值进、特值出——`appearance` 走 serde 递归合并，这一格也一样。
+            opacity: Some(180),
             ..Default::default()
         };
 
@@ -5556,6 +5613,11 @@ mod config_tests {
         assert_eq!(got.appearance.width, 720.0, "appearance 递归合并：width");
         assert_eq!(got.appearance.status_bar, false, "appearance.status_bar");
         assert_eq!(got.appearance.fade, true, "appearance.fade");
+        assert_eq!(
+            got.appearance.opacity,
+            Some(180),
+            "appearance.opacity（批次 F2：覆盖值要能读回来，读成 None 就退回主题了）"
+        );
         assert_eq!(got.history_size, 7, "history_size");
         assert_eq!(got.history_limit(), 7, "history_limit：配置值小于上限时原样");
         assert_eq!(
