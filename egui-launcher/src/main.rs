@@ -1018,6 +1018,16 @@ struct LauncherApp {
     icon_failed: std::collections::HashSet<String>,
     /// 行渲染的单调序号：每帧 +1，写进 `IconEntry.last_use` 做 LRU 排序。
     icon_tick: std::cell::Cell<u64>,
+    // ---- 批次 D2 第二半（FR-SRC-11）：引擎图标 ----
+    /// 「下载站点图标」的回执：引擎 id + 结果。下载在后台线程里做（要联网），
+    /// 主线程只在 `ui()` 里收，成功就把相对路径写回那条引擎的 `icon`。
+    site_icon_rx: mpsc::Receiver<(String, Result<source::siteicon::DownloadedIcon, String>)>,
+    site_icon_tx: mpsc::Sender<(String, Result<source::siteicon::DownloadedIcon, String>)>,
+    /// 正在下载的那条引擎（id）。有值时设置页的「下载图标」按钮禁用，避免同一条连点几下发几次。
+    site_icon_pending: Option<String>,
+    /// 数据目录（`user_items.json` / `Icons\` 所在处）。`data_dir()` 每调一次都要写一次探针文件，
+    /// 不能按帧调 ⇒ 构造时取一次。设置页改过的路径不会立刻生效，与 AHK 那边同口径。
+    data_dir: std::path::PathBuf,
     // ---- 批次 U：FR-SRC-06 路径四态（后台线程算、主线程按 uid 缓存）----
     path_tx: mpsc::Sender<Vec<(String, source::pathcheck::PathState)>>,
     path_rx: mpsc::Receiver<Vec<(String, source::pathcheck::PathState)>>,
@@ -1157,6 +1167,39 @@ fn icon_jobs(items: &[source::application::LaunchItem]) -> Vec<IconJob> {
         }
     }
     out
+}
+
+/// 批次 D2 第二半（FR-SRC-11）：一条引擎要取的图标（缓存键 + 规格）。
+/// 规格与设置页里那格文本同一口径（[`source::siteicon::web_icon_spec`]）：
+/// 留空 ⇒ `url:`（浏览器默认图标）、有文件 ⇒ 按扩展名走 `thumb:` 或裸路径。
+fn engine_icon_job(
+    e: &source::websearch::WebEngine,
+    data_dir: &std::path::Path,
+) -> Option<IconJob> {
+    let spec = source::siteicon::web_icon_spec(&e.icon, data_dir);
+    let key = source::icon::cache_key(&spec)?;
+    Some((key, spec))
+}
+
+/// 引擎图标槽：纹理到了就画（尺寸与结果行图标同宽），没到就先占位——
+/// 占位字形沿用这条行原本用的那个（搜索行 `🔍`、补全提示行 `…`），所以加载中是熟悉的模样。
+fn engine_icon_slot(
+    ui: &mut egui::Ui,
+    icon: f32,
+    glyph: &str,
+    glyph_size: f32,
+    tex: Option<egui::TextureId>,
+) -> egui::Response {
+    match tex {
+        Some(id) => ui.image(egui::load::SizedTexture::new(
+            id,
+            egui::vec2(icon, icon),
+        )),
+        None => ui.add_sized(
+            [icon, icon],
+            egui::Label::new(egui::RichText::new(glyph).size(glyph_size).weak()),
+        ),
+    }
 }
 
 fn spawn_icon_loader(
@@ -4141,6 +4184,10 @@ impl LauncherApp {
         broken_settings: Option<Corrupted>,
     ) -> Self {
         let (icon_tx, icon_rx) = mpsc::channel();
+        // 批次 D2 第二半：「下载站点图标」的回执通道（下载在后台线程，主线程只收）。
+        let (site_icon_tx, site_icon_rx) = mpsc::channel();
+        // `data_dir()` 每次调用都写一次探针文件 ⇒ 取一次留在结构体里，别按帧调。
+        let data_dir = source::application::data_dir();
         let (apps_tx, apps_rx) = mpsc::channel();
         let (path_tx, path_rx) = mpsc::channel();
         // 清单文件不存在（首次运行）→ 用内置系统工具播种一次并落盘；此后它就是一张普通用户清单，
@@ -4419,6 +4466,10 @@ impl LauncherApp {
             icon_pending: std::collections::HashSet::new(),
             icon_failed: std::collections::HashSet::new(),
             icon_tick: std::cell::Cell::new(0),
+            site_icon_rx,
+            site_icon_tx,
+            site_icon_pending: None,
+            data_dir,
             path_tx,
             path_rx,
             path_states: std::collections::HashMap::new(),
@@ -5731,6 +5782,86 @@ impl LauncherApp {
         true
     }
 
+    /// 批次 D2 第二半（FR-SRC-11）：「下载站点图标」按下的那一刻。
+    /// 联网在后台线程里做（WinHTTP 最长 8 s 一档），主线程不等；回执在 `ui()` 里收。
+    /// 传进来的 `name` 只用来给文件起名（清洗在 `DownloadedIcon` 那一侧做），不落日志。
+    fn start_icon_download(&mut self, engine_id: String, address: String, name: String) {
+        if self.site_icon_pending.is_some() {
+            return;
+        }
+        let tx = self.site_icon_tx.clone();
+        let dir = self.data_dir.clone();
+        self.site_icon_pending = Some(engine_id.clone());
+        eprintln!("设置页：开始下载站点图标（一次只跑一条）");
+        thread::spawn(move || {
+            let fetch = |url: &str, limit: usize| source::siteicon::fetch_winhttp(url, limit);
+            let got = source::siteicon::download_icon(&address, &name, &dir, &fetch);
+            let _ = tx.send((engine_id, got));
+        });
+    }
+
+    /// 把下载到的图标写回那条引擎：`icon` 存相对数据目录的路径（`Icons\g.ico`）。
+    /// 两张表都要改——prefs 是生效值，编辑缓冲是设置页上正显示的那份。
+    fn set_engine_icon(&mut self, engine_id: &str, icon: &str) -> bool {
+        let mut changed = false;
+        if let Some(e) = self.prefs.web_engines.iter_mut().find(|e| e.id == engine_id) {
+            if e.icon != icon {
+                e.icon = icon.to_string();
+                changed = true;
+            }
+        }
+        if let Some(list) = self.web_engines_edit.as_mut() {
+            if let Some(e) = list.iter_mut().find(|e| e.id == engine_id) {
+                e.icon = icon.to_string();
+            }
+        }
+        changed
+    }
+
+    /// 下载回执落地。成功 ⇒ 写配置 + 让那张纹理失效（同名重下要能看见新图）；
+    /// 失败 ⇒ 只给 Toast，配置一个字都不动。
+    fn apply_downloaded_icon(
+        &mut self,
+        engine_id: &str,
+        got: Result<source::siteicon::DownloadedIcon, String>,
+    ) {
+        self.site_icon_pending = None;
+        match got {
+            Ok(icon) => {
+                // 那条引擎在下载途中被删掉 ⇒ 配置一个字都不动（图标文件留在 Icons\，不静默删用户文件）。
+                if self.set_engine_icon(engine_id, &icon.relative) {
+                    source::application::save_settings(&self.prefs);
+                }
+                // 同名重下时 `icon` 原文不变 ⇒ 缓存键不变 ⇒ 不清掉就永远画旧图。
+                let spec = source::siteicon::web_icon_spec(&icon.relative, &self.data_dir);
+                if let Some(key) = source::icon::cache_key(&spec) {
+                    self.icons.remove(&key);
+                    self.icon_failed.remove(&key);
+                    self.icon_pending.remove(&key);
+                }
+                eprintln!(
+                    "设置页：站点图标已保存（{} 字节，{} 格式）",
+                    icon.bytes, icon.ext
+                );
+                self.hotkey_note(
+                    &format!(
+                        "图标已保存：{}（{} KB）",
+                        icon.relative,
+                        icon.bytes.div_ceil(1024)
+                    ),
+                    true,
+                );
+            }
+            Err(msg) => {
+                eprintln!("设置页：站点图标没下到（{msg}）");
+                self.hotkey_note(&format!("图标没下到：{msg}"), false);
+            }
+        }
+        if let Some(ctx) = CTX.get() {
+            ctx.request_repaint();
+        }
+    }
+
     /// 离开「网页引擎」页（换分类 / 关设置页）时收尾：整理 → 写盘 → 丢缓冲。
     /// 丢掉的条数走 Toast 说清（残缺 / 关键字重复），不静默吞行。
     fn finish_web_engine_edits(&mut self) {
@@ -6221,8 +6352,9 @@ impl LauncherApp {
     /// 恢复出厂 / 选兜底引擎。在此之前增删改只能手改 `settings.json`。
     ///
     /// 三条口径：
-    /// - 表就是 `settings.json` 的 `web_engines`（手改文件仍然有效）；`id` 与 `icon` 不在界面上：
-    ///   前者是兜底与日志的锚、后者还没有显示入口（既有偏差，本批不碰）；
+    /// - 表就是 `settings.json` 的 `web_engines`（手改文件仍然有效）；`id` 不在界面上
+    ///   （兜底与日志的锚）。`icon` 从 2026-10-29（批次 D2 第二半）起有了第三行：
+    ///   预览 + 路径框 + 「下载图标」，搜索行最左边画的就是它；
     /// - 编辑走跨帧缓冲（理由同文件搜索页），**改一格就写盘**（原样、不丢行）；
     ///   整理（残缺行丢弃、关键字去重）只在离开这一页时做，丢了几条走 Toast 说清；
     /// - 「兜底」是单选：出厂序列 Google → Bing，或某一条引擎。
@@ -6248,6 +6380,24 @@ impl LauncherApp {
         let mut remove_row: Option<usize> = None;
         let mut add_row = false;
         let mut restore_default = false;
+        let mut download_row: Option<usize> = None;
+        // 批次 D2 第二半：每行第三个框是图标。预览纹理得在下面 `list` 的可变借用**之前**取好
+        // （`self.icons` 是 `&self`，与 `as_mut()` 打架），所以先按当前缓冲算「键 + 纹理」。
+        let downloading = self.site_icon_pending.is_some();
+        let mut previews: Vec<Option<egui::TextureId>> = Vec::new();
+        let mut preview_jobs: Vec<IconJob> = Vec::new();
+        if let Some(list) = self.web_engines_edit.as_ref() {
+            for e in list.iter() {
+                match engine_icon_job(e, &self.data_dir) {
+                    Some(job) => {
+                        previews.push(self.icons.get(&job.0).map(|x| x.texture.id()));
+                        preview_jobs.push(job);
+                    }
+                    None => previews.push(None),
+                }
+            }
+        }
+        self.spawn_missing_icons(preview_jobs);
         {
             let list = self.web_engines_edit.as_mut().expect("上面刚填过");
             for (i, e) in list.iter_mut().enumerate() {
@@ -6281,6 +6431,33 @@ impl LauncherApp {
                 if resp.lost_focus() {
                     commit = true;
                 }
+                // 批次 D2 第二半：图标路径 + 「下载图标」。路径是相对数据目录的写法
+                // （`Icons\g.ico`），也可以手填绝对路径或 `res:` 一类现成图标规格。
+                ui.horizontal(|ui| {
+                    engine_icon_slot(
+                        ui,
+                        16.0,
+                        "\u{1F310}",
+                        14.0,
+                        previews.get(i).copied().flatten(),
+                    )
+                    .on_hover_text("搜索行最左边那个图标");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut e.icon)
+                            .hint_text("图标（留空＝系统给网址的默认图标）")
+                            .desired_width((ui.available_width() - 96.0).max(80.0)),
+                    );
+                    if resp.lost_focus() {
+                        commit = true;
+                    }
+                    let btn = ui.add_enabled(!downloading, egui::Button::new("下载图标"));
+                    if btn
+                        .on_hover_text("按这条的网址去站点上取一张图标，存进 Icons\\ 并把路径填到左边")
+                        .clicked()
+                    {
+                        download_row = Some(i);
+                    }
+                });
                 ui.add_space(2.0);
             }
         }
@@ -6340,6 +6517,18 @@ impl LauncherApp {
             }
             commit = true;
         }
+        // 点「下载图标」只在这里开工：先把三个串取出来（借用到此行结束），再交后台线程。
+        if let Some(i) = download_row {
+            let target = self
+                .web_engines_edit
+                .as_ref()
+                .and_then(|l| l.get(i))
+                .map(|e| (e.id.clone(), e.url.clone(), e.keyword.clone()));
+            if let Some((id, url, name)) = target {
+                self.start_icon_download(id, url, name);
+                ui.ctx().request_repaint();
+            }
+        }
         if add_row {
             let id = self
                 .web_engines_edit
@@ -6369,7 +6558,8 @@ impl LauncherApp {
         ui.label(
             egui::RichText::new(
                 "改一格、点别处就保存。「恢复出厂九条」会把整张表换成出厂那九条，自己加的条目会被清掉。\
-                 引擎的图标字段暂时不显示（既有偏差）。手改 settings.json 与本页等价。",
+                 图标留空就是系统给网址的默认图标；「下载图标」按这条的网址去站点上取一张，\
+                 存到数据目录的 Icons\\ 下并把相对路径填进左边那格。下载要联网，一次只跑一条。",
             )
             .weak()
             .small(),
@@ -9684,6 +9874,36 @@ impl LauncherApp {
         spawn_icon_loader(self.icon_tx.clone(), missing);
     }
 
+    /// 批次 D2 第二半：头段「网页搜索 / 补全提示」两行要画的引擎图标。
+    /// 返回「引擎 id → 缓存键」，顺手把还没取的派给加载线程。
+    /// 引擎表最多几十条，头段更少，每条一次 `Path::exists` 是够用的。
+    fn head_engine_icons(
+        &mut self,
+        head: &[source::SourceRow],
+    ) -> std::collections::HashMap<String, String> {
+        let mut keys = std::collections::HashMap::new();
+        let mut jobs: Vec<IconJob> = Vec::new();
+        for row in head {
+            let id = match row {
+                source::SourceRow::Search(hit) => &hit.engine_id,
+                source::SourceRow::Hint(hint) => &hint.engine_id,
+                _ => continue,
+            };
+            if keys.contains_key(id) {
+                continue;
+            }
+            let Some(e) = self.prefs.web_engines.iter().find(|e| &e.id == id) else {
+                continue;
+            };
+            if let Some(job) = engine_icon_job(e, &self.data_dir) {
+                keys.insert(id.clone(), job.0.clone());
+                jobs.push(job);
+            }
+        }
+        self.spawn_missing_icons(jobs);
+        keys
+    }
+
     /// 批次 F7：从「高级」页恢复一条隐藏条目之后的收尾——两份落盘、补取图标、刷新路径态。
     /// 恢复出来的条目来自隐藏快照（老记录没有快照时才按出厂种子重建），
     /// 图标纹理与路径四态都还没有缓存。
@@ -10005,6 +10225,16 @@ impl eframe::App for LauncherApp {
             if Instant::now() >= *deadline {
                 self.toast = None;
             }
+        }
+
+        // 批次 D2 第二半：「下载站点图标」的回执。成功写配置、失败只 Toast（配置一个字不动）。
+        // 2026-10-29 真机：egui 不产事件就不跑 `ui()`，联网那条线程回来时没有任何一帧来收
+        // ⇒ 文件已经躺在 `Icons\` 里、配置却还是空的。下载期间每 120 ms 自唤醒一次。
+        while let Ok((engine_id, got)) = self.site_icon_rx.try_recv() {
+            self.apply_downloaded_icon(&engine_id, got);
+        }
+        if self.site_icon_pending.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(120));
         }
 
         // 批次 F4：回执是「缓存键 + 可选像素」。取不到的键记进 failed，免得可见行每帧重开线程。
@@ -11538,6 +11768,15 @@ impl eframe::App for LauncherApp {
                 let (row_h, icon, row_spacing) = self.row_geom();
                 let sub_size = self.theme.subtitle_font_size;
                 let glyph = (icon * 0.6).max(10.0);
+                // 批次 F4：本帧的 LRU 序号。2026-10-29 批次 D2 第二半把它挪到滚动区之前——
+                // 头段的搜索行也要画引擎图标、也要刷 LRU，而这些行画在结果行之前。
+                let tick = {
+                    let t = self.icon_tick.get() + 1;
+                    self.icon_tick.set(t);
+                    t
+                };
+                // 批次 D2 第二半：头段两行（网页搜索 / 补全提示）的引擎图标，先派后画。
+                let engine_keys = self.head_engine_icons(&plan.head);
                 // results 是下标（见 MatchIndex::search），逐项回指 self.items。
                 // 套 ScrollArea 才谈得上翻页与滚动跟随：窗口只装得下约十行，清单可达上百行。
                 // 批次 F8：状态栏要占底部 38 + 6，滚动区先把它让出来（否则列表会垫在栏下面）。
@@ -11597,13 +11836,17 @@ impl eframe::App for LauncherApp {
                                     // FR-SRC-11：标题是「Google「词」」，副标题给域名与执行提示。
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "搜索");
-                                        ui.add_sized(
-                                            [icon, icon],
-                                            egui::Label::new(
-                                                egui::RichText::new("\u{1F50D}").size(glyph).weak(),
-                                            ),
-                                        )
-                                        .on_hover_text("网页搜索（FR-SRC-11）");
+                                        // 批次 D2 第二半：引擎图标（设置页「下载图标」存下来的那张）；
+                                        // 留空/没下过 ⇒ `url:` 走系统给网址的默认图标。
+                                        let tex = engine_keys
+                                            .get(&hit.engine_id)
+                                            .and_then(|k| self.icons.get(k))
+                                            .map(|entry| {
+                                                entry.last_use.set(tick);
+                                                entry.texture.id()
+                                            });
+                                        engine_icon_slot(ui, icon, "\u{1F50D}", glyph, tex)
+                                            .on_hover_text("网页搜索（FR-SRC-11）");
                                         let sel = ui.selectable_label(is_sel, hit.title.clone());
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
@@ -11629,12 +11872,15 @@ impl eframe::App for LauncherApp {
                                     // 不可执行行：弱色显示，点/按只给一句 Toast（`hint_toast`）。
                                     ui.horizontal(|ui| {
                                         row_badge(ui, h, "查看");
-                                        ui.add_sized(
-                                            [icon, icon],
-                                            egui::Label::new(
-                                                egui::RichText::new("…").monospace().size(glyph).weak(),
-                                            ),
-                                        );
+                                        // 空词 `g ` 时的补全提示——同一条引擎，图标跟着它走。
+                                        let tex = engine_keys
+                                            .get(&hint.engine_id)
+                                            .and_then(|k| self.icons.get(k))
+                                            .map(|entry| {
+                                                entry.last_use.set(tick);
+                                                entry.texture.id()
+                                            });
+                                        engine_icon_slot(ui, icon, "…", glyph, tex);
                                         let sel = ui.selectable_label(
                                             is_sel,
                                             egui::RichText::new(hint.title.as_str()).weak(),
@@ -11995,11 +12241,6 @@ impl eframe::App for LauncherApp {
                         }
                         // 批次 F4：可见行缺图标（含被 LRU 淘汰掉的）就地补一次，
                         // 不指望别的事件来兜；`spawn_missing_icons` 会把已在飞/已失败过的滤掉。
-                        let tick = {
-                            let t = self.icon_tick.get() + 1;
-                            self.icon_tick.set(t);
-                            t
-                        };
                         let visible_jobs: Vec<IconJob> = results
                             .iter()
                             .filter_map(|&hit| {

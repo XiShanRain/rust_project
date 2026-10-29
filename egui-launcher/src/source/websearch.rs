@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::source::{DataSource, SearchCtx, SourceId, SourceRow};
 
-/// 一条引擎。字段与需求书 FR-SRC-11 一一对应；`icon` 本批只存不显示（「下载站点图标」待定）。
+/// 一条引擎。字段与需求书 FR-SRC-11 一一对应。
+/// `icon` 是图标规格：相对数据目录的路径（`Icons\g.ico`，由设置页「下载图标」写入），
+/// 空 ⇒ 用系统给网址的默认图标。解析在 [`crate::source::siteicon::web_icon_spec`]。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebEngine {
     pub id: String,

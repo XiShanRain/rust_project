@@ -47,6 +47,9 @@ features = [
     "Win32_System_SystemInformation",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    # 批次 D2 第二半「下载站点图标」：WinHTTP 直调（AHK 那边用 WinHttpRequest COM）。
+    # 只在这里出网，也就是用户点「下载图标」那一刻。
+    "Win32_Networking_WinHttp",
     # 批次 A2（FR-SRC-17）「锁定屏幕」：LockWorkStation 在这个模块里。
     # 关机的三条（shutdown /r /s /l）走 shutdown.exe，不需要 Token 提权那一套。
     "Win32_System_Shutdown",
