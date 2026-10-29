@@ -412,9 +412,13 @@ enum SettingsTab {
     /// 与「高级」同为低频维护，但它是"对整张清单动刀"，单开一页免得混进设置开关里。
     Manage,
     /// 批次 D8（FR-SYS-06）：使用统计——合计 / 近 30 天柱状 / 按功能次数 / 按条目前 10。第 9 页。
-    /// 排在最后：它是只读看板（唯一的写动作是「清除统计」），与上面那些真要动配置的页放一起
+    /// ~~排在最后~~【2026-10-29 批次 D2：第 10 页「网页引擎」追加在它后面，本页不再是末项】：
+    /// 它是只读看板（唯一的写动作是「清除统计」），与上面那些真要动配置的页放一起
     /// 反而让分类栏显得杂乱。
     Usage,
+    /// 批次 D2（FR-SRC-11 的缺口）：网页搜索引擎表——列出 / 增删改 / 恢复出厂 / 兜底引擎。第 10 页。
+    /// 排在「使用统计」后面：同属低频维护页，且不打断前九页的页号（`-Preferences` 是线性协议）。
+    WebEngines,
 }
 
 impl SettingsTab {
@@ -423,6 +427,7 @@ impl SettingsTab {
     /// 改为「文件搜索」，原第 5/6 页顺延——`-Preferences 5/6` 的旧语义随之变，与设置页分类栏一起改口径。
     /// 【批次 D5：第 8 页追加在末尾，1–7 的语义与 `-Preferences` 参数一格不动。】
     /// 【批次 D8：第 9 页同样追加在末尾，1–8 一格不动。】
+    /// 【批次 D2（2026-10-29）：第 10 页「网页引擎」同样追加在末尾，1–9 一格不动。】
     fn from_page(page: u32) -> Option<Self> {
         match page {
             1 => Some(Self::General),
@@ -434,6 +439,7 @@ impl SettingsTab {
             7 => Some(Self::Advanced),
             8 => Some(Self::Manage),
             9 => Some(Self::Usage),
+            10 => Some(Self::WebEngines),
             _ => None,
         }
     }
@@ -890,6 +896,9 @@ struct LauncherApp {
     /// `None`＝这一页没在编辑；进页时按 prefs 取一份，离开页/关设置页时回写并丢掉。
     file_folders_edit: Option<Vec<String>>,
     file_exclude_edit: Option<Vec<String>>,
+    /// 批次 D2：设置页「网页引擎」页的编辑缓冲，跨帧理由与上面两条相同（每帧克隆会把键吞掉）。
+    /// `None`＝这一页没在编辑；进页时按 prefs 取一份，离开页/关设置页时整理后回写并丢掉。
+    web_engines_edit: Option<Vec<source::websearch::WebEngine>>,
     prefs: source::application::AppSettings, // 用户偏好（settings.json，目前只有 space_to_run）
     // ---- 批次 F1：FR-UIX-01 主题（`prefs.theme` 是入口名，这里是解析后的生效形态）----
     /// 本帧渲染读的那一套尺寸 / 颜色。换主题时由 [`LauncherApp::sync_theme`] 一次性替换。
@@ -2995,6 +3004,7 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_CONTROL, 0x42),             // Ctrl+B 设置页·批量管理（批次 D5）
     (HKF_CONTROL, 0x52),             // Ctrl+R 批量管理·重新校验路径（批次 D5）
     (HKF_CONTROL, 0x54),             // Ctrl+T 设置页·使用统计（批次 D8）
+    (HKF_CONTROL, 0x57),             // Ctrl+W 设置页·网页引擎（批次 D2）
     (HKF_CONTROL | HKF_SHIFT, 0x44), // Ctrl+Shift+D 删除选中项
     (HKF_CONTROL | HKF_SHIFT, 0x4E), // Ctrl+Shift+N 新建快捷项
     (HKF_CONTROL | HKF_SHIFT, 0x50), // Ctrl+Shift+P 置顶 / 取消置顶
@@ -3993,6 +4003,7 @@ impl LauncherApp {
             settings_tab,
             file_folders_edit: None,
             file_exclude_edit: None,
+            web_engines_edit: None,
             prefs,
             theme,
             theme_applied: None,
@@ -4395,14 +4406,14 @@ impl LauncherApp {
     }
 
     /// FR-WIN-08：打开设置页并切到指定页码（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观
-    /// 7=高级 8=批量管理 9=使用统计）。
+    /// 7=高级 8=批量管理 9=使用统计 10=网页引擎）。
     fn open_settings_page(&mut self, page: u32) {
         self.settings_open = true;
         self.settings_tab = match SettingsTab::from_page(page) {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级 8=批量管理 9=使用统计），落回通用"
+                    "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级 8=批量管理 9=使用统计 10=网页引擎），落回通用"
                 );
                 SettingsTab::General
             }
@@ -5039,6 +5050,78 @@ impl LauncherApp {
         self.file_exclude_edit = None;
     }
 
+    /// 关设置页 / 切页时的统一收尾：把**所有**页的编辑缓冲回写掉。
+    /// 只在 `settings_open = false` 的那几条路上调用——`settings_ui` 里的"换分类"那条分支
+    /// 管不到"整页关掉"，漏了它缓冲会留着旧值：下次进页时 `is_none()` 判假，页面拿到的
+    /// 是不再刷新的旧表（2026-10-29 批次 D2 接线时发现的既有漏洞，文件搜索页同样中招）。
+    fn finish_settings_edits(&mut self) {
+        self.finish_file_scope_edits();
+        self.finish_web_engine_edits();
+    }
+
+    /// 批次 D2：把「网页引擎」页的编辑缓冲**原样**写回 prefs（不丢行、不去重）。
+    /// 整理留给 [`Self::finish_web_engine_edits`]：编辑途中"关键字已填、网址还没填"是正常中间态，
+    /// 这时候丢行等于把用户刚敲的字吃掉。
+    fn save_web_engines_edit(&mut self) -> bool {
+        let Some(buf) = self.web_engines_edit.as_ref() else {
+            return false;
+        };
+        if *buf == self.prefs.web_engines {
+            return false;
+        }
+        self.prefs.web_engines = buf.clone();
+        source::application::save_settings(&self.prefs);
+        eprintln!(
+            "设置页：网页引擎表已改（现 {} 条；关键字与网址不落日志）",
+            self.prefs.web_engines.len()
+        );
+        true
+    }
+
+    /// 离开「网页引擎」页（换分类 / 关设置页）时收尾：整理 → 写盘 → 丢缓冲。
+    /// 丢掉的条数走 Toast 说清（残缺 / 关键字重复），不静默吞行。
+    fn finish_web_engine_edits(&mut self) {
+        let Some(mut buf) = self.web_engines_edit.take() else {
+            return;
+        };
+        let cleaned = source::websearch::sanitize_engines(&mut buf);
+        if cleaned.incomplete > 0 || cleaned.duplicate > 0 {
+            let mut parts: Vec<String> = Vec::new();
+            if cleaned.incomplete > 0 {
+                parts.push(format!("{} 条没填关键字或网址", cleaned.incomplete));
+            }
+            if cleaned.duplicate > 0 {
+                parts.push(format!("{} 条关键字重复", cleaned.duplicate));
+            }
+            self.hotkey_note(
+                &format!("网页引擎：{}，这些没保存", parts.join("、")),
+                false,
+            );
+            eprintln!(
+                "设置页：网页引擎表整理丢弃 {} 条（残缺）+ {} 条（重复）",
+                cleaned.incomplete, cleaned.duplicate
+            );
+        }
+        let mut changed = false;
+        // 兜底序列不能指着已经被删掉的引擎（自定义 id 被删、或那条本身就被整理丢了）。
+        if source::websearch::prune_fallback(&mut self.prefs.web_fallback, &buf) {
+            eprintln!("设置页：兜底序列已按现表整理（不在表里的 id 去掉）");
+            changed = true;
+        }
+        if buf != self.prefs.web_engines {
+            eprintln!(
+                "设置页：网页引擎表已写入 settings.json（{} 条）",
+                buf.len()
+            );
+            self.prefs.web_engines = buf;
+            changed = true;
+        }
+        // 「进来看看又出去」不该白写一次盘（与文件搜索页同一条口径）。
+        if changed {
+            source::application::save_settings(&self.prefs);
+        }
+    }
+
     /// 批次 D5（FR-ACT-09）：设置页第 8 页「批量管理」。
     ///
     /// 三件事：勾选批量删（只删清单条目，不动磁盘文件）、失效项校验（复用 FR-SRC-06 的四态）
@@ -5421,6 +5504,17 @@ impl LauncherApp {
                 .small(),
             );
         }
+        // 2026-10-29 用户裁定（§六十三 记的那条「双记」）：两个桶语义各自成立，不去重，
+        // 但必须写在这儿——否则下一个人（或下一轮的我）会把它当成重复计错的 bug 再查一遍。
+        ui.label(
+            egui::RichText::new(
+                "一次启动可能落两个桶：清单里那些自定义命令既算「清单项」也算「自定义命令」\
+                 （前者＝这条清单被启动，后者＝一条自定义命令被执行）⇒「合计」会比实际启动次数多。\
+                 这是有意的口径，不是重复计错。",
+            )
+            .weak()
+            .small(),
+        );
         ui.separator();
 
         // ---- 按条目前 10（现成 use_count，只喂排序、从不给用户看的那一格）----
@@ -5470,6 +5564,230 @@ impl LauncherApp {
         }
     }
 
+    /// 批次 D2（FR-SRC-11 的偏差收口）：设置页第 10 页「网页引擎」——列出 / 增删改 /
+    /// 恢复出厂 / 选兜底引擎。在此之前增删改只能手改 `settings.json`。
+    ///
+    /// 三条口径：
+    /// - 表就是 `settings.json` 的 `web_engines`（手改文件仍然有效）；`id` 与 `icon` 不在界面上：
+    ///   前者是兜底与日志的锚、后者还没有显示入口（既有偏差，本批不碰）；
+    /// - 编辑走跨帧缓冲（理由同文件搜索页），**改一格就写盘**（原样、不丢行）；
+    ///   整理（残缺行丢弃、关键字去重）只在离开这一页时做，丢了几条走 Toast 说清；
+    /// - 「兜底」是单选：出厂序列 Google → Bing，或某一条引擎。
+    fn web_engines_ui(&mut self, ui: &mut egui::Ui) {
+        use source::websearch;
+
+        ui.label(egui::RichText::new("网页搜索引擎").strong());
+        ui.label(
+            egui::RichText::new(
+                "「关键字 + 空格 + 词」独占整张列表（例：g 天气）。网址模板里的 {query} 换成词、\
+                 {query|8000} 是空词时的默认值；模板里一个占位符都没有，那就是一条网址书签。\
+                 关键字只在首词精确相等时独占（不分大小写），打一半（goo）不算。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.separator();
+
+        if self.web_engines_edit.is_none() {
+            self.web_engines_edit = Some(self.prefs.web_engines.clone());
+        }
+        let mut commit = false;
+        let mut remove_row: Option<usize> = None;
+        let mut add_row = false;
+        let mut restore_default = false;
+        {
+            let list = self.web_engines_edit.as_mut().expect("上面刚填过");
+            for (i, e) in list.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label("关键字");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut e.keyword)
+                            .hint_text("g")
+                            .desired_width(88.0),
+                    );
+                    if resp.lost_focus() {
+                        commit = true;
+                    }
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut e.title)
+                            .hint_text("Google")
+                            .desired_width((ui.available_width() - 60.0).max(60.0)),
+                    );
+                    if resp.lost_focus() {
+                        commit = true;
+                    }
+                    if ui.button("删除").clicked() {
+                        remove_row = Some(i);
+                    }
+                });
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut e.url)
+                        .hint_text("https://www.google.com/search?q={query}")
+                        .desired_width(ui.available_width()),
+                );
+                if resp.lost_focus() {
+                    commit = true;
+                }
+                ui.add_space(2.0);
+            }
+        }
+        // 现场体检：整理发生在离开这一页时，先在这儿说清楚"你看到的这些将会发生什么"。
+        let (dups, incomplete) = self
+            .web_engines_edit
+            .as_ref()
+            .map(|list| {
+                let mut seen: Vec<String> = Vec::new();
+                let mut dups = 0usize;
+                let mut incomplete = 0usize;
+                for e in list.iter() {
+                    let kw = e.keyword.trim().to_lowercase();
+                    if kw.is_empty() || e.url.trim().is_empty() {
+                        incomplete += 1;
+                        continue;
+                    }
+                    if seen.contains(&kw) {
+                        dups += 1;
+                    } else {
+                        seen.push(kw);
+                    }
+                }
+                (dups, incomplete)
+            })
+            .unwrap_or((0, 0));
+        if incomplete > 0 || dups > 0 {
+            let mut parts: Vec<String> = Vec::new();
+            if incomplete > 0 {
+                parts.push(format!("{incomplete} 条还没填关键字或网址"));
+            }
+            if dups > 0 {
+                parts.push(format!("{dups} 条关键字与前面重复"));
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}——离开这一页时不保存（重复的只留靠前那条）。",
+                    parts.join("、")
+                ))
+                .small()
+                .color(TOAST_ERR),
+            );
+        }
+        ui.horizontal(|ui| {
+            if ui.button("＋ 添加引擎").clicked() {
+                add_row = true;
+            }
+            if ui.button("恢复出厂九条").clicked() {
+                restore_default = true;
+            }
+        });
+        if let Some(i) = remove_row {
+            if let Some(list) = self.web_engines_edit.as_mut() {
+                if i < list.len() {
+                    list.remove(i);
+                }
+            }
+            commit = true;
+        }
+        if add_row {
+            let id = self
+                .web_engines_edit
+                .as_ref()
+                .map(|l| websearch::next_custom_id(l))
+                .unwrap_or_else(|| "custom-1".to_string());
+            if let Some(list) = self.web_engines_edit.as_mut() {
+                list.push(websearch::WebEngine {
+                    id,
+                    keyword: String::new(),
+                    title: String::new(),
+                    url: String::new(),
+                    icon: String::new(),
+                });
+            }
+            eprintln!("设置页：网页引擎表加了一条空行（填完关键字与网址才算数）");
+            ui.ctx().request_repaint();
+        }
+        if restore_default {
+            self.web_engines_edit = Some(websearch::builtin_engines());
+            commit = true;
+            eprintln!("设置页：网页引擎表恢复出厂九条（自定义过的条目被替换）");
+        }
+        if commit && self.save_web_engines_edit() {
+            ui.ctx().request_repaint();
+        }
+        ui.label(
+            egui::RichText::new(
+                "改一格、点别处就保存。「恢复出厂九条」会把整张表换成出厂那九条，自己加的条目会被清掉。\
+                 引擎的图标字段暂时不显示（既有偏差）。手改 settings.json 与本页等价。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.separator();
+
+        // ---- 兜底（没有结果时的那几行）----
+        ui.label(egui::RichText::new("兜底搜索").strong());
+        ui.label(
+            egui::RichText::new(
+                "一条结果都没有时，列表末尾按这个序列给搜索行。出厂＝Google → Bing（表里没有的跳过）。\
+                 选某一条引擎就只出它那一行。",
+            )
+            .weak()
+            .small(),
+        );
+        let factory = websearch::default_fallback();
+        let list = self
+            .web_engines_edit
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.prefs.web_engines.clone());
+        let current = if self.prefs.web_fallback == factory {
+            "出厂：Google → Bing".to_string()
+        } else if self.prefs.web_fallback.len() == 1 {
+            let id = &self.prefs.web_fallback[0];
+            match list.iter().find(|e| &e.id == id) {
+                Some(e) if !e.title.is_empty() => format!("{}（{}）", e.title, e.keyword),
+                Some(e) => e.keyword.clone(),
+                None => "已删除的引擎（离开本页时改回出厂）".to_string(),
+            }
+        } else {
+            "自定义序列".to_string()
+        };
+        let mut picked: Option<Vec<String>> = None;
+        egui::ComboBox::from_id_salt("web_fallback_pick")
+            .selected_text(current)
+            .width(240.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(self.prefs.web_fallback == factory, "出厂：Google → Bing")
+                    .clicked()
+                {
+                    picked = Some(factory.clone());
+                }
+                for e in list.iter() {
+                    let one = vec![e.id.clone()];
+                    let label = if e.title.is_empty() {
+                        format!("（{}）", e.keyword)
+                    } else {
+                        format!("{}（{}）", e.title, e.keyword)
+                    };
+                    if ui
+                        .selectable_label(self.prefs.web_fallback == one, label)
+                        .clicked()
+                    {
+                        picked = Some(one);
+                    }
+                }
+            });
+        if let Some(v) = picked {
+            self.prefs.web_fallback = v;
+            source::application::save_settings(&self.prefs);
+            eprintln!(
+                "设置页：兜底序列已改（现 {} 条，id 不落日志）",
+                self.prefs.web_fallback.len()
+            );
+            ui.ctx().request_repaint();
+        }
+    }
+
 
     /// 设置页（2026-10-17 用户要求，参考 AHK 版设置窗口的左侧分类栏；只立当下有真实选项的分类，
     /// 不做无功能的占位开关）。入口：托盘「设置…」/ `Ctrl+,`；Esc 或「返回搜索」回搜索页。
@@ -5483,6 +5801,10 @@ impl LauncherApp {
         if self.settings_tab != SettingsTab::Manage {
             self.manage_checked.clear();
         }
+        // 批次 D2：换到别的分类 ⇒ 引擎表的编辑缓冲回写后丢掉（见 [`finish_web_engine_edits`]）。
+        if self.settings_tab != SettingsTab::WebEngines {
+            self.finish_web_engine_edits();
+        }
         // 顶栏空白也是拖动手柄（2026-10-18 用户：「顶部输入框右侧点击空白不能拖动，顶部的不是菜单栏吗？」）。
         // 右边界必须取"整行可用宽度"，不能用 `head_row.response.rect.max.x`：横向行的 response 矩形
         // 只覆盖**已用宽度**（返回按钮 + 标题 ≈ 110px），用它算出来的手柄宽度是负数、被 drag_handle
@@ -5493,6 +5815,9 @@ impl LauncherApp {
             if ui.button("← 返回搜索 (Esc)").clicked() {
                 self.settings_open = false;
                 self.manage_checked.clear();
+                // 批次 D2：整页关掉时把所有编辑缓冲回写（这条路上 `settings_ui` 已经不再跑了，
+                // 页内"换分类"那条 finish 分支盖不到）。
+                self.finish_settings_edits();
                 self.focus_query = true;
             }
             heading_right = ui.heading("设置").rect.max.x;
@@ -5528,6 +5853,7 @@ impl LauncherApp {
                     ("高级", SettingsTab::Advanced),
                     ("批量管理", SettingsTab::Manage),
                     ("使用统计", SettingsTab::Usage),
+                    ("网页引擎", SettingsTab::WebEngines),
                 ] {
                     if ui.selectable_label(self.settings_tab == tab, label).clicked() {
                         // 批次 D5：进「批量管理」页时强制重跑一轮路径四态——这一页的状态列就是
@@ -6831,6 +7157,7 @@ impl LauncherApp {
                         }
                         SettingsTab::Manage => self.manage_ui(ui),
                         SettingsTab::Usage => self.usage_ui(ui),
+                        SettingsTab::WebEngines => self.web_engines_ui(ui),
                     });
                 }
             );
@@ -8657,6 +8984,7 @@ impl LauncherApp {
             query: scope_q.query,
             items: &self.items,
             engines: &self.prefs.web_engines,
+            web_fallback: &self.prefs.web_fallback,
             learn_rank: self.prefs.learn_rank,
             index: &mut self.index,
             now_ms: now,
@@ -9062,8 +9390,16 @@ impl eframe::App for LauncherApp {
             // 同一口径（设置页开着时也生效）。
             let hit_ctrl_t =
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T));
+            // 批次 D2（FR-SRC-11）：`Ctrl+W` 直达设置页「网页引擎」——三颗"直达设置页"的键
+            // （B/T/W）同一层取，设置页开着时也跳。
+            let hit_ctrl_w =
+                ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W));
             if hit_comma || hit_f2 {
                 self.settings_open = !self.settings_open;
+                // 批次 D2：这一下是"关掉设置页"时也要回写编辑缓冲。
+                if !self.settings_open {
+                    self.finish_settings_edits();
+                }
                 self.focus_query = true;
                 // 批次 F6：☰ 只在搜索页渲染 ⇒ 进设置页必须先把旗标落下，
                 // 否则回到搜索页的第一帧会带着一个"没人负责关闭"的菜单。
@@ -9094,6 +9430,14 @@ impl eframe::App for LauncherApp {
                 self.focus_query = true;
                 self.menu_open = false;
                 eprintln!("快捷键 Ctrl+T：设置页「使用统计」");
+                ui.ctx().request_repaint();
+            } else if hit_ctrl_w {
+                // 批次 D2：直达「网页引擎」。与 Ctrl+B / Ctrl+T 同形态——设置页开着时也跳。
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::WebEngines;
+                self.focus_query = true;
+                self.menu_open = false;
+                eprintln!("快捷键 Ctrl+W：设置页「网页引擎」");
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
                 // ---- 批次 B8（FR-ACT-10 附录 A）：F3 编辑 · F4 打开配置文件 · Ctrl+C 复制这一行 ----
@@ -12498,6 +12842,8 @@ impl eframe::App for LauncherApp {
             } else if self.settings_open {
                 self.settings_open = false;
                 self.manage_checked.clear();
+                // 批次 D2：Esc 关设置页同样要把编辑缓冲回写（见 [`finish_settings_edits`]）。
+                self.finish_settings_edits();
                 self.focus_query = true;
                 ui.ctx().request_repaint();
             } else if self.panel.is_some() {
@@ -12979,9 +13325,10 @@ mod nav_tests {
     /// 批次 D7：插入「文件搜索」第 5 页后外观/高级顺延，`-Preferences 5/6` 语义随之变。
     /// 批次 D5：第 8 页「批量管理」追加在末尾，1–7 一格不动。
     /// 批次 D8：第 9 页「使用统计」同样追加在末尾，1–8 一格不动。
-    /// 这条钉住 1..=9 的整张映射——只测旧值漂没漂是不够的，页号是线性协议，两端都得钉。
+    /// 批次 D2：第 10 页「网页引擎」同样追加在末尾，1–9 一格不动。
+    /// 这条钉住 1..=10 的整张映射——只测旧值漂没漂是不够的，页号是线性协议，两端都得钉。
     #[test]
-    fn settings_tab_page_mapping_covers_one_through_nine() {
+    fn settings_tab_page_mapping_covers_one_through_ten() {
         assert_eq!(SettingsTab::from_page(1), Some(SettingsTab::General));
         assert_eq!(SettingsTab::from_page(2), Some(SettingsTab::Features));
         assert_eq!(SettingsTab::from_page(3), Some(SettingsTab::Hotkeys));
@@ -12999,7 +13346,12 @@ mod nav_tests {
             Some(SettingsTab::Usage),
             "批次 D8：第 9 页是「使用统计」"
         );
-        assert_eq!(SettingsTab::from_page(10), None, "越界要给 None，调用方落回通用");
+        assert_eq!(
+            SettingsTab::from_page(10),
+            Some(SettingsTab::WebEngines),
+            "批次 D2：第 10 页是「网页引擎」"
+        );
+        assert_eq!(SettingsTab::from_page(11), None, "越界要给 None，调用方落回通用");
         assert_eq!(SettingsTab::from_page(0), None);
     }
 

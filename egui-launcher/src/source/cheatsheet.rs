@@ -59,7 +59,7 @@ pub struct CheatEntry {
     /// 依赖哪个数据源：该源关掉时这一条整条不出现。`None` ＝ 与数据源无关。
     pub source: Option<SourceId>,
     /// 帮助页上「打开设置页」跳到第几页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级
-    /// 8=批量管理）。
+    /// 8=批量管理 9=使用统计 10=网页引擎）。
     pub settings_page: Option<u32>,
 }
 
@@ -83,12 +83,13 @@ pub const ENTRIES: &[CheatEntry] = &[
         summary: "`引擎关键字 词` 独占整张列表",
         detail: "出厂九条：`g` Google、`bing` Bing、`bd` 百度、`gh` GitHub、`wiki` 维基、\
                  `yt` YouTube、`tb` 淘宝、`jd` 京东、`tr` Google 翻译。\n\
-                 引擎表写在 settings.json 的 `web_engines`（含网址模板，`{query}` 会被替换）。\n\
-                 关键字打全、还没跟空格时仍是普通搜索；跟上空格与词才独占。一条结果都没有时按 google → bing 兜底。",
+                 引擎表在设置页「网页引擎」（第 10 页，`Ctrl+W`）里增删改，也仍可直接改 settings.json 的\n\
+                 `web_engines`（含网址模板，`{query}` 会被替换）。\n\
+                 关键字打全、还没跟空格时仍是普通搜索；跟上空格与词才独占。一条结果都没有时按兜底序列出行（出厂 google → bing，可改）。",
         tags: "web search 搜索 网页 引擎 google 百度 github",
         group: Group::Syntax,
         source: Some(SourceId::Web),
-        settings_page: Some(4),
+        settings_page: Some(10),
     },
     CheatEntry {
         key: "关键字 参数",
@@ -137,7 +138,7 @@ pub const ENTRIES: &[CheatEntry] = &[
         title: "运行标志",
         summary: "命令行首/尾加一个标志，改目标窗口打开时的状态",
         detail: "`@+` 最大化 · `@-` 最小化 · `@` 隐藏（后台起、不弹窗）。\n\
-                 写在命令行**尾**（`notepad.exe@`，需求书原文）或**首**（`@notepad.exe`，Delphi 写法）都认；\
+                 写在命令行「尾」（`notepad.exe@`，需求书原文）或「首」（`@notepad.exe`，Delphi 写法）都认；\
                  一条命令只认一个，两头都写着时前导那个说了算。\n\
                  只在本程序启动这一条路上生效；网址不认（浏览器自己开窗）。\n\
                  目标程序自己不认系统给的初始显示状态时这一档没效果——记事本、cmd 这类认。",
@@ -864,16 +865,32 @@ pub const ENTRIES: &[CheatEntry] = &[
         key: "Ctrl+T",
         title: "使用统计",
         summary: "设置页第 9 页：合计 / 近 30 天柱状 / 按功能次数 / 按条目前 10",
-        detail: "直接打开设置页「使用统计」（左侧分类栏最后一项）。这一页是只读看板，除了「清除统计」没有能改的东西。\n\
+        detail: "直接打开设置页「使用统计」（左侧分类栏；批次 D2 起它后面还多了一页「网页引擎」）。这一页是只读看板，除了「清除统计」没有能改的东西。\n\
                  合计与「按功能次数」的数据在 `usage.json`：只记哪天、哪一类功能、几次，查询词 / 条目名 / 路径都不进这个文件。\n\
                  记账点跟条目上的累计次数是同一批：清单项与系统命令跑成功各记一次，计算器复制成功、网页搜索、\n\
                  文件与目录、终端命令、自定义命令打开成功同理；没跑成的不记。\n\
                  条目上的「累计次数 / 最近使用」是另一本账（排序用），清统计不动它——要清那个去「重置学习排序」。\n\
-                 保留 400 天（含今天）：更早的按真实日期裁掉，读不出来的日期键直接丢。",
+                 保留 400 天（含今天）：更早的按真实日期裁掉，读不出来的日期键直接丢。\n\
+                 一次启动可能同时落「清单项」与「自定义命令」两个桶（这条清单被启动 / 一条自定义命令被执行），\n\
+                 所以「合计」会比实际启动次数多——这是有意的口径，不是重复计错（2026-10-29 用户裁定保留）。",
         tags: "key 统计 stats usage 使用次数 图表 使用频率",
         group: Group::Keys,
         source: None,
         settings_page: Some(9),
+    },
+    CheatEntry {
+        key: "Ctrl+W",
+        title: "网页引擎表",
+        summary: "设置页第 10 页：增删改搜索引擎、选兜底引擎",
+        detail: "直接打开设置页「网页引擎」（左侧分类栏）。\n\
+                 每一条是「关键字 / 名称 / 网址模板」：关键字 + 空格 + 词 才独占整张列表，模板里的 {query} 换成年词。\n\
+                 改一格、点别处就保存；「恢复出厂九条」把整张表换回出厂的九条，自己加的条目会被清掉。\n\
+                 「兜底搜索」决定一条结果都没有时用哪个引擎出行，出厂是 Google → Bing。\n\
+                 关键字或网址没填全的行、以及关键字与前面重复的行，离开这一页时不保存（页面上会先提示条数）。",
+        tags: "key 网页 引擎 搜索 engine 设置 settings 兜底",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(10),
     },
     CheatEntry {
         key: "呼出键 / 补字符键",
@@ -1071,8 +1088,9 @@ mod tests {
                 // 【2026-10-27 批次 D7：插入第 5 页「文件搜索」，外观/高级顺延为 6/7，上界 1..=7。】
                 // 【2026-10-28 批次 D5：追加第 8 页「批量管理」，上界 1..=8。】
                 // 【2026-10-28 批次 D8：追加第 9 页「使用统计」，上界 1..=9。】
+                // 【2026-10-29 批次 D2：追加第 10 页「网页引擎」，上界 1..=10。】
                 assert!(
-                    (1..=9).contains(&page),
+                    (1..=10).contains(&page),
                     "「{}」指向不存在的设置页 {page}",
                     e.title
                 );
@@ -1132,6 +1150,7 @@ mod tests {
             query: "?",
             items: &items,
             engines: &[],
+            web_fallback: &[],
             learn_rank: super::super::application::LearnRank::Count,
             index: &mut index,
             now_ms: 0,

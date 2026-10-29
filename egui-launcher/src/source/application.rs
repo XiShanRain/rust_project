@@ -760,8 +760,17 @@ pub struct AppSettings {
     /// 所以旧 `settings.json` 照旧解析、不写就不丢内置项。
     /// 本批**没有编辑入口**：设置页还没有「数据源 / 网页搜索」那一页（与 FR-CFG-04 的偏差已登记），
     /// 要加自定义引擎目前只能手改这个文件——需求书 TC 11-1 那条 `localhost:{query|8000}` 就是这么验的。
+    /// 【2026-10-29 批次 D2：上面"没有编辑入口"到此失效——设置页第 10 页「网页引擎」可增删改、
+    /// 可恢复出厂九条；手改这个文件仍然有效（那是同一份表）。】
     #[serde(default = "crate::source::websearch::builtin_engines")]
     pub web_engines: Vec<websearch::WebEngine>,
+
+    /// 没有结果时的兜底序列（FR-QRY-08 的后半，批次 D2）。存引擎 `id`，按顺序出行；
+    /// 缺省＝[`websearch::FALLBACK_IDS`] 那三条（`google,files,bing`，`files` 现在仍被跳过）。
+    /// 设置页「网页引擎」页给一个单选：「出厂」写回默认三连，「某个引擎」就换成它一条。
+    /// 存的是 id 而不是关键字：关键字随时可改，兜底不该跟着漂。
+    #[serde(default = "crate::source::websearch::default_fallback")]
+    pub web_fallback: Vec<String>,
 
     /// 出厂命令集已经自动补到第几轮（§4.2.1）。`0` = 这份清单建于 2026-10-21 扩充出厂集之前
     /// ⇒ 下次启动补一次缺，补完记账。记过账之后就不再自动补 ⇒ 用户删掉的条目不会自己回来；
@@ -901,6 +910,7 @@ impl Default for AppSettings {
             secondary_action: SecondaryAction::default(),
             secondary_hotkey: HotkeySpec::SECONDARY_DEFAULT,
             web_engines: crate::source::websearch::builtin_engines(),
+            web_fallback: crate::source::websearch::default_fallback(),
             seed_round: 0,
             sources_off: Vec::new(),
             hidden: Vec::new(),
@@ -4161,6 +4171,23 @@ mod dedup_tests {
         );
         assert!(d.web_engines.iter().any(|e| e.keyword == "g"));
         assert!(d.sources_off.is_empty());
+    }
+
+    /// 批次 D2：兜底序列也要有缺省值，否则旧 `settings.json`（没有这一格）读出来是空表，
+    /// 网页搜索一条结果都没有时连兜底行都不出——与 A6 那次"空引擎表"是同一种形状。
+    #[test]
+    fn web_fallback_defaults_to_the_factory_sequence() {
+        let missing: AppSettings = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            missing.web_fallback,
+            vec!["google".to_string(), "files".to_string(), "bing".to_string()],
+            "缺字段要回出厂三条，不是空表"
+        );
+        let custom: AppSettings =
+            serde_json::from_str(r#"{"web_fallback":["bd","jd"]}"#).unwrap();
+        assert_eq!(custom.web_fallback, vec!["bd".to_string(), "jd".to_string()]);
+        let empty: AppSettings = serde_json::from_str(r#"{"web_fallback":[]}"#).unwrap();
+        assert!(empty.web_fallback.is_empty(), "空序列是合法的用户选择");
     }
 
     #[test]

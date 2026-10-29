@@ -145,6 +145,9 @@ pub struct SearchCtx<'a> {
     pub query: &'a str,
     pub items: &'a [LaunchItem],
     pub engines: &'a [websearch::WebEngine],
+    /// 没有结果时的兜底序列（批次 D2）：存引擎 id，按顺序出行。设置页随时可改 ⇒
+    /// 与 `engines` 一样每帧从 `prefs` 取，不挂在源身上。
+    pub web_fallback: &'a [String],
     pub learn_rank: LearnRank,
     /// 清单的匹配键缓存。带 `&mut` 是因为它按内容指纹懒重建（FR-QRY-06）。
     pub index: &'a mut MatchIndex,
@@ -367,6 +370,7 @@ mod registry_tests {
             query,
             items,
             engines: &[],
+            web_fallback: &[],
             learn_rank: LearnRank::Count,
             index,
             now_ms: 0,

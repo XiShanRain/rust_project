@@ -108,9 +108,84 @@ pub fn builtin_engines() -> Vec<WebEngine> {
     ]
 }
 
-/// 兜底序列（FR-QRY-08 的后半）。`files` 是还没落地的 FR-SRC-14 ⇒ [`fallback_rows`]
+/// 兜底序列的出厂值（FR-QRY-08 的后半）。`files` 是还没落地的 FR-SRC-14 ⇒ [`fallback_rows`]
 /// 遇到没有对应引擎的 id 就跳过，而不是整条兜底失效。
+/// 【2026-10-29 批次 D2：改名为"出厂值"——设置页「网页引擎」页可以把这一串换成别的
+/// （存 `settings.json` 的 `web_fallback`），运行期不再直接读这个常量。】
 pub const FALLBACK_IDS: [&str; 3] = ["google", "files", "bing"];
+
+/// 出厂兜底序列的拷贝。`settings.json` 缺 `web_fallback` 这一格时用它（见
+/// [`crate::source::application::AppSettings`] 的 serde 缺省）。
+pub fn default_fallback() -> Vec<String> {
+    FALLBACK_IDS.iter().map(|s| s.to_string()).collect()
+}
+
+/// 引擎表的保存前整理结果：丢了几条、为什么丢。给设置页的 Toast 用，
+/// 与 [`sanitize_engines`] 是同一条判据的两个面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EngineCleanup {
+    /// 关键字或网址为空 ⇒ 丢掉（这样的行既搜不到、点了也打不开）。
+    pub incomplete: usize,
+    /// 关键字与前面某条重复（不分大小写）⇒ 丢掉后来那条（[`find`] 本来就取先出现的）。
+    pub duplicate: usize,
+}
+
+/// 落盘前的整理（纯函数）：三个可编辑字段都 trim；关键字或网址为空的行丢掉；
+/// 关键字重复只留先出现的那条；名称留空就用关键字顶上。
+/// **不动 `id`**：它是兜底序列与日志的锚，跟着条目走、不随关键字改。
+pub fn sanitize_engines(list: &mut Vec<WebEngine>) -> EngineCleanup {
+    let mut out = EngineCleanup::default();
+    let mut seen: Vec<String> = Vec::new();
+    list.retain_mut(|e| {
+        e.keyword = e.keyword.trim().to_string();
+        e.title = e.title.trim().to_string();
+        e.url = e.url.trim().to_string();
+        if e.keyword.is_empty() || e.url.is_empty() {
+            out.incomplete += 1;
+            return false;
+        }
+        if e.title.is_empty() {
+            e.title = e.keyword.clone();
+        }
+        let key = e.keyword.to_lowercase();
+        if seen.contains(&key) {
+            out.duplicate += 1;
+            return false;
+        }
+        seen.push(key);
+        true
+    });
+    out
+}
+
+/// 兜底序列里剔掉"表里已经没有了"的 id（删引擎 / 整理丢行之后调用），剔空了就回出厂序列。
+/// 出厂那三条**不剔**（`files` 从来就不是引擎，[`fallback_rows`] 会自己跳过）——否则
+/// "出厂序列"这个状态每次整理都会漂成两条，设置页那个单选就再也对不上出厂档。
+/// 返回是否真的改过。
+pub fn prune_fallback(fallback: &mut Vec<String>, engines: &[WebEngine]) -> bool {
+    let before = fallback.clone();
+    fallback.retain(|id| {
+        FALLBACK_IDS.contains(&id.as_str()) || engines.iter().any(|e| &e.id == id)
+    });
+    if fallback.is_empty() {
+        *fallback = default_fallback();
+    }
+    *fallback != before
+}
+
+/// 新加引擎的 id：`custom-1`、`custom-2`…（跳过已被占用的号）。
+/// 出厂九条的 id 是稳定名（`google` 等），兜底序列按 id 取；用户新加的走这个前缀，
+/// 既不与出厂名撞车，也不与用户手改过的 id 撞车。
+pub fn next_custom_id(list: &[WebEngine]) -> String {
+    let mut n = 1;
+    loop {
+        let id = format!("custom-{n}");
+        if !list.iter().any(|e| e.id == id) {
+            return id;
+        }
+        n += 1;
+    }
+}
 
 /// RFC 3986 的 unreserved 之外全部按 UTF-8 字节百分号编码（大写十六进制）。
 /// 空格按 `%20` 而不是 `+`：`+` 只在 `application/x-www-form-urlencoded` 的 query 里被解释成空格，
@@ -264,14 +339,16 @@ pub fn exclusive_for(engines: &[WebEngine], query: &str) -> Exclusive {
     exclusive_rows(engines, &parsed.keyword, &parsed.rest)
 }
 
-/// 结果为空时的兜底行（FR-QRY-08）。查询词就是用户敲的整串；`FALLBACK_IDS` 里
-/// 没有对应引擎的 id（现阶段只有 `files`）静默跳过。
-pub fn fallback_rows(engines: &[WebEngine], query: &str) -> Vec<SearchHit> {
+/// 结果为空时的兜底行（FR-QRY-08）。查询词就是用户敲的整串；`fallback` 里
+/// 没有对应引擎的 id（出厂序列里的 `files`，或用户删掉的引擎）静默跳过。
+/// 【2026-10-29 批次 D2：序列由调用方给（`settings.json` 的 `web_fallback`），
+/// 出厂值见 [`default_fallback`]。】
+pub fn fallback_rows(engines: &[WebEngine], fallback: &[String], query: &str) -> Vec<SearchHit> {
     let word = query.trim();
     if word.is_empty() {
         return Vec::new();
     }
-    FALLBACK_IDS
+    fallback
         .iter()
         .filter_map(|id| engines.iter().find(|e| e.id == *id))
         .filter_map(|engine| {
@@ -321,7 +398,7 @@ impl DataSource for WebSource {
     }
 
     fn fallback(&mut self, cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {
-        fallback_rows(cx.engines, cx.query)
+        fallback_rows(cx.engines, cx.web_fallback, cx.query)
             .into_iter()
             .map(SourceRow::Search)
             .collect()
@@ -461,7 +538,7 @@ mod tests {
 
     #[test]
     fn fallback_skips_sources_that_do_not_exist_yet() {
-        let rows = fallback_rows(&engines(), "zzzz");
+        let rows = fallback_rows(&engines(), &default_fallback(), "zzzz");
         assert_eq!(
             rows.iter()
                 .map(|r| r.engine_id.as_str())
@@ -470,7 +547,124 @@ mod tests {
             "files 源（FR-SRC-14）还没落地 ⇒ 跳过，不拖垮整条兜底"
         );
         assert!(rows[0].url.ends_with("q=zzzz"));
-        assert!(fallback_rows(&engines(), "   ").is_empty(), "空查询不兜底");
+        assert!(
+            fallback_rows(&engines(), &default_fallback(), "   ").is_empty(),
+            "空查询不兜底"
+        );
+    }
+
+    /// 批次 D2：序列由设置页给。换顺序就换顺序，删掉的 id 跳过，剩下一条也照出。
+    #[test]
+    fn fallback_follows_the_configured_sequence() {
+        let seq = vec!["bing".to_string(), "google".to_string()];
+        let ids: Vec<String> = fallback_rows(&engines(), &seq, "x")
+            .into_iter()
+            .map(|r| r.engine_id)
+            .collect();
+        assert_eq!(ids, vec!["bing", "google"], "顺序照配置表");
+
+        let gone = vec!["no-such-engine".to_string(), "jd".to_string()];
+        let ids: Vec<String> = fallback_rows(&engines(), &gone, "x")
+            .into_iter()
+            .map(|r| r.engine_id)
+            .collect();
+        assert_eq!(ids, vec!["jd"], "不存在的 id 静默跳过");
+
+        assert!(
+            fallback_rows(&engines(), &[], "x").is_empty(),
+            "空序列＝不出兜底行"
+        );
+    }
+
+    /// 批次 D2：保存前整理——空字段的行丢掉、关键字重复只留先出现的、名称留空用关键字顶。
+    #[test]
+    fn sanitize_drops_incomplete_and_duplicate_rows() {
+        let e = |id: &str, kw: &str, title: &str, url: &str| WebEngine {
+            id: id.to_string(),
+            keyword: kw.to_string(),
+            title: title.to_string(),
+            url: url.to_string(),
+            icon: String::new(),
+        };
+        let mut list = vec![
+            e("a", "  g  ", " Google ", " https://g/{query} "),
+            e("b", "", "没关键字", "https://x/{query}"),
+            e("c", "nourl", "没网址", "   "),
+            e("d", "G", "大小写重复", "https://dup/{query}"),
+            e("e", "wiki", "", "https://w/{query}"),
+        ];
+        let cleaned = sanitize_engines(&mut list);
+        assert_eq!(cleaned.incomplete, 2, "b / c 各缺一格");
+        assert_eq!(cleaned.duplicate, 1, "d 与 a 的关键字只差大小写");
+        let got: Vec<(&str, &str, &str)> = list
+            .iter()
+            .map(|x| (x.id.as_str(), x.keyword.as_str(), x.title.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("a", "g", "Google"), ("e", "wiki", "wiki")],
+            "留下的两条都 trim 过，名称留空的用关键字顶上"
+        );
+        assert_eq!(list[0].url, "https://g/{query}", "网址也要 trim");
+    }
+
+    /// 批次 D2：删掉引擎之后兜底序列不能留着它的 id；出厂三条不能被"整理"漂掉。
+    #[test]
+    fn prune_fallback_drops_only_ids_that_are_really_gone() {
+        let mut list = engines();
+        let mut fb = default_fallback();
+        assert!(
+            !prune_fallback(&mut fb, &list),
+            "出厂序列原样通过：files 不是引擎，但它本来就在出厂序列里"
+        );
+        assert_eq!(fb, default_fallback(), "出厂档不能被整理漂成两条");
+
+        list.push(WebEngine {
+            id: "custom-1".to_string(),
+            keyword: "c1".to_string(),
+            title: "自定义".to_string(),
+            url: "https://c/{query}".to_string(),
+            icon: String::new(),
+        });
+        let mut fb = vec!["custom-1".to_string()];
+        assert!(!prune_fallback(&mut fb, &list), "表里还有这条 ⇒ 不动");
+        list.retain(|e| e.id != "custom-1");
+        assert!(prune_fallback(&mut fb, &list), "表里没了 ⇒ 剔掉");
+        assert_eq!(fb, default_fallback(), "剔空了回出厂序列");
+    }
+
+    /// 批次 D2：新加引擎的 id 跳过已占用的号，且不碰出厂稳定名。
+    #[test]
+    fn next_custom_id_skips_taken_numbers() {
+        let mut list = engines();
+        assert_eq!(next_custom_id(&list), "custom-1");
+        list.push(WebEngine {
+            id: "custom-1".to_string(),
+            keyword: "c1".to_string(),
+            title: String::new(),
+            url: String::new(),
+            icon: String::new(),
+        });
+        list.push(WebEngine {
+            id: "custom-3".to_string(),
+            keyword: "c3".to_string(),
+            title: String::new(),
+            url: String::new(),
+            icon: String::new(),
+        });
+        assert_eq!(next_custom_id(&list), "custom-2", "跳过已占用的 1/3");
+        list.push(WebEngine {
+            id: "custom-2".to_string(),
+            keyword: "c2".to_string(),
+            title: String::new(),
+            url: String::new(),
+            icon: String::new(),
+        });
+        assert_eq!(
+            next_custom_id(&list),
+            "custom-4",
+            "1/2/3 都占了，下一个是 4"
+        );
     }
 
     #[test]
