@@ -467,6 +467,7 @@ fn settings_from_map(
     take_field!(map, s, "", toggle_hotkey, HotkeySpec);
     take_field!(map, s, "", typeback_hotkey, Option<HotkeySpec>);
     take_field!(map, s, "", extra_hotkey, Option<HotkeySpec>);
+    take_field!(map, s, "", selection_hotkey, Option<HotkeySpec>);
     take_field!(map, s, "", dbl_tap, DblTap);
     take_field!(map, s, "", secondary_action, SecondaryAction);
     take_field!(map, s, "", secondary_hotkey, HotkeySpec);
@@ -764,6 +765,15 @@ pub struct AppSettings {
     #[serde(default = "extra_hotkey_default")]
     pub extra_hotkey: Option<HotkeySpec>,
 
+    /// 选中内容动作面板的呼出键（批次 G3，2026-10-30 用户裁定 `Ctrl+Alt+\`）。
+    /// 按下它取**当前前台窗口**里的选区（走 `Ctrl+C` / 控制台 `Ctrl+Insert`），
+    /// 分类成文件 / URL / 文本后弹既有的动作面板。`None` = 不用这个键。
+    ///
+    /// 兜底值同样必须显式指定：`#[serde(default)]` 会给 `None`（老配置读出来这个功能就没了），
+    /// 而用户裁定的出厂值是「出厂即启用」。
+    #[serde(default = "selection_hotkey_default")]
+    pub selection_hotkey: Option<HotkeySpec>,
+
     /// 双击呼出用哪颗修饰键（批次 G1：需求书 FR-WIN-03，出厂关）。
     /// 连按两下 `Ctrl` / `Shift` 当一次呼出，语义与判据全在 [`crate::dbltap`]。
     #[serde(default)]
@@ -935,6 +945,7 @@ impl Default for AppSettings {
             toggle_hotkey: HotkeySpec::default(),
             typeback_hotkey: None,
             extra_hotkey: Some(HotkeySpec::EXTRA_DEFAULT),
+            selection_hotkey: Some(HotkeySpec::SELECTION_DEFAULT),
             dbl_tap: DblTap::default(),
             secondary_action: SecondaryAction::default(),
             secondary_hotkey: HotkeySpec::SECONDARY_DEFAULT,
@@ -1102,6 +1113,10 @@ pub const VK_DELETE: u32 = 0x2E;
 /// 反引号 `` ` `` 键（美式布局上同时是 `~` 键，`Win32_UI_Input_KeyboardAndMouse` 里叫 `VK_OEM_3`）。
 /// 批次 R（2026-10-20 用户点名「重音号 ` 」）：这是唯一允许不带修饰键注册成全局热键的键。
 pub const VK_OEM_3: u32 = 0xC0;
+/// 反斜杠 `\` 键（`VK_OEM_5`，美式布局上同时是 `|` 键）。
+/// 批次 G3（2026-10-30：选中内容动作面板的呼出键 `Ctrl+Alt+\` 由用户裁定）。
+/// 它与 `` ` `` 不同：**没有裸键例外**，必须带 Ctrl / Alt / Win 才收。
+pub const VK_OEM_5: u32 = 0xDC;
 
 /// `RegisterHotKey` 失败码：组合已被系统或别的程序占走。这是"全局冲突"唯一的实测途径
 /// （Windows 没有枚举别人热键的 API），所以判据只能是"试注册"。
@@ -1145,6 +1160,14 @@ impl HotkeySpec {
         vk: VK_R,
     };
 
+    /// 批次 G3（2026-10-30 用户裁定）：选中内容动作面板的呼出键 = `Ctrl+Alt+\`。
+    /// 这是一颗**新增的全局键**（出厂即启用），按下去取当前前台窗口的选区并弹动作面板。
+    /// 与呼出键 `Ctrl+Alt+Space` 同一个修饰键对，只是主键不同 ⇒ 两格互不干扰。
+    pub const SELECTION_DEFAULT: Self = Self {
+        mods: HKF_CONTROL | HKF_ALT | HKF_NOREPEAT,
+        vk: VK_OEM_5,
+    };
+
     /// 去掉 [`HKF_NOREPEAT`]：它是行为位，不是键名的一部分，比对与展示都要剥掉它。
     pub fn mods_named(&self) -> u32 {
         self.mods & !HKF_NOREPEAT
@@ -1181,10 +1204,12 @@ impl HotkeySpec {
     pub fn check(&self) -> Result<(), &'static str> {
         let m = self.mods_named();
         let function = (VK_F1..=VK_F24).contains(&self.vk);
-        let letterish =
-            matches!(self.vk, VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN | VK_OEM_3);
+        let letterish = matches!(
+            self.vk,
+            VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN | VK_OEM_3 | VK_OEM_5
+        );
         if !(function || letterish) {
-            return Err("只收字母、数字、空格、回车、反引号 ` 与 F1–F24");
+            return Err("只收字母、数字、空格、回车、反引号 `、反斜杠 \\ 与 F1–F24");
         }
         if function {
             return Ok(());
@@ -1255,6 +1280,39 @@ impl HotkeySpec {
         Ok(())
     }
 
+    /// 选中内容动作面板的呼出键（[`AppSettings::selection_hotkey`]，批次 G3）专用的判据。
+    /// 形状与 [`check_extra`](Self::check_extra) 同一套，只是它要同时避开**前三格**：
+    /// 同一个线程里同 vk + 同修饰只能注册一次，撞出来的 1409 会被念成"被别的程序占用"，
+    /// 而占用者其实是我们自己。
+    pub fn check_selection(
+        &self,
+        toggle: &HotkeySpec,
+        typeback: Option<&HotkeySpec>,
+        extra: Option<&HotkeySpec>,
+    ) -> Result<(), &'static str> {
+        self.check()?;
+        if self.mods_named() == 0 {
+            // `check()` 只为裸 `` ` `` 开了口子，这里补上这一条：裸 `\` 压根过不了 check，
+            // 但裸 `` ` `` 能过 ⇒ 判据得自己再说一遍，不依赖上游的例外集。
+            return Err("选中内容热键必须带修饰键：裸键会把那一颗键从全系统吞掉");
+        }
+        let mine = (self.mods_named(), self.vk);
+        if mine == (toggle.mods_named(), toggle.vk) {
+            return Err("选中内容热键不能和呼出热键是同一组：系统只会把它当成呼出键");
+        }
+        if let Some(tb) = typeback {
+            if mine == (tb.mods_named(), tb.vk) {
+                return Err("选中内容热键不能和补字符热键同一组：同组时系统只认先注册的那一个");
+            }
+        }
+        if let Some(ex) = extra {
+            if mine == (ex.mods_named(), ex.vk) {
+                return Err("选中内容热键不能和副呼出热键同一组：同组时系统只认先注册的那一个");
+            }
+        }
+        Ok(())
+    }
+
     /// 撞上本程序自己的键表（新建 / 编辑 / 删除 / 导航 / 数字行…）。
     pub fn conflicts_local(&self, table: &[(u32, u32)]) -> bool {
         let mine = (self.mods_named(), self.vk);
@@ -1273,10 +1331,12 @@ impl HotkeySpec {
     ) -> Result<(), &'static str> {
         let m = self.mods_named();
         let function = (VK_F1..=VK_F24).contains(&self.vk);
-        let letterish =
-            matches!(self.vk, VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN | VK_OEM_3);
+        let letterish = matches!(
+            self.vk,
+            VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN | VK_OEM_3 | VK_OEM_5
+        );
         if !(function || letterish) {
-            return Err("只收字母、数字、空格、回车、反引号 ` 与 F1–F24");
+            return Err("只收字母、数字、空格、回车、反引号 `、反斜杠 \\ 与 F1–F24");
         }
         if m & HKF_WIN != 0 {
             return Err("窗口内热键用不了 Win 键：egui 在 Windows 上不把 Win 传上来，设了也永远匹配不到");
@@ -1317,12 +1377,19 @@ fn extra_hotkey_default() -> Option<HotkeySpec> {
     Some(HotkeySpec::EXTRA_DEFAULT)
 }
 
+/// `AppSettings::selection_hotkey` 的 serde 兜底（批次 G3）。同上：缺这一格的老配置
+/// 要读成"出厂即启用 `Ctrl+Alt+\`"，不是"没有这个功能"。
+fn selection_hotkey_default() -> Option<HotkeySpec> {
+    Some(HotkeySpec::SELECTION_DEFAULT)
+}
+
 /// VK → 展示名。范围外的码原样写成 `VK#xNN`，让日志里看得见"没映射到"而不是显示空白。
 /// 键名用英文（Space / Enter）：设置页那张快捷键表一直这么写，且启动日志那行
 /// `hotkey: Ctrl+Alt+Space registered` 从批次 A 起就是原文，复测判据直接抄它——
 /// 改成「空格」会让同一份判据对不上号。
-/// 唯一例外是 [`VK_OEM_3`]，直接显示成 `` ` ``：这个键的名字就是它打出的那个字符，
-/// 写成 "Backtick" 反而要用户先去查词，而 `Win+`` ` `` 这种串正是用户提需求时的原话。
+/// 唯一两个例外是 [`VK_OEM_3`] 与 [`VK_OEM_5`]，直接显示成它们打出的那个字符 `` ` `` / `\`：
+/// 这两个键的名字就是字符本身，写成 "Backtick" / "Oem5" 反而要用户先去查词，
+/// 而 `Win+`` ` `` 这种串正是用户提需求时的原话。
 fn vk_name(vk: u32) -> String {
     match vk {
         VK_A..=VK_Z => char::from_u32(vk).unwrap_or('?').to_string(),
@@ -1332,6 +1399,7 @@ fn vk_name(vk: u32) -> String {
         VK_BACK => "Backspace".to_string(),
         VK_DELETE => "Delete".to_string(),
         VK_OEM_3 => "`".to_string(),
+        VK_OEM_5 => "\\".to_string(),
         VK_F1..=VK_F24 => format!("F{}", vk - VK_F1 + 1),
         other => format!("VK#{other:02X}"),
     }
@@ -2528,7 +2596,8 @@ pub fn reset_learning(items: &mut [LaunchItem]) -> usize {
 
 /// 批次 F7（FR-CFG-08）：恢复默认**只重置偏好里的口径类字段**，用户资产一概不动。
 ///
-/// 保留：`toggle_hotkey` / `typeback_hotkey` / `extra_hotkey` / `secondary_hotkey`（热键四格——
+/// 保留：`toggle_hotkey` / `typeback_hotkey` / `extra_hotkey` / `selection_hotkey` /
+/// `secondary_hotkey`（热键五格——
 /// 按哪颗键是用户的手感，不该被"恢复默认"改掉）、`dbl_tap`（双击呼出用哪颗修饰键，同一条理由）、
 /// `web_engines`（自定义引擎）、
 /// `hidden` 与 `hidden_stash`（被隐藏的条目及其快照）、`seed_round`（已补种到第几轮——重置它会让下一轮启动
@@ -2537,6 +2606,7 @@ pub fn reset_learning(items: &mut [LaunchItem]) -> usize {
 ///
 /// 【2026-10-29 批次 G1：原写「热键三格」，新增 `extra_hotkey` 与 `dbl_tap` 之后是四格 + 一档。
 /// 下面这个函数体**没有** `*_hotkey` / `dbl_tap` 的赋值行就是"保留"的实现，别当成漏写。】
+/// 【2026-10-30 批次 G3：再加 `selection_hotkey` ⇒ 五格 + 一档。函数体仍然不动它。】
 pub fn restore_defaults(s: &mut AppSettings) {
     s.space_to_run = SpaceRun::default();
     s.tab_mode = TabMode::default();
@@ -4976,6 +5046,8 @@ mod hotkey_tests {
         // 批次 R：`` ` `` 的展示名就是它自己，`Win+` 这个串是用户提需求时的原话。
         assert_eq!(show(0, VK_OEM_3), "`");
         assert_eq!(show(HKF_WIN | HKF_NOREPEAT, VK_OEM_3), "Win+`");
+        // 批次 G3：`\` 同理，展示名是它自己打出来的那个字符（用户裁定的 `Ctrl+Alt+\` 要能原样显示）。
+        assert_eq!(show(HKF_CONTROL | HKF_ALT | HKF_NOREPEAT, VK_OEM_5), "Ctrl+Alt+\\");
     }
 
     #[test]
@@ -4995,6 +5067,12 @@ mod hotkey_tests {
         assert!(!ok(HKF_CONTROL, VK_BACK), "Backspace 不是可录制目标");
         assert!(!ok(HKF_CONTROL, 0x6A), "小键盘键不在本批口径内");
         assert!(!ok(HKF_CONTROL, VK_F24 + 1));
+        // 批次 G3：`\` 进可录集合（选中内容热键的出厂键就是 `Ctrl+Alt+\`）。
+        // 但它没有裸键例外（与 `` ` `` 不同），单带 Shift 更是打字（那是 `|`）。
+        assert!(ok(HKF_CONTROL | HKF_ALT, VK_OEM_5));
+        assert!(!ok(0, VK_OEM_5), "裸 \\ 不许注册成全局键");
+        assert!(!ok(HKF_SHIFT, VK_OEM_5), "Shift+\\ 打出来是 |，不能当全局键");
+        assert!(!ok(HKF_NOREPEAT, VK_OEM_5));
     }
 
     /// 批次 R 的例外集：无修饰键**只**允许 `` ` ``，且 `Shift+`` ` ```（也就是 `~`）必须被挡。
@@ -5114,6 +5192,42 @@ mod hotkey_tests {
         let shift_only = bt(HKF_SHIFT, VK_R)
             .check_extra(&toggle, Some(&typeback))
             .unwrap_err();
+        assert!(shift_only.contains("Shift"), "实得：{shift_only}");
+    }
+
+    /// 批次 G3：选中内容热键的判据。形状同 `check_extra`，要避开的是**前三格**。
+    /// 证伪思路：把 `check_selection` 里任意一条比对删掉，下面必有一条断言变红。
+    #[test]
+    fn selection_hotkey_must_be_modified_and_distinct() {
+        let bt = |mods, code| HotkeySpec { mods, vk: code };
+        let toggle = HotkeySpec::DEFAULT;
+        let typeback = HotkeySpec {
+            mods: HKF_WIN | HKF_NOREPEAT,
+            vk: VK_OEM_3,
+        };
+        let extra = HotkeySpec::EXTRA_DEFAULT;
+        let check = |spec: HotkeySpec| spec.check_selection(&toggle, Some(&typeback), Some(&extra));
+        // 出厂值自己必须合法且能显示成用户裁定的那个串。
+        assert!(check(HotkeySpec::SELECTION_DEFAULT).is_ok(), "Ctrl+Alt+\\ 必须过判据");
+        assert_eq!(HotkeySpec::SELECTION_DEFAULT.display(), "Ctrl+Alt+\\");
+        // 裸键：`check()` 只为裸 `` ` `` 开口子，这条得自己再说一遍。
+        let bare = check(bt(0, VK_OEM_3)).unwrap_err();
+        assert!(bare.contains("必须带修饰键"), "实得：{bare}");
+        // 与前三个槽逐格同组（比对剥 NOREPEAT）。
+        let same_toggle = check(bt(HKF_CONTROL | HKF_ALT, VK_SPACE)).unwrap_err();
+        assert!(same_toggle.contains("呼出热键"), "实得：{same_toggle}");
+        let same_typeback = check(bt(HKF_WIN, VK_OEM_3)).unwrap_err();
+        assert!(same_typeback.contains("补字符"), "实得：{same_typeback}");
+        let same_extra = check(bt(HKF_ALT, VK_R)).unwrap_err();
+        assert!(same_extra.contains("副呼出"), "实得：{same_extra}");
+        // 后两格没启用时那两条检查不生效（`None` = 这一格空着）。
+        assert!(
+            bt(HKF_WIN, VK_OEM_3)
+                .check_selection(&toggle, None, None)
+                .is_ok()
+        );
+        // 先过 check()：单带 Shift 的 `\`（＝`|`）仍然挡。
+        let shift_only = check(bt(HKF_SHIFT, VK_OEM_5)).unwrap_err();
         assert!(shift_only.contains("Shift"), "实得：{shift_only}");
     }
 
@@ -5244,6 +5358,12 @@ mod hotkey_tests {
             "缺字段按 FR-WIN-02 的次热键 Alt+R"
         );
         assert_eq!(s.dbl_tap, DblTap::Off, "缺字段 = 不用双击呼出");
+        // 批次 G3：老文件里没有这一格 ⇒ 选中内容热键按用户裁定的出厂键 `Ctrl+Alt+\`（启用）。
+        assert_eq!(
+            s.selection_hotkey,
+            Some(HotkeySpec::SELECTION_DEFAULT),
+            "缺字段 = 出厂即用 Ctrl+Alt+\\"
+        );
 
         let custom = AppSettings {
             toggle_hotkey: HotkeySpec {
@@ -5283,6 +5403,12 @@ mod hotkey_tests {
         );
         assert_eq!(back.extra_hotkey, custom.extra_hotkey);
         assert_eq!(back.dbl_tap, custom.dbl_tap);
+        // 批次 G3：新格落盘是同一形态；出厂值 = Ctrl+Alt+\ ⇒ 2|1|16384 = 16387，vk 220（0xDC）。
+        assert!(
+            json.contains("\"selection_hotkey\":{\"mods\":16387,\"vk\":220}"),
+            "Ctrl+Alt+\\ = HKF_CONTROL 2 | HKF_ALT 1 | HKF_NOREPEAT 16384 = 16387，vk 220，实得：{json}"
+        );
+        assert_eq!(back.selection_hotkey, custom.selection_hotkey);
         // 次级动作形态落盘用稳定名（批次 E3-丙）。
         assert!(
             json.contains(r#""secondary_action":"shortcut""#),
@@ -5524,6 +5650,11 @@ mod config_tests {
             vk: 0x77, // F8
         });
         x.dbl_tap = DblTap::Shift;
+        // 批次 G3 的新格（选中内容热键）：同样是"特值进、特值出"。
+        x.selection_hotkey = Some(HotkeySpec {
+            mods: HKF_WIN | HKF_CONTROL | HKF_NOREPEAT,
+            vk: 0x79, // F10
+        });
         // 批次 E3 加的两格当时只进了 `settings_field_defaults_when_absent_and_round_trips`，
         // 而那条走的是 serde 派生（`from_slice`），**不经过 `take_field!` 这张表**——
         // 表里漏一行时的症状是"这两格永远回默认"，那条测试一点感觉都没有。
@@ -5597,6 +5728,14 @@ mod config_tests {
             "extra_hotkey（批次 G1）"
         );
         assert_eq!(got.dbl_tap, DblTap::Shift, "dbl_tap（批次 G1）");
+        assert_eq!(
+            got.selection_hotkey,
+            Some(HotkeySpec {
+                mods: HKF_WIN | HKF_CONTROL | HKF_NOREPEAT,
+                vk: 0x79
+            }),
+            "selection_hotkey（批次 G3）"
+        );
         assert_eq!(got.web_engines.len(), 2, "web_engines");
         assert_eq!(got.web_fallback, vec!["bd".to_string()], "web_fallback");
         assert_eq!(got.seed_round, 7, "seed_round");

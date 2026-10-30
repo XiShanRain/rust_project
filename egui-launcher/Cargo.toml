@@ -33,6 +33,10 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    # 打磨档 G3（选中内容动作面板）：全格式剪贴板快照要用 OLE 的 IDataObject
+    #（`OleGetClipboard` / `OleSetClipboard` / `OleFlushClipboard` / `OleInitialize`）。
+    # 只为取选区那一条路，别处不碰 OLE；`Win32_System_Com` 早就在，IDataObject 也从那里来。
+    "Win32_System_Ole",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",

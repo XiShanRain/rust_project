@@ -31,11 +31,15 @@ use windows::core::PCWSTR;
 // 批次 E4（FR-ACT-05）：「Preferred DropEffect」是**运行时注册的自定义格式**，
 // 名字要交给 RegisterClipboardFormatW 换 id，没有现成常量。
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
-    SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
+// 打磨档 G3（选中内容动作面板）·选择乙案「全格式快照」：剪贴板里除了文本/文件还可能是
+// 位图、HTML、富文本……要原样还给用户就得逐格式抄。**只能用经典 API 抄**：OLE 那条路
+// （`OleGetClipboard` 拿对象、`OleSetClipboard` 放回去）在 ole32 里自引用递归，直接爆栈
+// （2026-10-30 批次 G3 真机 T2 崩溃，WER 落在 ole32.dll 0xc000041d）。
 // 批次 A2（FR-SRC-17）「锁定屏幕」。走 API 而不是 `rundll32 user32.dll,LockWorkStation`：
 // 少起一个进程，也就没有控制台窗口闪烁那一档事。
 use windows::Win32::System::Shutdown::LockWorkStation;
@@ -45,10 +49,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR, MapVirtualKeyW, RegisterHotKey,
-    SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE,
-    VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
+    GetAsyncKeyState, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
+    KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR, MapVirtualKeyW,
+    RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_LWIN,
+    VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP, VK_MENU,
+    VK_RWIN, VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
     DROPFILES, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -82,6 +87,9 @@ const HOTKEY_TYPEBACK: i32 = 2;
 /// 副呼出热键（批次 G1，FR-WIN-02 的「次热键」）：与 `HOTKEY_TOGGLE` **做同一件事**，
 /// 只是换了一颗键（出厂 `Alt+R`）。单独占一个 id 是因为 `WM_HOTKEY` 的 `wparam` 只带 id。
 const HOTKEY_EXTRA: i32 = 3;
+/// 选中内容动作面板的呼出键（批次 G3，出厂 `Ctrl+Alt+\`）：按下它取前台窗口的选区，
+/// 分类后弹既有的动作面板。与前三颗都不同效，所以单占一个 id。
+const HOTKEY_SELECTION: i32 = 4;
 
 mod actions;
 mod cli;
@@ -89,6 +97,7 @@ mod dbltap;
 mod hud;
 mod large_type;
 mod matching;
+mod selection;
 mod source;
 mod theme;
 use source::application::{
@@ -101,8 +110,8 @@ use source::application::{
 // 是这台机器上唯一能把 Win 位设进去的入口——录制路径产不出它，见 `spec_from_press` 的注释。
 use source::application::{
     ERROR_HOTKEY_ALREADY_REGISTERED, HKF_ALT, HKF_CONTROL, HKF_NOREPEAT, HKF_SHIFT, HKF_WIN,
-    HotkeySpec, SecondaryAction, VK_0, VK_9, VK_A, VK_F1, VK_F24, VK_OEM_3, VK_RETURN, VK_SPACE,
-    VK_Z,
+    HotkeySpec, SecondaryAction, VK_0, VK_9, VK_A, VK_F1, VK_F24, VK_OEM_3, VK_OEM_5, VK_RETURN,
+    VK_SPACE, VK_Z,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1047,6 +1056,9 @@ struct LauncherApp {
     startup_notice: Option<String>,
     tray_rx: mpsc::Receiver<TrayEvent>,
     hotkey_rx: mpsc::Receiver<()>,
+    /// 批次 G3：选中内容键的结论（工作线程 → UI）。主窗可能正隐藏着，所以每次回执都带着
+    /// 一次 `ctx.request_repaint()`（见 [`spawn_selection_capture`]），否则这一帧根本不会跑。
+    selection_rx: mpsc::Receiver<SelectionOutcome>,
     // FR-SRC-21：主实例收二次进程转发（Activate/AddPath/Ping/Preferences/AddBatch）。
     ipc_rx: mpsc::Receiver<IpcMsg>,
     ipc_pending: Vec<DialogState>,
@@ -1104,6 +1116,13 @@ struct LauncherApp {
     extra_awaiting: Option<HotkeySpec>,
     /// 副呼出的键框正在等一次按键（三格互斥，见 `take_keypick`）。
     extra_recording: bool,
+    // ---- 批次 G3：选中内容动作面板的呼出键（出厂 `Ctrl+Alt+\`）----
+    /// 系统里此刻真正装着的选中内容键（显示口径）。`None` = 用户清掉了，或注册失败。
+    selection_active: Option<HotkeySpec>,
+    /// 已投递、还没拿到回执的选中内容组合（这段时间禁用"应用/清除"，与另三格同一口径）。
+    selection_awaiting: Option<HotkeySpec>,
+    /// 选中内容的键框正在等一次按键（四格互斥，见 `take_keypick`）。
+    selection_recording: bool,
     // ---- 批次 E3-丙：次级动作键（`Ctrl+Enter` 一类窗口内热键）----
     /// 设置页「次级动作」卡片的键框正在等一次按键。这颗键**不注册给系统**（不占别人的键、
     /// 也不进热键线程），所以不需要 `*_awaiting` / `*_active` 那一套回执；录制完直接落配置。
@@ -1400,6 +1419,404 @@ fn write_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+// ---- 打磨档 G3（选中内容动作面板）：借剪贴板取「选中的东西」 ----
+//
+// 五步逐条照 AHK `Src/Extensions/SelectionActions.ahk` 的 `Capture()`：等修饰键抬起 →
+// 全格式快照 → 清空 → 发复制键 → 等剪贴板出现内容 → 读 → 还原快照。
+// **整套跑在工作线程上**：发完键要等最多 800ms，堵在主线程就是用户能感觉到的卡顿。
+//
+// 快照照 AHK `ClipboardAll` 的做法：`EnumClipboardFormats` 枚举，逐格式把 `HGLOBAL` 里的
+// 字节拷进自己的内存；还原时用 `SetClipboardData` 一格一格放回去。图片走 `CF_DIB`/`CF_DIBV5`/
+// 注册格式 `PNG` 那几格（都是内存块），`CF_BITMAP` 这类**句柄型**格式跳过——那些格子里装的
+// 是 GDI 句柄，拷字节等于拷一个会失效的号码。
+//
+// 分类（是文件 / 网址 / 文本）与字节解析全在 `src/selection.rs`，这里只管碰系统。
+
+/// 一次取选区的结论，工作线程 → UI。
+enum SelectionOutcome {
+    /// 拿到了：已按文件 / 网址 / 文本分好类。
+    Got(selection::Target),
+    /// 没拿到（或为了不动用户剪贴板而主动放弃）。带一句能直接念给用户听的话。
+    Nothing(&'static str),
+}
+
+/// 结论的投递口。热键线程的窗口过程收到 `WM_HOTKEY` 就得往这儿塞一条，而它只拿得到
+/// 静态量——所以与 [`HOTKEY_TX`] 同一形态：`main` 建好通道、`spawn_hotkey_thread` 里登记。
+static SELECTION_TX: std::sync::OnceLock<mpsc::Sender<SelectionOutcome>> = std::sync::OnceLock::new();
+
+/// 等物理修饰键松手的上限。热键是 `Ctrl+Alt+\`，按下去那一瞬 Ctrl/Alt 还压着 ⇒ 这时候发出去的
+/// `^c` 会被目标程序理解成 `Ctrl+Alt+C`（多半什么都不做，用户看到的就是"按了没反应"）。
+/// AHK 那版是 `Win.WaitModifiersUp()`，本程序没有等待队列，只能轮询 `GetAsyncKeyState`。
+const MODIFIERS_UP_TIMEOUT: Duration = Duration::from_millis(1000);
+const MODIFIERS_UP_POLL: Duration = Duration::from_millis(5);
+/// 等剪贴板出现内容的轮询间隔（总上限是 `selection::CLIP_WAIT_MS`）。
+const CLIP_WAIT_POLL: Duration = Duration::from_millis(10);
+/// 剪贴板打不开时的重试节奏。复制刚落地的一小段时间里，目标程序或剪贴板监视器常在那几十
+/// 毫秒里握着它——`OpenClipboard` 撞一次失败就整条放弃，"刚复制完立刻读"这条路天然不可靠
+/// （2026-10-30 批次 G3 真机 T2 抓到：读结果与还原两处同时报 `CLIPBRD_E_CANT_OPEN`，
+/// 用户原来的剪贴板就这么被留在"刚才那次复制"上）。上限 ≈300ms，仍在 CLIP_WAIT 的量级内。
+const CLIP_OPEN_TRIES: u32 = 30;
+const CLIP_OPEN_POLL: Duration = Duration::from_millis(10);
+/// 复制键的主键 vk：`C` 与 `Insert`（后者给控制台类窗口，`Ctrl+C` 在那儿是"中断程序"）。
+const VK_C: u16 = 0x43;
+const VK_INSERT: u16 = 0x2D;
+
+/// 带重试地打开剪贴板。取选区那一路的**每**一次打开都走这里（清空 / 读结果 / 还原），
+/// 免得"某个瞬间被占着"被记成"功能坏了"。
+fn open_clipboard_retry() -> Result<(), String> {
+    let mut last = String::new();
+    for i in 0..CLIP_OPEN_TRIES {
+        match unsafe { OpenClipboard(None) } {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = format!("{e}");
+                if i + 1 < CLIP_OPEN_TRIES {
+                    thread::sleep(CLIP_OPEN_POLL);
+                }
+            }
+        }
+    }
+    Err(last)
+}
+
+/// 剪贴板里此刻有没有值得读的东西。**只问有没有、不开剪贴板**——被别的程序占着时这两个
+/// 函数照样答得上来，而 `OpenClipboard` 会失败。
+fn clipboard_has_selection() -> bool {
+    unsafe {
+        IsClipboardFormatAvailable(CF_HDROP).is_ok()
+            || IsClipboardFormatAvailable(CF_UNICODETEXT).is_ok()
+    }
+}
+
+/// Ctrl / Alt / Shift / Win 是不是都松开了。超时返回 `false`（调用方照发，日志里留一行）。
+fn wait_modifiers_up(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let down = unsafe {
+            [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                .into_iter()
+                .any(|vk| (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0)
+        };
+        if !down {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(MODIFIERS_UP_POLL);
+    }
+}
+
+/// 发一次「复制」：`Ctrl+C` 或 `Ctrl+Insert`，四个事件一次投出去（中间被别的按键插进来就白干）。
+fn send_copy_keystroke(key: selection::CopyKey) -> bool {
+    let main = match key {
+        selection::CopyKey::C => VK_C,
+        selection::CopyKey::Insert => VK_INSERT,
+    };
+    let inputs = [
+        vk_input(VK_CONTROL.0, false),
+        vk_input(main, false),
+        vk_input(main, true),
+        vk_input(VK_CONTROL.0, true),
+    ];
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    sent == inputs.len() as u32
+}
+
+/// 清空剪贴板。与其余几处同一条纪律：打开了就必须关，失败路径也走同一个 `CloseClipboard`。
+fn clear_clipboard() -> Result<(), String> {
+    open_clipboard_retry()
+        .map_err(|e| format!("打开剪贴板失败（可能正被别的程序占着）：{e}"))?;
+    let done = unsafe { EmptyClipboard() }.map_err(|e| format!("清空剪贴板失败：{e}"));
+    let _ = unsafe { CloseClipboard() };
+    done
+}
+
+/// 剪贴板已打开时读 `CF_HDROP`（资源管理器里选中一批文件按 `Ctrl+C` 放的就是它）。
+/// 打不开 / 没有这一格 / 载荷读不懂一律 `None`，由调用方接着问文本。
+fn clipboard_hdrop_locked() -> Option<Vec<String>> {
+    unsafe {
+        let handle = GetClipboardData(CF_HDROP).ok()?;
+        if handle.is_invalid() {
+            return None;
+        }
+        let h = HGLOBAL(handle.0);
+        let p = GlobalLock(h);
+        if p.is_null() {
+            return None;
+        }
+        // 载荷长度只能问系统要：`DROPFILES` 头里的路径表是变长的，没有别处记着总长。
+        let len = GlobalSize(h);
+        let parsed = if len == 0 {
+            None
+        } else {
+            selection::parse_hdrop(std::slice::from_raw_parts(p.cast::<u8>(), len))
+        };
+        let _ = GlobalUnlock(h);
+        parsed
+    }
+}
+
+/// 剪贴板已打开时读 `CF_UNICODETEXT`。**调用方负责 `OpenClipboard` / `CloseClipboard`**——
+/// 这一份是从 [`read_clipboard_text`] 里拆出来的，好让取选区那一路只开一次剪贴板就同时问
+/// 「文件」和「文本」两格（开两次也合法，但中途被别人抢走一次就白开）。
+fn clipboard_text_locked() -> Option<String> {
+    unsafe {
+        match GetClipboardData(CF_UNICODETEXT) {
+            Ok(handle) if !handle.is_invalid() => {
+                let h = HGLOBAL(handle.0);
+                let p = GlobalLock(h);
+                let s = if p.is_null() {
+                    None
+                } else {
+                    let base = p.cast::<u16>();
+                    let mut units: Vec<u16> = Vec::new();
+                    for i in 0..(1usize << 20) {
+                        let u = *base.add(i);
+                        if u == 0 {
+                            break;
+                        }
+                        units.push(u);
+                    }
+                    let _ = GlobalUnlock(h);
+                    Some(String::from_utf16_lossy(&units))
+                };
+                s
+            }
+            // 剪贴板里没有文本（只有文件 / 图片，或者干脆是空的）⇒ 空值，不报错。
+            _ => None,
+        }
+    }
+}
+
+/// 剪贴板里读到的原料，还没分类。
+enum ClipboardPayload {
+    Files(Vec<String>),
+    Text(String),
+}
+
+/// 一次开剪贴板读完全部：`CF_HDROP` 优先（AHK `Capture()` 同样先问"复制的是不是文件"），
+/// 没有文件再读文本。
+fn read_clipboard_payload() -> Option<ClipboardPayload> {
+    if let Err(e) = open_clipboard_retry() {
+        eprintln!("取选区：读结果时剪贴板打不开（可能正被别的程序占着）：{e}");
+        return None;
+    }
+    let payload = clipboard_hdrop_locked()
+        .map(ClipboardPayload::Files)
+        .or_else(|| clipboard_text_locked().map(ClipboardPayload::Text));
+    let _ = unsafe { CloseClipboard() };
+    payload
+}
+
+/// 抓之前那一刻的前台窗口类名。**在动任何东西之前取**——窗口没弹出来之前前台还是用户待的
+/// 那个程序；`""` = 取不到（按普通窗口处理，与 AHK 的 `try` 兜底同效）。
+fn foreground_class_name() -> String {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        String::new()
+    } else {
+        window_class_name(fg)
+    }
+}
+
+/// 快照里的一格：格式号 + 从 `HGLOBAL` 拷出来的原始字节。
+///
+/// 格式号在会话内是全局的（系统那张格式表），所以还原时不用重新 `RegisterClipboardFormatW`，
+/// 直接拿快照里的号 `SetClipboardData` 就认。
+struct ClipFormat {
+    id: u32,
+    bytes: Vec<u8>,
+}
+
+/// 这一格的载荷不是内存块、而是某个 GDI/系统句柄：拷字节只会拷到一个马上失效的号码。
+///
+/// - `CF_BITMAP(2)` `CF_METAFILEPICT(3)` `CF_PALETTE(9)` `CF_ENHMETAFILE(14)`：GDI 句柄
+/// - `0x80..=0x8F`：`CF_OWNERDISPLAY` 与 `CF_DSP*` 一系（显示格式，归原主人管）
+/// - `0x200..=0x3FF`：`CF_PRIVATEFIRST..CF_GDIOBJLAST`（私有格式与 GDI 对象区间）
+///
+/// 图片不必担心：资源管理器/浏览器复制图片时同时放 `CF_DIB`（8）或 `CF_DIBV5`（17），
+/// 那是内存块，会照抄。
+fn is_handle_format(id: u32) -> bool {
+    matches!(id, 2 | 3 | 9 | 14) || (0x80..=0x8F).contains(&id) || (0x200..=0x3FF).contains(&id)
+}
+
+/// 外壳注册的 `DataObject` 格式号。它是**运行时注册**的，名字换号；`0` = 注册失败（那就当没有这一格）。
+///
+/// 这一格里装的是一个 8 字节的 COM 对象指针，只在设置它的那个进程里有效。抄字节还原等于把一个
+/// 失效号码放回剪贴板——下一个读它的程序可能直接崩（2026-10-30 假机实测：还原后剪贴板里
+/// 就躺着这么一格 `DataObject size=8`）。文件/文本/图片各有实格式（`CF_HDROP` /
+/// `CF_UNICODETEXT` / `CF_DIB`），跳过这一格不影响粘贴。
+fn data_object_format_id() -> u32 {
+    let name: Vec<u16> = "DataObject"
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+    unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) }
+}
+
+/// 快照要整格跳过的：句柄型，以及指针型（`DataObject`）。
+fn is_skipped_format(id: u32, data_object_id: u32) -> bool {
+    is_handle_format(id) || (data_object_id != 0 && id == data_object_id)
+}
+
+/// 剪贴板已打开时，把某一格的 `HGLOBAL` 字节整块拷出来。锁不上 / 长度为 0 一律 `None`——
+/// 这一格就当没快照过，不影响别的格子。
+fn clipboard_format_bytes(id: u32) -> Option<Vec<u8>> {
+    unsafe {
+        let handle = GetClipboardData(id).ok()?;
+        if handle.is_invalid() {
+            return None;
+        }
+        let h = HGLOBAL(handle.0);
+        let p = GlobalLock(h);
+        if p.is_null() {
+            return None;
+        }
+        let len = GlobalSize(h);
+        let out = if len == 0 {
+            None
+        } else {
+            Some(std::slice::from_raw_parts(p.cast::<u8>(), len).to_vec())
+        };
+        let _ = GlobalUnlock(h);
+        out
+    }
+}
+
+/// 把用户剪贴板整份抄进内存。**每一格都开剪贴板一次是错的**——中途被别人抢走就白抄，
+/// 所以整趟只开一次；打开了就必须关，任何出口都走同一个 `CloseClipboard`。
+///
+/// 返回值只用于日志计数，**格式名与内容都不落日志**。
+fn snapshot_clipboard() -> Result<Vec<ClipFormat>, String> {
+    open_clipboard_retry().map_err(|e| format!("{e}"))?;
+    let data_object = data_object_format_id();
+    let mut out: Vec<ClipFormat> = Vec::new();
+    let mut id = 0u32;
+    loop {
+        id = unsafe { EnumClipboardFormats(id) };
+        if id == 0 {
+            break;
+        }
+        if is_skipped_format(id, data_object) {
+            continue;
+        }
+        if let Some(bytes) = clipboard_format_bytes(id) {
+            out.push(ClipFormat { id, bytes });
+        }
+    }
+    let _ = unsafe { CloseClipboard() };
+    Ok(out)
+}
+
+/// 把快照一格一格放回空剪贴板。调用前剪贴板已经 `EmptyClipboard` 过（本函数自己清）。
+///
+/// 单独一格失败不回滚也别中断：剩下的格子照放，最后把"放进去几格 / 一共几格"报上去——
+/// 用户至少知道自己是"全还原"还是"只回来了文本"。
+fn restore_clipboard(snapshot: &[ClipFormat]) -> Result<(), String> {
+    open_clipboard_retry().map_err(|e| format!("{e}"))?;
+    if let Err(e) = unsafe { EmptyClipboard() } {
+        let _ = unsafe { CloseClipboard() };
+        return Err(format!("清空剪贴板失败：{e}"));
+    }
+    let mut put = 0usize;
+    let mut first_err = String::new();
+    for f in snapshot {
+        match write_clipboard_bytes(f.id, &f.bytes) {
+            Ok(()) => put += 1,
+            Err(e) => {
+                if first_err.is_empty() {
+                    first_err = e;
+                }
+            }
+        }
+    }
+    let _ = unsafe { CloseClipboard() };
+    if put == snapshot.len() {
+        eprintln!("取选区：剪贴板已还原（{put} 格，全格式快照）");
+        Ok(())
+    } else {
+        Err(format!(
+            "还原了 {put}/{} 格，第一处失败：{first_err}",
+            snapshot.len()
+        ))
+    }
+}
+
+/// 取选区的主体（工作线程）。返回给 UI 的只有分类结论，**原文一律不出这个函数的日志**。
+///
+/// 剪贴板快照拿不到就**整条放弃**，不清空也不发键：宁可不做，也不能先把用户剪贴板里的东西
+/// 扔掉再失败——那等于按一次热键就毁掉他复制的东西。
+fn capture_selection() -> SelectionOutcome {
+    let class_name = foreground_class_name();
+    let copy_key = selection::copy_key_for(&class_name);
+    if !wait_modifiers_up(MODIFIERS_UP_TIMEOUT) {
+        eprintln!(
+            "取选区：等修饰键松开超时（{}ms）⇒ 照发复制键，目标程序可能把它当成带修饰的组合",
+            MODIFIERS_UP_TIMEOUT.as_millis()
+        );
+    }
+    let snapshot = match snapshot_clipboard() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("取选区：剪贴板快照失败（{e}）⇒ 本次不做（你的剪贴板没有被改动）");
+            return SelectionOutcome::Nothing("剪贴板正被别的程序占着，这次没取");
+        }
+    };
+    if let Err(e) = clear_clipboard() {
+        eprintln!("取选区：清空剪贴板失败（{e}）⇒ 本次不做");
+        return SelectionOutcome::Nothing("剪贴板正被别的程序占着，这次没取");
+    }
+    if !send_copy_keystroke(copy_key) {
+        // 键没投全：目标程序多半一个字符都没复制，但仍按"等一下再看"处理——投出去的那几个
+        // 事件可能已经让它复制了，读一遍总比漏掉强。
+        eprintln!("取选区：复制键没投全（SendInput 少于 4 个事件）");
+    }
+    let deadline = Instant::now() + Duration::from_millis(selection::CLIP_WAIT_MS);
+    while !clipboard_has_selection() && Instant::now() < deadline {
+        thread::sleep(CLIP_WAIT_POLL);
+    }
+    let payload = read_clipboard_payload();
+    // 先还原再分类：分类是纯计算，而还原越早，"用户此刻又复制了别的东西"被覆盖的窗口越小。
+    if let Err(e) = restore_clipboard(&snapshot) {
+        eprintln!("取选区：剪贴板还原不完整（{e}）⇒ 现在里面可能只有刚才那次复制");
+    }
+
+    let exists = |p: &str| std::path::Path::new(p).exists();
+    match payload {
+        Some(ClipboardPayload::Files(paths)) => selection::classify_files(paths)
+            .map_or(SelectionOutcome::Nothing("选中的文件列表是空的"), SelectionOutcome::Got),
+        Some(ClipboardPayload::Text(text)) => selection::classify_text(&text, exists)
+            .map_or(SelectionOutcome::Nothing("没有选中任何内容"), SelectionOutcome::Got),
+        None => SelectionOutcome::Nothing("没有选中任何内容"),
+    }
+}
+
+/// 派一个取选区线程，结论经通道回 UI。**不回日志原文**：只有类别与条数/字符数。
+fn spawn_selection_capture(tx: mpsc::Sender<SelectionOutcome>) {
+    thread::spawn(move || {
+        let outcome = capture_selection();
+        match &outcome {
+            SelectionOutcome::Got(selection::Target::Files(paths)) => {
+                eprintln!("取选区：拿到 {} 条路径（路径不落日志）", paths.len())
+            }
+            SelectionOutcome::Got(selection::Target::Url(_)) => {
+                eprintln!("取选区：拿到一个网址（原文不落日志）")
+            }
+            SelectionOutcome::Got(selection::Target::Text(text)) => eprintln!(
+                "取选区：拿到 {} 个字符的文本（原文不落日志）",
+                text.chars().count()
+            ),
+            SelectionOutcome::Nothing(why) => eprintln!("取选区：没拿到内容（{why}）"),
+        }
+        let _ = tx.send(outcome);
+        // 窗口可能正隐藏着（eframe 隐藏后就不再跑 `ui()`）⇒ 必须主动唤醒，否则回执没人收。
+        if let Some(ctx) = CTX.get() {
+            ctx.request_repaint();
+        }
+    });
+}
+
 // ---- 批次 E5（FR-ACT-01 第三格「文本 ⇒ 粘贴」）：呼出前那个窗口的记账与注入 ----
 
 /// 呼出之前那个窗口的句柄数值；`0` = 这次没记下（呼出时系统前台本来就是空的）。
@@ -1447,30 +1864,7 @@ fn read_clipboard_text() -> Option<String> {
             eprintln!("参数标记：剪贴板打不开（可能正被别的程序占着）⇒ {{%c}} 这次是空值");
             return None;
         }
-        let text = match GetClipboardData(CF_UNICODETEXT) {
-            Ok(handle) if !handle.is_invalid() => {
-                let h = HGLOBAL(handle.0);
-                let p = GlobalLock(h);
-                let s = if p.is_null() {
-                    None
-                } else {
-                    let base = p.cast::<u16>();
-                    let mut units: Vec<u16> = Vec::new();
-                    for i in 0..(1usize << 20) {
-                        let u = *base.add(i);
-                        if u == 0 {
-                            break;
-                        }
-                        units.push(u);
-                    }
-                    let _ = GlobalUnlock(h);
-                    Some(String::from_utf16_lossy(&units))
-                };
-                s
-            }
-            // 剪贴板里没有文本（只有文件 / 图片，或者干脆是空的）⇒ 空值，不报错。
-            _ => None,
-        };
+        let text = clipboard_text_locked();
         let _ = CloseClipboard();
         if let Some(t) = &text {
             // 长度可以入日志，原文不行（FR-SYS-03）。
@@ -3033,9 +3427,10 @@ fn run_console_tool(exe: &str, args: &[&str]) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// 音量/媒体键：按下 + 抬起各一次。与补字符那格同一个 `SendInput`，区别是这里发真 VK。
-fn press_vk(vk: u16) {
-    let key = |up: bool| INPUT {
+/// 一个键盘 `INPUT` 事件。抽出来是因为「按下 + 抬起」与「`Ctrl` + 主键」两处都要造同一种结构，
+/// 抄两份只会让两边的字段漂开。
+fn vk_input(vk: u16, up: bool) -> INPUT {
+    INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
@@ -3050,7 +3445,12 @@ fn press_vk(vk: u16) {
                 dwExtraInfo: 0,
             },
         },
-    };
+    }
+}
+
+/// 音量/媒体键：按下 + 抬起各一次。与补字符那格同一个 `SendInput`，区别是这里发真 VK。
+fn press_vk(vk: u16) {
+    let key = |up: bool| vk_input(vk, up);
     let sent = unsafe {
         SendInput(
             &[key(false), key(true)],
@@ -3099,20 +3499,25 @@ const WM_APP_CLEAR_EXTRA: u32 = WM_APP + 5;
 /// 为什么这件事也要投消息：低级键盘钩子`WH_KEYBOARD_LL` 的回调**跑在装钩子的那条线程**
 /// （系统往它的消息队列里投），所以钩子只能在热键线程装、也只能在热键线程卸。
 const WM_APP_SET_DOUBLE_TAP: u32 = WM_APP + 6;
+/// 「清除选中内容热键」（批次 G3）。同一条理由：注销只能在热键线程做。
+const WM_APP_CLEAR_SELECTION: u32 = WM_APP + 7;
 /// 暂停的兜底定时器 id 与时长：注销状态一旦漏掉恢复（比如窗口隐藏后 eframe 不再跑 `ui()`，
 /// UI 侧那条边沿检测就永远不执行），全局呼出会一直不可用。定时器挂在消息窗上，
 /// 由热键线程自己的消息循环驱动 ⇒ 与窗口可见与否无关，这条兜底才是真兜底。
 const HOTKEY_SUSPEND_TIMER: usize = 0x5EED;
 const HOTKEY_SUSPEND_TIMEOUT: u32 = 30_000;
 
-/// 系统里最多同时装着两个热键，用 id 区分。槽位这个概念只存在于本文件：
-/// 落盘的是两份 `HotkeySpec`（`toggle_hotkey` / `typeback_hotkey`），没有"槽"这个字段。
+/// 系统里最多同时装着四个热键，用 id 区分。槽位这个概念只存在于本文件：
+/// 落盘的是四份 `HotkeySpec`（`toggle_hotkey` / `typeback_hotkey` / `extra_hotkey` /
+/// `selection_hotkey`），没有"槽"这个字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HotkeySlot {
     Toggle,
     Typeback,
     /// 批次 G1：副呼出键（`extra_hotkey`）。
     Extra,
+    /// 批次 G3：选中内容动作面板的呼出键（`selection_hotkey`）。
+    Selection,
 }
 
 impl HotkeySlot {
@@ -3121,6 +3526,7 @@ impl HotkeySlot {
             Self::Toggle => HOTKEY_TOGGLE,
             Self::Typeback => HOTKEY_TYPEBACK,
             Self::Extra => HOTKEY_EXTRA,
+            Self::Selection => HOTKEY_SELECTION,
         }
     }
 
@@ -3130,6 +3536,7 @@ impl HotkeySlot {
             Self::Toggle => "全局呼出热键",
             Self::Typeback => "补字符热键",
             Self::Extra => "副呼出热键",
+            Self::Selection => "选中内容热键",
         }
     }
 
@@ -3139,6 +3546,7 @@ impl HotkeySlot {
             Self::Toggle => &HOTKEY_ACTIVE,
             Self::Typeback => &TYPEBACK_ACTIVE,
             Self::Extra => &EXTRA_ACTIVE,
+            Self::Selection => &SELECTION_ACTIVE,
         }
     }
 }
@@ -3154,6 +3562,8 @@ static HOTKEY_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
 static TYPEBACK_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
 /// 副呼出键的同一份口径（批次 G1；`None` = 不用，或用了但注册失败）。
 static EXTRA_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
+/// 选中内容热键的同一份口径（批次 G3；`None` = 不用，或用了但注册失败）。
+static SELECTION_ACTIVE: Mutex<Option<HotkeySpec>> = Mutex::new(None);
 /// 此刻装着的低级键盘钩子句柄（0 = 没装）。`HHOOK` 是裸指针、不 `Sync`，存数值。
 /// 只有热键线程读写它（装/卸都在 `set_tap_hook` 里，而它只在热键线程被调用）。
 static TAP_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -3348,6 +3758,9 @@ fn vk_from_egui_key(k: egui::Key) -> Option<u32> {
         // 批次 R：`` ` `` 进可录集合（egui 那边这个变体叫 `Backtick`，winit 的 `Backquote` 映射到它）。
         // 和上面两条同一个理由写数字字面量，不写 `VK_OEM_3`：模式位上的单标识符是新绑定。
         Backtick => 0xC0,
+        // 批次 G3：`\` 进可录集合（`VK_OEM_5`，选中内容热键的出厂键 Ctrl+Alt+\ 要用它）。
+        // 同样是数字字面量。
+        Backslash => 0xDC,
         F1 => 0x70,
         F2 => 0x71,
         F3 => 0x72,
@@ -3381,6 +3794,7 @@ fn vk_from_egui_key(k: egui::Key) -> Option<u32> {
         || code == VK_SPACE
         || code == VK_RETURN
         || code == VK_OEM_3
+        || code == VK_OEM_5
     {
         Some(code)
     } else {
@@ -3512,6 +3926,11 @@ fn suspend_hotkey(hwnd: HWND) {
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_EXTRA);
                 eprintln!("hotkey: 取键期间临时注销副呼出键（退出取键时装回）");
             }
+            // 批次 G3：选中内容键同理——正在录它自己的组合时，不摘就一个事件都收不到。
+            if hotkey_lock(&SELECTION_ACTIVE).is_some() {
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SELECTION);
+                eprintln!("hotkey: 取键期间临时注销选中内容键（退出取键时装回）");
+            }
             match *hotkey_lock(&HOTKEY_ACTIVE) {
                 Some(k) => eprintln!(
                     "hotkey: 取键期间临时注销 {}（退出取键或 {}ms 后装回）",
@@ -3558,6 +3977,31 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
                     eprintln!(
                         "hotkey: 退出取键（{why}）时装回副呼出键 {} 失败（{err}）",
                         e.display()
+                    );
+                    if let Some(ctx) = CTX.get() {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+        // 批次 G3：选中内容键也放在主热键那格之前（同一条理由：主热键可能是空的）。
+        if let Some(s) = *hotkey_lock(&SELECTION_ACTIVE) {
+            match apply_hotkey(hwnd, HotkeySlot::Selection, s) {
+                Ok(()) => eprintln!(
+                    "hotkey: 退出取键（{why}）⇒ 已装回选中内容键 {}",
+                    s.display()
+                ),
+                Err(err) => {
+                    *hotkey_lock(&SELECTION_ACTIVE) = None;
+                    hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
+                        slot: HotkeySlot::Selection,
+                        tried: s,
+                        err,
+                        now_active: None,
+                    });
+                    eprintln!(
+                        "hotkey: 退出取键（{why}）时装回选中内容键 {} 失败（{err}）",
+                        s.display()
                     );
                     if let Some(ctx) = CTX.get() {
                         ctx.request_repaint();
@@ -3805,8 +4249,8 @@ unsafe extern "system" fn hotkey_wndproc(
 ) -> LRESULT {
     unsafe {
         if msg == WM_HOTKEY {
-            // 批次 R 起系统里最多装着两个键，`wparam` 就是注册时那个 id ⇒ 必须按 id 分派，
-            // 否则按下补字符键会把窗口弹出来（用户要的是打一个字符）。
+            // 批次 R 起系统里可能装着多个键（批次 G3 起最多四颗），`wparam` 就是注册时那个 id
+            // ⇒ 必须按 id 分派，否则按下补字符键会把窗口弹出来（用户要的是打一个字符）。
             match wparam.0 as i32 {
                 // 批次 G1：「副呼出热键」与主呼出键是同一件事（AHK 版把两个键绑在同一个
                 // `SearchWindow.Toggle()` 上），所以走同一个分支。
@@ -3819,6 +4263,15 @@ unsafe extern "system" fn hotkey_wndproc(
                     }
                 }
                 HOTKEY_TYPEBACK => inject_typeback_char(),
+                // 批次 G3：取选区跑在工作线程上（要等修饰键松开、等剪贴板出内容，最坏 1.8s），
+                // 本线程还要继续泵消息 ⇒ 派出去就返回，结论经通道回 UI。
+                HOTKEY_SELECTION => {
+                    eprintln!("hotkey: 选中内容键按下 ⇒ 派一个取选区线程");
+                    match SELECTION_TX.get() {
+                        Some(tx) => spawn_selection_capture(tx.clone()),
+                        None => eprintln!("hotkey: 结论通道还没登记，本次丢弃"),
+                    }
+                }
                 _ => {}
             }
             return LRESULT(0);
@@ -3857,6 +4310,13 @@ unsafe extern "system" fn hotkey_wndproc(
                 Some(mode) => set_tap_hook(mode),
                 None => eprintln!("dbltap: 收到不认识的档位码 {}", wparam.0),
             }
+            return LRESULT(0);
+        }
+        // 批次 G3：清除选中内容键，理由同上。
+        if msg == WM_APP_CLEAR_SELECTION {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SELECTION);
+            *hotkey_lock(&SELECTION_ACTIVE) = None;
+            eprintln!("hotkey: 已注销选中内容热键（设置页「清除」）");
             return LRESULT(0);
         }
         // FR-WIN-02（批次 Q）：换键。注册/注销只在本线程发生（hwnd 归属），UI 线程只投消息。
@@ -3967,9 +4427,13 @@ fn spawn_hotkey_thread(
     configured: HotkeySpec,
     typeback: Option<HotkeySpec>,
     extra: Option<HotkeySpec>,
+    selection: Option<HotkeySpec>,
     dbl_tap: DblTap,
+    // 批次 G3：取选区的结论从这里回 UI（工作线程自己 `send` + 唤醒）。
+    selection_tx: mpsc::Sender<SelectionOutcome>,
 ) {
     HOTKEY_TX.set(tx).ok();
+    SELECTION_TX.set(selection_tx).ok();
     thread::spawn(move || unsafe {
         let module = GetModuleHandleW(None).expect("GetModuleHandleW");
         let class_name: Vec<u16> = "EguiLauncherHotkeyClass\0".encode_utf16().collect();
@@ -4131,6 +4595,48 @@ fn spawn_hotkey_thread(
                 }
             }
         }
+        // 批次 G3：选中内容热键。与前三颗都不同效，撞组时的跳过逻辑同上。
+        if let Some(sel) = selection {
+            let clash = |other: Option<HotkeySpec>| {
+                other.is_some_and(|k| (k.mods_named(), k.vk) == (sel.mods_named(), sel.vk))
+            };
+            let toggle_now = *hotkey_lock(&HOTKEY_ACTIVE);
+            let typeback_now = *hotkey_lock(&TYPEBACK_ACTIVE);
+            let extra_now = *hotkey_lock(&EXTRA_ACTIVE);
+            if clash(toggle_now) || clash(typeback_now) || clash(extra_now) {
+                eprintln!(
+                    "hotkey: 选中内容热键 {} 与已装着的那颗同组（多半是手改过 settings.json）⇒ 本次跳过，不改配置",
+                    sel.display()
+                );
+            } else {
+                match apply_hotkey(hwnd, HotkeySlot::Selection, sel) {
+                    Ok(()) => {
+                        *hotkey_lock(&SELECTION_ACTIVE) = Some(sel);
+                        eprintln!(
+                            "hotkey: 选中内容热键 {} registered（取前台窗口的选区弹动作面板）",
+                            sel.display()
+                        );
+                    }
+                    Err(err) => {
+                        hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
+                            slot: HotkeySlot::Selection,
+                            tried: sel,
+                            err,
+                            now_active: None,
+                        });
+                        eprintln!(
+                            "hotkey: 选中内容热键 {} 注册失败（{err}={}）⇒ 本次不可用，其余三颗不受影响",
+                            sel.display(),
+                            if err == ERROR_HOTKEY_ALREADY_REGISTERED {
+                                "已被占用"
+                            } else {
+                                "其它原因"
+                            }
+                        );
+                    }
+                }
+            }
+        }
         // 批次 G1：双击呼出。钩子必须在**本线程**装（回调跑在装钩子的线程），
         // 而本线程此刻正好要进 `GetMessageW` 循环 ⇒ 时机就是这里。关闭档不装。
         set_tap_hook(dbl_tap);
@@ -4151,6 +4657,7 @@ fn spawn_hotkey_thread(
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TYPEBACK);
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_EXTRA);
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SELECTION);
         // 钩子不摘的话会一直挂在一条已经退出的线程上（系统只在进程结束时收拾）。
         set_tap_hook(DblTap::Off);
         let _ = KillTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER);
@@ -4185,6 +4692,8 @@ impl LauncherApp {
         // 降级日志从前一次启动打两遍，也是这第二次读造成的。
         settings: source::application::AppSettings,
         broken_settings: Option<Corrupted>,
+        // 批次 G3：选中内容键取回来的结论（热键线程派的工作线程往这里塞）。
+        selection_rx: mpsc::Receiver<SelectionOutcome>,
     ) -> Self {
         let (icon_tx, icon_rx) = mpsc::channel();
         // 批次 D2 第二半：「下载站点图标」的回执通道（下载在后台线程，主线程只收）。
@@ -4450,6 +4959,7 @@ impl LauncherApp {
         let hotkey_active = prefs.toggle_hotkey;
         let typeback_active = prefs.typeback_hotkey;
         let extra_active = prefs.extra_hotkey;
+        let selection_active = prefs.selection_hotkey;
         let typeback_draft = prefs.typeback_hotkey.map(|s| HotkeySpec {
             mods: s.mods_named(),
             vk: s.vk,
@@ -4513,6 +5023,7 @@ impl LauncherApp {
             icon_rx,
             tray_rx,
             hotkey_rx,
+            selection_rx,
             ipc_rx,
             ipc_pending: Vec::new(),
             pending_batch: intent.batch,
@@ -4546,6 +5057,10 @@ impl LauncherApp {
             extra_active,
             extra_awaiting: None,
             extra_recording: false,
+            // 批次 G3：选中内容键同一套口径（先按配置显示，首帧按 SELECTION_ACTIVE 校正）。
+            selection_active,
+            selection_awaiting: None,
+            selection_recording: false,
             secondary_recording: false,
             marked: Vec::new(),
             batch_confirm: None,
@@ -5297,6 +5812,18 @@ impl LauncherApp {
                             true,
                         );
                     }
+                    HotkeySlot::Selection => {
+                        self.selection_active = Some(on);
+                        self.selection_awaiting = None;
+                        if self.prefs.selection_hotkey != Some(on) {
+                            self.prefs.selection_hotkey = Some(on);
+                            source::application::save_settings(&self.prefs);
+                        }
+                        self.hotkey_note(
+                            &format!("✓ 选中内容热键已设为 {}", on.display()),
+                            true,
+                        );
+                    }
                 },
                 HotkeyOutcome::Rejected {
                     slot,
@@ -5349,6 +5876,18 @@ impl LauncherApp {
                                 false,
                             );
                         }
+                        HotkeySlot::Selection => {
+                            self.selection_awaiting = None;
+                            self.selection_active = now_active;
+                            let tail = match now_active {
+                                Some(k) => format!("，当前仍是 {}", k.display()),
+                                None => " ⇒ 本次只能靠托盘呼出".to_string(),
+                            };
+                            self.hotkey_note(
+                                &format!("⚠ 选中内容热键 {} {why}{tail}", tried.display()),
+                                false,
+                            );
+                        }
                     }
                 }
                 HotkeyOutcome::StartupFallback {
@@ -5386,6 +5925,8 @@ impl LauncherApp {
             self.typeback_active = *hotkey_lock(&TYPEBACK_ACTIVE);
             // 批次 G1：副呼出同理，`None` 也是有效信息（清掉了 / 撞组被跳过 / 注册失败）。
             self.extra_active = *hotkey_lock(&EXTRA_ACTIVE);
+            // 批次 G3：选中内容键同理。
+            self.selection_active = *hotkey_lock(&SELECTION_ACTIVE);
         }
 
         // ③ 取键，④ 边沿通知。
@@ -5400,6 +5941,7 @@ impl LauncherApp {
             && !self.typeback_armed
             && !self.secondary_recording
             && !self.extra_recording
+            && !self.selection_recording
         {
             return;
         }
@@ -5407,6 +5949,7 @@ impl LauncherApp {
         if self.hotkey_awaiting.is_some()
             || self.typeback_awaiting.is_some()
             || self.extra_awaiting.is_some()
+            || self.selection_awaiting.is_some()
         {
             return;
         }
@@ -5512,6 +6055,33 @@ impl LauncherApp {
             }
             return;
         }
+        if self.selection_recording {
+            match key {
+                egui::Key::Escape | egui::Key::Tab => {
+                    self.selection_recording = false;
+                    eprintln!(
+                        "设置页：选中内容键录制取消（按 {}），当前仍是 {}",
+                        if key == egui::Key::Escape { "Esc" } else { "Tab" },
+                        match self.selection_active {
+                            Some(k) => k.display().to_string(),
+                            None => "无".to_string(),
+                        }
+                    );
+                }
+                egui::Key::Backspace | egui::Key::Delete => {
+                    self.selection_recording = false;
+                    eprintln!("设置页：选中内容键收到 Backspace/Delete ⇒ 恢复出厂组合");
+                    self.request_selection(HotkeySpec::SELECTION_DEFAULT);
+                }
+                other => {
+                    let Some(spec) = spec_from_press(other, m) else {
+                        return; // 方向键之类：继续等，不提示（另三格同一口径）
+                    };
+                    self.selection_recording = !self.request_selection(spec);
+                }
+            }
+            return;
+        }
         match key {
             egui::Key::Escape | egui::Key::Tab => {
                 self.hotkey_recording = false;
@@ -5553,8 +6123,12 @@ impl LauncherApp {
     /// `ui()`，边沿检测等不到下一帧，全局呼出会一直停在注销状态（真等不到还有兜底定时器）。
     fn sync_keypick_suspend(&mut self) {
         // 批次 G1：副呼出的录制也进暂停态（`suspend_hotkey` 会把主/副两颗都摘掉）。
+        // 批次 G3：选中内容那颗同理（不摘掉时它自己就在系统里，按键被它先吃掉）。
         // `secondary_recording` 不在内：那颗键不注册给系统，摘了也没有意义。
-        let picking = self.hotkey_recording || self.typeback_armed || self.extra_recording;
+        let picking = self.hotkey_recording
+            || self.typeback_armed
+            || self.extra_recording
+            || self.selection_recording;
         if picking == self.keypick_suspended {
             return;
         }
@@ -5617,6 +6191,17 @@ impl LauncherApp {
                 return false;
             }
         }
+        // 批次 G3：第四格同理。
+        if let Some(sel) = self.selection_active {
+            if (sel.mods_named(), sel.vk) == (spec.mods_named(), spec.vk) {
+                self.hotkey_note(
+                    &format!("⚠ {show} 正被选中内容热键占着，请先改掉或清除它"),
+                    false,
+                );
+                eprintln!("设置页：热键 {show} 与选中内容热键同组，未采纳");
+                return false;
+            }
+        }
         if spec == self.hotkey_active {
             self.hotkey_note(&format!("ℹ {show} 就是当前热键，未改动"), true);
             eprintln!("设置页：热键 {show} 与当前一致，未改动");
@@ -5653,6 +6238,17 @@ impl LauncherApp {
                     false,
                 );
                 eprintln!("设置页：补字符热键 {show} 与副呼出热键同组，未采纳");
+                return false;
+            }
+        }
+        // 批次 G3：第四格同理。
+        if let Some(sel) = self.selection_active {
+            if (sel.mods_named(), sel.vk) == (spec.mods_named(), spec.vk) {
+                self.hotkey_note(
+                    &format!("⚠ 补字符热键 {show} 正被选中内容热键占着，请先改掉或清除它"),
+                    false,
+                );
+                eprintln!("设置页：补字符热键 {show} 与选中内容热键同组，未采纳");
                 return false;
             }
         }
@@ -5702,6 +6298,17 @@ impl LauncherApp {
             eprintln!("设置页：副呼出热键 {show} 与本程序键表冲突，未采纳");
             return false;
         }
+        // 批次 G3：`check_extra` 管不到第四格，这里补上（同线程同组只能注册一次）。
+        if let Some(sel) = self.selection_active {
+            if (sel.mods_named(), sel.vk) == (spec.mods_named(), spec.vk) {
+                self.hotkey_note(
+                    &format!("⚠ 副呼出热键 {show} 正被选中内容热键占着，请先改掉或清除它"),
+                    false,
+                );
+                eprintln!("设置页：副呼出热键 {show} 与选中内容热键同组，未采纳");
+                return false;
+            }
+        }
         if self.extra_active == Some(spec) {
             self.hotkey_note(&format!("ℹ {show} 就是当前副呼出热键，未改动"), true);
             eprintln!("设置页：副呼出热键 {show} 与当前一致，未改动");
@@ -5728,6 +6335,52 @@ impl LauncherApp {
         }
         eprintln!("设置页：副呼出热键已清除（注销 + settings.json 置空）");
         self.hotkey_note("✓ 已清除副呼出热键", true);
+    }
+
+    /// 批次 G3：选中内容热键的"应用"。判据在 `check_selection` 里（带修饰键 + 不许与另三格同组），
+    /// 其余与副呼出同一口径：键表预检、同值不动、**只有注册成功才写盘**。
+    fn request_selection(&mut self, spec: HotkeySpec) -> bool {
+        let show = spec.display();
+        if let Err(msg) = spec.check_selection(
+            &self.hotkey_active,
+            self.typeback_active.as_ref(),
+            self.extra_active.as_ref(),
+        ) {
+            self.hotkey_note(&format!("⚠ 选中内容热键 {show}：{msg}"), false);
+            eprintln!("设置页：选中内容热键 {show} 未采纳（{msg}）");
+            return false;
+        }
+        if spec.conflicts_local(LOCAL_TAKEN) {
+            self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
+            eprintln!("设置页：选中内容热键 {show} 与本程序键表冲突，未采纳");
+            return false;
+        }
+        if self.selection_active == Some(spec) {
+            self.hotkey_note(&format!("ℹ {show} 就是当前选中内容热键，未改动"), true);
+            eprintln!("设置页：选中内容热键 {show} 与当前一致，未改动");
+            return false;
+        }
+        if !post_hotkey_request(HotkeySlot::Selection, spec) {
+            self.hotkey_note("⚠ 热键线程还没就绪，请再录一次", false);
+            return false;
+        }
+        self.selection_awaiting = Some(spec);
+        eprintln!("设置页：选中内容热键请求已投递 → {show}（等注册结果）");
+        true
+    }
+
+    /// 批次 G3：「清除」选中内容键（与 `clear_extra` 同形态、不发回执）。
+    fn clear_selection(&mut self) {
+        post_hotkey_signal(WM_APP_CLEAR_SELECTION, "清除选中内容热键");
+        *hotkey_lock(&SELECTION_ACTIVE) = None;
+        self.selection_active = None;
+        self.selection_awaiting = None;
+        self.selection_recording = false;
+        if self.prefs.selection_hotkey.take().is_some() {
+            source::application::save_settings(&self.prefs);
+        }
+        eprintln!("设置页：选中内容热键已清除（注销 + settings.json 置空）");
+        self.hotkey_note("✓ 已清除选中内容热键", true);
     }
 
     /// 热键相关的一条回执提示：统一走 Toast（沿用各操作的 TTL 与配色）。
@@ -7260,6 +7913,65 @@ impl LauncherApp {
                                 .small(),
                             );
                             ui.separator();
+                            // 批次 G3（开发计划「选中内容动作面板」）：第四颗键。形态与副呼出那张一致，
+                            // 但它的语义不是"呼出本窗口"，而是"先取前台窗口的选区，再弹动作面板"。
+                            ui.label(egui::RichText::new("选中内容热键（取前台窗口的选区并弹动作面板）").strong());
+                            ui.horizontal(|ui| {
+                                let shown = if self.selection_recording {
+                                    "按下新组合…（Esc / Tab 取消，Backspace / Delete 恢复默认）"
+                                        .to_string()
+                                } else if let Some(w) = self.selection_awaiting {
+                                    format!("{} 注册中…", w.display())
+                                } else {
+                                    match self.selection_active {
+                                        Some(k) => k.display().to_string(),
+                                        None => "（未启用）".to_string(),
+                                    }
+                                };
+                                ui.label(egui::RichText::new(shown).monospace());
+                                if ui
+                                    .button(if self.selection_recording {
+                                        "取消录制"
+                                    } else {
+                                        "录制新热键"
+                                    })
+                                    .clicked()
+                                {
+                                    self.selection_recording = !self.selection_recording;
+                                    eprintln!(
+                                        "设置页：选中内容键录制 {}（当前 {}）",
+                                        if self.selection_recording { "开始" } else { "取消" },
+                                        match self.selection_active {
+                                            Some(k) => k.display().to_string(),
+                                            None => "未启用".to_string(),
+                                        }
+                                    );
+                                }
+                                let busy =
+                                    self.selection_recording || self.selection_awaiting.is_some();
+                                ui.add_enabled_ui(!busy, |ui| {
+                                    if ui.button("恢复默认").clicked() {
+                                        self.request_selection(HotkeySpec::SELECTION_DEFAULT);
+                                    }
+                                    if ui.button("清除").clicked() {
+                                        if self.selection_active.is_none()
+                                            && self.prefs.selection_hotkey.is_none()
+                                        {
+                                            self.hotkey_note("ℹ 本来就没有选中内容热键", true);
+                                        } else {
+                                            self.clear_selection();
+                                        }
+                                    }
+                                });
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "出厂是 Ctrl+Alt+\\（2026-10-30 按你的裁定）。在任何程序里选中一段文字 / 一个网址 / 若干文件，按下它：本程序会临时替你按一次 Ctrl+C（控制台窗口改用 Ctrl+Insert），把结果按「文件 / 网址 / 文本」分类后弹既有的动作面板——所以那些「用浏览器打开」「复制路径」「在所在目录打开」一类动作对选中的东西同样能用。\n发出去的那一下绝不会动坏你的剪贴板：按下之前先把剪贴板全格式快照一份，取完立刻原样放回（图片、文件这类非文本内容也一样），快照失败就直接放弃这次、什么都不碰。\n必须带修饰键、不能与另三颗热键是同一组；注册成功才写 settings.json。「清除」之后这颗键就不再被本程序占着了。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            ui.separator();
                             // 批次 G1（FR-WIN-03）：双击修饰键呼出。AHK `App.ahk` 的同名功能：
                             // 400ms 窗口、300ms 长按阈值；另按需求书加了 25ms 最小间隔挡远控抖动。
                             ui.label(egui::RichText::new("双击呼出（连按两下同一个修饰键）").strong());
@@ -8346,10 +9058,15 @@ impl LauncherApp {
         // 批次 R：窗口一隐藏，eframe 就不再跑 `ui()` ⇒ `hotkey_frame` 末尾那条边沿检测等不到
         // 下一帧。取键态若还开着，全局呼出会一直停在"临时注销"状态（按了没反应），所以在这里
         // 就地退出取键并把键装回。放在这个函数最前面是因为它下面有一条 `return`。
-        if self.hotkey_recording || self.typeback_armed || self.extra_recording {
+        if self.hotkey_recording
+            || self.typeback_armed
+            || self.extra_recording
+            || self.selection_recording
+        {
             self.hotkey_recording = false;
             self.typeback_armed = false;
             self.extra_recording = false;
+            self.selection_recording = false;
             eprintln!("设置页：窗口隐藏 ⇒ 退出取键（录制/选键状态不跨隐藏保留）");
             self.sync_keypick_suspend();
         }
@@ -9045,6 +9762,126 @@ impl LauncherApp {
             ctx,
             String::new(),
             "批量面板：查询框改作过滤词（原查询已存，原文不落日志）",
+        );
+        true
+    }
+
+    /// 批次 G3：把取回来的选区装进**既有的**动作面板（甲案：不另造一套界面）。
+    ///
+    /// 分类在 `src/selection.rs`，这里只管把三类对象翻译成 [`actions::PanelTarget`] 与
+    /// [`PanelOpen`]——译法与 `panel_for_row` 对同一批对象的处理逐条对齐：
+    /// 单个文件 / 目录 ⇔ 文件行、网址 ⇔ 搜索行、文本 ⇔ 计算器行、多选 ⇔ 标记集合。
+    fn open_selection_panel(&mut self, ctx: &egui::Context, target: selection::Target) -> bool {
+        // 面板与设置页 / 弹窗共用同一条渲染路径，两套同时开着只会叠在一起。取回来的东西已经
+        // 到手了，让用户先关掉再按一次比替他丢掉设置页 / 编辑框里的输入要安全。
+        if self.dialog.is_some() || self.settings_open {
+            eprintln!("选中内容：启动器的对话框 / 设置页开着 ⇒ 本次不弹面板（内容已取回但未装载）");
+            self.hud.notify(
+                ctx,
+                "先关掉启动器的对话框或设置页，再按一次选中内容热键".to_string(),
+                &self.theme,
+                hud::HOLD_FOREGROUND,
+                work_for(self.prefs.appearance.show_on),
+            );
+            return false;
+        }
+        let (panel_target, open) = match target {
+            selection::Target::Files(paths) => {
+                if paths.len() == 1 {
+                    let path = paths.into_iter().next().unwrap_or_default();
+                    let is_dir = std::path::Path::new(&path).is_dir();
+                    (
+                        actions::PanelTarget {
+                            // 标题用路径末段（与 `panel_for_row` 给文件行的译法一致）。
+                            title: actions::leaf_name(&path),
+                            subject: actions::subject_for(
+                                if is_dir {
+                                    source::application::ItemKind::Folder
+                                } else {
+                                    source::application::ItemKind::File
+                                },
+                                &path,
+                                is_dir,
+                            ),
+                            path,
+                            arguments: String::new(),
+                            // 刚从目标程序的拖放数据里读出来的，路径就是它此刻的样子。
+                            exists: true,
+                            editable: false,
+                            uid: None,
+                            pinned: false,
+                            batch: Vec::new(),
+                        },
+                        PanelOpen::Path,
+                    )
+                } else {
+                    let n = paths.len();
+                    (
+                        actions::PanelTarget {
+                            title: format!("选中的 {n} 项"),
+                            subject: actions::Subject::Batch,
+                            path: String::new(),
+                            arguments: String::new(),
+                            exists: true,
+                            editable: false,
+                            uid: None,
+                            pinned: false,
+                            batch: paths,
+                        },
+                        PanelOpen::Batch,
+                    )
+                }
+            }
+            selection::Target::Url(url) => (
+                actions::PanelTarget {
+                    title: url.clone(),
+                    subject: actions::subject_for(source::application::ItemKind::Url, &url, false),
+                    // `exists` 只对磁盘上的东西有意义（与搜索行同一句 `fs_exists` 口径）。
+                    exists: fs_exists(&url),
+                    path: url,
+                    arguments: String::new(),
+                    editable: false,
+                    uid: None,
+                    pinned: false,
+                    batch: Vec::new(),
+                },
+                PanelOpen::Path,
+            ),
+            selection::Target::Text(text) => (
+                actions::PanelTarget {
+                    // 标题只给前几十个字符：面板顶栏与大字显示都读它，整段原文会撑破排版。
+                    title: selection::preview(&text),
+                    subject: actions::Subject::Text,
+                    path: text,
+                    arguments: String::new(),
+                    exists: true,
+                    editable: false,
+                    uid: None,
+                    pinned: false,
+                    batch: Vec::new(),
+                },
+                PanelOpen::Value,
+            ),
+        };
+        let panel_actions = actions::actions_for(&panel_target);
+        // 与 `open_panel` 同一条日志口径：标题是从别的程序里取回来的 ⇒ 不落日志，只记种类与条数。
+        eprintln!(
+            "选中内容面板：进入（{:?}，动作 {} 条；标题与内容不落日志）",
+            panel_target.subject,
+            panel_actions.len()
+        );
+        // 现场照抄另两个入口：存查询原文与选中行、清空查询当过滤词。
+        self.panel = Some(PanelState {
+            saved_query: self.query.clone(),
+            saved_selected: self.selected,
+            target: panel_target,
+            actions: panel_actions,
+            open,
+        });
+        self.set_query(
+            ctx,
+            String::new(),
+            "选中内容面板：查询框改作过滤词（原查询已存，原文不落日志）",
         );
         true
     }
@@ -10044,6 +10881,7 @@ impl Default for LauncherApp {
         let (_t3, r3) = mpsc::channel();
         let (t4, _r4) = mpsc::channel();
         let (_t5, r5) = mpsc::channel();
+        let (_t6, r6) = mpsc::channel();
         Self::new(
             r1,
             r2,
@@ -10062,6 +10900,7 @@ impl Default for LauncherApp {
             // 同一条取向：兜底构造不碰盘上的设置文件，出厂默认 + "没有故障"就够测试用。
             source::application::AppSettings::default(),
             None,
+            r6,
         )
     }
 }
@@ -10225,6 +11064,30 @@ impl eframe::App for LauncherApp {
             } else {
                 eprintln!("FR-WIN-05: 热键切换 → 呼出");
                 self.show_now(ui.ctx());
+            }
+        }
+
+        // 批次 G3：选中内容键的结论。拿到东西 ⇒ 呼出主窗并直接落进动作面板；
+        // 没拿到 ⇒ 只弹一条 HUD（窗口不弹出来——用户按这颗键要的是"动作"，不是"看启动器"）。
+        while let Ok(outcome) = self.selection_rx.try_recv() {
+            match outcome {
+                SelectionOutcome::Got(target) => {
+                    self.show_now(ui.ctx());
+                    self.open_selection_panel(ui.ctx(), target);
+                }
+                SelectionOutcome::Nothing(why) => {
+                    eprintln!(
+                        "选中内容：没拿到内容（{why}）⇒ 只提示，主窗保持{}",
+                        if self.visible { "显示" } else { "隐藏" }
+                    );
+                    self.hud.notify(
+                        ui.ctx(),
+                        format!("没有取到选中内容：{why}"),
+                        &self.theme,
+                        hud::HOLD_FOREGROUND,
+                        work_for(self.prefs.appearance.show_on),
+                    );
+                }
             }
         }
 
@@ -10429,8 +11292,11 @@ impl eframe::App for LauncherApp {
         // 快捷键抢走（`take_keypick` 里的 `take_record_press` 已把整帧 Key 事件清空，这扇门是
         // 让"取键时不响应快捷键"这件事读得出来的那道显式保险）。
         // 批次 E3-丙的次级动作键框同理：它录的恰好也是窗口内热键，不挡就会"按什么键都先执行一次"。
-        let recording =
-            self.hotkey_recording || self.typeback_armed || self.secondary_recording || self.extra_recording;
+        let recording = self.hotkey_recording
+            || self.typeback_armed
+            || self.secondary_recording
+            || self.extra_recording
+            || self.selection_recording;
 
         let mut launch: Option<LaunchItem> = None;
         let mut launch_from_list = false;
@@ -14272,6 +15138,8 @@ fn main() -> eframe::Result {
 
     let (_tray, tray_rx) = init_tray();
     let (hotkey_tx, hotkey_rx) = mpsc::channel();
+    // 批次 G3：选中内容键的结论通道（热键线程派工作线程 → UI 在 `ui()` 里收）。
+    let (selection_tx, selection_rx) = mpsc::channel();
     let (ipc_tx, ipc_rx) = mpsc::channel();
     IPC_TX.set(ipc_tx).ok();
     let (notify_tx, notify_rx) = mpsc::channel();
@@ -14301,7 +15169,9 @@ fn main() -> eframe::Result {
         configured.toggle_hotkey,
         configured.typeback_hotkey,
         configured.extra_hotkey,
+        configured.selection_hotkey,
         configured.dbl_tap,
+        selection_tx,
     );
 
     // 批次 F1 的主题在这里解析一次：默认窗口高度要按主题行高算（一屏正好 10 行），
@@ -14370,6 +15240,7 @@ fn main() -> eframe::Result {
                 start_theme_choices,
                 configured,
                 broken,
+                selection_rx,
             )))
         }),
     )
@@ -14381,6 +15252,38 @@ mod nav_tests {
     // 批次 Q 这里有一句单独的 `use crate::source::application::HKF_WIN;`，理由是"只有测试断言
     // 录制路径不许产出 Win 位，运行期没人读它"。批次 R 把这个前提推翻了（补字符卡片上的复选框
     // 就在运行期读它），所以改成靠上面那条 glob 带进来。
+
+    /// 批次 G3：快照要把"内存块格式"抄字节、把"句柄格式"跳过。跳错一侧的后果不对称——
+    /// 漏跳一格句柄格式，还原时往剪贴板里放一个已失效的号码（读者可能崩）；多跳一格内存
+    /// 格式，用户原来那格东西就悄悄丢了。所以两侧都钉死，连区间边界也钉。
+    #[test]
+    fn handle_formats_are_exactly_the_gdi_and_private_ranges() {
+        for id in [2u32, 3, 9, 14, 0x80, 0x81, 0x8F, 0x200, 0x2FF, 0x300, 0x3FF] {
+            assert!(is_handle_format(id), "格式 {id:#x} 是句柄，必须跳过");
+        }
+        for id in [1u32, 7, 8, 13, 15, 16, 17, 0x7F, 0x90, 0x1FF, 0x400, 0xC000] {
+            assert!(!is_handle_format(id), "格式 {id:#x} 是内存块，必须照抄");
+        }
+        // 图片靠这两格活着：CF_DIB(8) 与 CF_DIBV5(17) 都是内存块，跳过 CF_BITMAP 不等于丢图。
+        assert!(!is_handle_format(8) && !is_handle_format(17));
+    }
+
+    /// 批次 G3：`DataObject` 那一格装的是设置方进程里的对象指针，抄字节还原＝放一个失效号码
+    /// 回去。注册失败（号是 0）时不能把"0"当成匹配条件，否则整张剪贴板会被跳空。
+    #[test]
+    fn data_object_is_skipped_only_when_registered() {
+        let data_object = 0xC123u32;
+        assert!(is_skipped_format(data_object, data_object), "DataObject 必须跳过");
+        assert!(
+            !is_skipped_format(15, data_object),
+            "CF_HDROP 不能被误跳——用户的文件对象全靠它"
+        );
+        assert!(
+            !is_skipped_format(0, 0),
+            "注册失败时不能把号 0 当成匹配，否则每一格都被跳过"
+        );
+        assert!(!is_skipped_format(13, 0));
+    }
 
     /// 批次 D5：行内路径截断按字符算——按字节切会在多字节字符中间下刀，
     /// 而且"多少字"对用户来说就是字符数，不是字节数。
@@ -15408,6 +16311,9 @@ mod nav_tests {
         assert_eq!(vk_from_egui_key(Enter), Some(0x0D), "回车是 Key::Enter");
         // 批次 R：` 是这套键表里唯一被允许裸按的键，录制端必须认得它（winit 那边叫 Backquote）。
         assert_eq!(vk_from_egui_key(Backtick), Some(0xC0), "` = VK_OEM_3");
+        // 批次 G3：`\` 也进可录集合（选中内容热键出厂值要用它）。它与 ` 的区别在判据里：
+        // 它没有裸键例外，必须带 Ctrl / Alt / Win（`check` / `check_selection` 各管一道）。
+        assert_eq!(vk_from_egui_key(Backslash), Some(0xDC), "\\ = VK_OEM_5");
         assert_eq!(vk_from_egui_key(F1), Some(0x70));
         assert_eq!(vk_from_egui_key(F12), Some(0x7B));
         assert_eq!(vk_from_egui_key(F13), Some(0x7C));
