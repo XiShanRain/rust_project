@@ -36,11 +36,11 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::{
     IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-    SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY,
+    SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SIIGBF, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    SIIGBF_THUMBNAILONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DI_NORMAL, DestroyIcon, DrawIconEx, GetIconInfo, GetSystemMetrics, HICON, ICONINFO,
-    PrivateExtractIconsW, SM_CXICON, SM_CYICON,
+    DI_NORMAL, DestroyIcon, DrawIconEx, GetIconInfo, HICON, ICONINFO, PrivateExtractIconsW,
 };
 use windows::core::PCWSTR;
 
@@ -212,21 +212,50 @@ fn normalize_path(p: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// 提取 `raw` 规格的图标，转成 (straight-alpha RGBA, width, height)。失败返回 None（留占位）。
-pub fn extract(raw: &str) -> Option<(Vec<u8>, u32, u32)> {
+/// 提取 `raw` 规格的图标，转成 (straight-alpha RGBA, width, height)。
+/// `px` 是请求的物理像素边长（调用方按 DPI 算好，见 `dpi::icon_px`）；
+/// 真图标走 shell 的按尺寸取图，扩展名 / `.url` / 资源索引这类没有磁盘实体的
+/// 由系统按属性给图，只有 LARGEICON 一档。
+/// 失败返回 None（留占位）。
+pub fn extract_at(raw: &str, px: u32) -> Option<(Vec<u8>, u32, u32)> {
     let spec = parse_spec(raw)?;
+    let px = px.clamp(16, 256);
     unsafe {
-        let cx = GetSystemMetrics(SM_CXICON).max(1) as u32;
-        let cy = GetSystemMetrics(SM_CYICON).max(1) as u32;
-        if let IconSpec::Thumb(path) = &spec {
-            let path = normalize_path(path);
-            if let Some(hit) = thumb_rgba(&path, cx, cy) {
-                return Some(hit);
+        let icon_image = |path: &str| {
+            image_rgba(path, px, px, SIIGBF_BIGGERSIZEOK | SIIGBF_ICONONLY)
+        };
+        match &spec {
+            IconSpec::Thumb(path) => {
+                let path = normalize_path(path);
+                if let Some(hit) =
+                    image_rgba(&path, px, px, SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY)
+                {
+                    return Some(hit);
+                }
+                // 缩略图取不到（文件没有缩略图 / 不是文件）⇒ 退图标。
+                if let Some(hit) = icon_image(&path) {
+                    return Some(hit);
+                }
+                from_hicon(shell_icon(&path, None), px, px)
             }
-            // 缩略图取不到（文件没有缩略图 / 不是文件）⇒ 退普通文件图标。
-            return from_hicon(shell_icon(&path, None), cx, cy);
+            // 真实路径：先让 shell 按目标像素直接给图，比把 32px 系统图标放大清楚。
+            IconSpec::Path(p) => {
+                let path = normalize_path(p);
+                if let Some(hit) = icon_image(&path) {
+                    return Some(hit);
+                }
+                from_hicon(shell_icon(&path, None), px, px)
+            }
+            IconSpec::Folder(p) => {
+                if !p.is_empty() {
+                    if let Some(hit) = icon_image(p) {
+                        return Some(hit);
+                    }
+                }
+                from_hicon(hicon_for(&spec, px, px), px, px)
+            }
+            _ => from_hicon(hicon_for(&spec, px, px), px, px),
         }
-        from_hicon(hicon_for(&spec, cx, cy), cx, cy)
     }
 }
 
@@ -285,6 +314,13 @@ unsafe fn shell_icon(path: &str, attrs: Option<FILE_FLAGS_AND_ATTRIBUTES>) -> Op
 unsafe fn from_hicon(hicon: Option<HICON>, cx: u32, cy: u32) -> Option<(Vec<u8>, u32, u32)> {
     let hicon = hicon?;
     unsafe {
+        // 遮罩是按位图原生尺寸取的，画得比原生大时 `GetDIBits` 整块失败 ⇒ 老图标会退成
+        // 整幅不透明（黑角）。所以绘制尺寸一律夹到原生尺寸：系统只给 32px 的图标，
+        // 就老老实实画 32px 再由 egui 缩放。
+        let (cx, cy) = match hicon_size(hicon) {
+            Some((nw, nh)) => (cx.min(nw).max(1), cy.min(nh).max(1)),
+            None => (cx, cy),
+        };
         let rgba = render_icon_to_rgba(hicon, cx, cy);
         let result = rgba.map(|mut buf| {
             if !unpremultiply(&mut buf) {
@@ -330,6 +366,35 @@ fn unpremultiply(buf: &mut [u8]) -> bool {
         }
     }
     true
+}
+
+/// `HICON` 的彩色位图原生尺寸。单色图标没有 `hbmColor`，返回 `None`。
+unsafe fn hicon_size(hicon: HICON) -> Option<(u32, u32)> {
+    unsafe {
+        let mut ii: ICONINFO = core::mem::zeroed();
+        if GetIconInfo(hicon, &mut ii).is_err() {
+            return None;
+        }
+        let mut size = None;
+        if !ii.hbmColor.0.is_null() {
+            let mut bm: BITMAP = core::mem::zeroed();
+            let got = GetObjectW(
+                HGDIOBJ(ii.hbmColor.0),
+                core::mem::size_of::<BITMAP>() as i32,
+                Some((&mut bm as *mut BITMAP).cast::<c_void>()),
+            );
+            if got > 0 && bm.bmWidth > 0 && bm.bmHeight > 0 {
+                size = Some((bm.bmWidth as u32, bm.bmHeight as u32));
+            }
+        }
+        if !ii.hbmColor.0.is_null() {
+            let _ = DeleteObject(ii.hbmColor.into());
+        }
+        if !ii.hbmMask.0.is_null() {
+            let _ = DeleteObject(ii.hbmMask.into());
+        }
+        size
+    }
 }
 
 /// `ICONINFO.hbmMask` → 每像素 alpha（黑＝不透明 255，白＝透明 0）。
@@ -380,10 +445,16 @@ unsafe fn dib_bits(hbm: HBITMAP, w: u32, h: u32) -> Option<Vec<u8>> {
     }
 }
 
-/// `thumb:`：shell 缩略图。不是文件、没有缩略图、COM 起不来都返回 `None`。
+/// `GetImage` 的通用外壳：`thumb:` 走缩略图，高 DPI 下取图标走 `SIIGBF_ICONONLY`。
+/// 不是文件、取不到图、COM 起不来都返回 `None`。
 ///
 /// 返回的尺寸是 shell 实际给的（未必等于请求的 cx/cy），调用方按实际宽高建纹理。
-unsafe fn thumb_rgba(path: &str, cx: u32, cy: u32) -> Option<(Vec<u8>, u32, u32)> {
+unsafe fn image_rgba(
+    path: &str,
+    cx: u32,
+    cy: u32,
+    flags: SIIGBF,
+) -> Option<(Vec<u8>, u32, u32)> {
     unsafe {
         // 加载线程多半没初始化过 COM；自己起一次、用完自己收。
         let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -396,9 +467,7 @@ unsafe fn thumb_rgba(path: &str, cx: u32, cy: u32) -> Option<(Vec<u8>, u32, u32)
                 cx: cx as i32,
                 cy: cy as i32,
             };
-            let hbm = factory
-                .GetImage(size, SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY)
-                .ok()?;
+            let hbm = factory.GetImage(size, flags).ok()?;
             let mut bm: BITMAP = core::mem::zeroed();
             let got = GetObjectW(
                 HGDIOBJ(hbm.0),

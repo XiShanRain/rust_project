@@ -854,13 +854,93 @@ pub fn install_fonts(ctx: &egui::Context, font_name: &str) {
     ctx.set_fonts(fonts);
 }
 
+/// 批次 F12（FR-UIX-14）：预热取样——CJK / 假名 / 谚文各一条，全是固定文案，不涉用户输入。
+/// egui 的字形是首次排版时才去栅格化的，这几类字又落在回退链靠后的字体上；不预热的话
+/// 第一批结果行会先冒出方框 / 空白，再跳成正常字形。
+pub const PREWARM_SAMPLES: [&str; 3] = ["启动器搜索", "あいうえお", "한글"];
+
+/// 把取样串按主题的主字号与标题字号各排一遍，逼 epaint 当场把字形栅格化进图集
+/// （字形分配发生在排版途中，见 `epaint` 的 `allocate_glyph`）。
+/// 返回（排版次数，总宽逻辑点）。
+///
+/// 必须在 `install_fonts` 之后的**下一帧**调用：`Context::set_fonts` 要到下一遍才生效。
+pub fn prewarm_fonts(ctx: &egui::Context, theme: &Theme) -> (usize, f32) {
+    let mut sizes = vec![theme.input_font_size];
+    if !sizes.contains(&theme.title_font_size) {
+        sizes.push(theme.title_font_size);
+    }
+    let mut layouts = 0;
+    let mut width = 0.0;
+    ctx.fonts_mut(|f| {
+        for &size in &sizes {
+            for text in PREWARM_SAMPLES {
+                let galley = f.layout(
+                    text.to_string(),
+                    egui::FontId::proportional(size),
+                    egui::Color32::WHITE,
+                    f32::INFINITY,
+                );
+                layouts += 1;
+                width += galley.size().x;
+            }
+        }
+    });
+    (layouts, width)
+}
+
+/// 批次 F12（FR-UIX-14）：`font_name` 允许写"显示名"而不只是文件名。这张表只收
+/// Windows 自带的常见中文 / 西文字体——查注册表当然更全，但为一条 P1 打磨项去枚举
+/// 整个 Fonts 键不值得；表里没有的名字仍按"就是文件名"去试。
+const FONT_ALIASES: &[(&str, &str)] = &[
+    ("微软雅黑", "msyh.ttc"),
+    ("微软雅黑 light", "msyhl.ttc"),
+    ("微软雅黑light", "msyhl.ttc"),
+    ("microsoft yahei", "msyh.ttc"),
+    ("microsoft yahei ui", "msyh.ttc"),
+    ("黑体", "simhei.ttf"),
+    ("宋体", "simsun.ttc"),
+    ("新宋体", "simsun.ttc"),
+    ("楷体", "simkai.ttf"),
+    ("等线", "Deng.ttf"),
+    ("等线 light", "Dengl.ttf"),
+    ("等线light", "Dengl.ttf"),
+    ("segoe ui", "segoeui.ttf"),
+    ("segoe ui light", "segoeuil.ttf"),
+    ("consolas", "consola.ttf"),
+    ("cascadia code", "CascadiaCode.ttf"),
+    ("cascadia mono", "CascadiaMono.ttf"),
+];
+
+/// 主题里的 `font_name` → 依次要在 `C:\Windows\Fonts` 下试的文件名。
+/// 容忍前后空格与引号；带扩展名就只试原名，不带就补 `.ttf/.ttc/.otf`。
+pub fn font_candidates(name: &str) -> Vec<String> {
+    let name = name.trim().trim_matches(['"', '\'']).trim();
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let lower = name.to_lowercase();
+    if let Some((_, file)) = FONT_ALIASES.iter().find(|(k, _)| *k == lower) {
+        out.push((*file).to_string());
+    }
+    let has_ext = [".ttf", ".ttc", ".otf"].iter().any(|e| lower.ends_with(e));
+    out.push(name.to_string());
+    if !has_ext {
+        for ext in ["ttf", "ttc", "otf"] {
+            out.push(format!("{name}.{ext}"));
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// 需求原文写的是「内存 DC 实测字串宽度预热」，那是 Delphi 的 GDI 口径。egui 不用 GDI
+/// 排字，真正决定"跳不跳字"的是它自己的字形图集——所以这里改用 `Context` 的排版走一遍，
+/// 见 [`prewarm_fonts`]。
 fn find_font(name: &str) -> Option<(String, Vec<u8>, u32)> {
     let dir = std::path::Path::new(r"C:\Windows\Fonts");
-    let mut candidates = vec![dir.join(name)];
-    for ext in ["ttf", "ttc", "otf"] {
-        candidates.push(dir.join(format!("{name}.{ext}")));
-    }
-    for path in candidates {
+    for file in font_candidates(name) {
+        let path = dir.join(&file);
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
@@ -1188,5 +1268,54 @@ mod tests {
         assert_eq!(free_export_stem("Dark", taken), "Dark-copy2");
         let none = |_: &str| false;
         assert_eq!(free_export_stem("Dark", none), "Dark");
+    }
+
+    #[test]
+    fn font_candidates_trims_and_fills_extensions() {
+        assert!(font_candidates("   ").is_empty());
+        assert_eq!(font_candidates("msyh.ttc"), vec!["msyh.ttc"]);
+        assert_eq!(
+            font_candidates("  \"msyh\" "),
+            vec!["msyh", "msyh.ttf", "msyh.ttc", "msyh.otf"]
+        );
+        assert_eq!(
+            font_candidates("Arial"),
+            vec!["Arial", "Arial.ttf", "Arial.ttc", "Arial.otf"]
+        );
+    }
+
+    #[test]
+    fn font_candidates_resolve_display_names_first() {
+        for name in ["微软雅黑", "Microsoft YaHei", "  microsoft yahei  "] {
+            assert_eq!(font_candidates(name)[0], "msyh.ttc", "{name}");
+        }
+        assert_eq!(font_candidates("黑体")[0], "simhei.ttf");
+        assert_eq!(font_candidates("Segoe UI")[0], "segoeui.ttf");
+        // 表里没有的名字不硬编，仍按文件名候选给
+        assert_eq!(font_candidates("NoSuchFont")[0], "NoSuchFont");
+    }
+
+    #[test]
+    fn prewarm_lays_out_every_sample_at_both_sizes() {
+        // `Context::fonts_mut` 要跑过一遍才存在 ⇒ 预热只能在 `run_ui` 的闭包里调。
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let theme = Theme::light();
+        let mut measured = None;
+        let mut out = ctx.run_ui(raw, |ui| {
+            measured = Some(prewarm_fonts(ui.ctx(), &theme));
+        });
+        // 预热会往图集里塞新字形 ⇒ 这一遍带出了纹理增量；测试里没人上传，得显式清掉再丢。
+        out.textures_delta.clear();
+        let (layouts, width) = measured.expect("run_ui 必须跑到闭包");
+        // 主字号 22 与标题字号 13 各一遍，每遍三串取样
+        assert_eq!(layouts, PREWARM_SAMPLES.len() * 2);
+        assert!(width > 0.0, "总宽应大于 0，说明真的排过一遍");
     }
 }

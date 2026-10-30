@@ -26,6 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
+use crate::dpi;
 use crate::theme::Theme;
 
 /// 前台事件（如「已复制」）的默认停留时间。
@@ -104,12 +105,7 @@ impl Hud {
         let ppp = ctx.pixels_per_point();
         let host = ctx.input(|i| i.viewport().outer_rect);
 
-        let host_pt = host.map(|h| {
-            (
-                (h.center().x * ppp).round() as i32,
-                (h.center().y * ppp).round() as i32,
-            )
-        });
+        let host_pt = host.map(|h| (dpi::px(h.center().x, ppp), dpi::px(h.center().y, ppp)));
         let last = {
             let s = self.shared.lock().unwrap();
             s.last_work
@@ -128,10 +124,7 @@ impl Hud {
                 .unwrap_or(egui::vec2(1280.0, 720.0));
             egui::Rect::from_min_size(egui::Pos2::ZERO, size * ppp)
         });
-        let work = egui::Rect::from_min_max(
-            egui::pos2(work_phys.min.x / ppp, work_phys.min.y / ppp),
-            egui::pos2(work_phys.max.x / ppp, work_phys.max.y / ppp),
-        );
+        let work = dpi::rect_to_pt(work_phys, ppp);
 
         let font = theme.input_font_size.clamp(14.0, 26.0);
         let wrap = (MAX_W.min(work.width() - 2.0 * SCREEN_MARGIN) - 2.0 * PAD - 2.0).max(1.0);

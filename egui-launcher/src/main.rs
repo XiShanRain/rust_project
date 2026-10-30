@@ -98,6 +98,7 @@ mod logging;
 mod actions;
 mod cli;
 mod dbltap;
+mod dpi;
 mod hud;
 mod large_type;
 mod matching;
@@ -901,7 +902,7 @@ fn panel_from_outer(outer: egui::Vec2) -> egui::Vec2 {
 
 /// 透明带在物理像素下有多宽。`GetWindowRect` / `SetWindowPos` 那一侧全用物理像素。
 fn shadow_margin_px(ppp: f32) -> i32 {
-    (SHADOW_MARGIN * ppp).round().max(0.0) as i32
+    dpi::px(SHADOW_MARGIN, ppp).max(0)
 }
 
 /// 面板尺寸 → 窗口外框尺寸（整数物理像素）。只有单测拿它当判据，产品路径走的是 egui 逻辑像素。
@@ -1078,14 +1079,22 @@ struct LauncherApp {
     theme_opacity: u8,
     /// 上一次装进 egui 的字体名。字体没变就只换样式，不重建字形缓存。
     theme_font: Option<String>,
+    /// 批次 F12（FR-UIX-14）：下一帧做一次字形预热。字体刚换（`set_fonts` 下一遍才生效）
+    /// 或 DPI / 缩放变了（字形要按新比例重新栅格化）时置位，跑完即落。
+    font_prewarm_due: bool,
+    /// 上一帧的 `pixels_per_point`：用来发现「换屏 / Ctrl+滚轮缩放」。
+    last_ppp: Option<f32>,
     /// 设置页画廊的选项（`System` + 内置 + 用户主题，每格带预览用的解析结果）。
     /// 只在启动 / 呼出 / 换主题 / 点「刷新」时重读，避免「外观」页每帧都去扫一遍 `Themes\` 目录。
     theme_gallery: Vec<theme::GalleryItem>,
-    /// 回执：缓存键 + `None`＝这条取不到图标（失败键不再重试）。
-    icon_rx: mpsc::Receiver<(String, Option<(Vec<u8>, u32, u32)>)>,
-    icon_tx: mpsc::Sender<(String, Option<(Vec<u8>, u32, u32)>)>, // 常驻，可 clone 给每批新项再起加载器
+    /// 回执：缓存键 + 提取时的目标像素 + `None`＝这条取不到图标（失败键不再重试）。
+    icon_rx: mpsc::Receiver<IconDone>,
+    icon_tx: mpsc::Sender<IconDone>, // 常驻，可 clone 给每批新项再起加载器
     /// 纹理缓存：`icon::cache_key` → 纹理 + 最近一次被画出的序号（LRU）。
     icons: std::collections::HashMap<String, IconEntry>,
+    /// 当前图标提取的目标物理像素（行密度图标字号 × ppp）。缓存键里不含尺寸 ⇒ 尺寸一变
+    /// 就整体重取。批次 F12（FR-UIX-14）。
+    icon_px: u32,
     /// 已派给加载线程、还没回执的键（防同一键重复起线程）。
     icon_pending: std::collections::HashSet<String>,
     /// 提取失败过的键——失败不重试，否则可见行每帧都会重开线程。
@@ -1226,6 +1235,10 @@ struct LauncherApp {
 /// 一条待取图标的作业：缓存键 + 图标规格（条目 `source_path` 原文）。
 type IconJob = (String, String);
 
+/// 图标回执：缓存键 + 提取时的目标像素 + 像素（`None`＝这条取不到图标）。
+/// 带上 px 是为了让换 DPI 之后迟到的旧尺寸结果被丢掉，而不是覆盖新尺寸的纹理。
+type IconDone = (String, u32, Option<(Vec<u8>, u32, u32)>);
+
 /// 缓存里的一条纹理。`last_use` 用 `Cell`，是为了行渲染只有 `&self` 时也能刷新 LRU 时刻。
 struct IconEntry {
     texture: egui::TextureHandle,
@@ -1294,21 +1307,18 @@ fn engine_icon_slot(
     }
 }
 
-fn spawn_icon_loader(
-    tx: mpsc::Sender<(String, Option<(Vec<u8>, u32, u32)>)>,
-    jobs: Vec<IconJob>,
-) {
+fn spawn_icon_loader(tx: mpsc::Sender<IconDone>, jobs: Vec<IconJob>, px: u32) {
     thread::spawn(move || {
         let mut ok = 0usize;
         let total = jobs.len();
         let mut first_logged = false;
         for (key, spec) in jobs {
-            let hit = source::icon::extract(&spec);
+            let hit = source::icon::extract_at(&spec, px);
             if let Some((rgba, w, h)) = &hit {
                 if !first_logged {
                     let nonzero = rgba.iter().filter(|&&v| v != 0).count();
                     log_info!(
-                        "icon probe: 首个成功 {}x{}，非零字节 {}/{}  ← {}",
+                        "icon probe: 首个成功 {}x{}（请求 {px}px），非零字节 {}/{}  ← {}",
                         w,
                         h,
                         nonzero,
@@ -1319,11 +1329,11 @@ fn spawn_icon_loader(
                 }
                 ok += 1;
             }
-            if tx.send((key, hit)).is_err() {
+            if tx.send((key, px, hit)).is_err() {
                 break;
             }
         }
-        log_info!("icon loader: {ok}/{total} 图标提取成功");
+        log_info!("icon loader: {ok}/{total} 图标提取成功（目标 {px}px）");
     });
 }
 
@@ -2278,7 +2288,6 @@ fn list_bottom_h(theme: &theme::Theme) -> f32 {
 }
 
 /// 一行的实际几何：（行高、图标边长、行与行的间距）。
-///
 /// 三档数字的来由见 [`RowDensity`] 的文档（Delphi `ItemHeight=16` 是无图标的下限参照，
 /// AHK 的 54 是"行距 0 + 宽 700"才成立的上限参照）。[`RowDensity::Theme`] 把两个尺寸交还给
 /// 主题，行距仍用 [`ROW_STEP_EXTRA`]——主题里没有"行距"这个键（需求书 6.2 的 24 键没有）。
@@ -2289,6 +2298,12 @@ pub fn row_geometry(density: RowDensity, theme: &theme::Theme) -> (f32, f32, f32
         RowDensity::Dense => (24.0, 16.0, 0.0),
         RowDensity::Theme => (theme.row_height, theme.icon_size, ROW_STEP_EXTRA),
     }
+}
+
+/// 批次 F12（FR-UIX-14）：列表图标该按多少物理像素去取。
+/// 取当前行密度/主题的图标边长——它是用户实际看到的逻辑尺寸，乘 ppp 才是要的清晰度。
+fn icon_px_for(theme: &theme::Theme, density: RowDensity, ppp: f32) -> u32 {
+    dpi::icon_px(row_geometry(density, theme).1, ppp)
 }
 
 /// 一行除主题行高之外的实际增量：`item_spacing.y` 3 + 取整 1。只在 [`RowDensity::Theme`] 下用到。
@@ -5083,6 +5098,7 @@ impl LauncherApp {
             apps_rx,
             icon_tx: icon_tx.clone(),
             icons: std::collections::HashMap::new(),
+            icon_px: 0,
             icon_pending: std::collections::HashSet::new(),
             icon_failed: std::collections::HashSet::new(),
             icon_tick: std::cell::Cell::new(0),
@@ -5126,6 +5142,8 @@ impl LauncherApp {
             theme_applied: None,
             theme_opacity: 255,
             theme_font: None,
+            font_prewarm_due: false,
+            last_ppp: None,
             theme_gallery,
             icon_rx,
             tray_rx,
@@ -5183,6 +5201,9 @@ impl LauncherApp {
             first_frame_at: Some(*PROCESS_START.get_or_init(Instant::now)),
         };
         // 立即为已有项起图标加载器（`source_path` 为空 ⇒ `cache_key` 给 None，自然跳过）。
+        // 批次 F12（FR-UIX-14）：提取尺寸先按构造时的 ppp 算一次，免得首帧再整体重取一遍。
+        let ppp0 = CTX.get().map(|c| c.pixels_per_point()).unwrap_or(1.0);
+        seed.icon_px = icon_px_for(&seed.theme, seed.prefs.row_density, ppp0);
         let jobs = icon_jobs(&seed.items);
         seed.spawn_missing_icons(jobs);
         // FR-SRC-06：启动就先在后台算一轮四态，首屏列表（很快会呼出）拿到的是缓存而不是
@@ -5323,6 +5344,8 @@ impl LauncherApp {
         if self.theme_font.as_deref() != Some(theme.font_name.as_str()) {
             theme::install_fonts(ctx, &theme.font_name);
             self.theme_font = Some(theme.font_name.clone());
+            // 批次 F12（FR-UIX-14）：`set_fonts` 下一遍才生效，预热也只能等下一帧再跑。
+            self.font_prewarm_due = true;
         }
         log_info!(
             "主题：{}（字体 {}，底色 {:02X}{:02X}{:02X}，不透明度 {}（主题 {}））",
@@ -11268,7 +11291,10 @@ impl LauncherApp {
 
     /// 批次 F4：把一批作业里「还没纹理、没在飞、也没失败过」的派给加载线程。
     /// 所有补图标的地方都走这一个口子，`pending` / `failed` 两张表才有一致的含义。
+    /// 批次 F12（FR-UIX-14）：提取尺寸跟着 [`Self::icon_px`] 走——换 DPI / 换密度时这个值
+    /// 先变，`ui()` 会把整表清空再从这里按新尺寸重派。
     fn spawn_missing_icons(&mut self, jobs: Vec<IconJob>) {
+        let px = self.icon_px.max(16);
         let missing: Vec<IconJob> = jobs
             .into_iter()
             .filter(|(k, _)| {
@@ -11283,7 +11309,7 @@ impl LauncherApp {
         for (k, _) in &missing {
             self.icon_pending.insert(k.clone());
         }
-        spawn_icon_loader(self.icon_tx.clone(), missing);
+        spawn_icon_loader(self.icon_tx.clone(), missing, px);
     }
 
     /// 批次 D2 第二半：头段「网页搜索 / 补全提示」两行要画的引擎图标。
@@ -11459,6 +11485,35 @@ impl eframe::App for LauncherApp {
         // 都在这一段里，正是开机自启时用户感觉到的那段空窗。
         if let Some(t0) = self.first_frame_at.take() {
             logging::perf("startup", t0.elapsed(), "");
+        }
+        // 批次 F12（FR-UIX-14）：字形预热。字体刚装（下一遍生效）或 DPI / 缩放变了，
+        // 就把取样串排一遍，把回退链上的 CJK / 假名 / 谚文字形当场栅格化进图集。
+        // 放在画窗口之前：这一帧画的就是已经热过的字体，不会出现「先方框再跳字」。
+        let ppp_now = ui.ctx().pixels_per_point();
+        if self
+            .last_ppp
+            .is_none_or(|p| (p - ppp_now).abs() > 1e-3)
+        {
+            self.last_ppp = Some(ppp_now);
+            self.font_prewarm_due = true;
+        }
+        if self.font_prewarm_due {
+            self.font_prewarm_due = false;
+            let (layouts, width) = theme::prewarm_fonts(ui.ctx(), &self.theme);
+            log_info!(
+                "字体预热：{layouts} 次排版，总宽 {width:.0} pt（{ppp_now:.2} px/pt）"
+            );
+        }
+        // 批次 F12（FR-UIX-14）：图标按当前 DPI / 行密度取原生像素。缓存键里不含尺寸，
+        // 所以目标尺寸一变就整表清空，让可见行按新尺寸重新派作业（失败过的也重试一次）。
+        let want_px = icon_px_for(&self.theme, self.prefs.row_density, ppp_now);
+        if want_px != self.icon_px {
+            self.icon_px = want_px;
+            self.icons.clear();
+            self.icon_pending.clear();
+            self.icon_failed.clear();
+            ui.ctx().request_repaint();
+            log_info!("icon: 提取尺寸改为 {want_px}px（{ppp_now:.2} px/pt）");
         }
         // 批次 F9（FR-UIX-06）：藏→画→露的放行门。放在最前面：这一遍画完的内容就是
         // 用户要看见的那一帧，门多等一遍没有意义。
@@ -11697,8 +11752,12 @@ impl eframe::App for LauncherApp {
             ui.ctx().request_repaint_after(Duration::from_millis(120));
         }
 
-        // 批次 F4：回执是「缓存键 + 可选像素」。取不到的键记进 failed，免得可见行每帧重开线程。
-        while let Ok((key, hit)) = self.icon_rx.try_recv() {
+        // 批次 F4：回执是「缓存键 + 目标像素 + 可选像素」。取不到的键记进 failed，免得可见行每帧重开线程。
+        // 批次 F12（FR-UIX-14）：换 DPI / 缩放之后旧尺寸的迟到回执直接丢掉，别让它盖掉新纹理。
+        while let Ok((key, px, hit)) = self.icon_rx.try_recv() {
+            if px != self.icon_px {
+                continue;
+            }
             self.icon_pending.remove(&key);
             match hit {
                 Some((rgba, w, h)) => {
@@ -12864,7 +12923,7 @@ impl eframe::App for LauncherApp {
                 // 面板下限之外还要加回四周阴影带，否则拖着拖着就比 MIN_W 还窄。
                 let ppf = ui.ctx().pixels_per_point();
                 let min_panel = (MIN_W as f32 + 2.0 * SHADOW_MARGIN, MIN_H as f32 + 2.0 * SHADOW_MARGIN);
-                let (min_w, min_h) = ((min_panel.0 * ppf) as i32, (min_panel.1 * ppf) as i32);
+                let (min_w, min_h) = (dpi::px(min_panel.0, ppf), dpi::px(min_panel.1, ppf));
                 let (mut x, mut y, mut w, mut h) = if a.edge == EDGE_MOVE {
                     (a.origin.0 + dx, a.origin.1 + dy, a.size.0, a.size.1)
                 } else {

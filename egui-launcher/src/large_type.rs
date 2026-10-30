@@ -27,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 use windows::core::PCWSTR;
 
+use crate::dpi;
 use crate::hud;
 
 /// AHK 版 `g.BackColor := "141414"` + `SetFont cFFFFFF`，硬编码，不跟随主题。
@@ -103,10 +104,7 @@ impl LargeType {
                     .unwrap_or(egui::vec2(1280.0, 720.0));
                 egui::Rect::from_min_size(egui::Pos2::ZERO, size * ppp)
             });
-        let work = egui::Rect::from_min_max(
-            egui::pos2(work_phys.min.x / ppp, work_phys.min.y / ppp),
-            egui::pos2(work_phys.max.x / ppp, work_phys.max.y / ppp),
-        );
+        let work = dpi::rect_to_pt(work_phys, ppp);
 
         let chars = text.chars().count();
         let (font, wrap, text_size) = fit(work, chars, |font, wrap| {
