@@ -351,6 +351,113 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
+// ---------------------------------------------------------------- 画廊与导出（批次 F11 / FR-UIX-12）
+
+/// 画廊一格里的预览。`System` 是唯一要画两半的格子（需求书：左浅右深）。
+#[derive(Debug, Clone)]
+pub enum Preview {
+    /// 普通主题：一套解析结果。
+    Single(Theme),
+    /// 跟随系统：两套都解析好，与当前系统是哪一档无关。
+    System { light: Theme, dark: Theme },
+}
+
+/// 画廊一格：选择项名（写进 `settings.json` 的 `theme`）+ 预览。
+#[derive(Debug, Clone)]
+pub struct GalleryItem {
+    pub name: String,
+    pub preview: Preview,
+}
+
+/// 全部可选项的预览，顺序同 [`all_names`]（System → 19 内置 → 用户主题）。
+/// 纯函数：不读磁盘、不读注册表，单测走这条。
+pub fn gallery(files: &HashMap<String, ThemeFile>, system_dark: bool) -> Vec<GalleryItem> {
+    all_names(files)
+        .into_iter()
+        .map(|name| {
+            let preview = if name == SYSTEM_THEME {
+                Preview::System {
+                    light: resolve_with("Light", files, system_dark),
+                    dark: resolve_with("Dark", files, system_dark),
+                }
+            } else {
+                Preview::Single(resolve_with(&name, files, system_dark))
+            };
+            GalleryItem { name, preview }
+        })
+        .collect()
+}
+
+/// `RRGGBB` 大写、不带 `#`（与需求书 6.2 的写法一致，[`parse_hex`] 能原样读回）。
+pub fn color_hex(c: egui::Color32) -> String {
+    format!("{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
+/// 把解析好的一套主题摊平成"每个键都写死"的主题文件。
+///
+/// `base` 取 `Light`（不是自身）：导出的这份不该再依赖任何继承，用户改哪个键就是哪个键；
+/// 写成自身同名会触发「改内置主题」那条分支，读回来虽然等价，但语义上多绕一层。
+pub fn expanded_file(t: &Theme) -> ThemeFile {
+    ThemeFile {
+        base: Some(FALLBACK_THEME.to_string()),
+        font_name: Some(t.font_name.clone()),
+        input_font_size: Some(t.input_font_size),
+        title_font_size: Some(t.title_font_size),
+        subtitle_font_size: Some(t.subtitle_font_size),
+        shortcut_font_size: Some(t.shortcut_font_size),
+        padding: Some(t.padding),
+        row_height: Some(t.row_height),
+        icon_size: Some(t.icon_size),
+        selected_radius: Some(t.selected_radius),
+        opacity: Some(t.opacity),
+        background: Some(color_hex(t.background)),
+        border: Some(color_hex(t.border)),
+        input_text: Some(color_hex(t.input_text)),
+        separator: Some(color_hex(t.separator)),
+        title: Some(color_hex(t.title)),
+        subtitle: Some(color_hex(t.subtitle)),
+        shortcut: Some(color_hex(t.shortcut)),
+        selected_background: Some(color_hex(t.selected_background)),
+        selected_title: Some(color_hex(t.selected_title)),
+        selected_subtitle: Some(color_hex(t.selected_subtitle)),
+        selected_shortcut: Some(color_hex(t.selected_shortcut)),
+        highlight: Some(color_hex(t.highlight)),
+        selected_highlight: Some(color_hex(t.selected_highlight)),
+    }
+}
+
+/// 导出用的 JSON 正文（24 个键全在，缩进两格给人改）。序列化失败只可能是结构变了，返回空对象兜底。
+pub fn export_json(t: &Theme) -> String {
+    match serde_json::to_string_pretty(&expanded_file(t)) {
+        Ok(s) => s,
+        Err(e) => {
+            log_info!("theme: 导出 JSON 序列化失败（{e}）");
+            "{}".to_string()
+        }
+    }
+}
+
+/// 导出时用的文件主名（不含扩展名）：目标已被占用就顺延 `name-copy`、`name-copy2`…
+///
+/// **绝不覆盖**：用户 `Themes\` 里那份可能正是他手改过的 `Dark.json`，导出内置 Dark 时
+/// 不能把它顶掉。`taken` 由调用方给出（单测走闭包，不碰磁盘）。
+pub fn free_export_stem(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(name) {
+        return name.to_string();
+    }
+    for n in 1..=99 {
+        let cand = if n == 1 {
+            format!("{name}-copy")
+        } else {
+            format!("{name}-copy{n}")
+        };
+        if !taken(&cand) {
+            return cand;
+        }
+    }
+    format!("{name}-copy100")
+}
+
 // ---------------------------------------------------------------- 内置主题
 
 fn hex(s: &str) -> Option<String> {
@@ -582,13 +689,14 @@ pub fn system_is_dark() -> bool {
     rc == ERROR_SUCCESS && data == 0
 }
 
-/// 启动 / 每次呼出时用：读一遍磁盘，同时给出解析结果与下拉选项。
+/// 启动 / 每次呼出时用：读一遍磁盘，同时给出解析结果与画廊选项。
 /// 两者原先各读一次 `Themes\`——坏文件会在日志里出现两遍，改为共用同一份。
-pub fn load(selection: &str) -> (Theme, Vec<String>) {
+pub fn load(selection: &str) -> (Theme, Vec<GalleryItem>) {
     let files = load_user_files(&user_dir());
+    let system_dark = system_is_dark();
     (
-        resolve_with(selection, &files, system_is_dark()),
-        all_names(&files),
+        resolve_with(selection, &files, system_dark),
+        gallery(&files, system_dark),
     )
 }
 
@@ -969,5 +1077,116 @@ mod tests {
                 "「{name}」应判为浅色"
             );
         }
+    }
+
+    // ------------------------------------------------ 批次 F11（FR-UIX-12）画廊与导出
+
+    #[test]
+    fn gallery_lists_system_then_builtins_then_user_themes() {
+        let mut mine = ThemeFile::default();
+        mine.background = Some("123456".into());
+        let items = gallery(&files(&[("我的主题", mine)]), false);
+        assert_eq!(items[0].name, SYSTEM_THEME);
+        let builtins: Vec<&str> = items[1..20].iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(builtins, BUILTIN_NAMES.to_vec());
+        assert_eq!(items[20].name, "我的主题");
+        assert_eq!(items.len(), 21);
+    }
+
+    #[test]
+    fn gallery_preview_is_the_same_resolution_the_window_uses() {
+        let f = ThemeFile {
+            base: Some("Nord".into()),
+            background: Some("010203".into()),
+            ..Default::default()
+        };
+        let map = files(&[("Mine", f)]);
+        for item in gallery(&map, false)
+            .into_iter()
+            .filter(|i| i.name != SYSTEM_THEME)
+        {
+            let Preview::Single(t) = &item.preview else {
+                panic!("只有 System 是两半，{} 应是一套", item.name);
+            };
+            let resolved = resolve_with(&item.name, &map, false);
+            assert_eq!(t, &resolved, "「{}」的预览必须就是实窗解析结果", item.name);
+        }
+    }
+
+    #[test]
+    fn system_preview_carries_both_light_and_dark() {
+        let map = HashMap::new();
+        let items = gallery(&map, true);
+        let Some(Preview::System { light, dark }) = items.first().map(|i| &i.preview) else {
+            panic!("第一格应是 System 且带两套");
+        };
+        assert_eq!(light.background, resolve_with("Light", &map, true).background);
+        assert_eq!(dark.background, resolve_with("Dark", &map, true).background);
+        // 与系统当前是哪一档无关：传 true 时两半仍是"浅的浅、深的深"。
+        assert!(!light.is_dark());
+        assert!(dark.is_dark());
+    }
+
+    #[test]
+    fn exported_file_carries_every_key_and_round_trips() {
+        let source = resolve_with("Catppuccin Mocha", &HashMap::new(), false);
+        let file = expanded_file(&source);
+        for (name, present) in [
+            ("base", file.base.is_some()),
+            ("font_name", file.font_name.is_some()),
+            ("opacity", file.opacity.is_some()),
+            ("background", file.background.is_some()),
+            ("selected_highlight", file.selected_highlight.is_some()),
+        ] {
+            assert!(present, "导出的 {name} 必须是写死的值");
+        }
+        // 走一遍"落盘 → 读回 → 解析"：导出文件被本程序自己读回时必须等价。
+        let text = export_json(&source);
+        let parsed: ThemeFile = serde_json::from_str(&text).expect("导出的 JSON 必须能被自己读回");
+        let back = resolve_with("Dark", &files(&[("Dark", parsed)]), false);
+        assert_eq!(back.background, source.background);
+        assert_eq!(back.selected_highlight, source.selected_highlight);
+        assert_eq!(back.opacity, source.opacity);
+        assert_eq!(back.font_name, source.font_name);
+        assert_eq!(back.input_font_size, source.input_font_size);
+        assert_eq!(back.selected_radius, source.selected_radius);
+    }
+
+    #[test]
+    fn exported_json_has_twenty_four_hex_colour_keys() {
+        let t = resolve_with("Sepia", &HashMap::new(), false);
+        let v: serde_json::Value = serde_json::from_str(&export_json(&t)).unwrap();
+        let obj = v.as_object().expect("导出的是 JSON 对象");
+        assert_eq!(obj.len(), 24, "需求书 6.2 的 24 个键一个不少");
+        for key in [
+            "background",
+            "border",
+            "input_text",
+            "separator",
+            "title",
+            "subtitle",
+            "shortcut",
+            "selected_background",
+            "selected_title",
+            "selected_subtitle",
+            "selected_shortcut",
+            "highlight",
+            "selected_highlight",
+        ] {
+            let s = obj[key].as_str().unwrap_or_else(|| panic!("{key} 应是字符串"));
+            assert_eq!(s.len(), 6, "{key} 应是 RRGGBB");
+            assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+            assert!(parse_hex(s).is_some(), "{key} 必须能被 parse_hex 读回");
+        }
+        assert_eq!(obj["base"], serde_json::json!("Light"), "全展开 ⇒ 不再依赖继承");
+    }
+
+    #[test]
+    fn export_stem_never_overwrites_an_existing_file() {
+        let taken = |s: &str| ["Dark", "Dark-copy"].contains(&s);
+        assert_eq!(free_export_stem("Nord", taken), "Nord");
+        assert_eq!(free_export_stem("Dark", taken), "Dark-copy2");
+        let none = |_: &str| false;
+        assert_eq!(free_export_stem("Dark", none), "Dark");
     }
 }

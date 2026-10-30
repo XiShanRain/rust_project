@@ -105,6 +105,7 @@ mod selection;
 mod source;
 mod sysinfo;
 mod theme;
+mod theme_gallery;
 mod windowfx;
 use source::application::{
     Corrupted, ItemKind, LaunchItem, LearnRank, ListRows, RowDensity, Scope, SpaceRun, TabMode,
@@ -814,7 +815,8 @@ struct ParamPrompt {
     from_list: bool,
     /// 学别名用的那串词（清单进来是查询框，面板进来是面板存下的原查询）。
     alias_word: String,
-    /// 来自自定义命令源（`HeadRow::Custom`）：成功要记一次 `Bucket::Custom`。
+    /// 来自自定义命令源（`HeadRow::Custom`）：统计落 `Bucket::Custom` 而不是「清单项」
+    /// （转交给 `mark_used` 的第三个参数，同一次执行只记一桶）。
     from_custom: bool,
 }
 
@@ -1076,9 +1078,9 @@ struct LauncherApp {
     theme_opacity: u8,
     /// 上一次装进 egui 的字体名。字体没变就只换样式，不重建字形缓存。
     theme_font: Option<String>,
-    /// 设置页下拉的选项（`System` + 内置 + 用户主题）。只在启动 / 呼出 / 换主题时重读，
-    /// 避免「外观」页每帧都去扫一遍 `Themes\` 目录。
-    theme_choices: Vec<String>,
+    /// 设置页画廊的选项（`System` + 内置 + 用户主题，每格带预览用的解析结果）。
+    /// 只在启动 / 呼出 / 换主题 / 点「刷新」时重读，避免「外观」页每帧都去扫一遍 `Themes\` 目录。
+    theme_gallery: Vec<theme::GalleryItem>,
     /// 回执：缓存键 + `None`＝这条取不到图标（失败键不再重试）。
     icon_rx: mpsc::Receiver<(String, Option<(Vec<u8>, u32, u32)>)>,
     icon_tx: mpsc::Sender<(String, Option<(Vec<u8>, u32, u32)>)>, // 常驻，可 clone 给每批新项再起加载器
@@ -4789,7 +4791,7 @@ impl LauncherApp {
         // 批次 F1 的主题由 `main` 解析一次后传进来：窗口初始高度要按主题行高算，
         // 而 `Themes\` 只该读一遍（坏文件在日志里只出现一次）。
         theme: theme::Theme,
-        theme_choices: Vec<String>,
+        theme_gallery: Vec<theme::GalleryItem>,
         // 批次 E2：启动路径上的设置只由 `main` 读这一次，结果原样递进来（`reload_config` 那条
         // 用户手动重载除外）。以前这里读第二遍，而第一遍已经把
         // 坏文件改名隔离掉了 ⇒ 第二遍看到的是"文件不存在、没有故障"，那句界面提示永远轮不到出场
@@ -5124,7 +5126,7 @@ impl LauncherApp {
             theme_applied: None,
             theme_opacity: 255,
             theme_font: None,
-            theme_choices,
+            theme_gallery,
             icon_rx,
             tray_rx,
             hotkey_rx,
@@ -5205,8 +5207,8 @@ impl LauncherApp {
         // 首帧前把主题装进 egui：字体、尺寸表、控件配色一次到位。
         // 用构造时已解析好的那份，不再读一遍 `Themes\`（坏文件只该在日志里出现一次）。
         if let Some(ctx) = CTX.get() {
-            let (theme, choices) = (seed.theme.clone(), seed.theme_choices.clone());
-            seed.use_theme(ctx, theme, choices);
+            let (theme, gallery) = (seed.theme.clone(), seed.theme_gallery.clone());
+            seed.use_theme(ctx, theme, gallery);
         }
         // 批次 F3（FR-WIN-09）：老 `last_pos` 先折算成千分比，再按 `show_on` 做首次落点。
         // 顺序不能反——先摆位后折算，摆出来的默认位置会被一并记成"用户记住的位置"。
@@ -5223,14 +5225,91 @@ impl LauncherApp {
     /// `load` 会读 `Themes\` 目录，而 `System` 还要读注册表；呼出时重解析是为了让
     /// 隐藏期间切换的系统明暗在下次出现时生效。
     fn sync_theme(&mut self, ctx: &egui::Context) {
-        let (theme, choices) = theme::load(&self.prefs.theme);
-        self.use_theme(ctx, theme, choices);
+        let (theme, gallery) = theme::load(&self.prefs.theme);
+        self.use_theme(ctx, theme, gallery);
+    }
+
+    /// 批次 F11（FR-UIX-12）：外观页的主题缩略图画廊。
+    ///
+    /// 可用宽定列数（至少 1 列），行内逐格自绘；**不另开 ScrollArea**——外观页整页本来就在
+    /// 设置页那一个纵向滚动里，套第二层会让滚轮打架。点中、或聚焦后回车/空格，都走
+    /// [`Self::pick_theme`]（与旧下拉同一条落盘 → 日志 → 重解析链）。
+    fn theme_gallery_ui(&mut self, ui: &mut egui::Ui) {
+        let items = self.theme_gallery.clone();
+        let accent = self.theme.selected_highlight;
+        let spacing = 8.0;
+        let cols = theme_gallery::columns(ui.available_width(), theme_gallery::CELL_W, spacing);
+        for chunk in items.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = spacing;
+                for item in chunk {
+                    let selected = self.prefs.theme == item.name;
+                    let resp = theme_gallery::cell(ui, item, selected, accent);
+                    let activated = resp.clicked()
+                        || (resp.has_focus()
+                            && ui.input(|i| {
+                                i.key_pressed(egui::Key::Enter)
+                                    || i.key_pressed(egui::Key::Space)
+                            }));
+                    if activated && !selected {
+                        self.pick_theme(ui.ctx(), &item.name);
+                    }
+                }
+            });
+            ui.add_space(spacing);
+        }
+    }
+
+    /// 画廊与「恢复 Light」共用的一步：写 `settings.json` → 打日志 → 重读主题装进 egui。
+    fn pick_theme(&mut self, ctx: &egui::Context, name: &str) {
+        self.prefs.theme = name.to_string();
+        source::application::save_settings(&self.prefs);
+        log_info!("设置页：主题 → {name}（已写 settings.json）");
+        self.sync_theme(ctx);
+    }
+
+    /// 批次 F11（FR-UIX-12）：「复制为自定义主题」——把当前主题摊平成 24 键全在的 JSON
+    /// 写进 `Themes\`，再用记事本打开给人改。三条口径：
+    ///
+    /// - **不覆盖**：目标已存在就 `-copy`、`-copy2`… 顺延（用户手改过的文件不能被顶掉）；
+    /// - **不带 BOM**：自家加载器走 `serde_json::from_str`，BOM 会让整份文件解析失败；
+    /// - 写的是**主题自己那个 `opacity`**（`theme_opacity`），不是外观页临时覆盖值——
+    ///   覆盖值属于 settings.json，不该借一次导出被固化进主题文件。
+    ///
+    /// 日志只记主题名与文件主名，不记目录路径（隐私口径）。
+    fn export_theme_file(&mut self, ctx: &egui::Context) {
+        let mut t = self.theme.clone();
+        t.opacity = self.theme_opacity;
+        let dir = theme::user_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.internal_toast(ctx, &format!("⚠ 建不了主题文件夹：{e}"), false);
+            return;
+        }
+        let stem = theme::free_export_stem(&t.name, |s| dir.join(format!("{s}.json")).exists());
+        let path = dir.join(format!("{stem}.json"));
+        if let Err(e) = std::fs::write(&path, theme::export_json(&t)) {
+            self.internal_toast(ctx, &format!("⚠ 写不了 {}：{e}", path.display()), false);
+            return;
+        }
+        log_info!(
+            "设置页：导出主题「{}」→ Themes 目录（文件主名 {stem}）",
+            t.name
+        );
+        let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
+        self.internal_toast(ctx, &format!("✓ 已导出 {}", path.display()), true);
+        // 新文件立刻进画廊（同名时它本来就覆盖内置，外观不会跳）。
+        self.sync_theme(ctx);
     }
 
     /// 装一套已解析好的主题。[`Self::sync_theme`] 与启动路径共用，避免
     /// `new()` 里为了首帧和末尾各读一遍 `Themes\`。
-    fn use_theme(&mut self, ctx: &egui::Context, mut theme: theme::Theme, choices: Vec<String>) {
-        self.theme_choices = choices;
+    fn use_theme(
+        &mut self,
+        ctx: &egui::Context,
+        mut theme: theme::Theme,
+        gallery: Vec<theme::GalleryItem>,
+    ) {
+        self.theme_gallery = gallery;
         // 批次 F2（FR-UIX-06）：主题里那个 `opacity` 是默认来源，外观页的覆盖值压过它。
         // 先记下原值（拖覆盖值时要重算），再把生效值写进主题——`central_frame` 每帧都从
         // `self.theme` 取底色，所以生效值就是这一格。
@@ -5742,10 +5821,9 @@ impl LauncherApp {
         self.remember_history(self.query.clone());
         let started = self.launch_and_hide_masked(ctx, &entry, &p.uid);
         if started && p.from_list {
-            self.mark_used(&p.uid, &p.alias_word);
-        }
-        if started && p.from_custom {
-            self.record_usage(source::usage::Bucket::Custom);
+            // `from_custom` 只可能伴随 `from_list`（`HeadRow::Custom` 两个旗标一起置）；
+            // 批次 F11 起桶的归属交给 `mark_used`，不再在这里另记一次 `Custom`。
+            self.mark_used(&p.uid, &p.alias_word, p.from_custom);
         }
     }
 
@@ -8869,6 +8947,8 @@ impl LauncherApp {
                             ui.add_space(8.0);
                             ui.separator();
                             // 批次 F1（FR-UIX-01）：主题选择。改成即时生效——不重启、不丢焦点。
+                            // 批次 F11（FR-UIX-12）：下拉换成缩略图画廊，每格按主题自己的颜色画
+                            // 一只迷你搜索窗；整页本来就有一个 ScrollArea，这里不再套第二层滚动。
                             ui.label(egui::RichText::new("主题").strong());
                             ui.label(
                                 egui::RichText::new(
@@ -8877,29 +8957,14 @@ impl LauncherApp {
                                 .weak()
                                 .small(),
                             );
+                            self.theme_gallery_ui(ui);
                             // 用换行布局：500px 最小宽度下「下拉 + 两个按钮」放不进一行，
                             // 原先的 `horizontal` 会把「恢复 Light」裁在窗口右边缘外。
                             ui.horizontal_wrapped(|ui| {
-                                let choices = self.theme_choices.clone();
-                                egui::ComboBox::from_id_salt("theme_pick")
-                                    .width(200.0)
-                                    .selected_text(self.prefs.theme.clone())
-                                    .show_ui(ui, |ui| {
-                                        for name in choices {
-                                            if ui
-                                                .selectable_label(self.prefs.theme == name, name.as_str())
-                                                .clicked()
-                                                && self.prefs.theme != name
-                                            {
-                                                self.prefs.theme = name.clone();
-                                                source::application::save_settings(&self.prefs);
-                                                log_info!(
-                                                    "设置页：主题 → {name}（已写 settings.json）"
-                                                );
-                                                self.sync_theme(ui.ctx());
-                                            }
-                                        }
-                                    });
+                                if ui.button("刷新主题列表").clicked() {
+                                    self.sync_theme(ui.ctx());
+                                    self.internal_toast(ui.ctx(), "✓ 已重读 Themes 文件夹", true);
+                                }
                                 if ui.button("打开主题文件夹").clicked() {
                                     let dir = theme::user_dir();
                                     match std::fs::create_dir_all(&dir) {
@@ -8923,10 +8988,18 @@ impl LauncherApp {
                                 if ui.button("恢复 Light").clicked()
                                     && self.prefs.theme != theme::FALLBACK_THEME
                                 {
-                                    self.prefs.theme = theme::FALLBACK_THEME.to_string();
-                                    source::application::save_settings(&self.prefs);
-                                    log_info!("设置页：主题 → Light（已写 settings.json）");
-                                    self.sync_theme(ui.ctx());
+                                    self.pick_theme(ui.ctx(), theme::FALLBACK_THEME);
+                                }
+                                // 批次 F11（FR-UIX-12）：把当前生效配色摊平成一份主题文件。
+                                // 「跟随系统」没有单一配色可导，禁用并说明原因。
+                                let has_own_skin = self.prefs.theme != theme::SYSTEM_THEME;
+                                let export = ui
+                                    .add_enabled(has_own_skin, egui::Button::new("复制为自定义主题"))
+                                    .on_disabled_hover_text(
+                                        "「跟随系统」没有单一配色，先在画廊里选一套具体主题",
+                                    );
+                                if export.clicked() {
+                                    self.export_theme_file(ui.ctx());
                                 }
                             });
                             ui.add_space(8.0);
@@ -10519,6 +10592,8 @@ impl LauncherApp {
                     // 那一格刻意不同：那里是没得选，这里是用户自己撤的。
                     // `from_list = true`：面板里这条的非参数路径成功就 `mark_used`（见下方分支），
                     // 填完参数之后同样要记——不然同一条命令"要不要填参数"决定它算不算用过。
+                    // 第三个参数（`custom`）只能给 false：`PanelOpen::Entry` 不携带"这一行
+                    // 来自 `{query}` 自定义源"的身份，面板里启动一律按「清单项」记（既有口径）。
                     if self.param_prompt_if_needed(entry, uid, true, alias_word.clone(), false) {
                         PanelOutcome::Stay
                     } else {
@@ -10529,7 +10604,7 @@ impl LauncherApp {
                             self.launch_and_hide(ctx, &entry)
                         };
                         if started {
-                            self.mark_used(uid, &alias_word);
+                            self.mark_used(uid, &alias_word, false);
                             PanelOutcome::Gone
                         } else {
                             // 启动失败：`launch_with_log` 已经把窗口留在原地给了原因。
@@ -10607,7 +10682,7 @@ impl LauncherApp {
                 match shell_execute_runas(&target.path, &target.arguments, dir) {
                     Ok(()) => {
                         if let PanelOpen::Entry { uid, .. } = &open {
-                            self.mark_used(uid, &alias_word);
+                            self.mark_used(uid, &alias_word, false);
                         }
                         log_info!(
                             "操作面板：以管理员运行（{:?}）已交给 UAC → 关闭到托盘",
@@ -11061,19 +11136,20 @@ impl LauncherApp {
     /// 身份用派生 `uid`（见 §4.1.2）——同 exe 不同参数的两条目各算各的；
     /// 临时条目（如 Ctrl+D 的 explorer /select）不在清单里，自然匹配不到、跳过。
     /// `alias_word` 非空时顺带「提交即学别名」，与统计合并成同一次写盘。
-    fn mark_used(&mut self, uid: &str, alias_word: &str) {
+    /// `custom` 来自 `HeadRow::Custom`：带 `{query}` 的自定义命令记「自定义命令」桶，
+    /// 不再同时记一次「清单项」（批次 F11 去重，见 [`source::usage::bucket_for`]）。
+    fn mark_used(&mut self, uid: &str, alias_word: &str, custom: bool) {
         let Some(pos) = self.items.iter().position(|i| i.uid() == uid) else {
             return;
         };
         self.items[pos].use_count = self.items[pos].use_count.saturating_add(1);
         self.items[pos].last_used_ms = now_ms();
         // 批次 D8：功能桶按条目的类型分——内置动作（`internal:`）自成一桶，
-        // 其余（应用/命令/网址/文件夹/文件）都算「清单项」。
-        let bucket = if self.items[pos].kind == ItemKind::Internal {
-            source::usage::Bucket::Internal
-        } else {
-            source::usage::Bucket::Item
-        };
+        // 其余（应用/命令/网址/文件夹/文件）都算「清单项」；自定义命令另算。
+        let bucket = source::usage::bucket_for(
+            self.items[pos].kind == ItemKind::Internal,
+            custom,
+        );
         if !alias_word.is_empty() && learn_alias(&mut self.items[pos], alias_word) {
             // FR-SYS-03 隐私口径：别名字段本身就是"用户敲过的词的集合"——把 `keyword` 打进日志，
             // 等于把刚学到的那个词（以及历史上所有被学进去的查询原文）原样抄进一份能存好几天、
@@ -15009,7 +15085,7 @@ impl eframe::App for LauncherApp {
                         let ok = self.exec_internal(ui.ctx(), c.action);
                         if ok {
                             // 与「启动成功才累计」同一口径：确认后真的执行了才记一次。
-                            self.mark_used(&c.uid, "");
+                            self.mark_used(&c.uid, "", false);
                         }
                         log_info!(
                             "内部确认：按「执行」→ {}（{}）",
@@ -15121,8 +15197,9 @@ impl eframe::App for LauncherApp {
         if let Some(entry) = launch {
             // 自定义命令的 uid 取原条目（`entry` 是填过 `{query}` 的副本，派生 uid 已变）。
             let uid = launch_uid.clone().unwrap_or_else(|| entry.uid());
-            // 批次 D8：自定义命令源（`{query}`）的条目不在清单里，`mark_used` 会在
-            // "这条不在清单里就返回"那一步跳过 ⇒ 它的使用次数得在这儿单独记。
+            // 批次 D8 时这里曾判断"自定义命令不在清单里，得单独记一次"，于是同一次
+            // 执行被记成「清单项」+「自定义命令」两次。实际上 `CustomHit.uid` 就是原条目的
+            // uid（原条目仍在清单里），`mark_used` 找得到 ⇒ 批次 F11 起桶的归属交给它。
             // 判据用 `launch_uid` 是否被设过：三个分派点（数字键 / 回车 / 点击）只有
             // `HeadRow::Custom` 那一支会设它；清单行走的是 `entry.uid()` 现算。
             let from_custom = launch_uid.is_some();
@@ -15151,10 +15228,8 @@ impl eframe::App for LauncherApp {
                 };
                 if started && launch_from_list {
                     // FR-SRC-19 补全「提交即学别名」（口径与门槛见 learn_alias）。
-                    self.mark_used(&uid, &alias_word);
-                }
-                if started && from_custom {
-                    self.record_usage(source::usage::Bucket::Custom);
+                    // 批次 F11：自定义命令的桶由 `mark_used` 按 `from_custom` 定，同一次执行只 +1。
+                    self.mark_used(&uid, &alias_word, from_custom);
                 }
             }
         }
@@ -15625,7 +15700,7 @@ fn main() -> eframe::Result {
     // 批次 F1 的主题在这里解析一次：默认窗口高度要按主题行高算（一屏正好 10 行），
     // 同一份再传进 `LauncherApp`——`Themes\` 只读一遍，坏主题文件在日志里也只记一次。
     // 2026-10-24 用户需求：旧默认 400px 只装得下 6 行，现在按 `LIST_ROWS` 算。
-    let (start_theme, start_theme_choices) = theme::load(&configured.theme);
+    let (start_theme, start_gallery) = theme::load(&configured.theme);
     let start_height = window_height(
         &start_theme,
         configured.row_density,
@@ -15687,7 +15762,7 @@ fn main() -> eframe::Result {
                 self_hwnd,
                 intent,
                 start_theme,
-                start_theme_choices,
+                start_gallery,
                 configured,
                 broken,
                 selection_rx,

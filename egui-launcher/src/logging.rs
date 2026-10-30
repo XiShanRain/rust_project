@@ -112,10 +112,37 @@ pub fn perf_line(label: &str, dur: Duration, extra: &str) -> String {
     }
 }
 
+/// 各标签的验收预算（毫秒）。`None` = 需求书与开发计划都没给数，不设门槛。
+///
+/// - `search`：NFR-01「查询响应 ≤ 16 ms（单帧）」。`perf: search` 只量计划那一小段，
+///   是整帧的一部分 ⇒ 过了 16 ms 那一帧必然已经掉了；拿需求值当闸门只会漏报、不会误报。
+/// - `startup`：开发计划 1.1「热启动 ≤ 1s」。
+/// - `index`：没有需求依据（NFR-01 的 3 万条/P95 是文件搜索场景，不是建索引），留空。
+pub fn perf_budget(label: &str) -> Option<f64> {
+    match label {
+        "search" => Some(16.0),
+        "startup" => Some(1000.0),
+        _ => None,
+    }
+}
+
 /// 打一条性能日志（详细档）。`extra` 为空的常见形态见 [`perf_line`]。
 pub fn perf(label: &str, dur: Duration, extra: &str) {
     if enabled(LogLevel::Debug) {
-        eprintln!("{}", perf_line(label, dur, extra));
+        eprintln!("{}", perf_line_with_budget(label, dur, extra));
+    }
+}
+
+/// [`perf_line`] 的超预算版：超过 [`perf_budget`] 就在行尾追加「（超预算 N ms）」。
+///
+/// 尾巴加在**最后**：`target/g6-p95.ps1` 只按 `^perf: search <数> ms` 取样本，
+/// 前面的前缀与数字一个字符都不动。
+pub fn perf_line_with_budget(label: &str, dur: Duration, extra: &str) -> String {
+    let line = perf_line(label, dur, extra);
+    let ms = dur.as_secs_f64() * 1000.0;
+    match perf_budget(label) {
+        Some(budget) if ms > budget => format!("{line}（超预算 {:.2} ms）", ms - budget),
+        _ => line,
     }
 }
 
@@ -190,5 +217,32 @@ mod tests {
         let bare = perf_line("startup", Duration::from_millis(2), "");
         assert_eq!(bare, "perf: startup 2.00 ms");
         assert!(!bare.ends_with(' '), "没有 extra 时不留尾空格（脚本要按空格切）");
+    }
+
+    #[test]
+    fn perf_budget_covers_only_the_two_labels_with_a_requirement() {
+        assert_eq!(perf_budget("search"), Some(16.0), "NFR-01 单帧 16 ms");
+        assert_eq!(perf_budget("startup"), Some(1000.0), "开发计划 1.1 热启动 ≤1s");
+        assert_eq!(perf_budget("index"), None, "索引没有需求门槛，别自己造一个");
+    }
+
+    #[test]
+    fn over_budget_line_keeps_the_prefix_and_says_by_how_much() {
+        let ok = perf_line_with_budget("search", Duration::from_micros(12_340), "7 hits");
+        assert_eq!(ok, "perf: search 12.34 ms 7 hits");
+        assert!(!ok.contains("超预算"));
+
+        let slow = perf_line_with_budget("search", Duration::from_millis(20), "");
+        assert_eq!(slow, "perf: search 20.00 ms（超预算 4.00 ms）");
+        assert!(
+            slow.starts_with("perf: search 20.00 ms"),
+            "尾巴不许动前缀——`target/g6-p95.ps1` 按 `^perf: search <数> ms` 取样"
+        );
+
+        let edge = perf_line_with_budget("search", Duration::from_millis(16), "");
+        assert_eq!(edge, "perf: search 16.00 ms", "正好等于预算不算超");
+
+        let unbounded = perf_line_with_budget("index", Duration::from_millis(900), "");
+        assert_eq!(unbounded, "perf: index 900.00 ms", "没有预算的标签不加尾巴");
     }
 }

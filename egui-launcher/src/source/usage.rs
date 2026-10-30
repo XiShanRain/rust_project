@@ -90,6 +90,20 @@ impl Bucket {
 /// 不会被整份判坏，也不会在回写时丢掉。
 pub type DayBuckets = BTreeMap<String, u32>;
 
+/// 一次成功执行该记进哪个桶。
+///
+/// `custom`（带 `{query}` 的自定义命令，FR-SRC-05）对「清单项」是**替代**关系而不是叠加：
+/// 批次 D8 时清单项与自定义各记了一次，同一次执行在统计里 +2（2026-10-30 去重）。
+pub fn bucket_for(internal: bool, custom: bool) -> Bucket {
+    if custom {
+        Bucket::Custom
+    } else if internal {
+        Bucket::Internal
+    } else {
+        Bucket::Item
+    }
+}
+
 /// 整份统计。`days` 的键是本地日期 `YYYY-MM-DD`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageStats {
@@ -307,6 +321,15 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_for_records_a_custom_command_only_once() {
+        assert_eq!(bucket_for(false, false), Bucket::Item);
+        assert_eq!(bucket_for(true, false), Bucket::Internal);
+        assert_eq!(bucket_for(false, true), Bucket::Custom);
+        // 自定义命令同时"在清单里"：仍只落自定义这一桶（批次 F11 去重那条口径）。
+        assert_eq!(bucket_for(true, true), Bucket::Custom);
+    }
 
     /// 公历换算的两个方向必须互逆，跨闰日、跨年、跨世纪都得对上——
     /// 保留 400 天那条判据完全落在这两个函数上，它们错一天，裁掉的就会是今天。
