@@ -381,6 +381,42 @@ fn fill_for_icon(template: &str) -> String {
     out
 }
 
+/// 「每个候选地址为什么没成」的计数，只用来在最后挑一句能指路的话。
+///
+/// 不记网址、不记站点名——这份结构最后会进 Toast，也可能进日志。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DownloadFaults {
+    tried: usize,
+    unreachable: usize,
+    too_big: usize,
+    not_image: usize,
+    missing: usize,
+}
+
+/// 把四类失败翻成一句能指路的话。顺序是"越具体越靠前"：
+/// 太大 > 全连不上 > 全都不是图片 > 全都没有 > 混杂（把三类都摊开）。
+fn failure_message(f: DownloadFaults) -> String {
+    if f.tried == 0 {
+        return "站点上没有可用的图标地址".to_string();
+    }
+    if f.too_big > 0 {
+        return format!("图标超过 1 MB（试了 {} 个地址）", f.tried);
+    }
+    if f.unreachable == f.tried {
+        return format!("连不上这个站点（试了 {} 个地址，检查网络或代理）", f.tried);
+    }
+    if f.not_image == f.tried {
+        return "站点给的图标不是图片（认不出 PNG/ICO/JPG/GIF/BMP）".to_string();
+    }
+    if f.missing == f.tried {
+        return format!("站点上没找到能用的图标（{} 个地址都没有）", f.tried);
+    }
+    format!(
+        "没找到能用的图标（{} 个地址：{} 个没有、{} 个连不上、{} 个不是图片）",
+        f.tried, f.missing, f.unreachable, f.not_image
+    )
+}
+
 /// 下载 `address` 所在站点的图标，存成 `<data_dir>\Icons\<name>.<扩展名>`。
 ///
 /// 顺序：先看首页里写的图标（`apple-touch-icon` 优先），再试 `/apple-touch-icon.png`
@@ -415,15 +451,24 @@ pub fn download_icon(
     }
 
     let name = safe_icon_name(name, &origin);
+    let mut faults = DownloadFaults::default();
     for candidate in candidates {
+        faults.tried += 1;
         let Ok(reply) = fetch(&candidate, MAX_ICON_BYTES) else {
+            faults.unreachable += 1;
             continue;
         };
-        if reply.status != 200 || reply.body.is_empty() || reply.truncated {
+        if reply.truncated {
+            faults.too_big += 1;
+            continue;
+        }
+        if reply.status != 200 || reply.body.is_empty() {
+            faults.missing += 1;
             continue;
         }
         let ext = image_ext(&reply.body);
         if ext.is_empty() {
+            faults.not_image += 1;
             continue;
         }
         let folder = data_dir.join("Icons");
@@ -441,7 +486,7 @@ pub fn download_icon(
             bytes: reply.body.len(),
         });
     }
-    Err("站点上没找到能用的图标（或图标超过 1 MB）".to_string())
+    Err(failure_message(faults))
 }
 
 // ---- 联网：WinHTTP 直调（批次 D2 第二半；AHK 那边是 WinHttpRequest COM）----
@@ -752,8 +797,96 @@ mod tests {
                 truncated: true,
             })
         };
-        assert!(download_icon("https://big.example.com/", "big", &dir, &fetch).is_err());
+        let err = download_icon("https://big.example.com/", "big", &dir, &fetch).unwrap_err();
+        assert!(err.contains("超过 1 MB"), "{err}");
         assert!(!dir.join("Icons").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failure_message_points_at_the_reason() {
+        assert!(failure_message(DownloadFaults::default()).contains("没有可用的图标地址"));
+        assert!(
+            failure_message(DownloadFaults { tried: 2, too_big: 1, missing: 1, ..Default::default() })
+                .contains("超过 1 MB")
+        );
+        assert!(
+            failure_message(DownloadFaults { tried: 2, unreachable: 2, ..Default::default() })
+                .contains("连不上")
+        );
+        assert!(
+            failure_message(DownloadFaults { tried: 2, not_image: 2, ..Default::default() })
+                .contains("不是图片")
+        );
+        assert!(
+            failure_message(DownloadFaults { tried: 2, missing: 2, ..Default::default() })
+                .contains("没找到")
+        );
+        let mixed = DownloadFaults {
+            tried: 3,
+            missing: 1,
+            unreachable: 1,
+            not_image: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            failure_message(mixed),
+            "没找到能用的图标（3 个地址：1 个没有、1 个连不上、1 个不是图片）"
+        );
+    }
+
+    #[test]
+    fn download_says_unreachable_when_every_fetch_fails() {
+        let dir = tmp_dir("offline");
+        let fetch = |_t: &str, _l: usize| -> Result<FetchReply, String> {
+            Err("连不上这个站点".to_string())
+        };
+        let err = download_icon("https://offline.example.com/", "off", &dir, &fetch).unwrap_err();
+        assert!(err.contains("连不上"), "{err}");
+        assert!(!dir.join("Icons").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_says_not_an_image_when_the_bytes_are_html() {
+        let dir = tmp_dir("notimage");
+        let fetch = |_t: &str, _l: usize| -> Result<FetchReply, String> {
+            Ok(FetchReply {
+                status: 200,
+                body: b"<html>.........".to_vec(),
+                truncated: false,
+            })
+        };
+        let err =
+            download_icon("https://plain.example.com/", "plain", &dir, &fetch).unwrap_err();
+        assert!(err.contains("不是图片"), "{err}");
+        assert!(!dir.join("Icons").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_mixes_the_reasons_when_candidates_fail_differently() {
+        let dir = tmp_dir("mixed");
+        let fetch = |target: &str, _l: usize| -> Result<FetchReply, String> {
+            match target {
+                // 首页 404 ⇒ 没有 <link> 候选，只剩两条兜底
+                "https://www.mixed.com/" => Ok(FetchReply {
+                    status: 404,
+                    body: Vec::new(),
+                    truncated: false,
+                }),
+                "https://www.mixed.com/apple-touch-icon.png" => {
+                    Err("连不上这个站点".to_string())
+                }
+                _ => Ok(FetchReply {
+                    status: 404,
+                    body: Vec::new(),
+                    truncated: false,
+                }),
+            }
+        };
+        let err = download_icon("https://www.mixed.com/", "mix", &dir, &fetch).unwrap_err();
+        assert!(err.contains("1 个没有") && err.contains("1 个连不上"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
