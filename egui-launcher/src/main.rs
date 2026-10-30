@@ -105,6 +105,7 @@ mod selection;
 mod source;
 mod sysinfo;
 mod theme;
+mod windowfx;
 use source::application::{
     Corrupted, ItemKind, LaunchItem, LearnRank, ListRows, RowDensity, Scope, SpaceRun, TabMode,
     dedup_items, default_keyword, is_url, learn_alias, make_item_from_input,
@@ -875,6 +876,45 @@ fn win_size(hwnd: HWND) -> Option<(i32, i32)> {
         .map(|_| (r.right - r.left, r.bottom - r.top))
 }
 
+/// 批次 F10（FR-UIX-06）：自绘阴影在窗口四周留出的透明带宽度（逻辑像素，四边同宽）。
+/// 面板（圆角 + 边框 + 底色）整体内缩这么多再画，外带只画阴影 ⇒ 窗口外框 = 面板 + 2×12。
+/// 数值取 12：epaint 的 blur 只向外扩 0.5×blur，blur 20 恰好铺满 10px，再留 2px 给偏移。
+const SHADOW_MARGIN: f32 = 12.0;
+
+/// 阴影中心的黑度（0–255）。边缘由 blur 自然衰减到透明，所以这只是"最深处"。
+const SHADOW_ALPHA: u8 = 110;
+
+/// 面板尺寸 → 窗口（含四周阴影带）尺寸，逻辑像素。
+fn outer_from_panel(panel: egui::Vec2) -> egui::Vec2 {
+    panel + egui::vec2(2.0 * SHADOW_MARGIN, 2.0 * SHADOW_MARGIN)
+}
+
+/// 窗口尺寸 → 面板尺寸（[`outer_from_panel`] 的反函数）。
+fn panel_from_outer(outer: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(
+        (outer.x - 2.0 * SHADOW_MARGIN).max(1.0),
+        (outer.y - 2.0 * SHADOW_MARGIN).max(1.0),
+    )
+}
+
+/// 透明带在物理像素下有多宽。`GetWindowRect` / `SetWindowPos` 那一侧全用物理像素。
+fn shadow_margin_px(ppp: f32) -> i32 {
+    (SHADOW_MARGIN * ppp).round().max(0.0) as i32
+}
+
+/// 面板尺寸 → 窗口外框尺寸（整数物理像素）。只有单测拿它当判据，产品路径走的是 egui 逻辑像素。
+#[cfg(test)]
+fn outer_px(panel: (i32, i32), ppp: f32) -> (i32, i32) {
+    let m = shadow_margin_px(ppp);
+    (panel.0 + 2 * m, panel.1 + 2 * m)
+}
+
+/// 窗口外框尺寸 → 面板尺寸（整数物理像素）。
+fn panel_px(outer: (i32, i32), ppp: f32) -> (i32, i32) {
+    let m = shadow_margin_px(ppp);
+    ((outer.0 - 2 * m).max(1), (outer.1 - 2 * m).max(1))
+}
+
 /// 批次 F3（FR-WIN-09）：工作区千分比 → 窗口左上角（物理像素）。
 /// 与 AHK `SearchWindow.Place`（`SearchWindow.ahk:691-701`）逐式对译：X 按"可用宽度"摊、
 /// Y 按"整块高度"摊，然后各自夹回工作区内。
@@ -917,6 +957,14 @@ fn relative_in_work(work: egui::Rect, size: (i32, i32), pos: (i32, i32)) -> [u16
         fx.clamp(0.0, 1000.0) as u16,
         fy.clamp(0.0, 1000.0) as u16,
     ]
+}
+
+/// 批次 F10（FR-UIX-06）：按千分比把**面板**摆进工作区，再换算成窗口（含阴影带）左上角。
+/// `pos_rel` 一直记的是用户看得见的那块面板，所以摆位也按面板算，四周透明带随面板一起平移。
+fn window_origin_for_rel(work: egui::Rect, outer: (i32, i32), rel: [u16; 2], ppp: f32) -> (i32, i32) {
+    let m = shadow_margin_px(ppp);
+    let (px, py) = place_in_work(work, panel_px(outer, ppp), rel);
+    (px - m, py - m)
 }
 
 /// 「呼出前那个窗口」的中心点。最小化的窗口 `GetWindowRect` 给的是屏幕外的假坐标，
@@ -1082,6 +1130,8 @@ struct LauncherApp {
     visible: bool,
     /// 批次 F8（FR-UIX-07）：本次显示的开始时刻；淡入进度按它算（`None` = 没在淡）。
     shown_at: Option<Instant>,
+    /// 批次 F9（FR-UIX-06）：`Some` ＝ 窗口此刻被 DWM 藏着（藏→画→露），等 `ui()` 数帧放行。
+    cloak: Option<windowfx::CloakGate>,
     ime_before: Option<ImeState>, // E-05 呼出前的输入法状态
     self_hwnd: Option<HWND>,      // E-05 本机顶层窗口，切英文模式时对它发 WM_IME_CONTROL
     // FR-WIN-04 失焦关闭到托盘
@@ -2151,6 +2201,32 @@ fn with_alpha(c: egui::Color32, alpha: f32) -> egui::Color32 {
         c.b(),
         (c.a() as f32 * alpha.clamp(0.0, 1.0)) as u8,
     )
+}
+
+/// 批次 F10（FR-UIX-06）：阴影的 alpha 与面板底色同乘「不透明度 × 淡入进度」。
+/// 分开算的后果是淡入/调透明度时影子与面板各走各的节奏（观感上像两层纸在滑开）。
+fn shadow_alpha(opacity: u8, fade: Option<f32>) -> u8 {
+    let strength = (opacity as f32 / 255.0) * fade.unwrap_or(1.0);
+    (SHADOW_ALPHA as f32 * strength).round().clamp(0.0, 255.0) as u8
+}
+
+/// 批次 F10（FR-UIX-06）：把阴影画进面板四周那条透明带里。
+///
+/// epaint 的 blur 只向矩形外扩 `0.5 × blur`（`RectShape::visual_bounding_rect`），所以
+/// `blur = 20` 恰好铺满 10px，剩下 2px 留给 `offset` 那一格；再大的 blur 会被窗口裁出生硬的边。
+/// `alpha` 由调用方乘过淡入进度与「不透明度」，与面板底色保持同一个衰减。
+fn paint_window_shadow(ui: &egui::Ui, panel: egui::Rect, corner: u8, alpha: u8) {
+    if alpha == 0 {
+        return;
+    }
+    let shadow = egui::epaint::Shadow {
+        offset: [0, 1],
+        blur: 20,
+        spread: 0,
+        color: egui::Color32::from_black_alpha(alpha),
+    };
+    ui.painter()
+        .add(shadow.as_shape(panel, egui::CornerRadius::same(corner)));
 }
 
 /// 输入框的最小高度（2026-10-24 用户正文：「输入框大一点，像 ahk 版的输入框一样，大气一点」）。
@@ -3496,6 +3572,17 @@ fn confirm_warning(action: source::system::InternalAction) -> &'static str {
 
 static HOTKEY_TX: std::sync::OnceLock<mpsc::Sender<()>> = std::sync::OnceLock::new();
 static CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+/// 窗口所在显示器的缩放（逻辑像素 → 物理像素）。批次 F10 起窗口外框要按它给四周阴影带换算，
+/// 而落点/记位那几条路不在 `App::ui` 里、手上没有 `ctx`；`GetDpiForWindow` 何时问都对。
+fn window_ppp(hwnd: HWND) -> f32 {
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        CTX.get().map(|c| c.pixels_per_point()).unwrap_or(1.0)
+    } else {
+        dpi as f32 / 96.0
+    }
+}
 
 /// 批次 Q：换键请求走"发消息 + 共享槽"，不是在 UI 线程直接调 `RegisterHotKey`。
 /// 原因有两条：① 注册必须绑在同一个 hwnd 上（注销时 Windows 按 hwnd 找），而那个消息窗只活在
@@ -5050,6 +5137,7 @@ impl LauncherApp {
             notify_rx,
             visible: intent.visible,
             shown_at: None,
+            cloak: None,
             ime_before: None,
             self_hwnd,
             hide_at: None,
@@ -5218,14 +5306,17 @@ impl LauncherApp {
     /// 换主题与换行密度两条路共用，`why` 只进日志。
     fn resize_to_list(&self, ctx: &egui::Context, height: f32, why: &str) {
         let size = ctx.viewport_rect().size();
-        let next = egui::vec2(size.x.max(MIN_W as f32), height);
+        let panel = panel_from_outer(size);
+        let next = outer_from_panel(egui::vec2(panel.x.max(MIN_W as f32), height));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next));
         let (row_h, _, spacing) = row_geometry(self.prefs.row_density, &self.theme);
         log_info!(
-            "{why}：行密度 {}（行高 {row_h} + 行距 {spacing}）⇒ 窗口高度重算为 {}（原 {}）",
+            "{why}：行密度 {}（行高 {row_h} + 行距 {spacing}）⇒ 面板高度重算为 {}（原 {}；外框 {}×{}）",
             self.prefs.row_density.as_str(),
             height,
-            size.y.round()
+            panel.y.round(),
+            next.x,
+            next.y
         );
     }
 
@@ -5239,14 +5330,17 @@ impl LauncherApp {
     fn apply_width(&self, ctx: &egui::Context, width: f32, why: &str) {
         let w = source::application::clamp_window_width(width);
         let size = ctx.viewport_rect().size();
-        if (size.x - w).abs() < 0.5 {
+        let panel = panel_from_outer(size);
+        if (panel.x - w).abs() < 0.5 {
             return; // 已经是这个宽度：别每帧都发一条视图命令
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            w,
-            size.y.max(MIN_H as f32),
-        )));
-        log_info!("{why}：窗口宽度 → {w}（原 {}）", size.x.round());
+        let next = outer_from_panel(egui::vec2(w, panel.y.max(MIN_H as f32)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next));
+        log_info!(
+            "{why}：面板宽度 → {w}（原 {}；外框宽 {}）",
+            panel.x.round(),
+            next.x
+        );
     }
 
     /// 批次 F8（FR-UIX-07）：淡入进度 0..1。没开、已经到位、或正开着设置页都返回 `None`
@@ -5334,6 +5428,82 @@ impl LauncherApp {
             .unwrap_or(false)
     }
 
+    /// 批次 F9（FR-UIX-06）：创建窗口时一次性的合成层设置。
+    ///
+    /// 两件事都只在 DWM 侧生效：DWM 不认某一格就记一条日志、退回改动前的行为——
+    /// 「防白闪」不能把「窗口能正常显示」搭进去。
+    fn init_window_effects(&mut self, visible_at_start: bool) {
+        let Some(hwnd) = self.self_hwnd else {
+            log_info!("窗口：拿不到 HWND ⇒ 藏→画→露与系统过渡动画两项都跳过");
+            return;
+        };
+        // 本程序自己的淡入是 egui 画的 alpha（`shown_at`），与这一格无关：关掉的是
+        // DWM 给窗口最小化/还原/显示加的那套动画。
+        let set = windowfx::disable_transitions(hwnd);
+        log_info!(
+            "窗口：系统过渡动画 → 设置{}，DWMWA_TRANSITIONS_FORCEDISABLED 回读 {:?}",
+            if set { "成功" } else { "失败（DWM 不认）" },
+            windowfx::read_transitions_disabled(hwnd)
+        );
+        // 启动即可见时，从建窗到首帧之间的那段空框是用户唯一能看见"白底"的机会；
+        // 静默启动（-Startup）也先藏——eframe 首帧后会强制显示一次，那一瞬同样不该露内容。
+        log_info!(
+            "窗口：启动{} ⇒ 先藏，首帧画完再露",
+            if visible_at_start { "即可见" } else { "即隐藏" }
+        );
+        self.cloak_before_show();
+    }
+
+    /// 把窗口藏起来，等 `ui()` 画够帧数再露。
+    ///
+    /// `ShowWindow` / `Visible(true)` 之后到首帧内容提交之前，用户看到的是"有窗口、没内容"
+    /// 的空框（全透明底板上就是桌面或白底）。这一藏就是盖住那段空窗。
+    ///
+    /// 只在「真的要从隐藏→显示」那条分支里调：窗口已经可见时呼出只是重抢焦点，
+    /// 那时候藏两帧等于让窗口当着用户的面闪一下。
+    fn cloak_before_show(&mut self) {
+        let Some(hwnd) = self.self_hwnd else { return };
+        if !windowfx::set_cloak(hwnd, true) {
+            // DWM 不认这一格 ⇒ 退回改动前的行为：可能有空框，但绝不会"藏住不放"。
+            self.cloak = None;
+            log_info!("窗口：DWMWA_CLOAK 设不上（DWM 不认）⇒ 藏→画→露停用，呼出照旧");
+            return;
+        }
+        self.cloak = Some(windowfx::CloakGate::arm(Instant::now()));
+        log_info!(
+            "窗口：藏→画→露 起手（DWMWA_CLOAKED 回读 {:?}）",
+            windowfx::read_cloaked(hwnd)
+        );
+    }
+
+    /// 每遍 `ui()` 开头问一次放行门。
+    fn service_cloak(&mut self, ctx: &egui::Context) {
+        let released = match self.cloak.as_mut() {
+            Some(gate) => gate.tick(Instant::now()),
+            None => return,
+        };
+        if released {
+            self.release_cloak();
+        } else {
+            // egui 是反应式的：没有新事件就不跑下一遍 `ui()`，门会一直等不到第 2 帧。
+            ctx.request_repaint();
+        }
+    }
+
+    /// 放开藏。日志把"画了几遍 / 等了多久 / 回读值"一起写出来——藏没藏住这件事得能自证。
+    fn release_cloak(&mut self) {
+        let Some(gate) = self.cloak.take() else { return };
+        let Some(hwnd) = self.self_hwnd else { return };
+        let cleared = windowfx::set_cloak(hwnd, false);
+        log_info!(
+            "窗口：放行（画了 {} 遍 / {} ms；清藏{}；DWMWA_CLOAKED 回读 {:?}）",
+            gate.frames(),
+            gate.elapsed_ms(),
+            if cleared { "成功" } else { "失败" },
+            windowfx::read_cloaked(hwnd)
+        );
+    }
+
     /// FR-SRC-21：IPC 触发的呼出（已显示则只重抢焦点，不再走 on_show 重复切输入法）。
     fn show_now(&mut self, ctx: &egui::Context) {
         // 批次 F1：隐藏期间系统明暗可能已经切了（选择 `System` 时要用新的），
@@ -5352,6 +5522,9 @@ impl LauncherApp {
             if iconic && self.visible {
                 log_info!("呼出：旗标说「已显示」不作数（系统在最小化态）⇒ 还原并显示");
             }
+            // 批次 F9（FR-UIX-06）：从「看不见」到「看得见」这一跳先藏起来，等第 2 遍
+            // `ui()` 再放行——否则 `ShowWindow` 之后、首帧内容提交之前会露出一只空框。
+            self.cloak_before_show();
             self.visible = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             // winit 的可见标志会与实际窗口脱节（被系统/全屏程序最小化后，标志仍是「可见」，
@@ -5366,6 +5539,11 @@ impl LauncherApp {
                 self.place_on_summon(hwnd);
             }
             self.on_show();
+            // 批次 F9：藏着的窗口如果这一帧没有任何新事件，反应式渲染不会自己再跑一遍，
+            // 放行门就永远等不到第 2 帧 ⇒ 主动要一帧。
+            if self.cloak.is_some() {
+                ctx.request_repaint();
+            }
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
@@ -5385,7 +5563,8 @@ impl LauncherApp {
             log_info!("窗口：落点算不出来（读不到窗口尺寸或工作区）⇒ 保持原位");
             return;
         };
-        let (x, y) = place_in_work(work, size, rel);
+        // 批次 F10（FR-UIX-06）：`pos_rel` 摆的是面板，`SetWindowPos` 收的是含阴影带的外框。
+        let (x, y) = window_origin_for_rel(work, size, rel, window_ppp(hwnd));
         let moved = win_origin(hwnd).is_none_or(|(ox, oy)| (ox, oy) != (x, y));
         if moved {
             unsafe {
@@ -5432,7 +5611,14 @@ impl LauncherApp {
             }
             let size = win_size(hwnd)?;
             let work = hud::monitor_work_at((old[0], old[1]))?;
-            Some(relative_in_work(work, size, (old[0], old[1])))
+            // 批次 F10：`last_pos` 记的是窗口（含阴影带）左上角，面板要各加回一条边距。
+            let ppp = window_ppp(hwnd);
+            let m = shadow_margin_px(ppp);
+            Some(relative_in_work(
+                work,
+                panel_px(size, ppp),
+                (old[0] + m, old[1] + m),
+            ))
         });
         if let Some(rel) = converted {
             self.prefs.appearance.pos_rel = Some(rel);
@@ -5683,7 +5869,8 @@ impl LauncherApp {
     /// 手柄只贴最外圈，且四边手柄让开四角、四角手柄只占 6×6，与移动手柄的矩形互不重叠。
     fn edge_grips(&mut self, ui: &egui::Ui) {
         const T: f32 = 6.0;
-        let r = ui.ctx().viewport_rect();
+        // 批次 F10（FR-UIX-06）：窗口最外圈那 12px 是阴影的透明带，命中区要贴面板边。
+        let r = ui.ctx().viewport_rect().shrink(SHADOW_MARGIN);
         let (l, t, rt, b) = (r.min.x, r.min.y, r.max.x, r.max.y);
         let rect = |a: f32, c: f32, d: f32, e: f32| {
             egui::Rect::from_min_max(egui::pos2(a, c), egui::pos2(d, e))
@@ -9069,6 +9256,9 @@ impl LauncherApp {
     /// 窗口隐藏时：恢复 IME 状态。与 AHK `_RestoreImeMode` 同构——
     /// 恢复到隐藏时的前台窗口（此时焦点可能已回到别的程序），共用输入法时才需要。
     fn on_hide(&mut self) {
+        // 批次 F9（FR-UIX-06）：藏着的窗口直接被隐藏时，后面一帧 `ui()` 都不会再跑
+        // ⇒ 放行门永远等不到第 2 帧、窗口就一直被 DWM 藏着。这里必须当场放行。
+        self.release_cloak();
         // FR-WIN-04：关闭到托盘时清掉待触发的失焦定时器
         self.hide_at = None;
         self.had_focus_since_show = false;
@@ -9089,7 +9279,14 @@ impl LauncherApp {
                 let size = win_size(hwnd)?;
                 let pos = win_origin(hwnd)?;
                 let work = work_at_window(hwnd)?;
-                Some(relative_in_work(work, size, pos))
+                // 批次 F10（FR-UIX-06）：翻成"面板在工作区里的千分比"，四周阴影带不算进位置。
+                let ppp = window_ppp(hwnd);
+                let m = shadow_margin_px(ppp);
+                Some(relative_in_work(
+                    work,
+                    panel_px(size, ppp),
+                    (pos.0 + m, pos.1 + m),
+                ))
             });
             if let Some(rel) = rel {
                 if self.prefs.appearance.pos_rel != Some(rel) {
@@ -9687,7 +9884,8 @@ impl LauncherApp {
         ];
 
         let ppp = ctx.pixels_per_point();
-        let size = ctx.content_rect().size();
+        // 批次 F10：报面板尺寸（与设置项里的宽度同口径），不是含阴影带的外框。
+        let size = panel_from_outer(ctx.content_rect().size());
         let facts = sysinfo::SystemFacts {
             version: env!("CARGO_PKG_VERSION").to_string(),
             build_kind: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
@@ -11186,6 +11384,9 @@ impl eframe::App for LauncherApp {
         if let Some(t0) = self.first_frame_at.take() {
             logging::perf("startup", t0.elapsed(), "");
         }
+        // 批次 F9（FR-UIX-06）：藏→画→露的放行门。放在最前面：这一遍画完的内容就是
+        // 用户要看见的那一帧，门多等一遍没有意义。
+        self.service_cloak(ui.ctx());
         // eframe 为了保证首帧不出白闪，会在首帧渲染后无条件 set_visible(true)，
         // 把 with_visible(false) 覆盖掉；静默启动（-Startup）在第一帧末显式盖回隐藏。
         if self.hide_pending {
@@ -11580,20 +11781,21 @@ impl eframe::App for LauncherApp {
                 } else {
                     (-60.0, -40.0)
                 };
-                let cur = ui.ctx().viewport_rect().size();
+                let cur = panel_from_outer(ui.ctx().viewport_rect().size());
                 let next = egui::vec2(
                     (cur.x + dw).clamp(MIN_W as f32, 1200.0),
                     (cur.y + dh).clamp(MIN_H as f32, 900.0),
                 );
                 ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(next));
+                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(outer_from_panel(next)));
                 log_info!(
-                    "快捷键 Ctrl+{}：窗口 {}×{} → {}×{}",
+                    "快捷键 Ctrl+{}：面板 {}×{} → {}×{}（外框 +{}）",
                     if hit_zoom_in { "=" } else { "-" },
                     cur.x,
                     cur.y,
                     next.x,
-                    next.y
+                    next.y,
+                    2.0 * SHADOW_MARGIN
                 );
             }
             // 「打开日志」**不配快捷键**（用户 2026-10-19 裁定「不必要弄一个快捷键，将来有其他需求
@@ -12583,8 +12785,10 @@ impl eframe::App for LauncherApp {
             } else if let Some((cx, cy)) = win_cursor() {
                 let (dx, dy) = (cx - a.cursor.0, cy - a.cursor.1);
                 // 下限用逻辑像素写，撞上限再按当前 DPI 换算（360 逻辑 ≈ 540 物理 @150%）。
+                // 面板下限之外还要加回四周阴影带，否则拖着拖着就比 MIN_W 还窄。
                 let ppf = ui.ctx().pixels_per_point();
-                let (min_w, min_h) = ((MIN_W as f32 * ppf) as i32, (MIN_H as f32 * ppf) as i32);
+                let min_panel = (MIN_W as f32 + 2.0 * SHADOW_MARGIN, MIN_H as f32 + 2.0 * SHADOW_MARGIN);
+                let (min_w, min_h) = ((min_panel.0 * ppf) as i32, (min_panel.1 * ppf) as i32);
                 let (mut x, mut y, mut w, mut h) = if a.edge == EDGE_MOVE {
                     (a.origin.0 + dx, a.origin.1 + dy, a.size.0, a.size.1)
                 } else {
@@ -12638,7 +12842,20 @@ impl eframe::App for LauncherApp {
         // 批次 F8（FR-UIX-07）：淡入只做"入"这一半，120ms cubic ease-out。面板框架由
         // `CentralPanel` 自己画，`set_opacity` 管不到 ⇒ 底色与描边先乘一次同样的进度。
         let fade = self.fade_progress();
-        let mut frame = self.theme.central_frame();
+        // 批次 F10（FR-UIX-06）：面板由 `outer_margin` 内缩 SHADOW_MARGIN 绘制，四周那条
+        // 透明带里只放阴影。阴影先画、面板后画 ⇒ 面板把它压在下面，圆角外那圈才露得出来。
+        // alpha 与底色同乘淡入进度和不透明度，两层的衰减才不会脱节。
+        let shadow_alpha = shadow_alpha(self.theme.opacity, fade);
+        paint_window_shadow(
+            ui,
+            ui.max_rect().shrink(SHADOW_MARGIN),
+            theme::WINDOW_RADIUS,
+            shadow_alpha,
+        );
+        let mut frame = self
+            .theme
+            .central_frame()
+            .outer_margin(egui::Margin::same(SHADOW_MARGIN as i8));
         if let Some(t) = fade {
             frame.fill = with_alpha(frame.fill, t);
             frame.stroke.color = with_alpha(frame.stroke.color, t);
@@ -12710,9 +12927,12 @@ impl eframe::App for LauncherApp {
                 }
                 // 批次 F6：「＋ 新建」按钮撤掉，换成 ☰ 主菜单（用户点名「换成一个三条杠的菜单，
                 // 点击显示新建按钮和其他设置按钮」）。新建那条路一条没少：菜单第一项 + Ctrl+Shift+N。
+                // 批次 F10：按 [`MENU_BTN_W`] 的原文画本体宽——`menu_col_w` 是预算（含行距），
+                // 拿它当按钮宽会让这一行比可用宽多出 8px，`Frame` 按内容反推面板 ⇒ 面板被画宽、
+                // 右边框被窗口裁掉（F10 真机：右边缘只剩 5px 带宽）。
                 let menu_btn = ui
                     .add_sized(
-                        [menu_col_w, INPUT_MIN_H],
+                        [MENU_BTN_W, INPUT_MIN_H],
                         egui::Button::new(
                             egui::RichText::new("\u{2630}").size(self.theme.title_font_size + 5.0),
                         ),
@@ -12811,7 +13031,8 @@ impl eframe::App for LauncherApp {
             // 同层注册后：滚轮照常滚，点击仍归结果行（行是 click，这里是 drag-only，且行在本行之后注册）。
             // 弹窗/确认框/帮助页打开时整块撤掉，与原来的让位规则一致。
             if !self.keys_live() {
-                let root = ui.ctx().viewport_rect();
+                // 批次 F10：铺在面板上，不盖进四周那条阴影带。
+                let root = ui.ctx().viewport_rect().shrink(SHADOW_MARGIN);
                 let plate = egui::Rect::from_min_max(
                     egui::pos2(root.min.x + 260.0, root.min.y + 40.0),
                     root.max
@@ -13755,7 +13976,7 @@ impl eframe::App for LauncherApp {
                     // 尺寸（2026-10-22 用户要求）：原来内容只有 ~300 宽、且不可拉伸。
                     // `Resize` 给一块能拖右下角的区域，egui 按 id 记住用户拉到的尺寸（本次运行内）。
                     // 上限随主窗口走：主窗口本身最小 360×240，固定 640 宽会溢出到窗外。
-                    let avail = ui.ctx().viewport_rect().size();
+                    let avail = panel_from_outer(ui.ctx().viewport_rect().size());
                     let max_w = (avail.x - 48.0).clamp(320.0, 1200.0);
                     let max_h = (avail.y - 48.0).clamp(260.0, 900.0);
                     egui::Resize::default()
@@ -15411,6 +15632,8 @@ fn main() -> eframe::Result {
         configured.appearance.status_bar,
     );
     let start_width = source::application::clamp_window_width(configured.appearance.width);
+    // 批次 F10（FR-UIX-06）：窗口比面板大一圈，四周那条是自绘阴影的透明带。
+    let start_outer = outer_from_panel(egui::vec2(start_width, start_height));
 
     let mut wgpu_options = eframe::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
@@ -15423,7 +15646,7 @@ fn main() -> eframe::Result {
     }
 
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([start_width, start_height])
+        .with_inner_size(start_outer)
         .with_title("")
         .with_decorations(false)
         .with_always_on_top()
@@ -15455,7 +15678,7 @@ fn main() -> eframe::Result {
             if self_hwnd.is_none() {
                 log_info!("IME: 无法获取本机 HWND，E-05 英文模式切换将跳过");
             }
-            Ok(Box::new(LauncherApp::new(
+            let mut app = LauncherApp::new(
                 tray_rx,
                 hotkey_rx,
                 ipc_rx,
@@ -15468,7 +15691,11 @@ fn main() -> eframe::Result {
                 configured,
                 broken,
                 selection_rx,
-            )))
+            );
+            // 批次 F9（FR-UIX-06）：窗口已经建好、`self_hwnd` 已经在手，趁首帧还没跑
+            // 把 DWM 属性设上（关过渡动画 + 先藏），这一帧画完才露。
+            app.init_window_effects(start_visible);
+            Ok(Box::new(app))
         }),
     )
 }
@@ -17461,6 +17688,55 @@ mod nav_tests {
         let (x, y) = place_in_work(w, (500, 658), [0, 1000]);
         assert_eq!(x, -1920);
         assert_eq!(y, 1040 - 658, "贴底要夹到工作区底边减窗口高");
+    }
+
+    /// 批次 F10（FR-UIX-06）：外框 = 面板 + 四周 12px 阴影带，两个方向各 +24。
+    /// 四档面板高（438/498/318/658）换算成外框就是 462/522/342/682。
+    #[test]
+    fn outer_window_adds_the_shadow_band_on_both_axes() {
+        for (panel_w, panel_h) in [(500.0, 438.0), (500.0, 498.0), (500.0, 318.0), (500.0, 658.0)] {
+            let outer = outer_from_panel(egui::vec2(panel_w, panel_h));
+            assert_eq!(outer.x, panel_w + 2.0 * SHADOW_MARGIN);
+            assert_eq!(outer.y, panel_h + 2.0 * SHADOW_MARGIN);
+            assert_eq!(panel_from_outer(outer), egui::vec2(panel_w, panel_h));
+        }
+        assert_eq!(shadow_margin_px(1.0), 12);
+        assert_eq!(shadow_margin_px(1.5), 18);
+        assert_eq!(outer_px((500, 438), 1.0), (524, 462));
+        assert_eq!(panel_px((524, 462), 1.0), (500, 438));
+    }
+
+    /// 批次 F10：`pos_rel` 一直记的是**面板**位置。默认落点 [500,200] 摆到 1920×1040 的
+    /// 工作区上，面板左上角是 (710,208)，窗口（含阴影带）左上角再各减 12。
+    #[test]
+    fn window_origin_offsets_the_panel_by_the_shadow_margin() {
+        let w = work_rect(0.0, 0.0, 1920.0, 1040.0);
+        let outer = outer_px((500, 438), 1.0);
+        assert_eq!(
+            window_origin_for_rel(w, outer, source::application::POS_REL_DEFAULT, 1.0),
+            (698, 196)
+        );
+        // 隐藏时反算：窗口原点 + 12 = 面板原点，尺寸也按面板算 ⇒ 千分比不变。
+        let (x, y) = window_origin_for_rel(w, outer, [500, 200], 1.0);
+        assert_eq!(
+            relative_in_work(w, panel_px(outer, 1.0), (x + 12, y + 12)),
+            [500, 200]
+        );
+    }
+
+    /// 批次 F10：阴影 alpha 跟底色同乘「不透明度 × 淡入进度」。两者只要有一个见底，
+    /// 影子就必须跟着消失——否则全透明面板还会拖着一圈黑边。
+    #[test]
+    fn shadow_alpha_follows_opacity_and_fade() {
+        assert_eq!(shadow_alpha(255, None), SHADOW_ALPHA);
+        assert_eq!(shadow_alpha(255, Some(0.0)), 0);
+        assert_eq!(shadow_alpha(0, None), 0);
+        assert_eq!(shadow_alpha(128, Some(1.0)), (SHADOW_ALPHA as f32 * 0.502).round() as u8);
+        // 淡入一半 ≈ 满值一半（±1 的取整余量）。
+        let half = shadow_alpha(255, Some(0.5));
+        assert!((half as i32 - (SHADOW_ALPHA as i32 + 1) / 2).abs() <= 1);
+        // 上界：不透明度顶格也不许超过 SHADOW_ALPHA。
+        assert_eq!(shadow_alpha(255, Some(1.0)), SHADOW_ALPHA);
     }
 
     /// F4：文件夹 / 网址条目没写图标源时按类别兜通用图标（AHK `IconCache` 同口径），

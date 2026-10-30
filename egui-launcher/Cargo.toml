@@ -60,6 +60,9 @@ features = [
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_Ime",
+    # 批次 F10（FR-UIX-06 自绘阴影）：窗口外框 = 面板 + 四周阴影带，落点/记位在 UI 线程
+    # 之外换算物理像素，需要一个随时可问的缩放比例 ⇒ `GetDpiForWindow`。
+    "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]

@@ -328,8 +328,8 @@ impl Theme {
 }
 
 /// 窗口圆角：需求书 6.2 没有给圆角键（`selected_radius` 是选中行用的），
-/// FR-UIX-06 只说"圆角"，所以取一个固定值。
-const WINDOW_RADIUS: u8 = 10;
+/// FR-UIX-06 只说"圆角"，所以取一个固定值。批次 F10 起自绘阴影也要按它对齐圆角。
+pub const WINDOW_RADIUS: u8 = 10;
 
 /// `RRGGBB`（也接受 `#RRGGBB`）→ 颜色。位宽不对一律 `None`。
 pub fn parse_hex(s: &str) -> Option<egui::Color32> {
