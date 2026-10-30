@@ -37,7 +37,7 @@ pub fn parse(args: &[String]) -> Cli {
                 i += 1;
             }
         } else if is_flag(arg) {
-            eprintln!("cli: 未知参数 {arg:?}，已忽略");
+            log_info!("cli: 未知参数 {arg:?}，已忽略");
             i += 1;
         } else {
             if !arg.is_empty() {

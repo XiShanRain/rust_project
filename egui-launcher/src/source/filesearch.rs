@@ -206,7 +206,12 @@ pub enum Route {
 #[derive(Debug)]
 pub enum FileUpdate {
     /// 整表替换（旧快照在这条到达前一直可用 ⇒ FR-SRC-04 那条"不清空列表"的取向）。
-    Index(Vec<FileEntry>),
+    Index {
+        entries: Vec<FileEntry>,
+        /// 后台扫描本身花了多久（批次 G5 / NFR-01 的 `perf: index` 行读它）。
+        /// **只算扫描**：不含派线程与等下一帧 `poll` 的时间——那些跟索引本身有多慢无关。
+        elapsed: std::time::Duration,
+    },
     /// 一次目录浏览的回报。带上 `(dir, filter)` 是给主线程核对用的：查询已经变了的话
     /// 这一份就是过期的，列错目录比空一帧严重得多。
     Dir {
@@ -218,8 +223,10 @@ pub enum FileUpdate {
 
 pub fn spawn_rebuild(tx: mpsc::Sender<FileUpdate>, scope: ScanScope) {
     thread::spawn(move || {
+        let started = Instant::now();
         let entries = build_index(&scope);
-        let _ = tx.send(FileUpdate::Index(entries));
+        let elapsed = started.elapsed();
+        let _ = tx.send(FileUpdate::Index { entries, elapsed });
     });
 }
 
@@ -424,7 +431,7 @@ impl DataSource for FileSource {
         let mut changed = false;
         while let Ok(update) = self.rx.try_recv() {
             match update {
-                FileUpdate::Index(entries) => {
+                FileUpdate::Index { entries, elapsed } => {
                     let n = entries.len();
                     self.index = entries;
                     self.indexed_at = Some(Instant::now());
@@ -444,9 +451,11 @@ impl DataSource for FileSource {
                     let dirs = built.folders.len();
                     let depth = built.depth;
                     let cap = built.max_entries;
-                    eprintln!(
+                    log_info!(
                         "文件索引：本轮建成 {n} 条（范围＝清单 {dirs} 个目录，深度 {depth}，上限 {cap} 条）"
                     );
+                    // NFR-01：索引耗时的统一前缀行（详细档才打）。只带条数，不带任何路径。
+                    crate::logging::perf("index", elapsed, &format!("{n} entries"));
                     changed = true;
                 }
                 FileUpdate::Dir { dir, filter, hits } => {
@@ -460,7 +469,7 @@ impl DataSource for FileSource {
                         self.dir_in_flight = None;
                         let n = hits.len();
                         self.dir_hits = Some((dir, filter, hits));
-                        eprintln!("文件搜索：目录列表回报（{n} 条，路径不落日志）");
+                        log_debug!("文件搜索：目录列表回报（{n} 条，路径不落日志）");
                         changed = true;
                     }
                 }
@@ -1326,11 +1335,14 @@ mod tests {
         );
 
         let tx = src.tx.clone();
-        tx.send(FileUpdate::Index(vec![FileEntry {
-            name: "stub".to_string(),
-            path: root.join("stub").to_string_lossy().into_owned(),
-            is_dir: false,
-        }]))
+        tx.send(FileUpdate::Index {
+            entries: vec![FileEntry {
+                name: "stub".to_string(),
+                path: root.join("stub").to_string_lossy().into_owned(),
+                is_dir: false,
+            }],
+            elapsed: std::time::Duration::from_millis(1),
+        })
         .expect("注一条回报");
         src.poll();
         assert!(!src.scope_pending, "回报采纳后待扫账清零");

@@ -1150,7 +1150,7 @@ mod tests {
             let t = std::time::Instant::now();
             let n = idx.search(q, &items, LearnRank::Count, NOW).len();
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("FR-QRY-06：1000 条 query={q:?} 命中 {n} 用时 {ms:.3} ms");
+            log_info!("FR-QRY-06：1000 条 query={q:?} 命中 {n} 用时 {ms:.3} ms");
             worst = worst.max(ms);
         }
         assert!(worst <= 16.0, "单帧预算 16ms，实测最差 {worst:.3}ms");

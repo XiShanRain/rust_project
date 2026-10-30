@@ -832,7 +832,7 @@ mod tests {
             .expect("联网取图标应当成功");
         let path = dir.join("Icons").join(format!("netprobe.{}", got.ext));
         let bytes = std::fs::read(&path).expect("图标没落盘");
-        eprintln!("联网探针：{}，{} 字节，{} 格式", got.relative, got.bytes, got.ext);
+        log_info!("联网探针：{}，{} 字节，{} 格式", got.relative, got.bytes, got.ext);
         assert_eq!(bytes.len(), got.bytes, "回执字节数与文件不一致");
         assert!(!image_ext(&bytes).is_empty(), "落盘的不是能认的图片");
         assert_eq!(got.relative, format!("Icons\\netprobe.{}", got.ext));

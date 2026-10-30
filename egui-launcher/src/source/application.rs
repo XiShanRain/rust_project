@@ -24,6 +24,7 @@ use super::params;
 use super::usage::UsageStats;
 use super::websearch;
 use crate::dbltap::DblTap;
+use crate::logging::LogLevel;
 use crate::source::{DataSource, SearchCtx, SourceId};
 use pinyin::ToPinyin;
 use serde::{Deserialize, Serialize};
@@ -195,7 +196,7 @@ fn migrate_from_appdata(new_path: &Path) {
     if std::fs::copy(&old, new_path).is_ok() {
         let bak = old.with_extension("json.bak");
         let _ = std::fs::rename(&old, &bak);
-        eprintln!("source: 清单已迁移到便携位置 {new_path:?}（旧位置备份 {bak:?}）");
+        log_info!("source: 清单已迁移到便携位置 {new_path:?}（旧位置备份 {bak:?}）");
     }
 }
 
@@ -219,7 +220,7 @@ pub fn save_user_items(items: &[LaunchItem]) {
     }
     match serde_json::to_vec_pretty(items) {
         Ok(json) => write_atomic(&path, &json, "user_items.json"),
-        Err(e) => eprintln!("source: 序列化用户清单失败: {e}"),
+        Err(e) => log_info!("source: 序列化用户清单失败: {e}"),
     }
 }
 
@@ -283,7 +284,7 @@ fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Loaded<T>
         Ok(v) => Ok(v),
         Err(e) => {
             // 报文只留形态：serde 原文会把出问题那格的内容一起打出来（见 [`serde_shape`]）。
-            eprintln!("source: {path:?} 解析失败: {}", serde_shape(&e.to_string()));
+            log_info!("source: {path:?} 解析失败: {}", serde_shape(&e.to_string()));
             Err(quarantine(path, &bytes))
         }
     }
@@ -339,7 +340,7 @@ fn quarantine(path: &Path, bytes: &[u8]) -> Corrupted {
     if let Some(p) = keep_at(path, bytes, &format!("{name}.bad.{ms}")) {
         return Corrupted::Kept(p);
     }
-    eprintln!("source: {path:?} 解析失败且留证没成功 ⇒ 覆盖写会丢掉唯一证据，请人工处理");
+    log_info!("source: {path:?} 解析失败且留证没成功 ⇒ 覆盖写会丢掉唯一证据，请人工处理");
     Corrupted::Lost
 }
 
@@ -350,11 +351,11 @@ fn keep_at(path: &Path, bytes: &[u8], candidate: &str) -> Option<PathBuf> {
         return None;
     }
     if std::fs::rename(path, &bad).is_ok() {
-        eprintln!("source: 坏文件已改名留证 {bad:?}（默认值启动，不覆盖原内容）");
+        log_info!("source: 坏文件已改名留证 {bad:?}（默认值启动，不覆盖原内容）");
         return Some(bad);
     }
     if std::fs::write(&bad, bytes).is_ok() {
-        eprintln!("source: 坏文件改名失败，已另存副本留证 {bad:?}");
+        log_info!("source: 坏文件改名失败，已另存副本留证 {bad:?}");
         return Some(bad);
     }
     None
@@ -373,14 +374,14 @@ fn write_atomic(path: &Path, bytes: &[u8], label: &str) {
         .unwrap_or_default();
     let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, bytes) {
-        eprintln!("source: 写 {label} 临时文件失败 {path:?}: {e}（原文件未改动）");
+        log_info!("source: 写 {label} 临时文件失败 {path:?}: {e}（原文件未改动）");
         return;
     }
     match std::fs::rename(&tmp, path) {
         Ok(()) => {}
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
-            eprintln!("source: {label} 替换失败 {path:?}: {e}（原文件未改动）");
+            log_info!("source: {label} 替换失败 {path:?}: {e}（原文件未改动）");
         }
     }
 }
@@ -425,7 +426,7 @@ macro_rules! take_field {
         if let Some(raw) = $map.get(stringify!($field)) {
             match serde_json::from_value::<$ty>(raw.clone()) {
                 Ok(x) => $out.$field = x,
-                Err(_) => eprintln!(
+                Err(_) => log_info!(
                     "config: {}字段 `{}` 类型不符（实为{}）⇒ 取默认值",
                     $tag,
                     stringify!($field),
@@ -443,7 +444,7 @@ fn read_version(map: &serde_json::Map<String, serde_json::Value>) -> u32 {
         Some(raw) => match serde_json::from_value::<u32>(raw.clone()) {
             Ok(n) => n,
             Err(_) => {
-                eprintln!(
+                log_info!(
                     "config: 字段 `schema_version` 类型不符（实为{}）⇒ 按 v0 处理",
                     json_kind(raw)
                 );
@@ -501,6 +502,7 @@ fn settings_from_map(
     take_field!(map, s, "", file_max_entries, usize);
     take_field!(map, s, "", file_refresh_minutes, u64);
     take_field!(map, s, "", file_min_query_len, usize);
+    take_field!(map, s, "", log_level, Option<LogLevel>);
     s
 }
 
@@ -543,12 +545,12 @@ fn items_from_tree(list: &[serde_json::Value]) -> Vec<LaunchItem> {
             Some(map) => {
                 let it = item_from_value(map, &tag);
                 if it.name.is_empty() || it.path.is_empty() {
-                    eprintln!("config: {tag}缺 `name` 或 `path` ⇒ 这一条不认作条目，其余照常");
+                    log_info!("config: {tag}缺 `name` 或 `path` ⇒ 这一条不认作条目，其余照常");
                 } else {
                     out.push(it);
                 }
             }
-            None => eprintln!(
+            None => log_info!(
                 "config: {}不是对象（实为{}）⇒ 这一条不认作条目，其余照常",
                 tag,
                 json_kind(raw)
@@ -573,7 +575,7 @@ fn migrate_settings(
         match v {
             0 => {}
             other => {
-                eprintln!("config: 没有从 v{other} 往上一版的迁移步子 ⇒ 停在这里，不猜");
+                log_info!("config: 没有从 v{other} 往上一版的迁移步子 ⇒ 停在这里，不猜");
                 return other;
             }
         }
@@ -615,7 +617,7 @@ fn backup_before_migrate(path: &Path, version: u32) -> Option<PathBuf> {
 /// 按 FR-CFG-02 走与"语法坏"完全同一条留证路径，不新造第二种下场。
 /// 这里要再读一次文件只为拿字节：`load_json` 交回来的是解析后的树，而改名留证要的是原字节。
 fn shape_fault(path: &Path, got: &serde_json::Value) -> Option<Corrupted> {
-    eprintln!(
+    log_info!(
         "config: {path:?} 顶层形状不对（实为{}）⇒ 与语法坏同路，先留证再按默认值启动",
         json_kind(got)
     );
@@ -641,24 +643,24 @@ fn load_settings_at(path: &Path) -> (AppSettings, Option<Corrupted>) {
         serde_json::Value::Object(mut map) => {
             let claimed = read_version(&map);
             if claimed > SETTINGS_SCHEMA_VERSION {
-                eprintln!(
+                log_info!(
                     "config: {path:?} 标的是 v{claimed}，本程序只认到 v{SETTINGS_SCHEMA_VERSION} ⇒ 按认识的字段读，不改它的版本戳、不回写"
                 );
                 return (settings_from_map(&map, claimed), None);
             }
             if claimed < SETTINGS_SCHEMA_VERSION {
                 let Some(kept) = backup_before_migrate(path, claimed) else {
-                    eprintln!(
+                    log_info!(
                         "config: 迁移前留证写不进去 ⇒ 本次不迁移（宁可不迁移，不能无证据迁移），照常按 v{claimed} 读"
                     );
                     return (settings_from_map(&map, claimed), None);
                 };
-                eprintln!("config: 迁移前已留证 {kept:?}");
+                log_info!("config: 迁移前已留证 {kept:?}");
                 let reached = migrate_settings(&mut map, claimed);
                 let s = settings_from_map(&map, reached);
                 if reached > claimed {
                     save_settings_at(path, &s);
-                    eprintln!("config: {path:?} 已从 v{claimed} 迁到 v{reached}");
+                    log_info!("config: {path:?} 已从 v{claimed} 迁到 v{reached}");
                 }
                 return (s, None);
             }
@@ -676,7 +678,7 @@ fn load_settings_at(path: &Path) -> (AppSettings, Option<Corrupted>) {
 /// 反过来说，`[1, 2]` 这种一个字节都不值得留的写法本来就该进 `.bad`，批次 X 那条
 /// 「真的坏才报坏，且要留证在原位置之外」的断言到此仍然成立。
 fn quarantine_total_loss(path: &Path, count: usize) -> Option<Corrupted> {
-    eprintln!(
+    log_info!(
         "config: {path:?} 里 {count} 个元素没一个够作条目 ⇒ 整份清单不认，先留证再按空清单启动"
     );
     std::fs::read(path)
@@ -708,7 +710,7 @@ fn load_user_items_at(path: &Path) -> (Vec<LaunchItem>, Option<Corrupted>) {
 fn save_settings_at(path: &Path, s: &AppSettings) {
     match serde_json::to_vec_pretty(s) {
         Ok(json) => write_atomic(path, &json, "settings.json"),
-        Err(e) => eprintln!("source: 序列化偏好失败: {e}"),
+        Err(e) => log_info!("source: 序列化偏好失败: {e}"),
     }
 }
 
@@ -913,6 +915,20 @@ pub struct AppSettings {
     /// 进文件模式的最小过滤字数（`min_query_length`）。缺省 2；设置页给 1/2/3 三个档位。
     #[serde(default = "default_file_min_query_len")]
     pub file_min_query_len: usize,
+
+    /// 日志级别（批次 G5 / FR-SYS-03）。`None` = **跟随构建**：debug 构建记详细、
+    /// release 构建只记标准（见 [`LogLevel::fallback`]）。
+    ///
+    /// 为什么是 `Option` 而不是直接存 `LogLevel`：`fallback()` 的判据是 `cfg!(debug_assertions)`，
+    /// 它是**编译期**事实、不是用户的选择。若这一格写死 `LogLevel`，一份在 debug 构建下
+    /// 生成的 `settings.json` 会带着 `"debug"` 出厂，换到 release 构建里就悄悄成了"详细档"——
+    /// 用户从没点过那一档，日志却比他以为的多。存 `None` 才能让"没选过"这件事本身被记住。
+    ///
+    /// `None` 不落盘（`skip_serializing_if`）不是洁癖：这格缺席时读侧走 `take_field!` 的
+    /// "键不存在 ⇒ 保持 `Default::None`"，与首次运行一条路；写进去 `null` 也认，
+    /// 但会让用户手改配置时看不出"这是没设置"还是"设置成了 null"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<LogLevel>,
 }
 
 fn default_terminal_shell() -> String {
@@ -969,6 +985,8 @@ impl Default for AppSettings {
             file_max_entries: default_file_max_entries(),
             file_refresh_minutes: default_file_refresh_minutes(),
             file_min_query_len: default_file_min_query_len(),
+            // 批次 G5：出厂"跟随构建"，不替用户在 debug 构建里把 release 机器上的档位定死。
+            log_level: None,
         }
     }
 }
@@ -1982,7 +2000,7 @@ pub fn save_history(entries: &[String]) {
 fn save_history_at(path: &Path, entries: &[String]) {
     match serde_json::to_vec_pretty(entries) {
         Ok(json) => write_atomic(path, &json, "search_history.json"),
-        Err(e) => eprintln!("source: 序列化搜索历史失败: {e}"),
+        Err(e) => log_info!("source: 序列化搜索历史失败: {e}"),
     }
 }
 
@@ -2016,7 +2034,7 @@ pub fn save_usage(stats: &UsageStats) {
 fn save_usage_at(path: &Path, stats: &UsageStats) {
     match serde_json::to_vec_pretty(stats) {
         Ok(json) => write_atomic(path, &json, "usage.json"),
-        Err(e) => eprintln!("source: 序列化使用统计失败: {e}"),
+        Err(e) => log_info!("source: 序列化使用统计失败: {e}"),
     }
 }
 
@@ -2057,7 +2075,7 @@ pub fn save_param_history(history: &params::ParamHistory) {
 fn save_param_history_at(path: &Path, history: &params::ParamHistory) {
     match serde_json::to_vec_pretty(history) {
         Ok(json) => write_atomic(path, &json, "param_history.json"),
-        Err(e) => eprintln!("source: 序列化参数历史失败: {e}"),
+        Err(e) => log_info!("source: 序列化参数历史失败: {e}"),
     }
 }
 
@@ -2625,6 +2643,9 @@ pub fn restore_defaults(s: &mut AppSettings) {
     s.history_size = HISTORY_SIZE_DEFAULT;
     // 批次 F8：宽度 / 记住位置 / 状态栏 / 淡入也回厂，位置一起清掉（下次启动居中）。
     s.appearance = Appearance::default();
+    // 批次 G5：日志级别回「跟随构建」。它跟 `theme` / `row_density` 同类——是"程序该怎么表现"
+    // 的偏好，不是用户资产（热键、引擎、隐藏清单那种回来就找不着的），所以进回厂名单。
+    s.log_level = None;
 }
 
 /// 破坏性操作前的编号备份（FR-CFG-08「Restore Defaults 前写 `.bak`」）。
@@ -2649,7 +2670,7 @@ pub fn backup_file(path: &Path) -> Option<PathBuf> {
             return Some(target);
         }
     }
-    eprintln!("source: 备份名额用尽，未写成 {path:?}");
+    log_info!("source: 备份名额用尽，未写成 {path:?}");
     None
 }
 
@@ -2926,7 +2947,7 @@ pub fn spawn_batch_import(tx: mpsc::Sender<Vec<LaunchItem>>) {
                     .is_some_and(|key| is_self_target(&app.path, key))
                 {
                     skipped_self += 1;
-                    eprintln!(
+                    log_info!(
                         "source: 批量导入自排除（target 即本 exe）：{}",
                         file.display()
                     );
@@ -2945,7 +2966,7 @@ pub fn spawn_batch_import(tx: mpsc::Sender<Vec<LaunchItem>>) {
         let store = unsafe { scan_store_apps() };
         let store_count = store.len();
         apps.extend(store);
-        eprintln!(
+        log_info!(
             "source: 批量扫描 {} 个 .lnk，解析出 {} 条、未解析 {} 条（空 target／损坏），自排除 {} 条；\
              另从 shell:AppsFolder 收 UWP/MSIX {} 条（线程 {:?}，CoInit={hr:?}）",
             total,
@@ -3172,14 +3193,14 @@ unsafe fn scan_store_apps() -> Vec<LaunchItem> {
         let folder: IShellItem = match SHCreateItemFromParsingName(PCWSTR(spec.as_ptr()), pbc) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("source: shell:AppsFolder 打不开（{e}），本次不收 Store 应用");
+                log_info!("source: shell:AppsFolder 打不开（{e}），本次不收 Store 应用");
                 return Vec::new();
             }
         };
         let list: IEnumShellItems = match folder.BindToHandler(pbc, &BHID_EnumItems) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("source: 枚举 shell:AppsFolder 失败（{e}）");
+                log_info!("source: 枚举 shell:AppsFolder 失败（{e}）");
                 return Vec::new();
             }
         };
@@ -3226,7 +3247,7 @@ unsafe fn scan_store_apps() -> Vec<LaunchItem> {
                 ..Default::default()
             });
         }
-        eprintln!(
+        log_info!(
             "source: shell:AppsFolder 枚举到 UWP/MSIX {} 条（跳过 Win32 项 {} 条）",
             out.len(),
             win32
@@ -3387,8 +3408,8 @@ fn remove_legacy_sendto(dir: &Path, exe: &str) {
     if let Some((target, args)) = unsafe { read_link_target(&old) } {
         if target == exe && args == "%1" {
             match std::fs::remove_file(&old) {
-                Ok(_) => eprintln!("sendto: 已清理旧名入口（本程序创建、归属已验证）: {old:?}"),
-                Err(e) => eprintln!("sendto: 旧名入口清理失败（不影响新入口）: {e}"),
+                Ok(_) => log_info!("sendto: 已清理旧名入口（本程序创建、归属已验证）: {old:?}"),
+                Err(e) => log_info!("sendto: 旧名入口清理失败（不影响新入口）: {e}"),
             }
         }
     }
@@ -4912,7 +4933,7 @@ mod dedup_tests {
             .and_then(|e| e.parent().map(|p| p.to_path_buf()));
         let Some(exe_dir) = here else { return };
         if list.parent() != Some(exe_dir.as_path()) {
-            eprintln!(
+            log_info!(
                 "跳过：清单落盘位置 {} 不在测试 exe 同级 ⇒ 不往里写",
                 list.display()
             );
@@ -5690,6 +5711,8 @@ mod config_tests {
         x.file_max_entries = 100_000;
         x.file_refresh_minutes = 15;
         x.file_min_query_len = 3;
+        // 批次 G5：`Some` 与 `None` 是两种意思，特值用 `Some(Debug)` 才能区分"读回来了"与"没读"。
+        x.log_level = Some(LogLevel::Debug);
         x.appearance = Appearance {
             width: 720.0,
             status_bar: false,
@@ -5769,6 +5792,11 @@ mod config_tests {
         assert_eq!(got.file_max_entries, 100_000, "file_max_entries");
         assert_eq!(got.file_refresh_minutes, 15, "file_refresh_minutes");
         assert_eq!(got.file_min_query_len, 3, "file_min_query_len");
+        assert_eq!(
+            got.log_level,
+            Some(LogLevel::Debug),
+            "log_level（批次 G5：`Some` 要能读回来；读成 None 就悄悄变回'跟随构建'）"
+        );
         assert_eq!(got.file_scan_scope().depth, 6, "file_scan_scope 汇编");
         assert_eq!(got.file_scan_scope().refresh.as_secs(), 15 * 60);
     }

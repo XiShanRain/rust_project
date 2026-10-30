@@ -91,6 +91,10 @@ const HOTKEY_EXTRA: i32 = 3;
 /// 分类后弹既有的动作面板。与前三颗都不同效，所以单占一个 id。
 const HOTKEY_SELECTION: i32 = 4;
 
+// 批次 G5（FR-SYS-03）：日志级别闸门。**必须排在其余 `mod` 之前**——`#[macro_use]`
+// 给的是文本作用域，后面的模块才看得见 `log_debug!` / `log_info!`。
+#[macro_use]
+mod logging;
 mod actions;
 mod cli;
 mod dbltap;
@@ -99,6 +103,7 @@ mod large_type;
 mod matching;
 mod selection;
 mod source;
+mod sysinfo;
 mod theme;
 use source::application::{
     Corrupted, ItemKind, LaunchItem, LearnRank, ListRows, RowDensity, Scope, SpaceRun, TabMode,
@@ -188,13 +193,13 @@ fn dialog_for_sent_path(p: &str) -> DialogState {
                 unsafe { CoUninitialize() };
             }
             if let Some(it) = resolved {
-                eprintln!(
+                log_info!(
                     "FR-SRC-20①: .lnk 解析成功 {} → target={:?} args={:?} wd={:?}",
                     p, it.path, it.arguments, it.working_dir
                 );
                 return DialogState::from_sent(it);
             }
-            eprintln!("FR-SRC-20①: .lnk 解析失败（空 target/损坏），按原路径预填 {p}");
+            log_info!("FR-SRC-20①: .lnk 解析失败（空 target/损坏），按原路径预填 {p}");
         }
     }
     DialogState::from_input(p)
@@ -305,20 +310,20 @@ fn kill_hung_instance() -> bool {
         .chain(std::iter::once(0))
         .collect();
     let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }) else {
-        eprintln!("single instance: 找不到旧实例的消息窗，无法结束它");
+        log_info!("single instance: 找不到旧实例的消息窗，无法结束它");
         return false;
     };
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     if pid == 0 || pid == std::process::id() {
-        eprintln!("single instance: 消息窗 PID 异常（{pid}），放弃结束");
+        log_info!("single instance: 消息窗 PID 异常（{pid}），放弃结束");
         return false;
     }
     unsafe {
         let proc = match OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!(
+                log_info!(
                     "single instance: 结束旧实例 pid={pid} 失败（OpenProcess: {e}；可能权限不同）"
                 );
                 return false;
@@ -328,11 +333,11 @@ fn kill_hung_instance() -> bool {
         let wait = WaitForSingleObject(proc, 2000);
         let _ = CloseHandle(proc);
         if term.is_err() || wait != WAIT_OBJECT_0 {
-            eprintln!("single instance: 结束旧实例 pid={pid} 失败（term={term:?}, wait={wait:?}）");
+            log_info!("single instance: 结束旧实例 pid={pid} 失败（term={term:?}, wait={wait:?}）");
             return false;
         }
     }
-    eprintln!("single instance: 旧实例 pid={pid} 对 IPC 无应答，已结束");
+    log_info!("single instance: 旧实例 pid={pid} 对 IPC 无应答，已结束");
     true
 }
 
@@ -367,6 +372,8 @@ enum TrayEvent {
     BatchImport,
     Settings, // 2026-10-17：SendTo 从托盘直连改为设置页开关，托盘入口统一为「设置…」
     OpenLog,  // 批次 P（FR-SYS-03）：需求书托盘原文「打开日志、复制系统信息、退出」里的第一格
+    /// 批次 G5（FR-SYS-03）：需求书那三个托盘项的第二格。与设置页「高级」页的按钮同一份实现。
+    CopySysInfo,
     Exit,
 }
 
@@ -954,6 +961,11 @@ fn work_at_window(hwnd: HWND) -> Option<egui::Rect> {
     hud::monitor_work_at(((r.left + r.right) / 2, (r.top + r.bottom) / 2))
 }
 
+/// 批次 G5（NFR-01）：进程启动时刻，`main()` 头一条语句写一次。
+/// 「启动 → 首帧」的 `perf: startup` 行按它算——单看壳子构造到首帧那一段会漏掉
+/// 互斥体等待、IPC 判定与读盘，而那几段恰恰是开机自启时最容易被感知的部分。
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 struct LauncherApp {
     query: String,
     items: Vec<LaunchItem>,      // 当前显示项 = 内置种子 + 用户清单（去重后）
@@ -1151,6 +1163,12 @@ struct LauncherApp {
     /// `usage.json` 坏了且留证没成功 ⇒ 本次启动不写它（与 `history_blocked` 同一条门槛，
     /// 各管各的文件）。
     usage_blocked: bool,
+    // ---- 批次 G5（NFR-01）：`perf:` 行的两格记账 ----
+    /// 上次记过耗时的查询原文。`plan()` 每帧被调十余次、空闲重绘还会再跑，
+    /// 逐次打行就成了帧率的噪声 ⇒ 只有查询**变了的那一遍**记一次。
+    perf_query: Option<String>,
+    /// 启动→首帧还没记过（`ui()` 第一次跑时 take 掉）。`None` = 已经记过。
+    first_frame_at: Option<Instant>,
 }
 
 /// 一条待取图标的作业：缓存键 + 图标规格（条目 `source_path` 原文）。
@@ -1237,7 +1255,7 @@ fn spawn_icon_loader(
             if let Some((rgba, w, h)) = &hit {
                 if !first_logged {
                     let nonzero = rgba.iter().filter(|&&v| v != 0).count();
-                    eprintln!(
+                    log_info!(
                         "icon probe: 首个成功 {}x{}，非零字节 {}/{}  ← {}",
                         w,
                         h,
@@ -1253,7 +1271,7 @@ fn spawn_icon_loader(
                 break;
             }
         }
-        eprintln!("icon loader: {ok}/{total} 图标提取成功");
+        log_info!("icon loader: {ok}/{total} 图标提取成功");
     });
 }
 
@@ -1599,7 +1617,7 @@ enum ClipboardPayload {
 /// 没有文件再读文本。
 fn read_clipboard_payload() -> Option<ClipboardPayload> {
     if let Err(e) = open_clipboard_retry() {
-        eprintln!("取选区：读结果时剪贴板打不开（可能正被别的程序占着）：{e}");
+        log_info!("取选区：读结果时剪贴板打不开（可能正被别的程序占着）：{e}");
         return None;
     }
     let payload = clipboard_hdrop_locked()
@@ -1733,7 +1751,7 @@ fn restore_clipboard(snapshot: &[ClipFormat]) -> Result<(), String> {
     }
     let _ = unsafe { CloseClipboard() };
     if put == snapshot.len() {
-        eprintln!("取选区：剪贴板已还原（{put} 格，全格式快照）");
+        log_info!("取选区：剪贴板已还原（{put} 格，全格式快照）");
         Ok(())
     } else {
         Err(format!(
@@ -1751,7 +1769,7 @@ fn capture_selection() -> SelectionOutcome {
     let class_name = foreground_class_name();
     let copy_key = selection::copy_key_for(&class_name);
     if !wait_modifiers_up(MODIFIERS_UP_TIMEOUT) {
-        eprintln!(
+        log_info!(
             "取选区：等修饰键松开超时（{}ms）⇒ 照发复制键，目标程序可能把它当成带修饰的组合",
             MODIFIERS_UP_TIMEOUT.as_millis()
         );
@@ -1759,18 +1777,18 @@ fn capture_selection() -> SelectionOutcome {
     let snapshot = match snapshot_clipboard() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("取选区：剪贴板快照失败（{e}）⇒ 本次不做（你的剪贴板没有被改动）");
+            log_info!("取选区：剪贴板快照失败（{e}）⇒ 本次不做（你的剪贴板没有被改动）");
             return SelectionOutcome::Nothing("剪贴板正被别的程序占着，这次没取");
         }
     };
     if let Err(e) = clear_clipboard() {
-        eprintln!("取选区：清空剪贴板失败（{e}）⇒ 本次不做");
+        log_info!("取选区：清空剪贴板失败（{e}）⇒ 本次不做");
         return SelectionOutcome::Nothing("剪贴板正被别的程序占着，这次没取");
     }
     if !send_copy_keystroke(copy_key) {
         // 键没投全：目标程序多半一个字符都没复制，但仍按"等一下再看"处理——投出去的那几个
         // 事件可能已经让它复制了，读一遍总比漏掉强。
-        eprintln!("取选区：复制键没投全（SendInput 少于 4 个事件）");
+        log_info!("取选区：复制键没投全（SendInput 少于 4 个事件）");
     }
     let deadline = Instant::now() + Duration::from_millis(selection::CLIP_WAIT_MS);
     while !clipboard_has_selection() && Instant::now() < deadline {
@@ -1779,7 +1797,7 @@ fn capture_selection() -> SelectionOutcome {
     let payload = read_clipboard_payload();
     // 先还原再分类：分类是纯计算，而还原越早，"用户此刻又复制了别的东西"被覆盖的窗口越小。
     if let Err(e) = restore_clipboard(&snapshot) {
-        eprintln!("取选区：剪贴板还原不完整（{e}）⇒ 现在里面可能只有刚才那次复制");
+        log_info!("取选区：剪贴板还原不完整（{e}）⇒ 现在里面可能只有刚才那次复制");
     }
 
     let exists = |p: &str| std::path::Path::new(p).exists();
@@ -1798,16 +1816,16 @@ fn spawn_selection_capture(tx: mpsc::Sender<SelectionOutcome>) {
         let outcome = capture_selection();
         match &outcome {
             SelectionOutcome::Got(selection::Target::Files(paths)) => {
-                eprintln!("取选区：拿到 {} 条路径（路径不落日志）", paths.len())
+                log_info!("取选区：拿到 {} 条路径（路径不落日志）", paths.len())
             }
             SelectionOutcome::Got(selection::Target::Url(_)) => {
-                eprintln!("取选区：拿到一个网址（原文不落日志）")
+                log_info!("取选区：拿到一个网址（原文不落日志）")
             }
-            SelectionOutcome::Got(selection::Target::Text(text)) => eprintln!(
+            SelectionOutcome::Got(selection::Target::Text(text)) => log_info!(
                 "取选区：拿到 {} 个字符的文本（原文不落日志）",
                 text.chars().count()
             ),
-            SelectionOutcome::Nothing(why) => eprintln!("取选区：没拿到内容（{why}）"),
+            SelectionOutcome::Nothing(why) => log_info!("取选区：没拿到内容（{why}）"),
         }
         let _ = tx.send(outcome);
         // 窗口可能正隐藏着（eframe 隐藏后就不再跑 `ui()`）⇒ 必须主动唤醒，否则回执没人收。
@@ -1861,14 +1879,14 @@ fn window_title(hwnd: HWND) -> String {
 fn read_clipboard_text() -> Option<String> {
     unsafe {
         if OpenClipboard(None).is_err() {
-            eprintln!("参数标记：剪贴板打不开（可能正被别的程序占着）⇒ {{%c}} 这次是空值");
+            log_info!("参数标记：剪贴板打不开（可能正被别的程序占着）⇒ {{%c}} 这次是空值");
             return None;
         }
         let text = clipboard_text_locked();
         let _ = CloseClipboard();
         if let Some(t) = &text {
             // 长度可以入日志，原文不行（FR-SYS-03）。
-            eprintln!(
+            log_info!(
                 "参数标记：呼出快照读到剪贴板 {} 字（原文不落日志）",
                 t.chars().count()
             );
@@ -1908,7 +1926,7 @@ fn remember_previous_window(own: Option<HWND>) {
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() {
         PREVIOUS_HWND.store(0, Ordering::Relaxed);
-        eprintln!("paste: 呼出时系统前台为空 ⇒ 这次没有可粘贴的目标");
+        log_info!("paste: 呼出时系统前台为空 ⇒ 这次没有可粘贴的目标");
         return;
     }
     if let Some(me) = own {
@@ -1919,7 +1937,7 @@ fn remember_previous_window(own: Option<HWND>) {
     let raw = fg.0 as usize;
     let changed = PREVIOUS_HWND.swap(raw, Ordering::Relaxed) != raw;
     if changed {
-        eprintln!(
+        log_info!(
             "paste: 记下「呼出前的窗口」= 0x{raw:x}({})",
             window_class_name(fg)
         );
@@ -1995,7 +2013,7 @@ fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
         settle_polls += 1;
     }
     if settle_polls > 0 {
-        eprintln!("paste: 焦点等了 {settle_polls} 次才落到 0x{raw:x}({target})");
+        log_info!("paste: 焦点等了 {settle_polls} 次才落到 0x{raw:x}({target})");
     }
     let units: Vec<u16> = text.encode_utf16().collect();
     // ---- 批次 E5 真机抓到的根因：`KEYEVENTF_UNICODE` 的事件**先过一遍目标那边的输入法** ----
@@ -2059,7 +2077,7 @@ fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
         ),
         None => "，目标无 IME 窗口 ⇒ 没动输入法".to_string(),
     };
-    eprintln!(
+    log_info!(
         "paste: 已向 0x{raw:x}({target}) 投出 {} 个字符（SendInput {sent} 个事件{ime_note}）；内容不落日志",
         units.len()
     );
@@ -3390,8 +3408,8 @@ fn open_log_file() {
     }
     let file = path.display().to_string();
     match shell_execute(&file, "", None) {
-        Ok(_) => eprintln!("打开日志：{file}"),
-        Err(e) => eprintln!("打开日志失败：{}：{e}", path.display()),
+        Ok(_) => log_info!("打开日志：{file}"),
+        Err(e) => log_info!("打开日志失败：{}：{e}", path.display()),
     }
 }
 
@@ -3409,7 +3427,7 @@ fn open_config_folder() -> Result<(), String> {
     }
     let path = dir.display().to_string();
     shell_execute(&path, "", None).map_err(|e| format!("打开配置目录失败：{e}"))?;
-    eprintln!("快捷键 F4：打开配置目录（{path}）");
+    log_info!("快捷键 F4：打开配置目录（{path}）");
     Ok(())
 }
 
@@ -3458,7 +3476,7 @@ fn press_vk(vk: u16) {
         )
     };
     if sent != 2 {
-        eprintln!("internal: vk 0x{vk:02X} 只注入 {sent}/2（目标程序可能忽略了它）");
+        log_info!("internal: vk 0x{vk:02X} 只注入 {sent}/2（目标程序可能忽略了它）");
     }
 }
 
@@ -3863,7 +3881,7 @@ fn spec_from_press(key: egui::Key, m: egui::Modifiers) -> Option<HotkeySpec> {
 fn post_hotkey_request(slot: HotkeySlot, spec: HotkeySpec) -> bool {
     let raw = HOTKEY_HWND.load(Ordering::Relaxed);
     if raw == 0 {
-        eprintln!("hotkey: 消息窗还没建立，本次{}换键请求作废", slot.label());
+        log_info!("hotkey: 消息窗还没建立，本次{}换键请求作废", slot.label());
         return false;
     }
     *hotkey_lock(&HOTKEY_REQUEST) = Some((slot, spec));
@@ -3878,7 +3896,7 @@ fn post_hotkey_request(slot: HotkeySlot, spec: HotkeySpec) -> bool {
         Ok(()) => true,
         Err(e) => {
             *hotkey_lock(&HOTKEY_REQUEST) = None;
-            eprintln!("hotkey: {}换键请求投递失败：{e}", slot.label());
+            log_info!("hotkey: {}换键请求投递失败：{e}", slot.label());
             false
         }
     }
@@ -3890,11 +3908,11 @@ fn post_hotkey_request(slot: HotkeySlot, spec: HotkeySpec) -> bool {
 fn post_hotkey_signal(msg: u32, what: &str) {
     let raw = HOTKEY_HWND.load(Ordering::Relaxed);
     if raw == 0 {
-        eprintln!("hotkey: 消息窗还没建立，本次{what}作废");
+        log_info!("hotkey: 消息窗还没建立，本次{what}作废");
         return;
     }
     if let Err(e) = unsafe { PostMessageW(Some(HWND(raw as *mut _)), msg, WPARAM(0), LPARAM(0)) } {
-        eprintln!("hotkey: {what}投递失败：{e}");
+        log_info!("hotkey: {what}投递失败：{e}");
     }
 }
 
@@ -3924,20 +3942,20 @@ fn suspend_hotkey(hwnd: HWND) {
             // （`Alt+R` 就在出厂值上）会被系统整条吞掉，框里永远收不到一次按键。
             if hotkey_lock(&EXTRA_ACTIVE).is_some() {
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_EXTRA);
-                eprintln!("hotkey: 取键期间临时注销副呼出键（退出取键时装回）");
+                log_info!("hotkey: 取键期间临时注销副呼出键（退出取键时装回）");
             }
             // 批次 G3：选中内容键同理——正在录它自己的组合时，不摘就一个事件都收不到。
             if hotkey_lock(&SELECTION_ACTIVE).is_some() {
                 let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SELECTION);
-                eprintln!("hotkey: 取键期间临时注销选中内容键（退出取键时装回）");
+                log_info!("hotkey: 取键期间临时注销选中内容键（退出取键时装回）");
             }
             match *hotkey_lock(&HOTKEY_ACTIVE) {
-                Some(k) => eprintln!(
+                Some(k) => log_info!(
                     "hotkey: 取键期间临时注销 {}（退出取键或 {}ms 后装回）",
                     k.display(),
                     HOTKEY_SUSPEND_TIMEOUT
                 ),
-                None => eprintln!("hotkey: 取键期间没有装着的全局键可注销"),
+                None => log_info!("hotkey: 取键期间没有装着的全局键可注销"),
             }
         }
         // 每次都重起表：连着两次取键（录完主热键又去点补字符的框）不该让第二次的窗口期变短。
@@ -3964,7 +3982,7 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
         if let Some(e) = *hotkey_lock(&EXTRA_ACTIVE) {
             match apply_hotkey(hwnd, HotkeySlot::Extra, e) {
                 Ok(()) => {
-                    eprintln!("hotkey: 退出取键（{why}）⇒ 已装回副呼出键 {}", e.display())
+                    log_info!("hotkey: 退出取键（{why}）⇒ 已装回副呼出键 {}", e.display())
                 }
                 Err(err) => {
                     *hotkey_lock(&EXTRA_ACTIVE) = None;
@@ -3974,7 +3992,7 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
                         err,
                         now_active: None,
                     });
-                    eprintln!(
+                    log_info!(
                         "hotkey: 退出取键（{why}）时装回副呼出键 {} 失败（{err}）",
                         e.display()
                     );
@@ -3987,7 +4005,7 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
         // 批次 G3：选中内容键也放在主热键那格之前（同一条理由：主热键可能是空的）。
         if let Some(s) = *hotkey_lock(&SELECTION_ACTIVE) {
             match apply_hotkey(hwnd, HotkeySlot::Selection, s) {
-                Ok(()) => eprintln!(
+                Ok(()) => log_info!(
                     "hotkey: 退出取键（{why}）⇒ 已装回选中内容键 {}",
                     s.display()
                 ),
@@ -3999,7 +4017,7 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
                         err,
                         now_active: None,
                     });
-                    eprintln!(
+                    log_info!(
                         "hotkey: 退出取键（{why}）时装回选中内容键 {} 失败（{err}）",
                         s.display()
                     );
@@ -4010,11 +4028,11 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
             }
         }
         let Some(k) = *hotkey_lock(&HOTKEY_ACTIVE) else {
-            eprintln!("hotkey: 退出取键（{why}），本来就没有装着的全局键");
+            log_info!("hotkey: 退出取键（{why}），本来就没有装着的全局键");
             return;
         };
         match apply_hotkey(hwnd, HotkeySlot::Toggle, k) {
-            Ok(()) => eprintln!("hotkey: 退出取键（{why}）⇒ 已装回 {}", k.display()),
+            Ok(()) => log_info!("hotkey: 退出取键（{why}）⇒ 已装回 {}", k.display()),
             Err(err) => {
                 *hotkey_lock(&HOTKEY_ACTIVE) = None;
                 hotkey_lock(&HOTKEY_RESULT).push(HotkeyOutcome::Rejected {
@@ -4023,7 +4041,7 @@ fn resume_hotkey(hwnd: HWND, why: &str) {
                     err,
                     now_active: None,
                 });
-                eprintln!(
+                log_info!(
                     "hotkey: 退出取键（{why}）时装回 {} 失败（{err}）⇒ 全局呼出不可用，请用托盘",
                     k.display()
                 );
@@ -4102,8 +4120,8 @@ fn set_tap_hook(mode: DblTap) {
         if !mode.needs_hook() {
             if raw != 0 {
                 match UnhookWindowsHookEx(HHOOK(raw as *mut _)) {
-                    Ok(()) => eprintln!("dbltap: 已卸下键盘钩子（双击呼出改为「关闭」）"),
-                    Err(e) => eprintln!("dbltap: 卸下键盘钩子失败：{e}"),
+                    Ok(()) => log_info!("dbltap: 已卸下键盘钩子（双击呼出改为「关闭」）"),
+                    Err(e) => log_info!("dbltap: 卸下键盘钩子失败：{e}"),
                 }
                 TAP_HOOK.store(0, Ordering::Relaxed);
             }
@@ -4112,7 +4130,7 @@ fn set_tap_hook(mode: DblTap) {
         }
         tap_lock().set_mode(mode);
         if raw != 0 {
-            eprintln!(
+            log_info!(
                 "dbltap: 双击档改为「{}」（钩子已在，判定状态已重置）",
                 mode.label()
             );
@@ -4121,7 +4139,7 @@ fn set_tap_hook(mode: DblTap) {
         let module = match GetModuleHandleW(None) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("dbltap: GetModuleHandleW 失败：{e} ⇒ 双击呼出不可用");
+                log_info!("dbltap: GetModuleHandleW 失败：{e} ⇒ 双击呼出不可用");
                 return;
             }
         };
@@ -4135,12 +4153,12 @@ fn set_tap_hook(mode: DblTap) {
         ) {
             Ok(h) => {
                 TAP_HOOK.store(h.0 as usize, Ordering::Relaxed);
-                eprintln!(
+                log_info!(
                     "dbltap: 已装键盘钩子（{}；连按两下切一次显隐）",
                     mode.label()
                 );
             }
-            Err(e) => eprintln!("dbltap: 装键盘钩子失败（{e}）⇒ 双击呼出本次不可用"),
+            Err(e) => log_info!("dbltap: 装键盘钩子失败（{e}）⇒ 双击呼出本次不可用"),
         }
     }
 }
@@ -4149,7 +4167,7 @@ fn set_tap_hook(mode: DblTap) {
 fn post_double_tap(mode: DblTap) {
     let raw = HOTKEY_HWND.load(Ordering::Relaxed);
     if raw == 0 {
-        eprintln!("dbltap: 消息窗还没建立，本次换档作废");
+        log_info!("dbltap: 消息窗还没建立，本次换档作废");
         return;
     }
     if let Err(e) = unsafe {
@@ -4160,7 +4178,7 @@ fn post_double_tap(mode: DblTap) {
             LPARAM(0),
         )
     } {
-        eprintln!("dbltap: 换档消息投递失败：{e}");
+        log_info!("dbltap: 换档消息投递失败：{e}");
     }
 }
 
@@ -4184,14 +4202,14 @@ fn typeback_char_for(vk: u32) -> Option<char> {
 /// Windows Terminal / 中文输入法五处的真实表现要靠真机复测清单验收，见发布说明那一节。】
 fn inject_typeback_char() {
     let Some(toggle) = *hotkey_lock(&HOTKEY_ACTIVE) else {
-        eprintln!("typeback: 主热键当前没装着，不知道该补哪个字符");
+        log_info!("typeback: 主热键当前没装着，不知道该补哪个字符");
         return;
     };
     // 只有**裸键**注册才真的吞掉打字：带修饰的呼出键（Ctrl+Alt+Space）压根不影响 Space 键，
     // 这时候再按补字符键往焦点窗口塞一个空格就是凭空多出来的动作。所以这里挡住，
     // 让这一格的语义与卡片文案「打出被呼出键吞掉的那个字符」一致。
     if toggle.mods_named() != 0 {
-        eprintln!(
+        log_info!(
             "typeback: 呼出键 {} 带修饰，那个字符本来就打得出 ⇒ 本次不补（补字符键只在呼出键是裸键时才有事做）",
             toggle.display()
         );
@@ -4199,7 +4217,7 @@ fn inject_typeback_char() {
     }
     let vk = toggle.vk;
     let Some(ch) = typeback_char_for(vk) else {
-        eprintln!("typeback: vk 0x{vk:02X} 在当前键盘布局下映射不到可输入字符，本次不补");
+        log_info!("typeback: vk 0x{vk:02X} 在当前键盘布局下映射不到可输入字符，本次不补");
         return;
     };
     let key = |up: bool| INPUT {
@@ -4236,7 +4254,7 @@ fn inject_typeback_char() {
         let cls = String::from_utf16_lossy(&buf[..n as usize]);
         format!("前台=0x{:x}({})", fg.0 as usize, cls)
     };
-    eprintln!(
+    log_info!(
         "typeback: 已向焦点窗口补入 vk 0x{vk:02X} 对应的字符（SendInput {sent}/2，{fg_info}）"
     );
 }
@@ -4266,10 +4284,10 @@ unsafe extern "system" fn hotkey_wndproc(
                 // 批次 G3：取选区跑在工作线程上（要等修饰键松开、等剪贴板出内容，最坏 1.8s），
                 // 本线程还要继续泵消息 ⇒ 派出去就返回，结论经通道回 UI。
                 HOTKEY_SELECTION => {
-                    eprintln!("hotkey: 选中内容键按下 ⇒ 派一个取选区线程");
+                    log_info!("hotkey: 选中内容键按下 ⇒ 派一个取选区线程");
                     match SELECTION_TX.get() {
                         Some(tx) => spawn_selection_capture(tx.clone()),
-                        None => eprintln!("hotkey: 结论通道还没登记，本次丢弃"),
+                        None => log_info!("hotkey: 结论通道还没登记，本次丢弃"),
                     }
                 }
                 _ => {}
@@ -4294,7 +4312,7 @@ unsafe extern "system" fn hotkey_wndproc(
         if msg == WM_APP_CLEAR_TYPEBACK {
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TYPEBACK);
             *hotkey_lock(&TYPEBACK_ACTIVE) = None;
-            eprintln!("typeback: 已注销补字符热键（设置页「清除」）");
+            log_info!("typeback: 已注销补字符热键（设置页「清除」）");
             return LRESULT(0);
         }
         // 批次 G1：清除副呼出键 / 换双击档。两件都只能在本线程做——
@@ -4302,13 +4320,13 @@ unsafe extern "system" fn hotkey_wndproc(
         if msg == WM_APP_CLEAR_EXTRA {
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_EXTRA);
             *hotkey_lock(&EXTRA_ACTIVE) = None;
-            eprintln!("hotkey: 已注销副呼出热键（设置页「清除」）");
+            log_info!("hotkey: 已注销副呼出热键（设置页「清除」）");
             return LRESULT(0);
         }
         if msg == WM_APP_SET_DOUBLE_TAP {
             match DblTap::from_code(wparam.0 as u32) {
                 Some(mode) => set_tap_hook(mode),
-                None => eprintln!("dbltap: 收到不认识的档位码 {}", wparam.0),
+                None => log_info!("dbltap: 收到不认识的档位码 {}", wparam.0),
             }
             return LRESULT(0);
         }
@@ -4316,7 +4334,7 @@ unsafe extern "system" fn hotkey_wndproc(
         if msg == WM_APP_CLEAR_SELECTION {
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SELECTION);
             *hotkey_lock(&SELECTION_ACTIVE) = None;
-            eprintln!("hotkey: 已注销选中内容热键（设置页「清除」）");
+            log_info!("hotkey: 已注销选中内容热键（设置页「清除」）");
             return LRESULT(0);
         }
         // FR-WIN-02（批次 Q）：换键。注册/注销只在本线程发生（hwnd 归属），UI 线程只投消息。
@@ -4334,7 +4352,7 @@ unsafe extern "system" fn hotkey_wndproc(
             let outcome = match apply_hotkey(hwnd, slot, tried) {
                 Ok(()) => {
                     *hotkey_lock(slot.active()) = Some(tried);
-                    eprintln!(
+                    log_info!(
                         "hotkey: {} 换键成功 → {}（原组合已注销）",
                         slot.label(),
                         tried.display()
@@ -4351,7 +4369,7 @@ unsafe extern "system" fn hotkey_wndproc(
                     let now_active = if restored { kept } else { None };
                     *hotkey_lock(slot.active()) = now_active;
                     match now_active {
-                        Some(k) => eprintln!(
+                        Some(k) => log_info!(
                             "hotkey: {} {} 注册失败（{err}={}），已回到 {}",
                             slot.label(),
                             tried.display(),
@@ -4362,7 +4380,7 @@ unsafe extern "system" fn hotkey_wndproc(
                             },
                             k.display()
                         ),
-                        None => eprintln!(
+                        None => log_info!(
                             "hotkey: {} {} 注册失败（{err}）且原来的键也没装回去 ⇒ 该功能当前不可用",
                             slot.label(),
                             tried.display()
@@ -4446,7 +4464,7 @@ fn spawn_hotkey_thread(
             ..Default::default()
         };
         if RegisterClassExW(&wc) == 0 {
-            eprintln!("hotkey: RegisterClassExW failed");
+            log_info!("hotkey: RegisterClassExW failed");
             return;
         }
         let win_name: Vec<u16> = "EguiLauncherHotkey\0".encode_utf16().collect();
@@ -4466,7 +4484,7 @@ fn spawn_hotkey_thread(
         ) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("hotkey: CreateWindowExW failed: {e}");
+                log_info!("hotkey: CreateWindowExW failed: {e}");
                 return;
             }
         };
@@ -4478,7 +4496,7 @@ fn spawn_hotkey_thread(
         match apply_hotkey(hwnd, HotkeySlot::Toggle, configured) {
             Ok(()) => {
                 *hotkey_lock(&HOTKEY_ACTIVE) = Some(configured);
-                eprintln!("hotkey: {} registered", configured.display());
+                log_info!("hotkey: {} registered", configured.display());
             }
             Err(err) => {
                 let fallback = HotkeySpec::DEFAULT;
@@ -4490,7 +4508,7 @@ fn spawn_hotkey_thread(
                             fell_back_to: fallback,
                             err,
                         });
-                        eprintln!(
+                        log_info!(
                             "hotkey: {} 注册失败（{err}={}），本次退回 {}；settings.json 不改动",
                             configured.display(),
                             if err == ERROR_HOTKEY_ALREADY_REGISTERED {
@@ -4508,7 +4526,7 @@ fn spawn_hotkey_thread(
                             err: err2,
                             now_active: None,
                         });
-                        eprintln!(
+                        log_info!(
                             "hotkey: {} 与出厂值 {} 都注册失败（{err} / {err2}）⇒ 全局呼出不可用，消息窗仍在线（SendTo/单实例不受影响）",
                             configured.display(),
                             fallback.display()
@@ -4524,7 +4542,7 @@ fn spawn_hotkey_thread(
             match apply_hotkey(hwnd, HotkeySlot::Typeback, tb) {
                 Ok(()) => {
                     *hotkey_lock(&TYPEBACK_ACTIVE) = Some(tb);
-                    eprintln!(
+                    log_info!(
                         "typeback: {} registered（按下补入呼出键那个字符）",
                         tb.display()
                     );
@@ -4536,7 +4554,7 @@ fn spawn_hotkey_thread(
                         err,
                         now_active: None,
                     });
-                    eprintln!(
+                    log_info!(
                         "typeback: {} 注册失败（{err}={}）⇒ 本次不启用补字符，字符仍然打不出来",
                         tb.display(),
                         if err == ERROR_HOTKEY_ALREADY_REGISTERED {
@@ -4562,7 +4580,7 @@ fn spawn_hotkey_thread(
             let toggle_now = *hotkey_lock(&HOTKEY_ACTIVE);
             let typeback_now = *hotkey_lock(&TYPEBACK_ACTIVE);
             if clash(toggle_now) || clash(typeback_now) {
-                eprintln!(
+                log_info!(
                     "hotkey: 副呼出热键 {} 与已装着的那颗同组（多半是手改过 settings.json）⇒ 本次跳过，不改配置",
                     extra.display()
                 );
@@ -4570,7 +4588,7 @@ fn spawn_hotkey_thread(
                 match apply_hotkey(hwnd, HotkeySlot::Extra, extra) {
                     Ok(()) => {
                         *hotkey_lock(&EXTRA_ACTIVE) = Some(extra);
-                        eprintln!(
+                        log_info!(
                             "hotkey: 副呼出热键 {} registered（与主呼出键同效）",
                             extra.display()
                         );
@@ -4582,7 +4600,7 @@ fn spawn_hotkey_thread(
                             err,
                             now_active: None,
                         });
-                        eprintln!(
+                        log_info!(
                             "hotkey: 副呼出热键 {} 注册失败（{err}={}）⇒ 本次不可用，主呼出键不受影响",
                             extra.display(),
                             if err == ERROR_HOTKEY_ALREADY_REGISTERED {
@@ -4604,7 +4622,7 @@ fn spawn_hotkey_thread(
             let typeback_now = *hotkey_lock(&TYPEBACK_ACTIVE);
             let extra_now = *hotkey_lock(&EXTRA_ACTIVE);
             if clash(toggle_now) || clash(typeback_now) || clash(extra_now) {
-                eprintln!(
+                log_info!(
                     "hotkey: 选中内容热键 {} 与已装着的那颗同组（多半是手改过 settings.json）⇒ 本次跳过，不改配置",
                     sel.display()
                 );
@@ -4612,7 +4630,7 @@ fn spawn_hotkey_thread(
                 match apply_hotkey(hwnd, HotkeySlot::Selection, sel) {
                     Ok(()) => {
                         *hotkey_lock(&SELECTION_ACTIVE) = Some(sel);
-                        eprintln!(
+                        log_info!(
                             "hotkey: 选中内容热键 {} registered（取前台窗口的选区弹动作面板）",
                             sel.display()
                         );
@@ -4624,7 +4642,7 @@ fn spawn_hotkey_thread(
                             err,
                             now_active: None,
                         });
-                        eprintln!(
+                        log_info!(
                             "hotkey: 选中内容热键 {} 注册失败（{err}={}）⇒ 本次不可用，其余三颗不受影响",
                             sel.display(),
                             if err == ERROR_HOTKEY_ALREADY_REGISTERED {
@@ -4645,9 +4663,9 @@ fn spawn_hotkey_thread(
         // 不放开其它消息、不改完整性级别（放行范围＝这个 hwnd 的消息队列）。
         match ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, None) {
             Ok(()) => {
-                eprintln!("ipc: 已对本消息窗放行 WM_COPYDATA（管理员实例可收普通权限次进程）")
+                log_info!("ipc: 已对本消息窗放行 WM_COPYDATA（管理员实例可收普通权限次进程）")
             }
-            Err(e) => eprintln!("ipc: WM_COPYDATA 放行失败（不影响同级实例间转发）: {e}"),
+            Err(e) => log_info!("ipc: WM_COPYDATA 放行失败（不影响同级实例间转发）: {e}"),
         }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -4769,11 +4787,11 @@ impl LauncherApp {
             ("param_history.json", &broken_param, "空参数历史"),
         ] {
             match c {
-                Some(Corrupted::Kept(p)) => eprintln!(
+                Some(Corrupted::Kept(p)) => log_info!(
                     "配置损坏：{label} 解析失败，已隔离为 {}，本次按{fallback}启动（原文件未被覆盖）",
                     p.display()
                 ),
-                Some(Corrupted::Lost) => eprintln!(
+                Some(Corrupted::Lost) => log_info!(
                     "配置损坏：{label} 解析失败且留证没成功 ⇒ 本次启动不写它（写一次就覆盖掉唯一证据；之后手动保存仍会覆盖），请人工备份后删掉这个文件"
                 ),
                 None => {}
@@ -4853,12 +4871,12 @@ impl LauncherApp {
             let added = source::application::merge_missing_seeds(&mut items);
             if added > 0 {
                 if writes_blocked {
-                    eprintln!(
+                    log_info!(
                         "source: 出厂命令集本可补 {added} 条，但坏文件留证没成功 ⇒ 这次不写清单（补齐只在内存里生效）"
                     );
                 } else {
                     source::application::save_user_items(&items);
-                    eprintln!(
+                    log_info!(
                         "source: 出厂命令集补齐 {added} 条（第 {} 轮，老清单 {} 条）",
                         source::application::SEED_ROUND,
                         items.len() - added
@@ -4869,7 +4887,7 @@ impl LauncherApp {
             if writes_blocked {
                 // 连记账那一格也不写：settings.json 可能正是没留住证据的那一份。
                 // 代价是下一次启动会再补一轮种子（只加不删，幂等），比覆盖掉现场轻。
-                eprintln!(
+                log_info!(
                     "source: 留证没成功 ⇒ 本轮不写 settings.json（seed_round 只在内存里推进）"
                 );
             } else {
@@ -4880,24 +4898,24 @@ impl LauncherApp {
             let tagged = source::application::apply_factory_tags(&mut items);
             if tagged > 0 {
                 if writes_blocked {
-                    eprintln!(
+                    log_info!(
                         "source: 出厂分类回填 {tagged} 条（坏文件留证没成功 ⇒ 这次不写清单）"
                     );
                 } else {
                     source::application::save_user_items(&items);
-                    eprintln!("source: 出厂分类回填 {tagged} 条（已写清单）");
+                    log_info!("source: 出厂分类回填 {tagged} 条（已写清单）");
                 }
             }
             // 批次 F4：同一轮把内置动作的图标规格回填到老条目（uid 对得上且 `source_path` 为空才补）。
             let iconized = source::application::apply_factory_icons(&mut items);
             if iconized > 0 {
                 if writes_blocked {
-                    eprintln!(
+                    log_info!(
                         "source: 出厂图标回填 {iconized} 条（坏文件留证没成功 ⇒ 这次不写清单）"
                     );
                 } else {
                     source::application::save_user_items(&items);
-                    eprintln!("source: 出厂图标回填 {iconized} 条（已写清单）");
+                    log_info!("source: 出厂图标回填 {iconized} 条（已写清单）");
                 }
             }
         }
@@ -4907,10 +4925,10 @@ impl LauncherApp {
         let renamed = source::system::rename_legacy_settings(&mut items);
         if renamed > 0 {
             if writes_blocked {
-                eprintln!("source: 设置条目改名 {renamed} 条（坏文件留证没成功 ⇒ 这次不写清单）");
+                log_info!("source: 设置条目改名 {renamed} 条（坏文件留证没成功 ⇒ 这次不写清单）");
             } else {
                 source::application::save_user_items(&items);
-                eprintln!("source: 设置条目改名 {renamed} 条（已写清单）");
+                log_info!("source: 设置条目改名 {renamed} 条（已写清单）");
             }
         }
         // 2026-10-23 同目标去重：A9 从开始菜单导进过一条 Store 版「设置」，与出厂的
@@ -4930,12 +4948,12 @@ impl LauncherApp {
         if !dup_settings.is_empty() {
             prefs.hidden.extend(dup_settings.iter().cloned());
             if writes_blocked {
-                eprintln!(
+                log_info!(
                     "source: 隐藏重复的 Store 版「设置」（坏文件留证没成功 ⇒ 这次不写 settings.json）"
                 );
             } else {
                 source::application::save_settings(&prefs);
-                eprintln!("source: 隐藏重复的 Store 版「设置」（已写 hidden[]）");
+                log_info!("source: 隐藏重复的 Store 版「设置」（已写 hidden[]）");
             }
         }
         // FR-SRC-17 `hidden[]`：隐藏不是删除——补种会把条目塞回来，所以每一轮启动都再剔一次。
@@ -4943,10 +4961,10 @@ impl LauncherApp {
         let dropped = source::application::drop_hidden(&mut items, &prefs.hidden);
         if dropped > 0 {
             if writes_blocked {
-                eprintln!("source: hidden[] 隐藏 {dropped} 条（坏文件留证没成功 ⇒ 这次不写清单）");
+                log_info!("source: hidden[] 隐藏 {dropped} 条（坏文件留证没成功 ⇒ 这次不写清单）");
             } else {
                 source::application::save_user_items(&items);
-                eprintln!("source: hidden[] 隐藏 {dropped} 条（已写清单）");
+                log_info!("source: hidden[] 隐藏 {dropped} 条（已写清单）");
             }
         }
         let settings_open = intent.settings_page.is_some();
@@ -5069,6 +5087,10 @@ impl LauncherApp {
             history_blocked,
             usage,
             usage_blocked,
+            // 批次 G5：两格记账。`PROCESS_START` 在 `main()` 第一条语句就写好，
+            // 这里的 `get_or_init` 只兜测试/`Default` 那条不进 `main()` 的路径。
+            perf_query: None,
+            first_frame_at: Some(*PROCESS_START.get_or_init(Instant::now)),
         };
         // 立即为已有项起图标加载器（`source_path` 为空 ⇒ `cache_key` 给 None，自然跳过）。
         let jobs = icon_jobs(&seed.items);
@@ -5083,7 +5105,7 @@ impl LauncherApp {
             if seed.prefs.source_on(s.id()) {
                 s.init();
             } else {
-                eprintln!("数据源 {}：已在设置里关闭，本次不初始化", s.id().as_str());
+                log_info!("数据源 {}：已在设置里关闭，本次不初始化", s.id().as_str());
             }
         }
         // 启动即直接可见时永远走不到 `show_now()` 的「从不可见到可见」边沿，`on_show()` 里的输入法
@@ -5135,7 +5157,7 @@ impl LauncherApp {
             theme::install_fonts(ctx, &theme.font_name);
             self.theme_font = Some(theme.font_name.clone());
         }
-        eprintln!(
+        log_info!(
             "主题：{}（字体 {}，底色 {:02X}{:02X}{:02X}，不透明度 {}（主题 {}））",
             theme.name,
             theme.font_name,
@@ -5180,7 +5202,7 @@ impl LauncherApp {
         if let Some(applied) = self.theme_applied.as_mut() {
             applied.opacity = effective;
         }
-        eprintln!(
+        log_info!(
             "不透明度：{}（主题 {}，外观页 {}）",
             effective,
             self.theme_opacity,
@@ -5199,7 +5221,7 @@ impl LauncherApp {
         let next = egui::vec2(size.x.max(MIN_W as f32), height);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next));
         let (row_h, _, spacing) = row_geometry(self.prefs.row_density, &self.theme);
-        eprintln!(
+        log_info!(
             "{why}：行密度 {}（行高 {row_h} + 行距 {spacing}）⇒ 窗口高度重算为 {}（原 {}）",
             self.prefs.row_density.as_str(),
             height,
@@ -5224,7 +5246,7 @@ impl LauncherApp {
             w,
             size.y.max(MIN_H as f32),
         )));
-        eprintln!("{why}：窗口宽度 → {w}（原 {}）", size.x.round());
+        log_info!("{why}：窗口宽度 → {w}（原 {}）", size.x.round());
     }
 
     /// 批次 F8（FR-UIX-07）：淡入进度 0..1。没开、已经到位、或正开着设置页都返回 `None`
@@ -5270,7 +5292,7 @@ impl LauncherApp {
             st.store(ctx, search_field_id());
         }
         ctx.request_repaint();
-        eprintln!("{log}");
+        log_info!("{log}");
     }
 
     /// 补全：查询换成清单里那条命令的关键字 + 空格。
@@ -5292,7 +5314,7 @@ impl LauncherApp {
                 TOAST_OK,
             ));
             ctx.request_repaint_after(TOAST_TTL);
-            eprintln!(
+            log_info!(
                 "自定义命令：查询已在「{}」，等待用户输入参数",
                 hint.completion
             );
@@ -5328,7 +5350,7 @@ impl LauncherApp {
         let iconic = self.is_iconic();
         if !self.visible || iconic {
             if iconic && self.visible {
-                eprintln!("呼出：旗标说「已显示」不作数（系统在最小化态）⇒ 还原并显示");
+                log_info!("呼出：旗标说「已显示」不作数（系统在最小化态）⇒ 还原并显示");
             }
             self.visible = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -5360,7 +5382,7 @@ impl LauncherApp {
             source::application::POS_REL_DEFAULT
         };
         let (Some(size), Some(work)) = (win_size(hwnd), work_for(appearance.show_on)) else {
-            eprintln!("窗口：落点算不出来（读不到窗口尺寸或工作区）⇒ 保持原位");
+            log_info!("窗口：落点算不出来（读不到窗口尺寸或工作区）⇒ 保持原位");
             return;
         };
         let (x, y) = place_in_work(work, size, rel);
@@ -5379,7 +5401,7 @@ impl LauncherApp {
             }
         }
         // 与 F8 那条同口径：只记坐标与档位，不记任何用户内容。
-        eprintln!(
+        log_info!(
             "窗口：落点 {}（{}/{}{}）→ ({x}, {y})",
             appearance.show_on.as_str(),
             rel[0],
@@ -5401,7 +5423,7 @@ impl LauncherApp {
             return;
         };
         if writes_blocked {
-            eprintln!("窗口：settings.json 本轮只读 ⇒ 旧位置字段留到下次启动折算");
+            log_info!("窗口：settings.json 本轮只读 ⇒ 旧位置字段留到下次启动折算");
             return;
         }
         let converted = self.self_hwnd.and_then(|hwnd| {
@@ -5418,11 +5440,11 @@ impl LauncherApp {
         self.prefs.appearance.last_pos = None;
         source::application::save_settings(&self.prefs);
         match converted {
-            Some(rel) => eprintln!(
+            Some(rel) => log_info!(
                 "窗口：旧位置字段（绝对坐标）已折算为工作区 {}/1000、{}/1000",
                 rel[0], rel[1]
             ),
-            None => eprintln!("窗口：旧位置字段作废（不再记住或已不在任何显示器上）"),
+            None => log_info!("窗口：旧位置字段作废（不再记住或已不在任何显示器上）"),
         }
     }
 
@@ -5446,7 +5468,7 @@ impl LauncherApp {
         self.summon.window_id = (fg.0 as usize).to_string();
         self.summon.window_title = window_title(fg);
         self.summon.window_class = window_class_name(fg);
-        eprintln!(
+        log_info!(
             "参数标记：呼出快照 = 前台 0x{:x}（类名 {}；标题不落日志）、剪贴板 {} 字",
             fg.0 as usize,
             self.summon.window_class,
@@ -5469,7 +5491,7 @@ impl LauncherApp {
         if !source::params::needs_prompt(&entry.path, &entry.arguments, entry.param_type) {
             return false;
         }
-        eprintln!(
+        log_info!(
             "参数标记：条目「{}」要先填参数 ⇒ 弹参数框（{uid}）",
             entry.name
         );
@@ -5517,7 +5539,7 @@ impl LauncherApp {
         let param = p.text.trim().to_string();
         let (entry, expanded) = self.expand_for_launch(&p.entry, &param);
         if expanded {
-            eprintln!(
+            log_info!(
                 "参数标记：「{}」展开完成（参数 {} 字，原文不落日志）",
                 p.entry.name,
                 param.chars().count()
@@ -5526,7 +5548,7 @@ impl LauncherApp {
         // 历史只记非空的参数（空值没有复用价值）；写盘失败不影响启动。
         if !param.is_empty() && self.param_history.touch(&param) {
             if self.param_history_blocked {
-                eprintln!("参数历史：文件坏且留证没成功 ⇒ 这次不写盘（只在内存里记一条）");
+                log_info!("参数历史：文件坏且留证没成功 ⇒ 这次不写盘（只在内存里记一条）");
             } else {
                 source::application::save_param_history(&self.param_history);
             }
@@ -5548,7 +5570,7 @@ impl LauncherApp {
         self.settings_tab = match SettingsTab::from_page(page) {
             Some(t) => t,
             None => {
-                eprintln!(
+                log_info!(
                     "FR-WIN-08: -Preferences {page} 无对应页（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级 8=批量管理 9=使用统计 10=网页引擎），落回通用"
                 );
                 SettingsTab::General
@@ -5597,7 +5619,7 @@ impl LauncherApp {
             TOAST_OK,
         ));
         ctx.request_repaint_after(TOAST_TTL);
-        eprintln!(
+        log_info!(
             "FR-WIN-08: 批量 SendTo {} 条 → 新增 {added}、跳过 {skipped}",
             paths.len()
         );
@@ -5735,19 +5757,19 @@ impl LauncherApp {
     fn begin_win_drag(&mut self, ui: &egui::Ui, edge: u8, tag: &'static str) {
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.is_invalid() {
-            eprintln!("左键拖空白（{tag}）：拿不到前台窗口，忽略");
+            log_info!("左键拖空白（{tag}）：拿不到前台窗口，忽略");
             return;
         }
         let (Some(cursor), Some(origin), Some(size)) =
             (win_cursor(), win_origin(hwnd), win_size(hwnd))
         else {
-            eprintln!("左键拖空白（{tag}）：GetCursorPos/GetWindowRect 失败，忽略");
+            log_info!("左键拖空白（{tag}）：GetCursorPos/GetWindowRect 失败，忽略");
             return;
         };
         // 带上「本帧有没有被按下」与触屏判定：一次拖不动就能从日志分清是
         // 手势没成立、HWND 拿错，还是 ScrollArea 的拖滚（OnTouch）抢走了拖拽。
         let pressed = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-        eprintln!(
+        log_info!(
             "左键拖{}（{tag}）：hwnd={hwnd:?} 按下={pressed} 起点={origin:?} 尺寸={size:?}",
             if edge == EDGE_MOVE {
                 "空白移动"
@@ -5962,7 +5984,7 @@ impl LauncherApp {
             match key {
                 egui::Key::Escape | egui::Key::Tab => {
                     self.typeback_armed = false;
-                    eprintln!("设置页：补字符键选键取消（按 Esc / Tab）");
+                    log_info!("设置页：补字符键选键取消（按 Esc / Tab）");
                 }
                 _ => {
                     let Some(vk) = vk_from_egui_key(key) else {
@@ -5976,7 +5998,7 @@ impl LauncherApp {
                         None => self.typeback_draft = Some(HotkeySpec { mods: 0, vk }),
                     }
                     self.typeback_armed = false;
-                    eprintln!("设置页：补字符键的键框收到 {shown}（修饰键看四个复选框）");
+                    log_info!("设置页：补字符键的键框收到 {shown}（修饰键看四个复选框）");
                 }
             }
             return;
@@ -5985,7 +6007,7 @@ impl LauncherApp {
             match key {
                 egui::Key::Escape | egui::Key::Tab => {
                     self.secondary_recording = false;
-                    eprintln!(
+                    log_info!(
                         "设置页：次级动作键录制取消（按 {}），当前仍是 {}",
                         if key == egui::Key::Escape { "Esc" } else { "Tab" },
                         self.prefs.secondary_hotkey.display()
@@ -5996,7 +6018,7 @@ impl LauncherApp {
                     self.prefs.secondary_hotkey = HotkeySpec::SECONDARY_DEFAULT;
                     source::application::save_settings(&self.prefs);
                     let show = HotkeySpec::SECONDARY_DEFAULT.display();
-                    eprintln!("设置页：次级动作键收到 Backspace/Delete ⇒ 恢复默认 {show}（已写 settings.json）");
+                    log_info!("设置页：次级动作键收到 Backspace/Delete ⇒ 恢复默认 {show}（已写 settings.json）");
                     self.hotkey_note(&format!("✓ 次级动作键恢复默认：{show}"), true);
                 }
                 other => {
@@ -6013,7 +6035,7 @@ impl LauncherApp {
                         LOCAL_TAKEN,
                     ) {
                         self.hotkey_note(&format!("⚠ {show}：{msg}"), false);
-                        eprintln!(
+                        log_info!(
                             "设置页：次级动作键 {show} 未采纳（{msg}），当前仍是 {}",
                             self.prefs.secondary_hotkey.display()
                         );
@@ -6022,7 +6044,7 @@ impl LauncherApp {
                     self.secondary_recording = false;
                     self.prefs.secondary_hotkey = spec;
                     source::application::save_settings(&self.prefs);
-                    eprintln!("设置页：次级动作键 → {show}（已写 settings.json）");
+                    log_info!("设置页：次级动作键 → {show}（已写 settings.json）");
                     self.hotkey_note(&format!("✓ 次级动作键：{show}"), true);
                 }
             }
@@ -6032,7 +6054,7 @@ impl LauncherApp {
             match key {
                 egui::Key::Escape | egui::Key::Tab => {
                     self.extra_recording = false;
-                    eprintln!(
+                    log_info!(
                         "设置页：副呼出键录制取消（按 {}），当前仍是 {}",
                         if key == egui::Key::Escape { "Esc" } else { "Tab" },
                         match self.extra_active {
@@ -6043,7 +6065,7 @@ impl LauncherApp {
                 }
                 egui::Key::Backspace | egui::Key::Delete => {
                     self.extra_recording = false;
-                    eprintln!("设置页：副呼出键收到 Backspace/Delete ⇒ 恢复出厂组合");
+                    log_info!("设置页：副呼出键收到 Backspace/Delete ⇒ 恢复出厂组合");
                     self.request_extra(HotkeySpec::EXTRA_DEFAULT);
                 }
                 other => {
@@ -6059,7 +6081,7 @@ impl LauncherApp {
             match key {
                 egui::Key::Escape | egui::Key::Tab => {
                     self.selection_recording = false;
-                    eprintln!(
+                    log_info!(
                         "设置页：选中内容键录制取消（按 {}），当前仍是 {}",
                         if key == egui::Key::Escape { "Esc" } else { "Tab" },
                         match self.selection_active {
@@ -6070,7 +6092,7 @@ impl LauncherApp {
                 }
                 egui::Key::Backspace | egui::Key::Delete => {
                     self.selection_recording = false;
-                    eprintln!("设置页：选中内容键收到 Backspace/Delete ⇒ 恢复出厂组合");
+                    log_info!("设置页：选中内容键收到 Backspace/Delete ⇒ 恢复出厂组合");
                     self.request_selection(HotkeySpec::SELECTION_DEFAULT);
                 }
                 other => {
@@ -6085,7 +6107,7 @@ impl LauncherApp {
         match key {
             egui::Key::Escape | egui::Key::Tab => {
                 self.hotkey_recording = false;
-                eprintln!(
+                log_info!(
                     "设置页：热键录制取消（按 {}），当前仍是 {}",
                     if key == egui::Key::Escape {
                         "Esc"
@@ -6097,7 +6119,7 @@ impl LauncherApp {
             }
             egui::Key::Backspace | egui::Key::Delete => {
                 self.hotkey_recording = false;
-                eprintln!("设置页：热键录制收到 Backspace/Delete ⇒ 恢复出厂组合");
+                log_info!("设置页：热键录制收到 Backspace/Delete ⇒ 恢复出厂组合");
                 self.request_hotkey(HotkeySpec::DEFAULT);
             }
             other => {
@@ -6156,7 +6178,7 @@ impl LauncherApp {
         let show = spec.display();
         if let Err(msg) = spec.check() {
             self.hotkey_note(&format!("⚠ {show}：{msg}"), false);
-            eprintln!(
+            log_info!(
                 "设置页：热键 {show} 未采纳（{msg}），当前仍是 {}",
                 self.hotkey_active.display()
             );
@@ -6164,7 +6186,7 @@ impl LauncherApp {
         }
         if spec.conflicts_local(LOCAL_TAKEN) {
             self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
-            eprintln!("设置页：热键 {show} 与本程序键表冲突，未采纳");
+            log_info!("设置页：热键 {show} 与本程序键表冲突，未采纳");
             return false;
         }
         // 批次 R 新增的一格带来的新冲突：同一个 vk+修饰组合在同一个线程上只能注册一次，
@@ -6176,7 +6198,7 @@ impl LauncherApp {
                     &format!("⚠ {show} 正被补字符热键占着，请先改掉或清除它"),
                     false,
                 );
-                eprintln!("设置页：热键 {show} 与补字符热键同组，未采纳");
+                log_info!("设置页：热键 {show} 与补字符热键同组，未采纳");
                 return false;
             }
         }
@@ -6187,7 +6209,7 @@ impl LauncherApp {
                     &format!("⚠ {show} 正被副呼出热键占着，请先改掉或清除它"),
                     false,
                 );
-                eprintln!("设置页：热键 {show} 与副呼出热键同组，未采纳");
+                log_info!("设置页：热键 {show} 与副呼出热键同组，未采纳");
                 return false;
             }
         }
@@ -6198,13 +6220,13 @@ impl LauncherApp {
                     &format!("⚠ {show} 正被选中内容热键占着，请先改掉或清除它"),
                     false,
                 );
-                eprintln!("设置页：热键 {show} 与选中内容热键同组，未采纳");
+                log_info!("设置页：热键 {show} 与选中内容热键同组，未采纳");
                 return false;
             }
         }
         if spec == self.hotkey_active {
             self.hotkey_note(&format!("ℹ {show} 就是当前热键，未改动"), true);
-            eprintln!("设置页：热键 {show} 与当前一致，未改动");
+            log_info!("设置页：热键 {show} 与当前一致，未改动");
             return false;
         }
         if !post_hotkey_request(HotkeySlot::Toggle, spec) {
@@ -6212,7 +6234,7 @@ impl LauncherApp {
             return false;
         }
         self.hotkey_awaiting = Some(spec);
-        eprintln!("设置页：热键换键请求已投递 → {show}（等注册结果）");
+        log_info!("设置页：热键换键请求已投递 → {show}（等注册结果）");
         true
     }
 
@@ -6222,12 +6244,12 @@ impl LauncherApp {
         let show = spec.display();
         if let Err(msg) = spec.check_typeback(&self.hotkey_active) {
             self.hotkey_note(&format!("⚠ 补字符热键 {show}：{msg}"), false);
-            eprintln!("设置页：补字符热键 {show} 未采纳（{msg}）");
+            log_info!("设置页：补字符热键 {show} 未采纳（{msg}）");
             return false;
         }
         if spec.conflicts_local(LOCAL_TAKEN) {
             self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
-            eprintln!("设置页：补字符热键 {show} 与本程序键表冲突，未采纳");
+            log_info!("设置页：补字符热键 {show} 与本程序键表冲突，未采纳");
             return false;
         }
         // 批次 G1：`check_typeback` 管不到第三格，这里补上（同线程同组只能注册一次）。
@@ -6237,7 +6259,7 @@ impl LauncherApp {
                     &format!("⚠ 补字符热键 {show} 正被副呼出热键占着，请先改掉或清除它"),
                     false,
                 );
-                eprintln!("设置页：补字符热键 {show} 与副呼出热键同组，未采纳");
+                log_info!("设置页：补字符热键 {show} 与副呼出热键同组，未采纳");
                 return false;
             }
         }
@@ -6248,13 +6270,13 @@ impl LauncherApp {
                     &format!("⚠ 补字符热键 {show} 正被选中内容热键占着，请先改掉或清除它"),
                     false,
                 );
-                eprintln!("设置页：补字符热键 {show} 与选中内容热键同组，未采纳");
+                log_info!("设置页：补字符热键 {show} 与选中内容热键同组，未采纳");
                 return false;
             }
         }
         if self.typeback_active == Some(spec) {
             self.hotkey_note(&format!("ℹ {show} 就是当前补字符热键，未改动"), true);
-            eprintln!("设置页：补字符热键 {show} 与当前一致，未改动");
+            log_info!("设置页：补字符热键 {show} 与当前一致，未改动");
             return false;
         }
         if !post_hotkey_request(HotkeySlot::Typeback, spec) {
@@ -6262,7 +6284,7 @@ impl LauncherApp {
             return false;
         }
         self.typeback_awaiting = Some(spec);
-        eprintln!("设置页：补字符热键请求已投递 → {show}（等注册结果）");
+        log_info!("设置页：补字符热键请求已投递 → {show}（等注册结果）");
         true
     }
 
@@ -6280,7 +6302,7 @@ impl LauncherApp {
         if self.prefs.typeback_hotkey.take().is_some() {
             source::application::save_settings(&self.prefs);
         }
-        eprintln!("设置页：补字符热键已清除（注销 + settings.json 置空）");
+        log_info!("设置页：补字符热键已清除（注销 + settings.json 置空）");
         self.hotkey_note("✓ 已清除补字符热键", true);
     }
 
@@ -6290,12 +6312,12 @@ impl LauncherApp {
         let show = spec.display();
         if let Err(msg) = spec.check_extra(&self.hotkey_active, self.typeback_active.as_ref()) {
             self.hotkey_note(&format!("⚠ 副呼出热键 {show}：{msg}"), false);
-            eprintln!("设置页：副呼出热键 {show} 未采纳（{msg}）");
+            log_info!("设置页：副呼出热键 {show} 未采纳（{msg}）");
             return false;
         }
         if spec.conflicts_local(LOCAL_TAKEN) {
             self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
-            eprintln!("设置页：副呼出热键 {show} 与本程序键表冲突，未采纳");
+            log_info!("设置页：副呼出热键 {show} 与本程序键表冲突，未采纳");
             return false;
         }
         // 批次 G3：`check_extra` 管不到第四格，这里补上（同线程同组只能注册一次）。
@@ -6305,13 +6327,13 @@ impl LauncherApp {
                     &format!("⚠ 副呼出热键 {show} 正被选中内容热键占着，请先改掉或清除它"),
                     false,
                 );
-                eprintln!("设置页：副呼出热键 {show} 与选中内容热键同组，未采纳");
+                log_info!("设置页：副呼出热键 {show} 与选中内容热键同组，未采纳");
                 return false;
             }
         }
         if self.extra_active == Some(spec) {
             self.hotkey_note(&format!("ℹ {show} 就是当前副呼出热键，未改动"), true);
-            eprintln!("设置页：副呼出热键 {show} 与当前一致，未改动");
+            log_info!("设置页：副呼出热键 {show} 与当前一致，未改动");
             return false;
         }
         if !post_hotkey_request(HotkeySlot::Extra, spec) {
@@ -6319,7 +6341,7 @@ impl LauncherApp {
             return false;
         }
         self.extra_awaiting = Some(spec);
-        eprintln!("设置页：副呼出热键请求已投递 → {show}（等注册结果）");
+        log_info!("设置页：副呼出热键请求已投递 → {show}（等注册结果）");
         true
     }
 
@@ -6333,7 +6355,7 @@ impl LauncherApp {
         if self.prefs.extra_hotkey.take().is_some() {
             source::application::save_settings(&self.prefs);
         }
-        eprintln!("设置页：副呼出热键已清除（注销 + settings.json 置空）");
+        log_info!("设置页：副呼出热键已清除（注销 + settings.json 置空）");
         self.hotkey_note("✓ 已清除副呼出热键", true);
     }
 
@@ -6347,17 +6369,17 @@ impl LauncherApp {
             self.extra_active.as_ref(),
         ) {
             self.hotkey_note(&format!("⚠ 选中内容热键 {show}：{msg}"), false);
-            eprintln!("设置页：选中内容热键 {show} 未采纳（{msg}）");
+            log_info!("设置页：选中内容热键 {show} 未采纳（{msg}）");
             return false;
         }
         if spec.conflicts_local(LOCAL_TAKEN) {
             self.hotkey_note(&format!("⚠ {show} 是本程序自己的快捷键，换一个"), false);
-            eprintln!("设置页：选中内容热键 {show} 与本程序键表冲突，未采纳");
+            log_info!("设置页：选中内容热键 {show} 与本程序键表冲突，未采纳");
             return false;
         }
         if self.selection_active == Some(spec) {
             self.hotkey_note(&format!("ℹ {show} 就是当前选中内容热键，未改动"), true);
-            eprintln!("设置页：选中内容热键 {show} 与当前一致，未改动");
+            log_info!("设置页：选中内容热键 {show} 与当前一致，未改动");
             return false;
         }
         if !post_hotkey_request(HotkeySlot::Selection, spec) {
@@ -6365,7 +6387,7 @@ impl LauncherApp {
             return false;
         }
         self.selection_awaiting = Some(spec);
-        eprintln!("设置页：选中内容热键请求已投递 → {show}（等注册结果）");
+        log_info!("设置页：选中内容热键请求已投递 → {show}（等注册结果）");
         true
     }
 
@@ -6379,7 +6401,7 @@ impl LauncherApp {
         if self.prefs.selection_hotkey.take().is_some() {
             source::application::save_settings(&self.prefs);
         }
-        eprintln!("设置页：选中内容热键已清除（注销 + settings.json 置空）");
+        log_info!("设置页：选中内容热键已清除（注销 + settings.json 置空）");
         self.hotkey_note("✓ 已清除选中内容热键", true);
     }
 
@@ -6408,7 +6430,7 @@ impl LauncherApp {
         }
         self.prefs.file_folders = buf.clone();
         source::application::save_settings(&self.prefs);
-        eprintln!(
+        log_info!(
             "设置页：文件扫描目录已改（现 {} 个条目，路径不落日志）",
             self.prefs.file_folders.len()
         );
@@ -6425,7 +6447,7 @@ impl LauncherApp {
         }
         self.prefs.file_exclude = buf.clone();
         source::application::save_settings(&self.prefs);
-        eprintln!(
+        log_info!(
             "设置页：文件排除表已改（现 {} 个条目）",
             self.prefs.file_exclude.len()
         );
@@ -6465,7 +6487,7 @@ impl LauncherApp {
         }
         self.prefs.web_engines = buf.clone();
         source::application::save_settings(&self.prefs);
-        eprintln!(
+        log_info!(
             "设置页：网页引擎表已改（现 {} 条；关键字与网址不落日志）",
             self.prefs.web_engines.len()
         );
@@ -6482,7 +6504,7 @@ impl LauncherApp {
         let tx = self.site_icon_tx.clone();
         let dir = self.data_dir.clone();
         self.site_icon_pending = Some(engine_id.clone());
-        eprintln!("设置页：开始下载站点图标（一次只跑一条）");
+        log_info!("设置页：开始下载站点图标（一次只跑一条）");
         thread::spawn(move || {
             let fetch = |url: &str, limit: usize| source::siteicon::fetch_winhttp(url, limit);
             let got = source::siteicon::download_icon(&address, &name, &dir, &fetch);
@@ -6529,7 +6551,7 @@ impl LauncherApp {
                     self.icon_failed.remove(&key);
                     self.icon_pending.remove(&key);
                 }
-                eprintln!(
+                log_info!(
                     "设置页：站点图标已保存（{} 字节，{} 格式）",
                     icon.bytes, icon.ext
                 );
@@ -6543,7 +6565,7 @@ impl LauncherApp {
                 );
             }
             Err(msg) => {
-                eprintln!("设置页：站点图标没下到（{msg}）");
+                log_info!("设置页：站点图标没下到（{msg}）");
                 self.hotkey_note(&format!("图标没下到：{msg}"), false);
             }
         }
@@ -6571,7 +6593,7 @@ impl LauncherApp {
                 &format!("网页引擎：{}，这些没保存", parts.join("、")),
                 false,
             );
-            eprintln!(
+            log_info!(
                 "设置页：网页引擎表整理丢弃 {} 条（残缺）+ {} 条（重复）",
                 cleaned.incomplete, cleaned.duplicate
             );
@@ -6579,11 +6601,11 @@ impl LauncherApp {
         let mut changed = false;
         // 兜底序列不能指着已经被删掉的引擎（自定义 id 被删、或那条本身就被整理丢了）。
         if source::websearch::prune_fallback(&mut self.prefs.web_fallback, &buf) {
-            eprintln!("设置页：兜底序列已按现表整理（不在表里的 id 去掉）");
+            log_info!("设置页：兜底序列已按现表整理（不在表里的 id 去掉）");
             changed = true;
         }
         if buf != self.prefs.web_engines {
-            eprintln!(
+            log_info!(
                 "设置页：网页引擎表已写入 settings.json（{} 条）",
                 buf.len()
             );
@@ -6680,7 +6702,7 @@ impl LauncherApp {
                 ));
                 ui.ctx().request_repaint_after(TOAST_TTL);
             }
-            eprintln!("批量管理：只选失效项 → 勾上 {hit} 条");
+            log_info!("批量管理：只选失效项 → 勾上 {hit} 条");
         }
         if recheck {
             if self.path_in_flight {
@@ -6693,7 +6715,7 @@ impl LauncherApp {
                 ui.ctx().request_repaint_after(TOAST_TTL);
             } else {
                 self.refresh_path_states(true);
-                eprintln!("批量管理：重新校验路径（{} 条）", self.items.len());
+                log_info!("批量管理：重新校验路径（{} 条）", self.items.len());
             }
         }
 
@@ -6811,7 +6833,7 @@ impl LauncherApp {
                     TOAST_ERR,
                 ));
                 ui.ctx().request_repaint_after(TOAST_TTL);
-                eprintln!("批量管理：转换请求落空（{checked_n} 条全部跳过）");
+                log_info!("批量管理：转换请求落空（{checked_n} 条全部跳过）");
             } else {
                 self.manage_confirm = Some(ManageConfirm::Convert {
                     to_relative,
@@ -7033,7 +7055,7 @@ impl LauncherApp {
         );
         if ui.button("清除统计…").clicked() {
             self.pending_destructive = Some(Destructive::ClearUsage);
-            eprintln!("设置页：点了「清除统计」，等确认");
+            log_info!("设置页：点了「清除统计」，等确认");
             ui.ctx().request_repaint();
         }
     }
@@ -7234,13 +7256,13 @@ impl LauncherApp {
                     icon: String::new(),
                 });
             }
-            eprintln!("设置页：网页引擎表加了一条空行（填完关键字与网址才算数）");
+            log_info!("设置页：网页引擎表加了一条空行（填完关键字与网址才算数）");
             ui.ctx().request_repaint();
         }
         if restore_default {
             self.web_engines_edit = Some(websearch::builtin_engines());
             commit = true;
-            eprintln!("设置页：网页引擎表恢复出厂九条（自定义过的条目被替换）");
+            log_info!("设置页：网页引擎表恢复出厂九条（自定义过的条目被替换）");
         }
         if commit && self.save_web_engines_edit() {
             ui.ctx().request_repaint();
@@ -7313,7 +7335,7 @@ impl LauncherApp {
         if let Some(v) = picked {
             self.prefs.web_fallback = v;
             source::application::save_settings(&self.prefs);
-            eprintln!(
+            log_info!(
                 "设置页：兜底序列已改（现 {} 条，id 不落日志）",
                 self.prefs.web_fallback.len()
             );
@@ -7417,15 +7439,15 @@ impl LauncherApp {
                             if resp.changed() {
                                 if enabled {
                                     source::application::spawn_sendto_install(self.notify_tx.clone());
-                                    eprintln!("设置页：SendTo 开关→开，后台安装（结果走 Toast）");
+                                    log_info!("设置页：SendTo 开关→开，后台安装（结果走 Toast）");
                                 } else {
                                     let (text, color) = match source::application::uninstall_sendto() {
                                         Ok(s) => {
-                                            eprintln!("设置页：SendTo 开关→关，{s}");
+                                            log_info!("设置页：SendTo 开关→关，{s}");
                                             (format!("✓ {s}"), TOAST_OK)
                                         }
                                         Err(s) => {
-                                            eprintln!("设置页：SendTo 卸载失败：{s}");
+                                            log_info!("设置页：SendTo 卸载失败：{s}");
                                             (format!("⚠ {s}"), TOAST_ERR)
                                         }
                                     };
@@ -7450,15 +7472,15 @@ impl LauncherApp {
                             if resp.changed() {
                                 if auto {
                                     source::application::spawn_startup_install(self.notify_tx.clone());
-                                    eprintln!("设置页：开机自启 开关→开，后台写启动夹（结果走 Toast）");
+                                    log_info!("设置页：开机自启 开关→开，后台写启动夹（结果走 Toast）");
                                 } else {
                                     let (text, color) = match source::application::uninstall_startup() {
                                         Ok(s) => {
-                                            eprintln!("设置页：开机自启 开关→关，{s}");
+                                            log_info!("设置页：开机自启 开关→关，{s}");
                                             (format!("✓ {s}"), TOAST_OK)
                                         }
                                         Err(s) => {
-                                            eprintln!("设置页：开机自启 卸载失败：{s}");
+                                            log_info!("设置页：开机自启 卸载失败：{s}");
                                             (format!("⚠ {s}"), TOAST_ERR)
                                         }
                                     };
@@ -7490,7 +7512,7 @@ impl LauncherApp {
                             if space != self.prefs.space_to_run {
                                 self.prefs.space_to_run = space;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：space_to_run = {}（已写 settings.json）",
                                     space.as_str()
                                 );
@@ -7519,7 +7541,7 @@ impl LauncherApp {
                             if mode != self.prefs.tab_mode {
                                 self.prefs.tab_mode = mode;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!("设置页：tab_mode = {mode:?}（已写 settings.json）");
+                                log_info!("设置页：tab_mode = {mode:?}（已写 settings.json）");
                                 ui.ctx().request_repaint();
                             }
                             ui.label(
@@ -7541,7 +7563,7 @@ impl LauncherApp {
                             if rank != self.prefs.learn_rank {
                                 self.prefs.learn_rank = rank;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：learn_rank = {}（已写 settings.json）",
                                     rank.as_str()
                                 );
@@ -7565,7 +7587,7 @@ impl LauncherApp {
                             if list_rows != self.prefs.list_rows {
                                 self.prefs.list_rows = list_rows;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：list_rows = {}（已写 settings.json）",
                                     list_rows.as_str()
                                 );
@@ -7620,7 +7642,7 @@ impl LauncherApp {
                             if scope != self.prefs.default_scope {
                                 self.prefs.default_scope = scope;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：default_scope = {}（已写 settings.json）",
                                     scope.as_str()
                                 );
@@ -7678,7 +7700,7 @@ impl LauncherApp {
                                 if added > 0 || hidden > 0 {
                                     self.save_items();
                                 }
-                                eprintln!(
+                                log_info!(
                                     "设置页：补回缺失的出厂命令 → 补 {added} 条，按 hidden[] 再剔 {hidden} 条"
                                 );
                                 let text = if added == 0 {
@@ -7723,7 +7745,7 @@ impl LauncherApp {
                                 || (hr.changed() && !ui.input(|i| i.pointer.primary_down()))
                             {
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：history_size = {}（已写 settings.json）",
                                     self.prefs.history_size
                                 );
@@ -7747,7 +7769,7 @@ impl LauncherApp {
                                     TOAST_OK,
                                 ));
                                 ui.ctx().request_repaint_after(TOAST_TTL);
-                                eprintln!("设置页：批量导入全部 已触发（后台扫描开始菜单/桌面）");
+                                log_info!("设置页：批量导入全部 已触发（后台扫描开始菜单/桌面）");
                             }
                             ui.label(
                                 egui::RichText::new("扫描开始菜单/桌面的快捷方式并入清单（已有项不重复、不删除）。")
@@ -7767,7 +7789,7 @@ impl LauncherApp {
                             {
                                 self.prefs.confirm_actions = confirm_actions;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：confirm_actions = {confirm_actions}（已写 settings.json）"
                                 );
                                 ui.ctx().request_repaint();
@@ -7801,7 +7823,7 @@ impl LauncherApp {
                             if shell != before {
                                 self.prefs.terminal_shell = shell.as_str().to_string();
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：terminal_shell = {}（已写 settings.json）",
                                     shell.as_str()
                                 );
@@ -7833,7 +7855,7 @@ impl LauncherApp {
                                     .clicked()
                                 {
                                     self.hotkey_recording = !self.hotkey_recording;
-                                    eprintln!(
+                                    log_info!(
                                         "设置页：热键录制 {}（当前 {}）",
                                         if self.hotkey_recording { "开始" } else { "取消" },
                                         self.hotkey_active.display()
@@ -7879,7 +7901,7 @@ impl LauncherApp {
                                     .clicked()
                                 {
                                     self.extra_recording = !self.extra_recording;
-                                    eprintln!(
+                                    log_info!(
                                         "设置页：副呼出键录制 {}（当前 {}）",
                                         if self.extra_recording { "开始" } else { "取消" },
                                         match self.extra_active {
@@ -7938,7 +7960,7 @@ impl LauncherApp {
                                     .clicked()
                                 {
                                     self.selection_recording = !self.selection_recording;
-                                    eprintln!(
+                                    log_info!(
                                         "设置页：选中内容键录制 {}（当前 {}）",
                                         if self.selection_recording { "开始" } else { "取消" },
                                         match self.selection_active {
@@ -7987,7 +8009,7 @@ impl LauncherApp {
                                 // 钩子只活在热键线程里（低级键盘钩子的回调跑在装它的线程上），
                                 // 所以这里只投消息，换档与重置判定状态都在那边做。
                                 post_double_tap(tap_mode);
-                                eprintln!(
+                                log_info!(
                                     "设置页：双击呼出 → {}（已写 settings.json，钩子已换档）",
                                     tap_mode.as_str()
                                 );
@@ -8024,7 +8046,7 @@ impl LauncherApp {
                                 };
                                 if ui.button(shown).clicked() {
                                     self.typeback_armed = !self.typeback_armed;
-                                    eprintln!(
+                                    log_info!(
                                         "设置页：补字符键选键 {}（当前草稿 {}）",
                                         if self.typeback_armed { "开始" } else { "取消" },
                                         self.typeback_draft
@@ -8136,7 +8158,7 @@ impl LauncherApp {
                             if mode != self.prefs.secondary_action {
                                 self.prefs.secondary_action = mode;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：次级动作形态 → {}（已写 settings.json）",
                                     mode.as_str()
                                 );
@@ -8159,7 +8181,7 @@ impl LauncherApp {
                                     .clicked()
                                 {
                                     self.secondary_recording = !self.secondary_recording;
-                                    eprintln!(
+                                    log_info!(
                                         "设置页：次级动作键录制 {}（当前 {}）",
                                         if self.secondary_recording { "开始" } else { "取消" },
                                         self.prefs.secondary_hotkey.display()
@@ -8169,7 +8191,7 @@ impl LauncherApp {
                                     if ui.button("恢复默认").clicked() {
                                         self.prefs.secondary_hotkey = HotkeySpec::SECONDARY_DEFAULT;
                                         source::application::save_settings(&self.prefs);
-                                        eprintln!(
+                                        log_info!(
                                             "设置页：次级动作键恢复默认 {}（已写 settings.json）",
                                             HotkeySpec::SECONDARY_DEFAULT.display()
                                         );
@@ -8272,7 +8294,7 @@ impl LauncherApp {
                                     && self.prefs.set_source(id, on)
                                 {
                                     source::application::save_settings(&self.prefs);
-                                    eprintln!(
+                                    log_info!(
                                         "设置页：数据源 {} → {}（已写 settings.json）",
                                         id.as_str(),
                                         if on { "开" } else { "关" }
@@ -8421,7 +8443,7 @@ impl LauncherApp {
                                 if depth != before {
                                     self.prefs.file_depth = depth;
                                     source::application::save_settings(&self.prefs);
-                                    eprintln!("设置页：file_depth = {depth}（已写 settings.json）");
+                                    log_info!("设置页：file_depth = {depth}（已写 settings.json）");
                                     ui.ctx().request_repaint();
                                 }
                             });
@@ -8439,7 +8461,7 @@ impl LauncherApp {
                                 if cap != before {
                                     self.prefs.file_max_entries = cap;
                                     source::application::save_settings(&self.prefs);
-                                    eprintln!("设置页：file_max_entries = {cap}（已写 settings.json）");
+                                    log_info!("设置页：file_max_entries = {cap}（已写 settings.json）");
                                     ui.ctx().request_repaint();
                                 }
                             });
@@ -8459,7 +8481,7 @@ impl LauncherApp {
                                 if mins != before {
                                     self.prefs.file_refresh_minutes = mins;
                                     source::application::save_settings(&self.prefs);
-                                    eprintln!(
+                                    log_info!(
                                         "设置页：file_refresh_minutes = {mins}（已写 settings.json）"
                                     );
                                     ui.ctx().request_repaint();
@@ -8475,7 +8497,7 @@ impl LauncherApp {
                                 if mql != before {
                                     self.prefs.file_min_query_len = mql;
                                     source::application::save_settings(&self.prefs);
-                                    eprintln!(
+                                    log_info!(
                                         "设置页：file_min_query_len = {mql}（已写 settings.json）"
                                     );
                                     ui.ctx().request_repaint();
@@ -8517,7 +8539,7 @@ impl LauncherApp {
                                 || (wr.changed() && !ui.input(|i| i.pointer.primary_down()))
                             {
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：窗口宽度 = {}（已写 settings.json）",
                                     self.prefs.appearance.width.round()
                                 );
@@ -8529,7 +8551,7 @@ impl LauncherApp {
                             {
                                 self.prefs.appearance.remember_position = remember;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：remember_position = {remember}（已写 settings.json）"
                                 );
                             }
@@ -8548,7 +8570,7 @@ impl LauncherApp {
                             if show_on != self.prefs.appearance.show_on {
                                 self.prefs.appearance.show_on = show_on;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：show_on = {}（已写 settings.json）",
                                     show_on.as_str()
                                 );
@@ -8568,7 +8590,7 @@ impl LauncherApp {
                                     window_height(&self.theme, self.prefs.row_density, bar);
                                 self.resize_to_list(ui.ctx(), h, "切换状态栏");
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：status_bar = {bar}（窗口高度 → {h}，已写 settings.json）"
                                 );
                             }
@@ -8579,7 +8601,7 @@ impl LauncherApp {
                             {
                                 self.prefs.appearance.fade = fade;
                                 source::application::save_settings(&self.prefs);
-                                eprintln!(
+                                log_info!(
                                     "设置页：fade = {fade}（已写 settings.json；下一次呼出生效）"
                                 );
                             }
@@ -8613,7 +8635,7 @@ impl LauncherApp {
                                 source::application::save_settings(&self.prefs);
                                 // 记生效值 + 来源：`opacity` 是 `Option`，`None` 时
                                 // `unwrap_or_default()` 会打出「不透明度 = 0」，与窗口上的数正好相反。
-                                eprintln!(
+                                log_info!(
                                     "设置页：不透明度 → 生效 {}（外观页 {}，已写 settings.json）",
                                     self.theme.opacity,
                                     match self.prefs.appearance.opacity {
@@ -8634,7 +8656,7 @@ impl LauncherApp {
                                         self.prefs.appearance.opacity = None;
                                         self.apply_opacity_override(ui.ctx());
                                         source::application::save_settings(&self.prefs);
-                                        eprintln!(
+                                        log_info!(
                                             "设置页：不透明度回「跟随主题」（生效 {}，已写 settings.json）",
                                             self.theme.opacity
                                         );
@@ -8684,7 +8706,7 @@ impl LauncherApp {
                                             {
                                                 self.prefs.theme = name.clone();
                                                 source::application::save_settings(&self.prefs);
-                                                eprintln!(
+                                                log_info!(
                                                     "设置页：主题 → {name}（已写 settings.json）"
                                                 );
                                                 self.sync_theme(ui.ctx());
@@ -8716,7 +8738,7 @@ impl LauncherApp {
                                 {
                                     self.prefs.theme = theme::FALLBACK_THEME.to_string();
                                     source::application::save_settings(&self.prefs);
-                                    eprintln!("设置页：主题 → Light（已写 settings.json）");
+                                    log_info!("设置页：主题 → Light（已写 settings.json）");
                                     self.sync_theme(ui.ctx());
                                 }
                             });
@@ -8776,6 +8798,62 @@ impl LauncherApp {
                             );
                         }
                         SettingsTab::Advanced => {
+                            // 批次 G5（FR-SYS-03）：日志级别三选一。
+                            ui.label(egui::RichText::new("日志级别").strong());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "现在生效：{}（{}）。日志落在 launcher.log，☰ →「打开日志」可直接看。\n「标准」只记启动、配置、热键、动作这些一次性的结论；「详细」再加上每帧一样的性能行「perf: 标签 毫秒」与逐次搜索 / 索引的细目。两档都不记你输入的原文、窗口标题与目录路径。\n这格空白（跟随构建）时，debug 构建记详细、release 构建记标准——调试版多话、发布版闭嘴是默认口径。",
+                                    logging::level().label(),
+                                    match self.prefs.log_level {
+                                        Some(_) => "设置页指定",
+                                        None => "跟随构建",
+                                    },
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                            let mut log_choice = self.prefs.log_level;
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut log_choice, None, "跟随构建（默认）")
+                                    .on_hover_text(format!(
+                                        "按构建自动选：debug 构建＝详细、release 构建＝标准（当前构建会选「{}」）",
+                                        logging::LogLevel::fallback().label()
+                                    ));
+                                for lv in logging::LogLevel::ALL {
+                                    ui.selectable_value(&mut log_choice, Some(lv), lv.label())
+                                        .on_hover_text(lv.hint());
+                                }
+                            });
+                            if log_choice != self.prefs.log_level {
+                                self.prefs.log_level = log_choice;
+                                source::application::save_settings(&self.prefs);
+                                let applied = log_choice.unwrap_or_else(logging::LogLevel::fallback);
+                                logging::set_level(applied);
+                                log_info!(
+                                    "设置页：日志级别 = {}（已写 settings.json）",
+                                    applied.as_str()
+                                );
+                                self.internal_toast(
+                                    ui.ctx(),
+                                    &format!("日志级别已改为「{}」", applied.label()),
+                                    true,
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.separator();
+                            // 批次 G5（FR-SYS-03）：一键复制系统信息。
+                            ui.label(egui::RichText::new("复制系统信息").strong());
+                            ui.label(
+                                egui::RichText::new(
+                                    r"把版本 / 系统 / 渲染 / DPI / 外观 / 落盘位置 / 各类条数 / 热键拼成一段纯文本放进剪贴板，提问题时整段贴过去即可。路径里的 C:\Users\<用户名> 会换成 %USERPROFILE%；条目名称、查询原文、窗口标题一律不在里面。托盘菜单里也有同一个入口。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            if ui.button("复制系统信息").clicked() {
+                                self.copy_system_info(ui.ctx());
+                            }
+                            ui.separator();
                             // 批次 F7（FR-CFG-07）：重置学习排序。
                             ui.label(egui::RichText::new("重置学习排序").strong());
                             ui.label(
@@ -8787,7 +8865,7 @@ impl LauncherApp {
                             );
                             if ui.button("重置学习排序…").clicked() {
                                 self.pending_destructive = Some(Destructive::ResetLearning);
-                                eprintln!("设置页：点了「重置学习排序」，等确认");
+                                log_info!("设置页：点了「重置学习排序」，等确认");
                                 ui.ctx().request_repaint();
                             }
                             ui.separator();
@@ -8804,7 +8882,7 @@ impl LauncherApp {
                             );
                             if ui.button("清空搜索历史…").clicked() {
                                 self.pending_destructive = Some(Destructive::ClearHistory);
-                                eprintln!("设置页：点了「清空搜索历史」，等确认");
+                                log_info!("设置页：点了「清空搜索历史」，等确认");
                                 ui.ctx().request_repaint();
                             }
                             ui.separator();
@@ -8830,7 +8908,7 @@ impl LauncherApp {
                                 );
                                 if ui.button("清空参数历史…").clicked() {
                                     self.pending_destructive = Some(Destructive::ClearParamHistory);
-                                    eprintln!("设置页：点了「清空参数历史」，等确认");
+                                    log_info!("设置页：点了「清空参数历史」，等确认");
                                     ui.ctx().request_repaint();
                                 }
                             }
@@ -8846,7 +8924,7 @@ impl LauncherApp {
                             );
                             if ui.button("恢复默认…").clicked() {
                                 self.pending_destructive = Some(Destructive::RestoreDefaults);
-                                eprintln!("设置页：点了「恢复默认」，等确认");
+                                log_info!("设置页：点了「恢复默认」，等确认");
                                 ui.ctx().request_repaint();
                             }
                             ui.separator();
@@ -8935,7 +9013,7 @@ impl LauncherApp {
                                             Instant::now() + TOAST_TTL,
                                             TOAST_OK,
                                         ));
-                                        eprintln!(
+                                        log_info!(
                                             "设置页：全部恢复隐藏条目 → {n} 条（孤儿 uid 保留）"
                                         );
                                         ui.ctx().request_repaint_after(TOAST_TTL);
@@ -8982,7 +9060,7 @@ impl LauncherApp {
         }
         switch_ime_to_english(ime_wnd, before);
         let after = get_ime_state(ime_wnd);
-        eprintln!(
+        log_info!(
             "IME→English: before open={} conv=0x{:X} | after open={} conv=0x{:X}",
             before.open, before.conv, after.open, after.conv
         );
@@ -9017,7 +9095,7 @@ impl LauncherApp {
                 if self.prefs.appearance.pos_rel != Some(rel) {
                     self.prefs.appearance.pos_rel = Some(rel);
                     source::application::save_settings(&self.prefs);
-                    eprintln!(
+                    log_info!(
                         "窗口：记住位置（工作区 {}/1000、{}/1000）",
                         rel[0], rel[1]
                     );
@@ -9033,7 +9111,7 @@ impl LauncherApp {
         // 光标也要一起放到末尾（`query` 是程序化改写的，见 [`caret_to_end`]）。
         if let Some(p) = self.panel.take() {
             let chars = p.saved_query.chars().count();
-            eprintln!(
+            log_info!(
                 "操作面板：窗口隐藏 ⇒ 退出面板，原查询（{chars} 个字符，不落原文）与第 {} 行已放回",
                 p.saved_selected + 1
             );
@@ -9046,14 +9124,14 @@ impl LauncherApp {
         // 批次 E4：批量回收站的确认框同样不跨隐藏保留——留着的话下次呼出会直接看见一句
         // 「把这 N 项移到回收站？」，而用户早已忘了自己标过什么。
         if self.batch_confirm.take().is_some() {
-            eprintln!("全部回收站：窗口隐藏 ⇒ 取消确认（未删除）");
+            log_info!("全部回收站：窗口隐藏 ⇒ 取消确认（未删除）");
         }
         // 批次 C3：翻历史的位置同样不跨隐藏保留。不归零的症状最扎手：执行一次之后那条被
         // `push_history` 挪到了第 1 格，而 `index` 还停在上一轮的 3 ⇒ 下次呼出按 `Ctrl+↑`
         // 从第 4 格起跳，前三条全被跳过。草稿也一起丢（那串属于上一轮，不是这一轮要回来的东西）。
         if self.history_browse.index != 0 {
             self.history_browse = Default::default();
-            eprintln!("搜索历史：窗口隐藏 ⇒ 翻页位置归零");
+            log_info!("搜索历史：窗口隐藏 ⇒ 翻页位置归零");
         }
         // 批次 R：窗口一隐藏，eframe 就不再跑 `ui()` ⇒ `hotkey_frame` 末尾那条边沿检测等不到
         // 下一帧。取键态若还开着，全局呼出会一直停在"临时注销"状态（按了没反应），所以在这里
@@ -9067,14 +9145,14 @@ impl LauncherApp {
             self.typeback_armed = false;
             self.extra_recording = false;
             self.selection_recording = false;
-            eprintln!("设置页：窗口隐藏 ⇒ 退出取键（录制/选键状态不跨隐藏保留）");
+            log_info!("设置页：窗口隐藏 ⇒ 退出取键（录制/选键状态不跨隐藏保留）");
             self.sync_keypick_suspend();
         }
         // 批次 E3-丙：次级动作键框同理，但它没进 `sync_keypick_suspend`（那颗键不在系统里，
         // 没有"装回去"这回事），所以只落自己的旗标。
         if self.secondary_recording {
             self.secondary_recording = false;
-            eprintln!("设置页：窗口隐藏 ⇒ 退出次级动作键录制");
+            log_info!("设置页：窗口隐藏 ⇒ 退出次级动作键录制");
         }
         let Some(before) = self.ime_before.take() else {
             return;
@@ -9082,7 +9160,7 @@ impl LauncherApp {
         if let Some(ime_wnd) = foreground_ime_wnd() {
             restore_ime(ime_wnd, before);
             let after = get_ime_state(ime_wnd);
-            eprintln!(
+            log_info!(
                 "IME restore: before open={} conv=0x{:X} | after open={} conv=0x{:X}",
                 before.open, before.conv, after.open, after.conv
             );
@@ -9104,11 +9182,11 @@ impl LauncherApp {
         match make_fill_prompt(dg, &fill) {
             Some(p) => {
                 dg.fill_prompt = Some(p);
-                eprintln!("弹窗：{origin}与已填的别名/名称不同，等用户选「替换」还是「保留」（内容不落日志）");
+                log_info!("弹窗：{origin}与已填的别名/名称不同，等用户选「替换」还是「保留」（内容不落日志）");
             }
             None => {
                 apply_fill(dg, &fill, true);
-                eprintln!("弹窗：{origin}已填入表单（内容不落日志）");
+                log_info!("弹窗：{origin}已填入表单（内容不落日志）");
             }
         }
         ctx.request_repaint();
@@ -9149,7 +9227,7 @@ impl LauncherApp {
                 self.fill_dialog(ctx, fill, origin);
             }
             Ok(None) => {
-                eprintln!("弹窗：{what}选择已取消");
+                log_info!("弹窗：{what}选择已取消");
                 ctx.request_repaint();
             }
             Err(e) => self.internal_toast(ctx, &format!("⚠ {e}"), false),
@@ -9210,12 +9288,12 @@ impl LauncherApp {
         let name = if name.trim().is_empty() { path.clone() } else { name };
         match shell_execute_show(&path, &args, wd.as_deref(), nshow(show_flag)) {
             Ok(_) => {
-                eprintln!("弹窗测试执行：已启动（名称/路径/参数不落日志）");
+                log_info!("弹窗测试执行：已启动（名称/路径/参数不落日志）");
                 let note = if asked { "（标记已按当前现场展开，{%p} 为空）" } else { "" };
                 self.internal_toast(ctx, &format!("✓ 已测试启动「{name}」{note}"), true);
             }
             Err(e) => {
-                eprintln!("弹窗测试执行失败：{e}");
+                log_info!("弹窗测试执行失败：{e}");
                 self.internal_toast(ctx, &format!("⚠ 测试启动失败：{e}"), false);
             }
         }
@@ -9262,7 +9340,7 @@ impl LauncherApp {
         // 整条命令只写了一个 `@` ⇒ 剥完没东西可启动。不交给 ShellExecute 换一个
         // "找不到文件"的系统错误，直接说清楚是标志后面缺命令。
         if file.is_empty() {
-            eprintln!(
+            log_info!(
                 "launch: 运行标志后面没有命令，未启动（{}）",
                 entry.kind.label()
             );
@@ -9276,8 +9354,8 @@ impl LauncherApp {
             nshow(flag),
         ) {
             Ok(_) => match masked_uid {
-                None => eprintln!("launch: {} {}", file, entry.arguments),
-                Some(uid) => eprintln!(
+                None => log_info!("launch: {} {}", file, entry.arguments),
+                Some(uid) => log_info!(
                     "launch(custom): 已启动「{}」（{uid}，填入的路径/参数含用户内容，不落日志）",
                     entry.name
                 ),
@@ -9285,8 +9363,8 @@ impl LauncherApp {
             Err(e) => {
                 // M1 验收：启动失败不崩溃、不隐藏——窗口留在原地显示 Toast，TOAST_TTL 后自动消失。
                 match masked_uid {
-                    None => eprintln!("launch failed: {}: {e}", file),
-                    Some(uid) => eprintln!("launch(custom) failed: 「{}」{uid}: {e}", entry.name),
+                    None => log_info!("launch failed: {}: {e}", file),
+                    Some(uid) => log_info!("launch(custom) failed: 「{}」{uid}: {e}", entry.name),
                 }
                 self.toast = Some((
                     format!("⚠ 启动失败：{}（{e}）", entry.name),
@@ -9316,12 +9394,12 @@ impl LauncherApp {
     /// 返回 `false` ＝ 这一帧什么都没做（路径不认识 / 正在等确认），调用方据此不记学习统计。
     fn run_internal(&mut self, ctx: &egui::Context, entry: &LaunchItem) -> bool {
         let Some(action) = source::system::InternalAction::from_path(&entry.path) else {
-            eprintln!("internal: 不认识的系统命令路径 {}", entry.path);
+            log_info!("internal: 不认识的系统命令路径 {}", entry.path);
             self.internal_toast(ctx, &format!("⚠ 这条系统命令不认识：{}", entry.path), false);
             return false;
         };
         if action.needs_confirm() && self.prefs.confirm_actions {
-            eprintln!("internal: 「{}」执行前确认（{}）", entry.name, action.id());
+            log_info!("internal: 「{}」执行前确认（{}）", entry.name, action.id());
             self.internal_confirm = Some(InternalConfirm {
                 action,
                 name: entry.name.clone(),
@@ -9347,7 +9425,7 @@ impl LauncherApp {
                     SettingsTab::from_page(u32::from(page)).unwrap_or(SettingsTab::General);
                 self.clear_query_next_frame = true;
                 self.focus_query = false;
-                eprintln!("internal: 打开设置页 {page}");
+                log_info!("internal: 打开设置页 {page}");
                 ctx.request_repaint();
                 true
             }
@@ -9357,13 +9435,13 @@ impl LauncherApp {
             }
             A::RebuildAppIndex => {
                 source::application::spawn_batch_import(self.apps_tx.clone());
-                eprintln!("internal: 重建应用索引（后台扫描开始菜单/桌面）");
+                log_info!("internal: 重建应用索引（后台扫描开始菜单/桌面）");
                 self.internal_toast(ctx, "✓ 应用索引已在后台重建，完成后自动合并", true);
                 true
             }
             A::RebuildFileIndex => {
                 if !self.prefs.source_on(source::SourceId::Files) {
-                    eprintln!("internal: 文件搜索源已关闭，拒绝重建索引");
+                    log_info!("internal: 文件搜索源已关闭，拒绝重建索引");
                     self.internal_toast(ctx, "⚠ 文件搜索源已关闭，没有可重建的索引", false);
                     return false;
                 }
@@ -9374,13 +9452,13 @@ impl LauncherApp {
                         hit = true;
                     }
                 }
-                eprintln!("internal: 文件索引重建请求已派发（找到文件源={hit}）");
+                log_info!("internal: 文件索引重建请求已派发（找到文件源={hit}）");
                 self.internal_toast(ctx, "✓ 文件索引已在后台重建", hit);
                 hit
             }
             A::About => {
                 self.about_open = true;
-                eprintln!("internal: 打开「关于本程序」");
+                log_info!("internal: 打开「关于本程序」");
                 ctx.request_repaint();
                 true
             }
@@ -9390,18 +9468,18 @@ impl LauncherApp {
                 true
             }
             A::Quit => {
-                eprintln!("internal: 退出启动器");
+                log_info!("internal: 退出启动器");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 true
             }
             A::Lock => match unsafe { LockWorkStation() } {
                 Ok(()) => {
-                    eprintln!("internal: 已锁定屏幕");
+                    log_info!("internal: 已锁定屏幕");
                     self.collapse_after_run(ctx);
                     true
                 }
                 Err(e) => {
-                    eprintln!("internal: 锁定屏幕失败：{e}");
+                    log_info!("internal: 锁定屏幕失败：{e}");
                     self.internal_toast(ctx, &format!("⚠ 锁定屏幕失败：{e}"), false);
                     false
                 }
@@ -9422,13 +9500,13 @@ impl LauncherApp {
                 let flags = SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND;
                 match unsafe { SHEmptyRecycleBinW(None, PCWSTR::null(), flags) } {
                     Ok(()) => {
-                        eprintln!("internal: 回收站已清空");
+                        log_info!("internal: 回收站已清空");
                         self.collapse_after_run(ctx);
                         true
                     }
                     Err(e) => {
                         // 回收站本来就空时也可能回一个失败码；照实说，不谎报成功。
-                        eprintln!("internal: 清空回收站失败：{e}");
+                        log_info!("internal: 清空回收站失败：{e}");
                         self.internal_toast(ctx, &format!("⚠ 清空回收站失败：{e}"), false);
                         false
                     }
@@ -9446,7 +9524,7 @@ impl LauncherApp {
                         None,
                     )
                 };
-                eprintln!(
+                log_info!(
                     "internal: 已请求关闭显示器（SendMessageTimeout 返回 {}）",
                     r.0
                 );
@@ -9466,7 +9544,7 @@ impl LauncherApp {
     /// 音量/媒体键：走 `SendInput` 的虚拟键注入（与补字符那格同一个 API，但这里是真 VK）。
     fn send_media_key(&mut self, ctx: &egui::Context, vk: VIRTUAL_KEY, what: &str) -> bool {
         press_vk(vk.0);
-        eprintln!("internal: 已发送「{what}」键（vk 0x{:02X}）", vk.0);
+        log_info!("internal: 已发送「{what}」键（vk 0x{:02X}）", vk.0);
         self.collapse_after_run(ctx);
         true
     }
@@ -9481,12 +9559,12 @@ impl LauncherApp {
     ) -> bool {
         match run_console_tool(exe, args) {
             Ok(()) => {
-                eprintln!("internal: {what} 已派发（{exe}）");
+                log_info!("internal: {what} 已派发（{exe}）");
                 self.collapse_after_run(ctx);
                 true
             }
             Err(e) => {
-                eprintln!("internal: {what} 失败：{e}");
+                log_info!("internal: {what} 失败：{e}");
                 self.internal_toast(ctx, &format!("⚠ {what}失败：{e}"), false);
                 false
             }
@@ -9521,6 +9599,16 @@ impl LauncherApp {
             note.push("settings.json 解析失败，沿用当前设置".to_string());
         } else {
             self.prefs = prefs;
+            // 批次 G5：日志级别也随这一入口生效（手改 `log_level` 之后不必重启）。
+            // 只在真的变了才记一条，免得每次"重新加载配置"都刷一行。
+            let wanted_log = self
+                .prefs
+                .log_level
+                .unwrap_or_else(logging::LogLevel::fallback);
+            if wanted_log != logging::level() {
+                logging::set_level(wanted_log);
+                note.push(format!("日志级别改为「{}」", wanted_log.label()));
+            }
             if self.prefs.toggle_hotkey != hotkey_before {
                 self.request_hotkey(self.prefs.toggle_hotkey);
                 note.push("呼出热键已按配置重装".to_string());
@@ -9546,7 +9634,7 @@ impl LauncherApp {
             self.selected = 0;
             let jobs = icon_jobs(&self.items);
             self.spawn_missing_icons(jobs);
-            eprintln!(
+            log_info!(
                 "internal: 重新加载配置 → 清单 {} 条（hidden 剔掉 {dropped} 条）",
                 self.items.len()
             );
@@ -9558,6 +9646,104 @@ impl LauncherApp {
             format!("⚠ 重新加载：{}", note.join("；"))
         };
         self.internal_toast(ctx, &text, note.is_empty());
+    }
+
+    /// 批次 G5（FR-SYS-03）：把一段脱敏后的系统信息写进剪贴板。
+    /// 两个入口（设置页「高级」页的按钮、托盘「复制系统信息」）走同一份实现。
+    ///
+    /// 只取"排障要用、又不认人"的字段：版本 / 系统 / 渲染 / DPI / 外观 / 路径（已脱敏）/
+    /// 各类计数 / 数据源开关 / 热键槽位。**条目名称、查询原文、窗口标题一概不取**——
+    /// 结构上没有对应字段，不是靠"记得别写"。
+    fn copy_system_info(&mut self, ctx: &egui::Context) {
+        let profile = sysinfo::user_profile();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let log = source::application::log_path();
+
+        let mut open: Vec<&str> = Vec::new();
+        let mut closed: Vec<&str> = Vec::new();
+        for s in &self.sources {
+            if self.prefs.source_on(s.id()) {
+                open.push(s.label());
+            } else {
+                closed.push(s.label());
+            }
+        }
+        let dash = |v: &[&str]| {
+            if v.is_empty() {
+                "—".to_string()
+            } else {
+                v.join("、")
+            }
+        };
+        let sources = format!("开 {}；关 {}", dash(&open), dash(&closed));
+
+        let key = |k: Option<HotkeySpec>| k.map(|k| k.display()).unwrap_or_else(|| "—".to_string());
+        let hotkeys = vec![
+            ("呼出", self.hotkey_active.display()),
+            ("次呼出", key(self.extra_active)),
+            ("补字符", key(self.typeback_active)),
+            ("选中内容", key(self.selection_active)),
+            ("双击", self.prefs.dbl_tap.label().to_string()),
+        ];
+
+        let ppp = ctx.pixels_per_point();
+        let size = ctx.content_rect().size();
+        let facts = sysinfo::SystemFacts {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build_kind: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
+            log_level: format!(
+                "{}（{}）",
+                logging::level().label(),
+                if self.prefs.log_level.is_some() {
+                    "设置页指定"
+                } else {
+                    "跟随构建"
+                }
+            ),
+            os: sysinfo::os_version(),
+            arch: std::env::consts::ARCH.to_string(),
+            backend: "OpenGL（wgpu GL 后端，程序固定只留 GL）".to_string(),
+            dpi: format!("{:.0}%（{ppp:.2} px/pt）", ppp * 100.0),
+            appearance: format!(
+                "{}｜字体 {} {:.0}｜行高 {:.0}｜行密度 {}｜窗口 {:.0}×{:.0}",
+                self.theme.name,
+                self.theme.font_name,
+                self.theme.input_font_size,
+                self.theme.row_height,
+                self.prefs.row_density.as_str(),
+                size.x,
+                size.y
+            ),
+            paths: vec![
+                ("程序", sysinfo::redact(&exe, &profile)),
+                ("数据", sysinfo::redact(&self.data_dir, &profile)),
+                ("日志", sysinfo::redact(&log, &profile)),
+            ],
+            counts: vec![
+                ("清单", self.items.len()),
+                ("隐藏", self.prefs.hidden.len()),
+                ("网页引擎", self.prefs.web_engines.len()),
+                ("搜索历史", self.history.len()),
+                ("参数历史", self.param_history.len()),
+            ],
+            sources,
+            hotkeys,
+        };
+        let report = sysinfo::build_report(&facts);
+        match copy_to_clipboard(&report) {
+            Ok(()) => {
+                // 只记字节数与"已脱敏"这个事实：报告正文本身不落日志（它就是给剪贴板用的）。
+                log_info!(
+                    "sysinfo: 系统信息已复制到剪贴板（{} 字节，路径已脱敏）",
+                    report.len()
+                );
+                self.internal_toast(ctx, "✓ 系统信息已复制到剪贴板（路径已脱敏）", true);
+            }
+            Err(e) => {
+                log_info!("sysinfo: 复制系统信息失败：{e}");
+                self.internal_toast(ctx, &format!("⚠ 复制系统信息失败：{e}"), false);
+            }
+        }
     }
 
     /// 补全提示行不可执行（需求书把空词这一格定为 `valid=false`）：Enter/点击/数字键
@@ -9574,12 +9760,12 @@ impl LauncherApp {
     /// URL 本身也不记（它同样带着查询词）。
     fn open_search_hit(&mut self, ctx: &egui::Context, hit: &source::websearch::SearchHit) -> bool {
         match shell_execute(&hit.url, "", None) {
-            Ok(_) => eprintln!(
+            Ok(_) => log_info!(
                 "websearch: 已用默认浏览器打开（引擎 {}，查询原文不落日志）",
                 hit.engine_id
             ),
             Err(e) => {
-                eprintln!("websearch: 打开失败（引擎 {}）：{e}", hit.engine_id);
+                log_info!("websearch: 打开失败（引擎 {}）：{e}", hit.engine_id);
                 self.toast = Some((
                     format!("⚠ 打开失败：{e}"),
                     Instant::now() + TOAST_TTL,
@@ -9605,12 +9791,12 @@ impl LauncherApp {
     /// 文件源不在清单里 ⇒ 只记动作与类型，路径与查询原文都不落日志。
     fn open_file_hit(&mut self, ctx: &egui::Context, hit: &source::filesearch::FileHit) -> bool {
         match shell_execute(&hit.path, "", None) {
-            Ok(_) => eprintln!(
+            Ok(_) => log_info!(
                 "文件搜索：已用系统关联程序打开{}（路径由查询现出，不落日志）",
                 if hit.is_dir { "目录" } else { "文件" }
             ),
             Err(e) => {
-                eprintln!("文件搜索：打开失败：{e}");
+                log_info!("文件搜索：打开失败：{e}");
                 self.toast = Some((
                     format!("⚠ 打开失败：{e}"),
                     Instant::now() + TOAST_TTL,
@@ -9636,7 +9822,7 @@ impl LauncherApp {
         // 命令原文不落日志，但**成败都要落一行**：这是唯一能事后看出「敲了 > 没反应」的线索。
         // 成功那句在 `spawn` 之后打，免得"已启动"和"启动失败"前后脚同时出现。
         if let Err(e) = hit.shell.spawn(&hit.command) {
-            eprintln!("terminal: 启动失败（shell {}）：{e}", hit.shell.as_str());
+            log_info!("terminal: 启动失败（shell {}）：{e}", hit.shell.as_str());
             self.toast = Some((
                 format!("⚠ 启动失败：{e}"),
                 Instant::now() + TOAST_TTL,
@@ -9645,7 +9831,7 @@ impl LauncherApp {
             ctx.request_repaint_after(TOAST_TTL);
             return false;
         }
-        eprintln!(
+        log_info!(
             "terminal: 已启动（shell {}，命令原文不落日志）",
             hit.shell.as_str()
         );
@@ -9686,7 +9872,7 @@ impl LauncherApp {
         let Some((target, open)) =
             panel_for_row(row, &plan.head, &plan.results, &self.items, &self.path_states)
         else {
-            eprintln!("操作面板：这一行没有可处置的对象（终端 / 提示 / 分类行），不进面板");
+            log_info!("操作面板：这一行没有可处置的对象（终端 / 提示 / 分类行），不进面板");
             return false;
         };
         // 「恢复选中行」按**这一行本身**记，不按此刻的选中记：键盘（`→`）进来时两者相等——
@@ -9698,14 +9884,14 @@ impl LauncherApp {
         let panel_actions = actions::actions_for(&target);
         // FR-SYS-03：只有清单里真实存在的条目才报名字——文件行 / 搜索行的标题是从查询现出来的。
         if target.editable {
-            eprintln!(
+            log_info!(
                 "操作面板：进入（{:?}，关于「{}」，动作 {} 条）",
                 target.subject,
                 target.title,
                 panel_actions.len()
             );
         } else {
-            eprintln!(
+            log_info!(
                 "操作面板：进入（{:?}，动作 {} 条；对象来自查询 ⇒ 标题不落日志）",
                 target.subject,
                 panel_actions.len()
@@ -9746,7 +9932,7 @@ impl LauncherApp {
             batch: paths,
         };
         let panel_actions = actions::actions_for(&target);
-        eprintln!(
+        log_info!(
             "批量面板：进入（已标记 {} 项，动作 {} 条；路径不落日志）",
             target.batch.len(),
             panel_actions.len()
@@ -9775,7 +9961,7 @@ impl LauncherApp {
         // 面板与设置页 / 弹窗共用同一条渲染路径，两套同时开着只会叠在一起。取回来的东西已经
         // 到手了，让用户先关掉再按一次比替他丢掉设置页 / 编辑框里的输入要安全。
         if self.dialog.is_some() || self.settings_open {
-            eprintln!("选中内容：启动器的对话框 / 设置页开着 ⇒ 本次不弹面板（内容已取回但未装载）");
+            log_info!("选中内容：启动器的对话框 / 设置页开着 ⇒ 本次不弹面板（内容已取回但未装载）");
             self.hud.notify(
                 ctx,
                 "先关掉启动器的对话框或设置页，再按一次选中内容热键".to_string(),
@@ -9865,7 +10051,7 @@ impl LauncherApp {
         };
         let panel_actions = actions::actions_for(&panel_target);
         // 与 `open_panel` 同一条日志口径：标题是从别的程序里取回来的 ⇒ 不落日志，只记种类与条数。
-        eprintln!(
+        log_info!(
             "选中内容面板：进入（{:?}，动作 {} 条；标题与内容不落日志）",
             panel_target.subject,
             panel_actions.len()
@@ -9920,7 +10106,7 @@ impl LauncherApp {
     ) -> PanelOutcome {
         match reveal_target(&target.path, source_path) {
             Some(p) => {
-                eprintln!(
+                log_info!(
                     "{via}：所在位置（{} 个字符的路径不落日志）→ 关闭到托盘",
                     p.chars().count()
                 );
@@ -9928,7 +10114,7 @@ impl LauncherApp {
                 PanelOutcome::Gone
             }
             None => {
-                eprintln!("{via}：所在位置落空（{:?}：没有可定位的本地路径）", target.subject);
+                log_info!("{via}：所在位置落空（{:?}：没有可定位的本地路径）", target.subject);
                 self.toast = Some((
                     "⚠ 这一条没有能在资源管理器里定位的本地路径".to_string(),
                     Instant::now() + TOAST_TTL,
@@ -9965,7 +10151,7 @@ impl LauncherApp {
         };
         match copy_to_clipboard(&text) {
             Ok(()) => {
-                eprintln!(
+                log_info!(
                     "{via}：已复制{verb}（{} 个字符，内容不落日志）",
                     text.chars().count()
                 );
@@ -9976,7 +10162,7 @@ impl LauncherApp {
                 ));
             }
             Err(e) => {
-                eprintln!("{via}：复制{verb}失败：{e}");
+                log_info!("{via}：复制{verb}失败：{e}");
                 self.toast = Some((
                     format!("⚠ 复制失败：{e}"),
                     Instant::now() + TOAST_TTL,
@@ -10004,7 +10190,7 @@ impl LauncherApp {
         let chars = target.path.chars().count();
         match paste_text_into_previous_window(&target.path) {
             Ok(where_) => {
-                eprintln!("{via}：已把 {chars} 个字符投给 {where_}（内容不落日志）");
+                log_info!("{via}：已把 {chars} 个字符投给 {where_}（内容不落日志）");
                 self.hud.notify(
                     ctx,
                     format!("✓ 已粘贴 {chars} 个字符到原来的窗口"),
@@ -10016,7 +10202,7 @@ impl LauncherApp {
                 PanelOutcome::Gone
             }
             Err(e) => {
-                eprintln!("{via}：粘贴未执行：{e}");
+                log_info!("{via}：粘贴未执行：{e}");
                 self.toast = Some((format!("⚠ {e}"), Instant::now() + TOAST_TTL, TOAST_ERR));
                 ctx.request_repaint_after(TOAST_TTL);
                 PanelOutcome::Stay
@@ -10039,7 +10225,7 @@ impl LauncherApp {
         let Some((target, open)) =
             panel_for_row(row, &plan.head, &plan.results, &self.items, &self.path_states)
         else {
-            eprintln!("次级动作 {key}：这一行没有可处置的对象（终端 / 提示 / 分类行）");
+            log_info!("次级动作 {key}：这一行没有可处置的对象（终端 / 提示 / 分类行）");
             self.toast = Some((
                 "这一行没有可处置的对象".to_string(),
                 Instant::now() + TOAST_TTL,
@@ -10049,12 +10235,12 @@ impl LauncherApp {
             return;
         };
         if self.prefs.secondary_action == SecondaryAction::Panel {
-            eprintln!("次级动作 {key}：面板版 ⇒ 进操作面板（{:?}）", target.subject);
+            log_info!("次级动作 {key}：面板版 ⇒ 进操作面板（{:?}）", target.subject);
             self.open_panel(ctx, row);
             return;
         }
         let Some(id) = actions::secondary_action_for(target.subject) else {
-            eprintln!(
+            log_info!(
                 "次级动作 {key}：快捷键版对这一行没有默认动作（{:?}）⇒ 提示按 → 看全部",
                 target.subject
             );
@@ -10072,7 +10258,7 @@ impl LauncherApp {
             // 批次 E5：`Value` 同样没有"源路径"——计算器行不在清单里，它只是一个算出来的串。
             PanelOpen::Path | PanelOpen::Batch | PanelOpen::Value => "",
         };
-        eprintln!(
+        log_info!(
             "次级动作 {key}：快捷键版 ⇒ {}（{:?}）",
             id.label(),
             target.subject
@@ -10094,7 +10280,7 @@ impl LauncherApp {
             }
             other => {
                 // 动作表以后扩了映射项、而这里还没接它的执行路径 ⇒ 退回面板，别静默什么都不做。
-                eprintln!(
+                log_info!(
                     "次级动作 {key}：{} 尚未接入快捷键版，退回操作面板",
                     other.label()
                 );
@@ -10158,7 +10344,7 @@ impl LauncherApp {
                     // 文件行 / 搜索行：串从查询现出 ⇒ 与 `open_file_hit` 同一口径，路径不落日志。
                     match shell_execute(&target.path, &target.arguments, None) {
                         Ok(()) => {
-                            eprintln!(
+                            log_info!(
                                 "操作面板：打开（{:?}，路径不落日志）→ 关闭到托盘",
                                 target.subject
                             );
@@ -10166,7 +10352,7 @@ impl LauncherApp {
                             PanelOutcome::Gone
                         }
                         Err(e) => {
-                            eprintln!("操作面板：打开失败（{:?}）：{e}", target.subject);
+                            log_info!("操作面板：打开失败（{:?}）：{e}", target.subject);
                             self.toast = Some((
                                 format!("⚠ 打开失败：{e}"),
                                 Instant::now() + TOAST_TTL,
@@ -10180,14 +10366,14 @@ impl LauncherApp {
                 // 批量面板的表里没有「打开」这一格（第一格是 `OpenAll`）；
                 // 真走到这里说明动作表与这里的分派脱节了，别静默丢掉这一按。
                 PanelOpen::Batch => {
-                    eprintln!("操作面板：批量面板里没有单体的「打开」，这一按未处理");
+                    log_info!("操作面板：批量面板里没有单体的「打开」，这一按未处理");
                     PanelOutcome::Stay
                 }
                 // 批次 E5：文本对象**刻意没有**「打开」——把 `14` 交给 `ShellExecuteExW`
                 // 是去搜一个叫 14 的程序。这里拒绝而不是回落 `Path` 那一条：面板的表已经不给
                 // 这一格了，走到这里只可能是两边分派脱节，宁可留人原地问一句。
                 PanelOpen::Value => {
-                    eprintln!("操作面板：文本对象没有「打开」这一说（那一串不是路径也不是协议）");
+                    log_info!("操作面板：文本对象没有「打开」这一说（那一串不是路径也不是协议）");
                     self.toast = Some((
                         "这一行是一串文本，没有能打开的东西".to_string(),
                         Instant::now() + TOAST_TTL,
@@ -10206,7 +10392,7 @@ impl LauncherApp {
                         &entry.arguments,
                         entry.param_type,
                     ) {
-                        eprintln!("操作面板：这条要先填参数，提权版不支持 ⇒ 请改用「打开」");
+                        log_info!("操作面板：这条要先填参数，提权版不支持 ⇒ 请改用「打开」");
                         self.toast = Some((
                             "这条带参数标记：请用「打开」填参数后再运行".to_string(),
                             Instant::now() + TOAST_TTL,
@@ -10225,7 +10411,7 @@ impl LauncherApp {
                         if let PanelOpen::Entry { uid, .. } = &open {
                             self.mark_used(uid, &alias_word);
                         }
-                        eprintln!(
+                        log_info!(
                             "操作面板：以管理员运行（{:?}）已交给 UAC → 关闭到托盘",
                             target.subject
                         );
@@ -10233,7 +10419,7 @@ impl LauncherApp {
                         PanelOutcome::Gone
                     }
                     Err(e) if user_cancelled(&e) => {
-                        eprintln!("操作面板：提权被用户取消（1223），未运行");
+                        log_info!("操作面板：提权被用户取消（1223），未运行");
                         self.toast = Some((
                             "已取消提权，未运行".to_string(),
                             Instant::now() + TOAST_TTL,
@@ -10243,7 +10429,7 @@ impl LauncherApp {
                         PanelOutcome::Stay
                     }
                     Err(e) => {
-                        eprintln!("操作面板：以管理员运行失败（{:?}）：{e}", target.subject);
+                        log_info!("操作面板：以管理员运行失败（{:?}）：{e}", target.subject);
                         self.toast = Some((
                             format!("⚠ 提权启动失败：{e}"),
                             Instant::now() + TOAST_TTL,
@@ -10265,7 +10451,7 @@ impl LauncherApp {
                 let shell = self.prefs.term_shell();
                 match shell.spawn_at(&dir) {
                     Ok(()) => {
-                        eprintln!(
+                        log_info!(
                             "操作面板：在终端打开（shell {}，目录不落日志）→ 关闭到托盘",
                             shell.as_str()
                         );
@@ -10273,7 +10459,7 @@ impl LauncherApp {
                         PanelOutcome::Gone
                     }
                     Err(e) => {
-                        eprintln!("操作面板：终端启动失败（shell {}）：{e}", shell.as_str());
+                        log_info!("操作面板：终端启动失败（shell {}）：{e}", shell.as_str());
                         self.toast = Some((
                             format!("⚠ 启动失败：{e}"),
                             Instant::now() + TOAST_TTL,
@@ -10287,11 +10473,11 @@ impl LauncherApp {
             // ---- 交给系统的对话框 ----
             actions::ActionId::OpenWith => match open_with_dialog(&target.path) {
                 Ok(()) => {
-                    eprintln!("操作面板：已交给系统「打开方式」（对象来自查询 ⇒ 路径不落日志）");
+                    log_info!("操作面板：已交给系统「打开方式」（对象来自查询 ⇒ 路径不落日志）");
                     PanelOutcome::Stay
                 }
                 Err(e) => {
-                    eprintln!("操作面板：「打开方式」调用失败：{e}");
+                    log_info!("操作面板：「打开方式」调用失败：{e}");
                     self.toast = Some((
                         format!("⚠ 打开方式失败：{e}"),
                         Instant::now() + TOAST_TTL,
@@ -10303,10 +10489,10 @@ impl LauncherApp {
             },
             actions::ActionId::Properties => {
                 if show_properties(&target.path) {
-                    eprintln!("操作面板：属性框已交给系统（{:?}，路径不落日志）", target.subject);
+                    log_info!("操作面板：属性框已交给系统（{:?}，路径不落日志）", target.subject);
                 } else {
                     // `SHObjectProperties` 与 `properties` 动词两道都落空——网络盘上的某些形态会这样。
-                    eprintln!("操作面板：属性框起不来（{:?}）", target.subject);
+                    log_info!("操作面板：属性框起不来（{:?}）", target.subject);
                     self.toast = Some((
                         "⚠ 这个对象没有属性框".to_string(),
                         Instant::now() + TOAST_TTL,
@@ -10338,7 +10524,7 @@ impl LauncherApp {
                 match recycle_path(&target.path) {
                     Ok(()) => {
                         self.refresh_path_states(true);
-                        eprintln!(
+                        log_info!(
                             "操作面板：已移入回收站（{} 个字符的路径不落日志）",
                             target.path.chars().count()
                         );
@@ -10353,7 +10539,7 @@ impl LauncherApp {
                         PanelOutcome::Close
                     }
                     Err(1223) => {
-                        eprintln!("操作面板：那句「永久删除」警告被用户驳回，未删除");
+                        log_info!("操作面板：那句「永久删除」警告被用户驳回，未删除");
                         self.toast = Some((
                             "已取消，未删除".to_string(),
                             Instant::now() + TOAST_TTL,
@@ -10363,7 +10549,7 @@ impl LauncherApp {
                         PanelOutcome::Stay
                     }
                     Err(c) => {
-                        eprintln!("操作面板：移入回收站失败（系统返回 {c}）");
+                        log_info!("操作面板：移入回收站失败（系统返回 {c}）");
                         self.toast = Some((
                             format!("⚠ 移入回收站失败（系统返回 {c}）"),
                             Instant::now() + TOAST_TTL,
@@ -10398,7 +10584,7 @@ impl LauncherApp {
                             name: it.name.clone(),
                             path: it.path.clone(),
                         });
-                        eprintln!("操作面板：删除 {uid} 前先弹确认（未删除）");
+                        log_info!("操作面板：删除 {uid} 前先弹确认（未删除）");
                     }
                 }
                 PanelOutcome::Close
@@ -10419,7 +10605,7 @@ impl LauncherApp {
                             Instant::now() + TOAST_TTL,
                             TOAST_OK,
                         ));
-                        eprintln!("操作面板：置顶切换 {uid} → {on}（「{name}」）");
+                        log_info!("操作面板：置顶切换 {uid} → {on}（「{name}」）");
                     }
                 }
                 PanelOutcome::Reland(new_target)
@@ -10431,11 +10617,11 @@ impl LauncherApp {
                 for p in &target.batch {
                     if let Err(e) = shell_execute(p, "", None) {
                         failed += 1;
-                        eprintln!("批量面板：全部打开失败一项（系统错误）：{e}");
+                        log_info!("批量面板：全部打开失败一项（系统错误）：{e}");
                     }
                 }
                 if failed == total {
-                    eprintln!("批量面板：全部打开 {total} 项全部失败，窗口留在原地");
+                    log_info!("批量面板：全部打开 {total} 项全部失败，窗口留在原地");
                     self.toast = Some((
                         format!("⚠ {total} 项都没能打开"),
                         Instant::now() + TOAST_TTL,
@@ -10444,7 +10630,7 @@ impl LauncherApp {
                     ctx.request_repaint_after(TOAST_TTL);
                     PanelOutcome::Stay
                 } else {
-                    eprintln!(
+                    log_info!(
                         "批量面板：全部打开 {total} 项（失败 {failed} 项；路径不落日志）→ 关闭到托盘"
                     );
                     self.collapse_after_run(ctx);
@@ -10470,7 +10656,7 @@ impl LauncherApp {
                 let verb = if cut { "剪切" } else { "复制" };
                 match copy_files_to_clipboard(&paths, cut) {
                     Ok(()) => {
-                        eprintln!("{via}：{n} 项已{verb}进剪贴板（路径不落日志）");
+                        log_info!("{via}：{n} 项已{verb}进剪贴板（路径不落日志）");
                         self.toast = Some((
                             format!("✓ 已{verb} {n} 项，去资源管理器粘贴"),
                             Instant::now() + TOAST_TTL,
@@ -10478,7 +10664,7 @@ impl LauncherApp {
                         ));
                     }
                     Err(e) => {
-                        eprintln!("{via}：{verb}文件失败：{e}");
+                        log_info!("{via}：{verb}文件失败：{e}");
                         self.toast = Some((
                             format!("⚠ {verb}文件失败：{e}"),
                             Instant::now() + TOAST_TTL,
@@ -10495,7 +10681,7 @@ impl LauncherApp {
                 let joined = target.batch.join("\r\n");
                 match copy_to_clipboard(&joined) {
                     Ok(()) => {
-                        eprintln!("批量面板：已复制 {n} 条路径（内容不落日志）");
+                        log_info!("批量面板：已复制 {n} 条路径（内容不落日志）");
                         self.toast = Some((
                             format!("✓ 已复制 {n} 条路径（每行一条）"),
                             Instant::now() + TOAST_TTL,
@@ -10503,7 +10689,7 @@ impl LauncherApp {
                         ));
                     }
                     Err(e) => {
-                        eprintln!("批量面板：复制路径失败：{e}");
+                        log_info!("批量面板：复制路径失败：{e}");
                         self.toast = Some((
                             format!("⚠ 复制失败：{e}"),
                             Instant::now() + TOAST_TTL,
@@ -10518,16 +10704,16 @@ impl LauncherApp {
                 let n = target.batch.len();
                 let outcome = match pick_folder() {
                     Ok(None) => {
-                        eprintln!("批量面板：复制到 — 用户在文件夹选择框里取消，未复制");
+                        log_info!("批量面板：复制到 — 用户在文件夹选择框里取消，未复制");
                         ("已取消，未复制".to_string(), TOAST_OK)
                     }
                     Ok(Some(dest)) => match copy_many_to(&target.batch, &dest) {
                         Ok(0) => {
-                            eprintln!("批量面板：复制到 — 全部来源都在目标目录里，没有可复制的项");
+                            log_info!("批量面板：复制到 — 全部来源都在目标目录里，没有可复制的项");
                             ("这些项都在目标文件夹里，无需复制".to_string(), TOAST_OK)
                         }
                         Ok(done) => {
-                            eprintln!(
+                            log_info!(
                                 "批量面板：复制到完成 {done}/{n} 项（目标目录名不落日志）"
                             );
                             (
@@ -10539,16 +10725,16 @@ impl LauncherApp {
                             )
                         }
                         Err(1223) => {
-                            eprintln!("批量面板：复制到 — 用户在系统复制里取消");
+                            log_info!("批量面板：复制到 — 用户在系统复制里取消");
                             ("已取消，未复制".to_string(), TOAST_OK)
                         }
                         Err(code) => {
-                            eprintln!("批量面板：复制到失败（系统返回 {code}）");
+                            log_info!("批量面板：复制到失败（系统返回 {code}）");
                             (format!("⚠ 复制到失败（系统返回 {code}）"), TOAST_ERR)
                         }
                     },
                     Err(e) => {
-                        eprintln!("批量面板：文件夹选择框失败：{e}");
+                        log_info!("批量面板：文件夹选择框失败：{e}");
                         (format!("⚠ {e}"), TOAST_ERR)
                     }
                 };
@@ -10567,7 +10753,7 @@ impl LauncherApp {
                     added.push(command_item_from_path(p));
                 }
                 if added.is_empty() {
-                    eprintln!("批量面板：全部加入命令 — {skipped} 项都已在清单里，未新增");
+                    log_info!("批量面板：全部加入命令 — {skipped} 项都已在清单里，未新增");
                     self.toast = Some((
                         "这些项都已在清单里（未新增）".to_string(),
                         Instant::now() + TOAST_TTL,
@@ -10583,7 +10769,7 @@ impl LauncherApp {
                     let jobs = icon_jobs(&added);
                     self.spawn_missing_icons(jobs);
                     self.save_items();
-                    eprintln!(
+                    log_info!(
                         "批量面板：全部加入命令 — 新增 {grew} 条，跳过 {skipped} 条已存在（名称不落日志）"
                     );
                     let tail = if skipped > 0 {
@@ -10602,7 +10788,7 @@ impl LauncherApp {
             }
             actions::ActionId::RecycleAll => {
                 let paths = target.batch.clone();
-                eprintln!(
+                log_info!(
                     "批量面板：全部回收站 — 先弹确认（{} 项，未删除）",
                     paths.len()
                 );
@@ -10667,7 +10853,7 @@ impl LauncherApp {
     /// 把当前整张清单写盘（种子播种一次后即普通用户项，不再剔除）。
     fn save_items(&self) {
         source::application::save_user_items(&self.items);
-        eprintln!(
+        log_info!(
             "source: 已写清单 user_items.json（{} 条）",
             self.items.len()
         );
@@ -10694,7 +10880,7 @@ impl LauncherApp {
             // FR-SYS-03 隐私口径：别名字段本身就是"用户敲过的词的集合"——把 `keyword` 打进日志，
             // 等于把刚学到的那个词（以及历史上所有被学进去的查询原文）原样抄进一份能存好几天、
             // 还能托盘一键打开的文件里。所以只记"写过了"，字段内容一个字都不出。
-            eprintln!(
+            log_info!(
                 "提交即学别名：已写入「{}」的别名字段（学到的词与既有别名都不落日志）",
                 self.items[pos].name
             );
@@ -10716,14 +10902,14 @@ impl LauncherApp {
         let n = self.usage.record(&today, bucket);
         self.usage.trim(&today, source::usage::KEEP_DAYS);
         if self.usage_blocked {
-            eprintln!(
+            log_info!(
                 "使用统计：{} 今日第 {n} 次（usage.json 坏且留证没成功 ⇒ 本次不写它）",
                 bucket.label()
             );
             return;
         }
         source::application::save_usage(&self.usage);
-        eprintln!(
+        log_info!(
             "使用统计：+1 {}（今日 {n} 次，累计 {} 次）",
             bucket.label(),
             self.usage.total()
@@ -10779,13 +10965,13 @@ impl LauncherApp {
         }
         let n = self.history.len();
         if self.history_blocked {
-            eprintln!(
+            log_info!(
                 "source: 搜索历史已在内存里更新（现 {n} 条），但留证没成功 ⇒ 本次启动不写 search_history.json"
             );
             return;
         }
         source::application::save_history(&self.history);
-        eprintln!("source: 已写搜索历史 search_history.json（{n} 条，文本不落日志）");
+        log_info!("source: 已写搜索历史 search_history.json（{n} 条，文本不落日志）");
     }
 
     /// FR-SRC-19 编辑保统计：按派生 `uid` 把 `old` 里的 pinned/use_count/last_used_ms
@@ -10933,6 +11119,7 @@ impl LauncherApp {
                 results: Vec::new(),
             };
         }
+        let started = Instant::now();
         let now = now_ms();
         // 先取值再借 `prefs.engines`：配置里存的是稳定名，认识的才留下，不认识回落 cmd。
         let term_shell = self.prefs.term_shell();
@@ -10972,6 +11159,16 @@ impl LauncherApp {
         if self.prefs.list_rows == ListRows::Ten {
             cap_plan_rows(&mut plan, LIST_ROWS);
         }
+        // 批次 G5（NFR-01）：查询**变了的那一遍**才记一行。`plan()` 每帧被调十余次、
+        // 空闲重绘还会再跑，逐次记就成了帧率噪声。extra 只放条数，不放查询原文（隐私口径）。
+        if self.perf_query.as_deref() != Some(self.query.as_str()) {
+            self.perf_query = Some(self.query.clone());
+            logging::perf(
+                "search",
+                started.elapsed(),
+                &format!("head {} results {}", plan.head.len(), plan.results.len()),
+            );
+        }
         plan
     }
 }
@@ -10984,6 +11181,11 @@ impl eframe::App for LauncherApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 批次 G5（NFR-01）：启动→首帧只记一次（take 掉）。窗口初建、字体装配、首张清单
+        // 都在这一段里，正是开机自启时用户感觉到的那段空窗。
+        if let Some(t0) = self.first_frame_at.take() {
+            logging::perf("startup", t0.elapsed(), "");
+        }
         // eframe 为了保证首帧不出白闪，会在首帧渲染后无条件 set_visible(true)，
         // 把 with_visible(false) 覆盖掉；静默启动（-Startup）在第一帧末显式盖回隐藏。
         if self.hide_pending {
@@ -11035,7 +11237,7 @@ impl eframe::App for LauncherApp {
                 TrayEvent::BatchImport => {
                     // 显式「批量导入全部」：后台扫 .lnk，结果经 apps_rx 回报后合并落清单。
                     source::application::spawn_batch_import(self.apps_tx.clone());
-                    eprintln!("托盘：批量导入全部 已触发（后台扫描开始菜单/桌面）");
+                    log_info!("托盘：批量导入全部 已触发（后台扫描开始菜单/桌面）");
                 }
                 TrayEvent::Settings => {
                     self.show_now(ui.ctx());
@@ -11043,6 +11245,9 @@ impl eframe::App for LauncherApp {
                 }
                 TrayEvent::OpenLog => {
                     open_log_file();
+                }
+                TrayEvent::CopySysInfo => {
+                    self.copy_system_info(ui.ctx());
                 }
                 TrayEvent::Exit => {
                     self.on_hide();
@@ -11056,13 +11261,13 @@ impl eframe::App for LauncherApp {
             // 隐藏那一支的条件是「旗标说显示着 **且** 系统那边也显示着」：只问旗标时，`Win+D`
             // 之后第一按会走成"再隐藏一次"（用户看到的就是按了没反应，2026-10-22 真机③）。
             if self.visible && !self.is_iconic() {
-                eprintln!("FR-WIN-05: 热键切换 → 隐藏");
+                log_info!("FR-WIN-05: 热键切换 → 隐藏");
                 self.visible = false;
                 self.on_hide();
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else {
-                eprintln!("FR-WIN-05: 热键切换 → 呼出");
+                log_info!("FR-WIN-05: 热键切换 → 呼出");
                 self.show_now(ui.ctx());
             }
         }
@@ -11076,7 +11281,7 @@ impl eframe::App for LauncherApp {
                     self.open_selection_panel(ui.ctx(), target);
                 }
                 SelectionOutcome::Nothing(why) => {
-                    eprintln!(
+                    log_info!(
                         "选中内容：没拿到内容（{why}）⇒ 只提示，主窗保持{}",
                         if self.visible { "显示" } else { "隐藏" }
                     );
@@ -11102,26 +11307,26 @@ impl eframe::App for LauncherApp {
         while let Ok(msg) = self.ipc_rx.try_recv() {
             match msg {
                 IpcMsg::Activate => {
-                    eprintln!("FR-SRC-21: 收到 Activate，呼出窗口");
+                    log_info!("FR-SRC-21: 收到 Activate，呼出窗口");
                     self.show_now(ui.ctx());
                 }
                 IpcMsg::AddPath(p) => {
                     // FR-SYS-03：转发来的是用户动作数据（SendTo 的路径），与 AddBatch 分支
                     // 「只记条数」同一口径，内容不落日志；这条存在的意义是证明 IPC 收到了。
-                    eprintln!("FR-SRC-21: 收到转发路径 1 条（内容不落日志）");
+                    log_info!("FR-SRC-21: 收到转发路径 1 条（内容不落日志）");
                     self.show_now(ui.ctx());
                     self.ipc_pending.push(dialog_for_sent_path(&p));
                 }
                 IpcMsg::Ping => {
-                    eprintln!("FR-WIN-08: 收到 Ping（仅探活，不改 UI）");
+                    log_info!("FR-WIN-08: 收到 Ping（仅探活，不改 UI）");
                 }
                 IpcMsg::Preferences(page) => {
-                    eprintln!("FR-WIN-08: 收到 -Preferences {page}");
+                    log_info!("FR-WIN-08: 收到 -Preferences {page}");
                     self.show_now(ui.ctx());
                     self.open_settings_page(page);
                 }
                 IpcMsg::AddBatch(paths) => {
-                    eprintln!("FR-WIN-08: 收到批量 SendTo {} 条", paths.len());
+                    log_info!("FR-WIN-08: 收到批量 SendTo {} 条", paths.len());
                     self.show_now(ui.ctx());
                     self.add_batch(ui.ctx(), paths);
                 }
@@ -11177,7 +11382,7 @@ impl eframe::App for LauncherApp {
                     Some(deadline) => {
                         let now = Instant::now();
                         if now >= deadline {
-                            eprintln!(
+                            log_info!(
                                 "FR-WIN-04: 失焦 {}ms 复查仍失焦 → 关闭到托盘",
                                 HIDE_DELAY.as_millis()
                             );
@@ -11249,7 +11454,7 @@ impl eframe::App for LauncherApp {
                 for k in &doomed {
                     self.icons.remove(k);
                 }
-                eprintln!(
+                log_info!(
                     "icon cache: 超上限 {} 条，淘汰最久没用的 {} 条（剩 {}）",
                     last_use.len(),
                     doomed.len(),
@@ -11266,7 +11471,7 @@ impl eframe::App for LauncherApp {
             // 批次 D6：隐藏项即使被重新扫描到也不许复活——进清单之前先按 hidden[] 剔掉。
             let hidden_hits = source::application::drop_hidden(&mut imported, &self.prefs.hidden);
             if hidden_hits > 0 {
-                eprintln!(
+                log_info!(
                     "批量导入：{hidden_hits} 条在 hidden[] 里，已跳过（设置 → 高级 可恢复）"
                 );
             }
@@ -11382,7 +11587,7 @@ impl eframe::App for LauncherApp {
                 );
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::InnerSize(next));
-                eprintln!(
+                log_info!(
                     "快捷键 Ctrl+{}：窗口 {}×{} → {}×{}",
                     if hit_zoom_in { "=" } else { "-" },
                     cur.x,
@@ -11405,7 +11610,7 @@ impl eframe::App for LauncherApp {
                 // 与 Ctrl+, 同一条理由：☰ 只在搜索页渲染，键盘打开别的界面时必须把旗标落下，
                 // 否则回到搜索页那一帧会带着一个"没人负责关闭"的菜单。
                 self.menu_open = false;
-                eprintln!("快捷键 F1：打开「关于本程序」");
+                log_info!("快捷键 F1：打开「关于本程序」");
                 ui.ctx().request_repaint();
             }
             let hit_comma =
@@ -11432,7 +11637,7 @@ impl eframe::App for LauncherApp {
                 // 批次 F6：☰ 只在搜索页渲染 ⇒ 进设置页必须先把旗标落下，
                 // 否则回到搜索页的第一帧会带着一个"没人负责关闭"的菜单。
                 self.menu_open = false;
-                eprintln!(
+                log_info!(
                     "快捷键 {}：设置页 {}",
                     if hit_f2 { "F2" } else { "Ctrl+," },
                     if self.settings_open {
@@ -11449,7 +11654,7 @@ impl eframe::App for LauncherApp {
                 self.focus_query = true;
                 self.menu_open = false;
                 self.refresh_path_states(true);
-                eprintln!("快捷键 Ctrl+B：设置页「批量管理」");
+                log_info!("快捷键 Ctrl+B：设置页「批量管理」");
                 ui.ctx().request_repaint();
             } else if hit_ctrl_t {
                 // 批次 D8：直达「使用统计」。与 Ctrl+B 同形态——设置页开着时也跳。
@@ -11457,7 +11662,7 @@ impl eframe::App for LauncherApp {
                 self.settings_tab = SettingsTab::Usage;
                 self.focus_query = true;
                 self.menu_open = false;
-                eprintln!("快捷键 Ctrl+T：设置页「使用统计」");
+                log_info!("快捷键 Ctrl+T：设置页「使用统计」");
                 ui.ctx().request_repaint();
             } else if hit_ctrl_w {
                 // 批次 D2：直达「网页引擎」。与 Ctrl+B / Ctrl+T 同形态——设置页开着时也跳。
@@ -11465,7 +11670,7 @@ impl eframe::App for LauncherApp {
                 self.settings_tab = SettingsTab::WebEngines;
                 self.focus_query = true;
                 self.menu_open = false;
-                eprintln!("快捷键 Ctrl+W：设置页「网页引擎」");
+                log_info!("快捷键 Ctrl+W：设置页「网页引擎」");
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
                 // ---- 批次 B8（FR-ACT-10 附录 A）：F3 编辑 · F4 打开配置文件 · Ctrl+C 复制这一行 ----
@@ -11536,7 +11741,7 @@ impl eframe::App for LauncherApp {
                                 ),
                             );
                         }
-                        None => eprintln!(
+                        None => log_info!(
                             "搜索历史 Ctrl+{key_name}：{}那头已经到底（共 {} 条），输入框不动",
                             if step > 0 { "更早" } else { "更新" },
                             self.history.len()
@@ -11642,7 +11847,7 @@ impl eframe::App for LauncherApp {
                 let hit_shift_space = space_down
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space));
                 if hit_shift_space {
-                    eprintln!(
+                    log_info!(
                         "快捷键 Shift+空格：按档位 {:?} 本会执行，改判为插入真空格",
                         self.prefs.space_to_run
                     );
@@ -11677,7 +11882,7 @@ impl eframe::App for LauncherApp {
                     // 反向判据也要留痕：注入实测要看的就是"这一按空格到底进没进输入框"。
                     // 【2026-10-20 批次 S 顺带修掉一处隐私漏词】这行原本把 `self.query` 原样写进
                     // 日志——与批次 P 定的「绝不记查询框原文」冲突，改成只记档位/条数/选中行号。
-                    eprintln!(
+                    log_info!(
                         "空格未接管（档位 {}，结果 {} 条，头段 {} 行，选中第 {} 行）：键事件留给输入框当文本",
                         self.prefs.space_to_run.as_str(),
                         space_results.len(),
@@ -11771,7 +11976,7 @@ impl eframe::App for LauncherApp {
                             if self.selected + 1 < total {
                                 self.selected += 1;
                             }
-                            eprintln!(
+                            log_info!(
                                 "快捷键 Insert：第 {} 行{}标记（共 {} 项已标记；路径不落日志）",
                                 here + 1,
                                 if added { "已" } else { "已取消" },
@@ -11786,7 +11991,7 @@ impl eframe::App for LauncherApp {
                                 TOAST_ERR,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!("快捷键 Insert：第 {} 行不是文件/文件夹，未标记", here + 1);
+                            log_info!("快捷键 Insert：第 {} 行不是文件/文件夹，未标记", here + 1);
                         }
                     }
                 } else if hit_copy || alt_enter_hit {
@@ -11816,7 +12021,7 @@ impl eframe::App for LauncherApp {
                     match text {
                         Some(text) => match copy_to_clipboard(&text) {
                             Ok(()) => {
-                                eprintln!(
+                                log_info!(
                                     "快捷键 {key_name}：已复制这一行（{} 个字符，内容不落日志）",
                                     text.chars().count()
                                 );
@@ -11828,7 +12033,7 @@ impl eframe::App for LauncherApp {
                                 ui.ctx().request_repaint_after(TOAST_TTL);
                             }
                             Err(e) => {
-                                eprintln!("快捷键 {key_name}：复制失败：{e}");
+                                log_info!("快捷键 {key_name}：复制失败：{e}");
                                 self.toast = Some((
                                     format!("⚠ 复制失败：{e}"),
                                     Instant::now() + TOAST_TTL,
@@ -11838,7 +12043,7 @@ impl eframe::App for LauncherApp {
                             }
                         },
                         None => {
-                            eprintln!("快捷键 {key_name}：这一屏没有可复制的行（选中第 {} 行）", self.selected + 1);
+                            log_info!("快捷键 {key_name}：这一屏没有可复制的行（选中第 {} 行）", self.selected + 1);
                             self.toast = Some((
                                 "⚠ 这一屏没有可复制的行".to_string(),
                                 Instant::now() + TOAST_TTL,
@@ -11854,7 +12059,7 @@ impl eframe::App for LauncherApp {
                             ui.ctx().request_repaint();
                         }
                         Err(e) => {
-                            eprintln!("快捷键 F4：{e}");
+                            log_info!("快捷键 F4：{e}");
                             self.toast = Some((
                                 format!("⚠ {e}"),
                                 Instant::now() + TOAST_TTL,
@@ -11867,7 +12072,7 @@ impl eframe::App for LauncherApp {
                     // 批次 F6：☰ 主菜单的键盘入口（用户裁定「三条杠菜单 + 快捷键都留」）。
                     // 这里只翻旗标——菜单项本身在顶栏那帧由 `main_menu_content` 渲染并返回动作。
                     self.menu_open = !self.menu_open;
-                    eprintln!(
+                    log_info!(
                         "快捷键 Ctrl+M：☰ 主菜单 {}",
                         if self.menu_open { "打开" } else { "收起" }
                     );
@@ -11891,7 +12096,7 @@ impl eframe::App for LauncherApp {
                             TOAST_OK,
                         ));
                         ui.ctx().request_repaint_after(TOAST_TTL);
-                        eprintln!("快捷键 Ctrl+F：已在文件模式，不叠第二个前缀");
+                        log_info!("快捷键 Ctrl+F：已在文件模式，不叠第二个前缀");
                     } else {
                         let text = format!("'{}", self.query.trim());
                         self.set_query(
@@ -11922,7 +12127,7 @@ impl eframe::App for LauncherApp {
                             self.toast = None;
                             self.large_type.show(ui.ctx(), text);
                         }
-                        None => eprintln!("快捷键 Ctrl+L：没有可显示的文字（空输入且没有选中行）"),
+                        None => log_info!("快捷键 Ctrl+L：没有可显示的文字（空输入且没有选中行）"),
                     }
                 } else if hit_csn {
                     // 批次 X：选中的是文件行时把这一行预填进添加对话框（"从眼前这一行建快捷项"），
@@ -11943,13 +12148,13 @@ impl eframe::App for LauncherApp {
                     };
                     self.dialog = Some(match hit {
                         Some(hit) => {
-                            eprintln!(
+                            log_info!(
                                 "快捷键 Ctrl+Shift+N：用选中的文件行预填添加框（路径不落日志）"
                             );
                             DialogState::from_file_hit(&hit)
                         }
                         None => {
-                            eprintln!(
+                            log_info!(
                                 "快捷键 Ctrl+Shift+N：选中的不是文件行（第 {} 行，头段 {head_len} 行）⇒ 空白添加框",
                                 self.selected + 1
                             );
@@ -11965,7 +12170,7 @@ impl eframe::App for LauncherApp {
                         TOAST_OK,
                     ));
                     ui.ctx().request_repaint_after(TOAST_TTL);
-                    eprintln!("快捷键 Ctrl+I：批量导入全部 已触发（后台扫描开始菜单/桌面）");
+                    log_info!("快捷键 Ctrl+I：批量导入全部 已触发（后台扫描开始菜单/桌面）");
                 } else if hit_e || hit_cd || hit_del || hit_csd || hit_csp || hit_cdel {
                     // 头段行（计算器/搜索/提示）没有条目身份 ⇒ 编辑/删除/置顶/打开目录这四档
                     // 整体不适用。判据只落在 `sel` 这一层：选中头段 ⇒ 拿不到条目，下面的动作原样跳过。
@@ -11983,7 +12188,7 @@ impl eframe::App for LauncherApp {
                     let handled_file_cd = hit_cd && on_file_row.is_some();
                     if let Some(hit) = on_file_row.filter(|_| hit_cd) {
                         select_path = Some(hit.path.clone());
-                        eprintln!(
+                        log_info!(
                             "快捷键 Ctrl+D：在资源管理器中定位文件行（路径由查询现出，不落日志）"
                         );
                     }
@@ -12002,7 +12207,7 @@ impl eframe::App for LauncherApp {
                         }
                     }
                     if item_row.is_none() && sel.is_none() && !handled_file_cd {
-                        eprintln!("快捷键 编辑/删除/隐藏/置顶/开目录：选中的是头段结果行，这几档不适用");
+                        log_info!("快捷键 编辑/删除/隐藏/置顶/开目录：选中的是头段结果行，这几档不适用");
                     }
                     // 身份一律用派生 uid（同 path 不同参数是两个条目），path 只作数据用。
                     if let Some(s) = sel {
@@ -12010,7 +12215,7 @@ impl eframe::App for LauncherApp {
                         let name = s.name.clone();
                         let (path, source_path) = (s.path.clone(), s.source_path.clone());
                         if hit_e {
-                            eprintln!(
+                            log_info!(
                                 "快捷键 {edit_via}：弹出编辑对话框（第 {} 行，名称不落日志）",
                                 self.selected + 1
                             );
@@ -12032,7 +12237,7 @@ impl eframe::App for LauncherApp {
                                 };
                                 self.toast = Some((text, Instant::now() + TOAST_TTL, TOAST_OK));
                                 ui.ctx().request_repaint_after(TOAST_TTL);
-                                eprintln!("快捷键 Ctrl+Shift+P：置顶切换 {uid} → {on}");
+                                log_info!("快捷键 Ctrl+Shift+P：置顶切换 {uid} → {on}");
                             }
                         } else if hit_cdel {
                             // 批次 D6：任何条目都能隐藏——出厂的、扫描导入的、自定义的都行。
@@ -12053,14 +12258,14 @@ impl eframe::App for LauncherApp {
                                 TOAST_OK,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!(
+                            log_info!(
                                 "快捷键 Ctrl+Del：隐藏条目 {uid}（已写 hidden[] 与快照，不删磁盘文件）"
                             );
                         } else if hit_del || hit_csd {
                             // 2026-10-18 用户要求（选中「控制面板」被误删过一次）：删除一律先弹确认，
                             // 按键不再一键生效；真正的移除在确认弹窗按「确定」那一帧才做。
                             self.confirm = Some(ConfirmRequest { uid, name, path });
-                            eprintln!("快捷键 删除（Delete/Ctrl+Shift+D）：已弹确认，未删除");
+                            log_info!("快捷键 删除（Delete/Ctrl+Shift+D）：已弹确认，未删除");
                         } else if let Some(target) = resolve_file_for_select(&path, &source_path) {
                             // Ctrl+D：资源管理器打开所在目录并选中该文件，随后关到托盘（同运行语义）。
                             let entry = LaunchItem {
@@ -12081,7 +12286,7 @@ impl eframe::App for LauncherApp {
                                 TOAST_ERR,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!("快捷键 Ctrl+D：{path:?} 无可定位文件，未打开目录");
+                            log_info!("快捷键 Ctrl+D：{path:?} 无可定位文件，未打开目录");
                         }
                     }
                 } else if hit_pgup || hit_pgdn {
@@ -12098,7 +12303,7 @@ impl eframe::App for LauncherApp {
                             list_chrome_h(&self.theme),
                         );
                         self.selected = page_target(self.selected, rows, len, hit_pgdn);
-                        eprintln!(
+                        log_info!(
                             "快捷键 {}：选中第 {} 行（一页 {rows} 行，共 {len} 行）",
                             if hit_pgdn { "PgDn" } else { "PgUp" },
                             self.selected + 1
@@ -12129,12 +12334,12 @@ impl eframe::App for LauncherApp {
                         } else {
                             (cur + 1) % len
                         };
-                        eprintln!(
+                        log_info!(
                             "快捷键 {key}：循环选中第 {} 行（共 {len} 行）",
                             self.selected + 1
                         );
                     } else {
-                        eprintln!("快捷键 {key}：当前查询无结果，忽略");
+                        log_info!("快捷键 {key}：当前查询无结果，忽略");
                     }
                 } else if hit_ctrl_g {
                     // 批次 G1：缺省分类范围一键轮换（all ⇄ basic），设置页「通用」页同一格的快捷键。
@@ -12145,7 +12350,7 @@ impl eframe::App for LauncherApp {
                     source::application::save_settings(&self.prefs);
                     let msg = format!("缺省分类范围：{}", self.prefs.default_scope.label());
                     self.hint_toast(ui.ctx(), &msg);
-                    eprintln!("快捷键 Ctrl+G：缺省分类范围 ⇄ {}（已写 settings.json）", msg);
+                    log_info!("快捷键 Ctrl+G：缺省分类范围 ⇄ {}（已写 settings.json）", msg);
                 } else if hit_tab || hit_shift_tab {
                     // FR-ACT-06 Tab 语义由设置页 `tab_mode` 二选一（2026-10-18 用户裁定两种都做）：
                     //   Complete（默认）＝查询能把结果集消歧到只剩一条可补长的候选 ⇒ 补全成它的名称；
@@ -12215,17 +12420,17 @@ impl eframe::App for LauncherApp {
                                 )));
                                 st.store(ui.ctx(), search_field_id());
                             }
-                            eprintln!("快捷键 Tab：查询补全为「{name}」（唯一可补全的候选）");
+                            log_info!("快捷键 Tab：查询补全为「{name}」（唯一可补全的候选）");
                         } else {
                             self.selected = next;
-                            eprintln!(
+                            log_info!(
                                 "快捷键 {}：循环选中第 {} 行（共 {len} 行）",
                                 if backward { "Shift+Tab" } else { "Tab" },
                                 next + 1
                             );
                         }
                     } else {
-                        eprintln!("快捷键 Tab：当前查询无结果，忽略");
+                        log_info!("快捷键 Tab：当前查询无结果，忽略");
                     }
                 } else if let Some(digit) = hit_digit {
                     let plan = self.plan();
@@ -12238,13 +12443,13 @@ impl eframe::App for LauncherApp {
                                 HeadRow::Calc(hit) => {
                                     // FR-SRC-10：数字键指到计算器行 ⇒ 与 Enter 同一语义（复制）。
                                     copy_text = Some(hit.copy.clone());
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：复制计算器结果（表达式原文不落日志）"
                                     );
                                 }
                                 HeadRow::Search(hit) => {
                                     // FR-SRC-11：与 Enter 同一语义（用默认浏览器打开）。
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：网页搜索（引擎 {}，查询原文不落日志）",
                                         hit.engine_id
                                     );
@@ -12252,12 +12457,12 @@ impl eframe::App for LauncherApp {
                                 }
                                 HeadRow::Hint(hint) => {
                                     // 需求书把空词这一格定为 valid=false：数字键不执行，只提示。
-                                    eprintln!("快捷键 数字键 {digit}：选中的是补全提示行，不执行");
+                                    log_info!("快捷键 数字键 {digit}：选中的是补全提示行，不执行");
                                     self.hint_toast(ui.ctx(), hint_message(hint));
                                 }
                                 HeadRow::Custom(hit) => {
                                     // FR-SRC-05：与 Enter 同一语义，日志走脱敏路径。
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：执行自定义命令「{}」（参数不落日志）",
                                         hit.name
                                     );
@@ -12268,51 +12473,51 @@ impl eframe::App for LauncherApp {
                                     launch_via_digit = true;
                                 }
                                 HeadRow::CustomHint(hint) => {
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：选中「{}」的补全提示行",
                                         hint.title
                                     );
                                     self.custom_hint_activate(ui.ctx(), hint);
                                 }
                                 HeadRow::File(hit) => {
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：打开文件行的{}（路径由查询现出，不落日志）",
                                         if hit.is_dir { "目录" } else { "文件" }
                                     );
                                     open_file = Some(hit.clone());
                                 }
                                 HeadRow::Terminal(hit) => {
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：在终端执行（shell {}，命令原文不落日志）",
                                         hit.shell.as_str()
                                     );
                                     open_term = Some(hit.clone());
                                 }
                                 HeadRow::TermHint(_) => {
-                                    eprintln!("快捷键 数字键 {digit}：选中的是终端用法行，不执行");
+                                    log_info!("快捷键 数字键 {digit}：选中的是终端用法行，不执行");
                                     self.hint_toast(ui.ctx(), source::terminal::USAGE_TOAST);
                                 }
                                 HeadRow::Cheat(hit) => {
                                     // FR-SRC-18：与 Enter 同一语义——打开帮助页，不关窗口。
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：打开速查表条目「{}」",
                                         hit.entry.title
                                     );
                                     self.help_entry = Some(*hit);
                                 }
                                 HeadRow::CheatHint(_) => {
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：选中速查表的无匹配提示行，不执行"
                                     );
                                     self.hint_toast(ui.ctx(), source::cheatsheet::NO_MATCH_TOAST);
                                 }
                                 HeadRow::ScopeTags(hint) => {
-                                    eprintln!("快捷键 数字键 {digit}：选中的是分类提示行，不执行");
+                                    log_info!("快捷键 数字键 {digit}：选中的是分类提示行，不执行");
                                     self.hint_toast(ui.ctx(), hint.subtitle.as_str());
                                 }
                                 HeadRow::Action(hit) => {
                                     // 批次 P1：面板那十几行也占前 10 个数字键位（口径与 Enter 一致）。
-                                    eprintln!(
+                                    log_info!(
                                         "快捷键 数字键 {digit}：执行操作面板动作「{}」",
                                         hit.id.label()
                                     );
@@ -12321,7 +12526,7 @@ impl eframe::App for LauncherApp {
                             },
                             Some(Row::Item(rank)) => {
                                 let item = self.items[results[rank]].clone();
-                                eprintln!(
+                                log_info!(
                                     "快捷键 数字键 {digit}：执行第 {} 行「{}」",
                                     idx + 1,
                                     item.name
@@ -12332,7 +12537,7 @@ impl eframe::App for LauncherApp {
                             }
                             None => {}
                         },
-                        None => eprintln!(
+                        None => log_info!(
                             "快捷键 数字键 {digit}：第 {} 行不存在（共 {len} 行），忽略",
                             if digit == 0 { 10 } else { digit as usize }
                         ),
@@ -12349,7 +12554,7 @@ impl eframe::App for LauncherApp {
                         head_len,
                     ) {
                         let item = self.items[results[rank]].clone();
-                        eprintln!(
+                        log_info!(
                             "快捷键 空格：执行第 {} 行「{}」",
                             rank + 1 + head_len,
                             item.name
@@ -12500,7 +12705,7 @@ impl eframe::App for LauncherApp {
                     // 不算用户改动。真机第 4 条专门验这一点（连按三次应依次回填三条）。
                     if self.history_browse.index != 0 {
                         self.history_browse = Default::default();
-                        eprintln!("搜索历史：输入已改 ⇒ 翻页位置归零");
+                        log_info!("搜索历史：输入已改 ⇒ 翻页位置归零");
                     }
                 }
                 // 批次 F6：「＋ 新建」按钮撤掉，换成 ☰ 主菜单（用户点名「换成一个三条杠的菜单，
@@ -12544,11 +12749,11 @@ impl eframe::App for LauncherApp {
                             TOAST_OK,
                         ));
                         ui.ctx().request_repaint_after(TOAST_TTL);
-                        eprintln!("☰ 菜单：批量导入全部 已触发（后台扫描开始菜单/桌面）");
+                        log_info!("☰ 菜单：批量导入全部 已触发（后台扫描开始菜单/桌面）");
                     }
                     MenuAction::Settings => {
                         self.settings_open = true;
-                        eprintln!("☰ 菜单：进设置页");
+                        log_info!("☰ 菜单：进设置页");
                     }
                     MenuAction::Cheatsheet => {
                         // 速查表在列表里，入口就是查询框的那个 `?`（批次 A8）：代打字，不另开一套渲染。
@@ -12556,12 +12761,12 @@ impl eframe::App for LauncherApp {
                     }
                     MenuAction::OpenLog => {
                         open_log_file();
-                        eprintln!("☰ 菜单：打开日志");
+                        log_info!("☰ 菜单：打开日志");
                     }
                     MenuAction::Exit => {
                         self.on_hide();
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        eprintln!("☰ 菜单：退出");
+                        log_info!("☰ 菜单：退出");
                     }
                 }
             });
@@ -12688,7 +12893,7 @@ impl eframe::App for LauncherApp {
                             self.selected = self.selected.saturating_sub(1);
                         }
                         if self.selected != before {
-                            eprintln!("滚轮：选中移到第 {} 行（共 {total} 行）", self.selected + 1);
+                            log_info!("滚轮：选中移到第 {} 行（共 {total} 行）", self.selected + 1);
                         }
                     }
                 }
@@ -13464,14 +13669,14 @@ impl eframe::App for LauncherApp {
                     name: it.name.clone(),
                     path: it.path.clone(),
                 });
-                eprintln!("右键「删除」：已弹确认 {u}（未删除）");
+                log_info!("右键「删除」：已弹确认 {u}（未删除）");
             }
         }
         if !pin_toggles.is_empty() {
             for u in &pin_toggles {
                 if let Some(it) = self.items.iter_mut().find(|i| i.uid() == *u) {
                     it.pinned = !it.pinned;
-                    eprintln!("右键：置顶切换 {u} → {}", it.pinned);
+                    log_info!("右键：置顶切换 {u} → {}", it.pinned);
                 }
             }
             self.save_items();
@@ -13790,7 +13995,7 @@ impl eframe::App for LauncherApp {
                         if let Some(dg) = self.dialog.as_mut() {
                             dg.marker_warn = true;
                         }
-                        eprintln!("弹窗：命令行/参数含参数标记、编码是「无参数」⇒ 保存前追问一次");
+                        log_info!("弹窗：命令行/参数含参数标记、编码是「无参数」⇒ 保存前追问一次");
                         ui.ctx().request_repaint();
                     } else if let Some(dg) = self.dialog.take() {
                         let item = dg.to_item();
@@ -13798,7 +14003,7 @@ impl eframe::App for LauncherApp {
                         // 这种逗号/竖线定界的行格式，名字里带逗号在那边会被拆成两列。我们存 JSON
                         // 本不需要这条，但需求书把它列为规则，照做——两份清单互相导时不至于分岔。
                         if item.name.contains(',') {
-                            eprintln!("弹窗：名称含英文逗号 ⇒ 不提交（改名后再存）");
+                            log_info!("弹窗：名称含英文逗号 ⇒ 不提交（改名后再存）");
                             self.toast = Some((
                                 format!(
                                     "名称里不能有英文逗号：「{}」请改一下（分类、参数各有自己的格子）",
@@ -13896,7 +14101,7 @@ impl eframe::App for LauncherApp {
             if let Some(replace) = prompt_answer {                if let Some(dg) = self.dialog.as_mut() {
                     if let Some(p) = dg.fill_prompt.take() {
                         apply_fill(dg, &p.fill, replace);
-                        eprintln!(
+                        log_info!(
                             "弹窗：导入值的别名/名称{}，命令行已填（内容不落日志）",
                             if replace { "已替换" } else { "保留原值" }
                         );
@@ -14014,7 +14219,7 @@ impl eframe::App for LauncherApp {
                 ParamResult::Cancel => {
                     self.param_prompt = None;
                     self.focus_query = true;
-                    eprintln!("参数框：取消，未启动（参数原文不落日志）");
+                    log_info!("参数框：取消，未启动（参数原文不落日志）");
                     ui.ctx().request_repaint();
                 }
                 ParamResult::Keep => {}
@@ -14072,12 +14277,12 @@ impl eframe::App for LauncherApp {
                             TOAST_OK,
                         ));
                         ui.ctx().request_repaint_after(TOAST_TTL);
-                        eprintln!("删除确认：按「确定」删除 {}（不删磁盘文件）", c.uid);
+                        log_info!("删除确认：按「确定」删除 {}（不删磁盘文件）", c.uid);
                         self.focus_query = true;
                     }
                 }
                 ConfirmResult::No => {
-                    eprintln!("删除确认：按「取消」，未删除");
+                    log_info!("删除确认：按「取消」，未删除");
                     self.confirm = None;
                     self.focus_query = true;
                     ui.ctx().request_repaint();
@@ -14138,13 +14343,13 @@ impl eframe::App for LauncherApp {
                                 Err(1223) => cancelled += 1,
                                 Err(c) => {
                                     failed += 1;
-                                    eprintln!("批量面板：回收一项失败（系统返回 {c}）");
+                                    log_info!("批量面板：回收一项失败（系统返回 {c}）");
                                 }
                             }
                         }
                         self.refresh_path_states(true);
                         self.marked.clear();
-                        eprintln!(
+                        log_info!(
                             "全部回收站：{total} 项 → 成功 {done}、失败 {failed}、取消 {cancelled}（路径不落日志）"
                         );
                         self.close_panel(ui.ctx(), "全部回收站", true);
@@ -14170,7 +14375,7 @@ impl eframe::App for LauncherApp {
                     }
                 }
                 BatchRecycleResult::No => {
-                    eprintln!("全部回收站：按「取消」，未删除");
+                    log_info!("全部回收站：按「取消」，未删除");
                     self.batch_confirm = None;
                     self.focus_query = true;
                     ui.ctx().request_repaint();
@@ -14255,7 +14460,7 @@ impl eframe::App for LauncherApp {
                                 TOAST_OK,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!("高级页：重置学习排序 → {n} 条统计清零（{bak_note}）");
+                            log_info!("高级页：重置学习排序 → {n} 条统计清零（{bak_note}）");
                         }
                         Destructive::RestoreDefaults => {
                             let bak = source::application::backup_file(
@@ -14287,7 +14492,7 @@ impl eframe::App for LauncherApp {
                                 TOAST_OK,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!("高级页：恢复默认 → 偏好已重置（{bak_note}）");
+                            log_info!("高级页：恢复默认 → 偏好已重置（{bak_note}）");
                         }
                         Destructive::ClearHistory => {
                             let n = self.history.len();
@@ -14305,7 +14510,7 @@ impl eframe::App for LauncherApp {
                                     Instant::now() + TOAST_TTL,
                                     TOAST_ERR,
                                 ));
-                                eprintln!(
+                                log_info!(
                                     "高级页：清空搜索历史 → 内存里 {n} 条已清；坏文件留证没成功 ⇒ 不写盘"
                                 );
                             } else {
@@ -14315,7 +14520,7 @@ impl eframe::App for LauncherApp {
                                     Instant::now() + TOAST_TTL,
                                     TOAST_OK,
                                 ));
-                                eprintln!(
+                                log_info!(
                                     "高级页：清空搜索历史 → {n} 条已清（search_history.json 写成空表，不备份）"
                                 );
                             }
@@ -14335,7 +14540,7 @@ impl eframe::App for LauncherApp {
                                     Instant::now() + TOAST_TTL,
                                     TOAST_ERR,
                                 ));
-                                eprintln!(
+                                log_info!(
                                     "设置页：清除使用统计 → 内存里已清（{n} 次 / {days} 天）；坏文件留证没成功 ⇒ 不写盘"
                                 );
                             } else {
@@ -14345,7 +14550,7 @@ impl eframe::App for LauncherApp {
                                     Instant::now() + TOAST_TTL,
                                     TOAST_OK,
                                 ));
-                                eprintln!(
+                                log_info!(
                                     "设置页：清除使用统计 → {n} 次 / {days} 天已清（usage.json 写成空表，不备份；条目 use_count 未动）"
                                 );
                             }
@@ -14364,7 +14569,7 @@ impl eframe::App for LauncherApp {
                                     Instant::now() + TOAST_TTL,
                                     TOAST_ERR,
                                 ));
-                                eprintln!(
+                                log_info!(
                                     "高级页：清空参数历史 → 内存里 {n} 条已清；坏文件留证没成功 ⇒ 不写盘"
                                 );
                             } else {
@@ -14374,7 +14579,7 @@ impl eframe::App for LauncherApp {
                                     Instant::now() + TOAST_TTL,
                                     TOAST_OK,
                                 ));
-                                eprintln!(
+                                log_info!(
                                     "高级页：清空参数历史 → {n} 条已清（param_history.json 写成空表，不备份）"
                                 );
                             }
@@ -14383,7 +14588,7 @@ impl eframe::App for LauncherApp {
                     }
                 }
                 DestructiveResult::No => {
-                    eprintln!("高级页：破坏性动作按「取消」，未执行");
+                    log_info!("高级页：破坏性动作按「取消」，未执行");
                     self.pending_destructive = None;
                     ui.ctx().request_repaint();
                 }
@@ -14487,7 +14692,7 @@ impl eframe::App for LauncherApp {
                                 TOAST_OK,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!(
+                            log_info!(
                                 "批量管理：转{} → {applied} 条，跳过 {skipped}（路径不落日志）",
                                 if to_relative { "相对写法" } else { "绝对路径" }
                             );
@@ -14500,7 +14705,7 @@ impl eframe::App for LauncherApp {
                                 TOAST_ERR,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!("批量管理：转换落空（计划里的条目已不在清单，未写盘）");
+                            log_info!("批量管理：转换落空（计划里的条目已不在清单，未写盘）");
                         }
                     }
                     ManageConfirm::Delete { uids } => {
@@ -14518,7 +14723,7 @@ impl eframe::App for LauncherApp {
                                 TOAST_OK,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!("批量管理：删除 → {removed} 条条目（不删磁盘文件，uid 不落日志）");
+                            log_info!("批量管理：删除 → {removed} 条条目（不删磁盘文件，uid 不落日志）");
                         } else {
                             self.toast = Some((
                                 "⚠ 清单已变，这次一条也没删".to_string(),
@@ -14526,12 +14731,12 @@ impl eframe::App for LauncherApp {
                                 TOAST_ERR,
                             ));
                             ui.ctx().request_repaint_after(TOAST_TTL);
-                            eprintln!("批量管理：删除落空（计划里的条目已不在清单）");
+                            log_info!("批量管理：删除落空（计划里的条目已不在清单）");
                         }
                     }
                 },
                 ManageResult::No => {
-                    eprintln!("批量管理确认：按「取消」，未执行");
+                    log_info!("批量管理确认：按「取消」，未执行");
                     ui.ctx().request_repaint();
                 }
                 ManageResult::Keep => self.manage_confirm = Some(pending),
@@ -14585,7 +14790,7 @@ impl eframe::App for LauncherApp {
                             // 与「启动成功才累计」同一口径：确认后真的执行了才记一次。
                             self.mark_used(&c.uid, "");
                         }
-                        eprintln!(
+                        log_info!(
                             "内部确认：按「执行」→ {}（{}）",
                             c.action.id(),
                             if ok { "成功" } else { "失败" }
@@ -14594,7 +14799,7 @@ impl eframe::App for LauncherApp {
                     }
                 }
                 InternalResult::No => {
-                    eprintln!("内部确认：按「取消」，未执行");
+                    log_info!("内部确认：按「取消」，未执行");
                     self.internal_confirm = None;
                     self.focus_query = true;
                     ui.ctx().request_repaint();
@@ -14768,7 +14973,7 @@ impl eframe::App for LauncherApp {
             match copy_to_clipboard(&path) {
                 Ok(()) => {
                     // 路径由查询现出 ⇒ 日志只记长度（FR-SYS-03 隐私口径）。
-                    eprintln!(
+                    log_info!(
                         "文件搜索：路径已复制（{} 个字符，路径原文不落日志）",
                         path.chars().count()
                     );
@@ -14784,7 +14989,7 @@ impl eframe::App for LauncherApp {
                         Instant::now() + TOAST_TTL,
                         TOAST_ERR,
                     ));
-                    eprintln!("文件搜索：复制路径失败（{e}）");
+                    log_info!("文件搜索：复制路径失败（{e}）");
                 }
             }
             ui.ctx().request_repaint_after(TOAST_TTL);
@@ -14799,7 +15004,7 @@ impl eframe::App for LauncherApp {
             match copy_to_clipboard(&text) {
                 Ok(()) => {
                     // 表达式原文不落日志（FR-SYS-03 隐私口径）⇒ 只记长度与成败。
-                    eprintln!(
+                    log_info!(
                         "计算器：结果已复制（{} 个字符，表达式原文不落日志）→ 关闭到托盘",
                         text.chars().count()
                     );
@@ -14830,7 +15035,7 @@ impl eframe::App for LauncherApp {
                         TOAST_ERR,
                     ));
                     ui.ctx().request_repaint_after(TOAST_TTL);
-                    eprintln!("计算器：复制失败（{e}）");
+                    log_info!("计算器：复制失败（{e}）");
                 }
             }
         }
@@ -14857,19 +15062,19 @@ impl eframe::App for LauncherApp {
                 // Popup 在本帧已经把旗标写回 false，这里只补一条日志并接住剩下的分支——
                 // 不接住的话这一次 Esc 会顺路把查询清空、甚至把窗口收进托盘。
                 self.menu_open = false;
-                eprintln!("☰ 菜单：按 Esc 收起（窗口与查询都不动）");
+                log_info!("☰ 菜单：按 Esc 收起（窗口与查询都不动）");
             } else if self.pending_destructive.is_some() {
-                eprintln!("高级页确认：按 Esc 取消，未执行");
+                log_info!("高级页确认：按 Esc 取消，未执行");
                 self.pending_destructive = None;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
             } else if self.manage_confirm.is_some() {
                 // 批次 D5：批量管理的确认框。只收框，设置页与勾选都留着（用户想改选再试）。
-                eprintln!("批量管理确认：按 Esc 取消，未执行");
+                log_info!("批量管理确认：按 Esc 取消，未执行");
                 self.manage_confirm = None;
                 ui.ctx().request_repaint();
             } else if self.internal_confirm.is_some() {
-                eprintln!("内部确认：按 Esc 取消，未执行");
+                log_info!("内部确认：按 Esc 取消，未执行");
                 self.internal_confirm = None;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
@@ -14882,12 +15087,12 @@ impl eframe::App for LauncherApp {
                 self.focus_query = true;
                 ui.ctx().request_repaint();
             } else if self.batch_confirm.is_some() {
-                eprintln!("全部回收站确认：按 Esc 取消，未删除");
+                log_info!("全部回收站确认：按 Esc 取消，未删除");
                 self.batch_confirm = None;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
             } else if self.confirm.is_some() {
-                eprintln!("删除确认：按 Esc 取消，未删除");
+                log_info!("删除确认：按 Esc 取消，未删除");
                 self.confirm = None;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
@@ -14895,7 +15100,7 @@ impl eframe::App for LauncherApp {
                 // 批次 B6：只收参数框，查询与选中都不动（用户可能想换个参数再来一次）。
                 self.param_prompt = None;
                 self.focus_query = true;
-                eprintln!("参数框：按 Esc 取消，未启动（参数原文不落日志）");
+                log_info!("参数框：按 Esc 取消，未启动（参数原文不落日志）");
                 ui.ctx().request_repaint();
             } else if self.dialog.as_ref().is_some_and(|d| d.fill_prompt.is_some()) {
                 // 批次 D4：替换询问那一屏，Esc 只收询问、不关弹窗——这里按 Esc 的意思是
@@ -14903,7 +15108,7 @@ impl eframe::App for LauncherApp {
                 if let Some(dg) = self.dialog.as_mut() {
                     dg.fill_prompt = None;
                 }
-                eprintln!("弹窗：按 Esc 收起「要不要替换」询问，弹窗保留（内容不落日志）");
+                log_info!("弹窗：按 Esc 收起「要不要替换」询问，弹窗保留（内容不落日志）");
                 ui.ctx().request_repaint();
             } else if self.dialog.is_some() {
                 self.dialog = None;
@@ -14969,17 +15174,20 @@ fn init_tray() -> (TrayIcon, mpsc::Receiver<TrayEvent>) {
     let import_id = muda::MenuId("import".to_string());
     let settings_id = muda::MenuId("settings".to_string());
     let log_id = muda::MenuId("openlog".to_string());
+    let sysinfo_id = muda::MenuId("sysinfo".to_string());
     let exit_id = muda::MenuId("exit".to_string());
     let show_item = MenuItem::with_id(show_id.clone(), "显示", true, None);
     let import_item = MenuItem::with_id(import_id.clone(), "批量导入全部", true, None);
     let settings_item = MenuItem::with_id(settings_id.clone(), "设置…", true, None);
     let log_item = MenuItem::with_id(log_id.clone(), "打开日志", true, None);
+    let sysinfo_item = MenuItem::with_id(sysinfo_id.clone(), "复制系统信息", true, None);
     let exit_item = MenuItem::with_id(exit_id.clone(), "退出", true, None);
     let menu = Menu::new();
     menu.append(&show_item).unwrap();
     menu.append(&import_item).unwrap();
     menu.append(&settings_item).unwrap();
     menu.append(&log_item).unwrap();
+    menu.append(&sysinfo_item).unwrap();
     menu.append(&exit_item).unwrap();
     let menu_channel = MenuEvent::receiver();
     thread::spawn(move || {
@@ -14994,6 +15202,8 @@ fn init_tray() -> (TrayIcon, mpsc::Receiver<TrayEvent>) {
                         let _ = tx.send(TrayEvent::Settings);
                     } else if event.id == log_id {
                         let _ = tx.send(TrayEvent::OpenLog);
+                    } else if event.id == sysinfo_id {
+                        let _ = tx.send(TrayEvent::CopySysInfo);
                     } else if event.id == exit_id {
                         let _ = tx.send(TrayEvent::Exit);
                     }
@@ -15022,7 +15232,9 @@ static LOG_FILE: OnceLock<std::fs::File> = OnceLock::new();
 
 /// 没有控制台可看日志时，把 stderr 接到 `launcher.log`（与清单同目录，便携优先）。
 ///
-/// 只换标准错误句柄 ⇒ 全部 `eprintln!` 调用点一行不动，panic 信息也一起进文件。
+/// 只换标准错误句柄 ⇒ 全部 `log_info!` / `log_debug!` 调用点一行不动，panic 信息也一起进文件。
+/// 批次 G5 起这句话里的 `eprintln!` 换成了两个宏名：句子本身仍然成立——接管发生在**句柄**这一层，
+/// 与哪些行会被打出来（电平闸门）是两件正交的事，闸门在上游决定"写不写"，这里决定"写到哪"。
 /// 判据是「没人听」：GUI 子系统进程从登录自启/资源管理器启动时 `GetStdHandle` 直接报
 /// 错（句柄为 NULL/INVALID），日志会全部落空 ⇒ 这时才接管；从终端启动或被外部重定向
 /// 捕获时句柄有效 ⇒ 一个字都不动，保住实时日志这条取证通道。两条分支均在本机实测。
@@ -15045,7 +15257,7 @@ fn redirect_stderr_if_orphan() {
     };
     let file = LOG_FILE.get_or_init(|| file);
     if unsafe { SetStdHandle(STD_ERROR_HANDLE, HANDLE(file.as_raw_handle())) }.is_ok() {
-        eprintln!(
+        log_info!(
             "{}{stamp} ｜ 本次启动没有控制台，stderr 接到 {}",
             source::application::LOG_DATE_TAG,
             path.display()
@@ -15054,6 +15266,8 @@ fn redirect_stderr_if_orphan() {
 }
 
 fn main() -> eframe::Result {
+    // 批次 G5（NFR-01）：放在 redirect 之前——`perf: startup` 要的是整条启动链的耗时。
+    let _ = PROCESS_START.get_or_init(Instant::now);
     redirect_stderr_if_orphan(); // 必须在第一条日志之前：换句柄只管之后的写
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = cli::parse(&args);
@@ -15080,7 +15294,7 @@ fn main() -> eframe::Result {
             }
             match status {
                 IpcSendStatus::Ack => {
-                    eprintln!("single instance: 已转发给运行实例，本进程退出");
+                    log_info!("single instance: 已转发给运行实例，本进程退出");
                     return Ok(());
                 }
                 IpcSendStatus::Timeout => {
@@ -15088,28 +15302,28 @@ fn main() -> eframe::Result {
                     if kill_hung_instance() {
                         match wait_for_mutex(Duration::from_secs(2)) {
                             Some(h) => {
-                                eprintln!("single instance: 已接管卡死的旧实例");
+                                log_info!("single instance: 已接管卡死的旧实例");
                                 Some(h)
                             }
                             None => {
-                                eprintln!(
+                                log_info!(
                                     "single instance: 旧实例已结束但互斥体未释放，按第二实例启动（降级）"
                                 );
                                 None
                             }
                         }
                     } else {
-                        eprintln!("single instance: 无法结束卡死的旧实例，按第二实例启动（降级）");
+                        log_info!("single instance: 无法结束卡死的旧实例，按第二实例启动（降级）");
                         None
                     }
                 }
                 IpcSendStatus::NoWindow => {
                     // 互斥体在但找不到消息窗：无法安全定位旧进程，不做无依据的杀进程。
                     if cli.startup {
-                        eprintln!("single instance: 已有实例但找不到消息窗，-Startup 本进程退出");
+                        log_info!("single instance: 已有实例但找不到消息窗，-Startup 本进程退出");
                         return Ok(());
                     }
-                    eprintln!("single instance: 已有实例但找不到消息窗，按第二实例启动（降级）");
+                    log_info!("single instance: 已有实例但找不到消息窗，按第二实例启动（降级）");
                     None
                 }
             }
@@ -15150,15 +15364,28 @@ fn main() -> eframe::Result {
     // 以前下面还会读第二遍，而这一次读顺手把坏文件改名隔离了 ⇒ 第二遍只看见"文件不存在"，
     // FR-CFG-02 那句界面提示因此从不出现（类型不符的降级日志反倒一次启动打两遍）。
     let (configured, broken) = source::application::load_settings();
+    // 批次 G5（FR-SYS-03）：日志级别要在**任何一条业务日志之前**落地，所以紧贴读盘之后。
+    // `None` = 跟随构建（debug 构建详细、release 构建标准）。落实的档位与来源记一条——
+    // "这次日志为什么这么少"得能从日志本身找到答案，而不是去翻设置页。
+    let (start_log_level, log_source) = match configured.log_level {
+        Some(l) => (l, "设置页指定"),
+        None => (logging::LogLevel::fallback(), "跟随构建"),
+    };
+    logging::set_level(start_log_level);
+    log_info!(
+        "日志级别：{}（{log_source}，构建={}）",
+        start_log_level.label(),
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
     match &broken {
-        Some(Corrupted::Kept(p)) => eprintln!(
+        Some(Corrupted::Kept(p)) => log_info!(
             "配置损坏：热键线程用的 settings.json 解析失败，已隔离为 {}，本轮按出厂热键注册",
             p.display()
         ),
         // 这一次读自己不写盘，所以 `Lost` 在这里不需要停手；"留证没成功就不写"那道门禁吃的是
         // 下面传进 `LauncherApp::new` 的这份 `broken`，门禁本身没有因为少了一次读而变空。
         Some(Corrupted::Lost) => {
-            eprintln!(
+            log_info!(
                 "配置损坏：settings.json 解析失败且留证没成功 ⇒ 热键线程按出厂热键注册（这一次只读不写）"
             )
         }
@@ -15226,7 +15453,7 @@ fn main() -> eframe::Result {
                 _ => None,
             });
             if self_hwnd.is_none() {
-                eprintln!("IME: 无法获取本机 HWND，E-05 英文模式切换将跳过");
+                log_info!("IME: 无法获取本机 HWND，E-05 英文模式切换将跳过");
             }
             Ok(Box::new(LauncherApp::new(
                 tray_rx,

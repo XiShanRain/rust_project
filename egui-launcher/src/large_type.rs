@@ -124,7 +124,7 @@ impl LargeType {
         let pos = centered(work, size);
 
         // 与其余动作日志同口径：只记长度与字号，显示原文不落盘。
-        eprintln!(
+        log_info!(
             "大字显示：显示（{chars} 个字符，字号 {font}，窗口 {}×{}）",
             size.x.round(),
             size.y.round()
@@ -221,13 +221,13 @@ fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, root: Option<usize>) {
             };
             s.showing = None;
             drop(s);
-            eprintln!("大字显示：收起（{reason}）");
+            log_info!("大字显示：收起（{reason}）");
             // 自己按键关掉的，焦点要还回主窗，接着改查询。**必须在藏窗之前**：
             // 藏起来的一瞬间系统会自己挑"下一个活动窗"，挑到谁不可控；由本进程
             // （此刻正是前台进程）先把主窗激活，藏窗就不会再转移焦点。
             // 「失焦」这一档不还——那时用户已经去点别的程序了，抢回来反而是错的。
             if (esc || click) && !return_to_root(root) {
-                eprintln!("大字显示：焦点没能还给主窗（SetForegroundWindow 失败）");
+                log_info!("大字显示：焦点没能还给主窗（SetForegroundWindow 失败）");
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             return;

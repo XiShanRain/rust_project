@@ -249,7 +249,7 @@ fn guarded<T>(id: SourceId, f: impl FnOnce() -> T) -> Option<T> {
         Ok(v) => Some(v),
         Err(_) => {
             // 默认 panic hook 已经把位置与消息打到 stderr（落 launcher.log）；这里只补一句归因。
-            eprintln!("数据源 {}：本帧 panic，已跳过（其余源照常）", id.as_str());
+            log_info!("数据源 {}：本帧 panic，已跳过（其余源照常）", id.as_str());
             None
         }
     }

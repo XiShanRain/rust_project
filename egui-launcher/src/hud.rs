@@ -152,7 +152,7 @@ impl Hud {
         let mut s = self.shared.lock().unwrap();
         s.last_work = Some((work_phys, Instant::now()));
         // 与其余动作日志同口径：只记长度与停留档位，提示原文不落盘。
-        eprintln!(
+        log_info!(
             "HUD：显示（{} 个字符，停留 {} ms）",
             text.chars().count(),
             hold.as_millis()
@@ -223,7 +223,7 @@ fn draw(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         if elapsed >= held + FADE_OUT_SECS {
             s.showing = None;
             drop(s);
-            eprintln!("HUD：收起（显示 {:.0} ms）", elapsed * 1000.0);
+            log_debug!("HUD：收起（显示 {:.0} ms）", elapsed * 1000.0);
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Visible(false));
             return;

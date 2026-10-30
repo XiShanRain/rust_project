@@ -167,7 +167,7 @@ impl Theme {
                 if let Some(s) = &f.$field {
                     match parse_hex(s) {
                         Some(c) => self.$field = c,
-                        None => eprintln!(
+                        None => log_info!(
                             "theme: 「{}」的 {} = {:?} 不是 RRGGBB，保留继承值 {:02X}{:02X}{:02X}",
                             self.name,
                             stringify!($field),
@@ -541,7 +541,7 @@ pub fn load_user_files(dir: &std::path::Path) -> HashMap<String, ThemeFile> {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("theme: 主题 {:?} 读不出来（{e}），忽略", path.file_name());
+                log_info!("theme: 主题 {:?} 读不出来（{e}），忽略", path.file_name());
                 continue;
             }
         };
@@ -549,7 +549,7 @@ pub fn load_user_files(dir: &std::path::Path) -> HashMap<String, ThemeFile> {
             Ok(f) => {
                 out.insert(name.to_string(), f);
             }
-            Err(e) => eprintln!("theme: 主题「{name}」解析失败（{e}），已忽略"),
+            Err(e) => log_info!("theme: 主题「{name}」解析失败（{e}），已忽略"),
         }
     }
     out
@@ -622,12 +622,12 @@ fn resolve_name(
     let file = files.get(name).cloned().or_else(|| builtin_file(name));
     let Some(file) = file else {
         if name != FALLBACK_THEME {
-            eprintln!("theme: 找不到主题「{name}」，按 {FALLBACK_THEME} 处理");
+            log_info!("theme: 找不到主题「{name}」，按 {FALLBACK_THEME} 处理");
         }
         return theme;
     };
     if depth >= MAX_DEPTH || stack.iter().any(|s| s == name) {
-        eprintln!(
+        log_info!(
             "theme: 继承链在「{name}」这里断开（深度 {depth} / 成环），按 {FALLBACK_THEME} 处理"
         );
         return theme;
@@ -686,7 +686,7 @@ pub fn install_fonts(ctx: &egui::Context, font_name: &str) {
     if !font_name.eq_ignore_ascii_case("auto") {
         preferred = find_font(font_name);
         if preferred.is_none() {
-            eprintln!("theme: 找不到字体「{font_name}」，按 auto 处理");
+            log_info!("theme: 找不到字体「{font_name}」，按 auto 处理");
         }
     }
     if let Some((label, bytes, index)) = preferred {
@@ -700,7 +700,7 @@ pub fn install_fonts(ctx: &egui::Context, font_name: &str) {
             .entry(egui::FontFamily::Proportional)
             .or_default()
             .insert(0, "theme".to_owned());
-        eprintln!("theme: 字体改用 {label}");
+        log_info!("theme: 字体改用 {label}");
     }
     for (file, index) in [("msyh.ttc", 0u32), ("simhei.ttf", 0), ("STXIHEI.TTF", 0)] {
         let Ok(bytes) = std::fs::read(format!(r"C:\Windows\Fonts\{file}")) else {
