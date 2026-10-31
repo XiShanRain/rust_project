@@ -529,7 +529,7 @@ A4 撤除后用户在选项面板里点了 **A9**。起因是一句实测：本�
 | 档 | 条目 | 处置 |
 | --- | --- | --- |
 | **主干** | 已完成的 A1/A9/B/C1/D/E1/G；待做 **A10 → A2 → A3 → A8 → F1** | 按序做，每项独立成批 |
-| **插件** | **A5 片段 + 自动展开**（FR-SRC-07/08）· **A6 浏览器书签**（FR-SRC-12）· **A7 脚本目录**（FR-SRC-15） | 延后；将来以插件形式提供 |
+| **插件** | **A5 片段 + 自动展开**（FR-SRC-07/08）· **A6 浏览器书签**（FR-SRC-12）· ~~**A7 脚本目录**（FR-SRC-15）~~【2026-10-31 批次 A7 **已按主干实现**，见 §八十二；A5 / A6 仍延后】 | 延后；将来以插件形式提供 |
 | **打磨** | B1/B3/B5/B6/B7/B8 · C2/C3 · D2/D4/D5/D8 · F2/F3/F4 · G1/G2/G3/G5 | 延后，不做插件 |
 
 | 项 | 现量 |
@@ -1651,6 +1651,24 @@ AHK 版的 `Ctrl+L` 是「看不清就把这串字放大」，Delphi 版没有�
 | 用户环境复原 | 只起 / 停本轮自建沙箱实例（`target/f16/bin/`，截图脚本每次截完即杀；收尾复查无 `egui-launcher.exe` 残留）。用户的运行实例全程未由本批启停；`%LOCALAPPDATA%\egui-launcher` 在最后那轮真二进制取证前后逐个核对，仍是 `settings.json` 2020 字节 / `user_items.json.bak` 31689 字节、两者 mtime 都冻在 2026-10-26 08:16:56 ⇒ **便携沙箱一个字节都没写到用户数据目录**。沙箱 `settings.json` 为三组对照临时改过 `language` 与 `appearance.width`，收尾已还原成 `en` / 500。沙箱里留着截图与探针脚本（不入库）。 |
 | 四格审计 | 新口径（`target/markup-audit.sh`）：工作区 **5 条**（需求书 453；发布说明 1075 / 1076 / 1098；开发计划 674），与按当前 HEAD（`9dda762`）重建的副本（`target/audit-f16-head/`，`git -C .. archive HEAD egui-launcher/docs`）同 5 条、同身份、同行号，去掉路径前缀后两侧 `diff` 为空；旧口径（`target/old-parity-audit.sh`）：工作区 **21 条**、HEAD 副本 **21 条**，两侧 `diff` 也为空 ⇒ **本批引入 0 条**（原始输出 `target/audit-f16-{new,old}-{wt,head}.txt`，HEAD 侧归一化副本另存 `-norm`）。标题序列检查：三份文档里只有发布说明多出「### 八十一」一条，需求说明书与开发计划一位没动（G4 那行是表格内容改动，不增删标题）。**首跑自伤 1 条**：插入 F16 行时把「F14 行尾 ＋ 空行」一并当成锚点，新行被粘到 F14 行尾（该行 12 个竖线 vs 表头 6 个，开发计划 715），切开成两行后复跑归零。真二进制取证补记完「验证」「用户环境复原」两格后又整组复跑一遍：仍工作区 5 条 / HEAD 副本 5 条、旧口径 21 / 21，两侧归一化后 `diff` 均为空（`target/audit-f16-*-{wt,head}.txt`）。 |
 | 提交 | **未提交**，等用户正文。 |
+
+### 八十二、批次 A7：脚本目录（FR-SRC-15，2026-10-31，用户经选项面板裁定「A7 脚本目录（推荐）」）
+
+| 项 | 内容 |
+| --- | --- |
+| 本轮要结的账 | FR-SRC-15 在 2026-10-22 被划进插件档（「扫用户自己的 `Scripts\`，按目录约定生成条目，与主程序无耦合」）。用户经选项面板裁定「A7 脚本目录（推荐）」⇒ 回主干交付，正好用上批次 A10 留的插槽：新增一个 `DataSource` 实现 ＋ 一行注册 ＋ 一个开关，**`plan()` 的匹配链一个字节没动**——这正是 A10 当时写下的插件体系验收判据。需求书与开发计划的「插件档」两句同步作废并保留原文。 |
+| 甲 数据层（`src/source/scripts.rs`，1014 行、13 条单测、零界面代码） | 常量：扩展名白名单 `SCRIPT_EXTS`（`scripts.rs:25`）、头部解析只看前 30 行 / 64KB（`:28` / `:30`）、热刷新间隔 2 s（`:32`）、至多 5 行（`:34`）、超时 120 s（`:36`）。`parse_header`（`:131`）认 `;` `#` `//` `::` `rem` 五种注释标记后的 `@altrun.title/keyword/argument/mode`，同名后行覆盖前行、空值当没写；UTF-8 BOM 先摘（记事本默认带 BOM），非 UTF-8 有损转换。首次启用生成 3 个示例脚本（`EXAMPLES` `:634`、`write_examples` `:667`，只补缺、**从不覆盖**同名文件，单测 `examples_are_ascii_crlf_without_bom_and_never_overwrite` `:905`）。打分复用清单七档表 `matching::score_text`（`src/matching.rs:334`），取 title / keyword / 拼音首字母三者最优，按（档位, 分数, 标题字数）排序后截到 5 行。 |
+| 乙 注册与行类型 | `SourceId::Scripts`（`src/source/mod.rs:52`）稳定名 `"scripts"`（`:84`）写进 `settings.json` 的 `sources_off`；注册顺序在**自定义命令与网页引擎之间**（`src/source/mod.rs:246`）——用户数据压过出厂源。新增头段行 `SourceRow::Script` 与补全行 `SourceRow::ScriptHint`；设置页第 4 页「数据源」自动多一行开关，页面代码零改动。i18n 两语各 9 个键（`locales/zh-CN.json:805-810` / `:868` / `:1059-1060`，英文包同位置），英文无 CJK 守卫沿用 F14。 |
+| 丙 三种运行模式 | `window`（缺省）起独立控制台；`silent` 用 `cmd /c` 捕获输出、取**最后一行非空**文本做 Toast（空输出报「跑完了」）；`output` 把全部输出写临时 `.txt` 交默认程序打开、文件保留。`spawn` 在 `scripts.rs:495`，两条捕获路在 `:550`；`main.rs:5641` 起后台线程 ＋ 120 s 超时，回执经通道回主线程（`main.rs:5699` / `:5703`）。**超时只有单测判据**：`a7_silent_report_reports_last_line_or_done_and_timeout_is_an_error`（`src/main.rs:18552`），真机没真跑过超时脚本。 |
+| 丁 修掉的缺陷：`cmd /c` 引号 | 捕获模式原来把 `script > temp 2>&1` 裸交给 `cmd /c`：cmd 会剥掉首尾各一个引号 ⇒ 带空格的 `prog` 被拆坏、脚本根本不执行、临时文件也不生成。修法照 AHK `ScriptProvider.ahk:92` 口径——**整条命令行（含重定向）再包一对引号** `cmd /c ""prog" > "out" 2>&1"`（`scripts.rs:510-511`），并补一条**真跑真读**的回归单测 `capture_really_runs_the_script_and_reads_its_last_line`（`:982`）。 |
+| 戊 热刷新 | 每 2 秒比一次目录内容指纹（文件名 ＋ 修改时间 ＋ 长度），不变不扫；变了才重扫并落一行日志。真机双向：新增 `Refresh.bat` 后 4 秒内日志 `目录有变化，重扫得 7 条`、查询 `rprobe` 出行；删除后回到 `重扫得 6 条`、同查询不再出行。 |
+| 己 真机（沙箱 `target/f17/bin/`，与用户实例双向隔离） | ① **开关真机配对**：同一落字方式、同一查询 `silast`，`sources_off:["scripts"]` 只剩 Google / Bing 两行（`shots/22-scripts-off-typed.png`），`[]` 时多出「Test: Silent Last Line / SilentLast.bat」（`shots/23-scripts-on-typed.png`）；日志两侧分别为 `数据源 scripts：已在设置里关闭，本次不初始化` 与 `scripts: 已载入 6 个脚本`。② **热刷新双向**：`24-refresh-probe.png` / `25-refresh-probe-gone.png`。③ **三种模式**：日志里三档都有「已启动 / 已结束」成对行（`scripts: 已启动（模式 window…）`、`已启动并等待结束（模式 silent…）`、`模式 output`）；silent 通知本体有 `shots/09-silast-toast-fixed.png`（「脚本「Test: Silent Last Line」输出：SILENT-LAST-731」）；参数确实交到脚本手里有物证——`Scripts/argument-marker.txt` 内容 `ARG="8080"`。④ **无效证据如实记**：`shots/04-echoit.png` 打开后发现拍到的是别的程序窗口，**判定作废**；window / output 两档的新控制台与 `.txt` 弹出**没有有效截图**，只有日志证据。⑤ F1 探针在旧进程上完全无反应（`20-f1-probe.png`），根因见下一格；换新进程后 F1 打开「关于本程序」正常（`21-f1-fresh.png`），顺带证明按键注入链路本身可用。 |
+| 庚 输入注入的环境事实（本轮踩坑，写下来免得下次重踩） | ① 本机前台常被 `AweSun`（远程桌面）占着，`SetForegroundWindow` / `AttachThreadInput` 强抢都失败 ⇒ 改成**鼠标点击自己窗口**取前台，点击后校验 `GetForegroundWindow` 属于沙箱 PID 才发键。② 第三方 TSF 输入法 `PalmInputUIStatus` 会组字吃字母，IMM 的 `ImmAssociateContext` / `ImmSetOpenStatus` 对它无效（`ImmGetContext` 返回 0 但组字照旧）⇒ 只能反复摘 IMM ＋ 点击取前台。③ 向窗口 `PostMessage(WM_CHAR / WM_KEYDOWN)` 会被 winit 丢弃，落字必须走 `keybd_event`。④ **`WM_INPUTLANGCHANGEREQUEST` ＋ `LoadKeyboardLayoutW("00000409")` 切 en-US 会让该进程此后完全收不到按键**（进程 31076 实证，重启新进程即恢复）⇒ 落字脚本里绝不切布局。四条都是沙箱探针层的事实，产品代码零改动。 |
+| 辛 快捷键与速查表 | **没有新增**：脚本目录是数据源，开关已在设置页第 4 页，没有新命令 / 新语法，按「设置页开关类不另配键」记豁免；速查表 68 条不变。 |
+| 验证 | `cargo test --bins` **493 passed / 0 failed / 1 ignored**（F16 的 479 ＋ 14：`scripts.rs` 13 条 ＋ `main.rs` 1 条；跑在 `--target-dir target/f17-test`，不碰用户 `target/debug`）；`cargo check --all-targets` **零警告**。取证二进制 `target/debug/egui-launcher.exe` 17:10:11，晚于最新源文件 `src/source/scripts.rs` 16:43 与 `src/main.rs` 15:39。**未跑 `cargo fmt`**（成规）。 |
+| 用户环境复原 | 只起 / 停本轮自建沙箱实例（`target/f17/bin/`，收尾复查无残留）；沙箱 `settings.json` 为开关对照临时改过 `sources_off`，收尾已按备份还原成 `[]`。用户的运行实例全程未由本批启停；`%LOCALAPPDATA%\egui-launcher\settings.json`（2020 字节）mtime 仍冻在 2026-10-26 08:16:56 ⇒ 一个字节都没写到用户数据目录。沙箱里留着截图与探针脚本（`fkey.ps1` / `type2.ps1`，不入库）。 |
+| 四格审计 | 新口径（`target/markup-audit.sh`）：工作区 **5 条**（需求书 453；发布说明 1075 / 1076 / 1098；开发计划 674），与按当前 HEAD（`f5e485b`）重建的副本（`target/audit-a7-head/`，`git -C .. archive HEAD egui-launcher/docs`）同 5 条、同身份、同行号，去掉路径前缀后两侧 `diff` 为空；旧口径（`target/old-parity-audit.sh`）：工作区 **21 条**、HEAD 副本 **21 条**，两侧归一化后 `diff` 也为空 ⇒ **本批引入 0 条**。**§八十二 这一节自身 0 条命中**。标题行数对照：需求书 55 / 55、开发计划 35 / 35 一位没动，发布说明 90 / 89，多出的正好是「### 八十二」。原始输出 `target/audit-a7-{new,old}-{wt,head}.txt`，HEAD 侧归一化副本另存 `-norm`。 |
+| 提交 | 代码由用户提交推送 **`f5e485b`**「批次 A7 脚本目录（FR-SRC-15）：Scripts\ 扫描、三种运行模式与收尾回执」；本轮只剩三份文档改动，**未提交**，等用户正文。 |
 
 ### 七十三、批次 G7：验收缺口收口（100 次唤起像素判据 ＋ 滑块真拖拽 ＋ G1 配置路径两条 ＋ G5 遗留两条）（FR-UIX-06 / FR-WIN-02 / FR-SYS-03，2026-10-30，用户经选项面板裁定「验收缺口收口（推荐）」）
 
