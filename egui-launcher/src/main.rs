@@ -1313,6 +1313,33 @@ fn engine_icon_slot(
     }
 }
 
+/// 批次 F16：设置页「一行文本输入 + 右缘按钮」的共用排版。按钮先用 `right_to_left` 落位，
+/// 输入框再吃剩下的整段宽度——按钮文案随语言变长（英文「Delete」实测 45.1 px，再加 8 px
+/// 列间距）也不会把行撑出内容区，不用再拍一个「减多少像素」的常数。
+/// 返回 (输入框响应, 按钮响应)。
+fn trailing_button_edit_row(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: &str,
+    hover: Option<&str>,
+    button_text: &str,
+) -> (egui::Response, egui::Response) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let btn = ui.button(button_text);
+        let resp = ui.add(
+            egui::TextEdit::singleline(text)
+                .hint_text(hint)
+                .desired_width(ui.available_width()),
+        );
+        let resp = match hover {
+            Some(h) => resp.on_hover_text(h),
+            None => resp,
+        };
+        (resp, btn)
+    })
+    .inner
+}
+
 fn spawn_icon_loader(tx: mpsc::Sender<IconDone>, jobs: Vec<IconJob>, px: u32) {
     thread::spawn(move || {
         let mut ok = 0usize;
@@ -6988,7 +7015,8 @@ impl LauncherApp {
         let mut clear_sel = false;
         let mut select_broken = false;
         let mut recheck = hit_recheck;
-        ui.horizontal(|ui| {
+        // 批次 F16：四个按钮 + 一个计数标签，英文文案在 500 px 窗宽下放不进一行 ⇒ 允许折行。
+        ui.horizontal_wrapped(|ui| {
             if ui.button(i18n::t("manage.select_all")).clicked() {
                 select_all = true;
             }
@@ -7135,7 +7163,7 @@ impl LauncherApp {
             .unwrap_or_default();
         let mut convert: Option<bool> = None;
         let mut ask_delete = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let some = checked_n > 0;
             if ui
                 .add_enabled(some, egui::Button::new(i18n::t("manage.to_relative")))
@@ -7486,15 +7514,23 @@ impl LauncherApp {
                     if resp.lost_focus() {
                         commit = true;
                     }
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut e.title)
-                            .hint_text("Google")
-                            .desired_width((ui.available_width() - 60.0).max(60.0)),
-                    );
+                    // 批次 F16：标题框 + 删除按钮走 right_to_left（按钮先落位、标题框吃剩余宽度）；
+                    // 旧写法 `available_width() - 60` 同样是拍脑袋常数，英文按钮一变宽就出界。
+                    let (resp, del) = ui
+                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let del = ui.button(i18n::t("common.delete")).clicked();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut e.title)
+                                    .hint_text("Google")
+                                    .desired_width(ui.available_width()),
+                            );
+                            (resp, del)
+                        })
+                        .inner;
                     if resp.lost_focus() {
                         commit = true;
                     }
-                    if ui.button(i18n::t("common.delete")).clicked() {
+                    if del {
                         remove_row = Some(i);
                     }
                 });
@@ -7517,22 +7553,28 @@ impl LauncherApp {
                         previews.get(i).copied().flatten(),
                     )
                     .on_hover_text(i18n::t("web.icon_hover"));
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut e.icon)
-                            .hint_text(i18n::t("web.icon_hint"))
-                            .desired_width((ui.available_width() - 96.0).max(80.0)),
-                    );
+                    // 批次 F16：同 keyword 行——「下载图标」按钮先落位，路径框吃剩余宽度。
+                    // 英文 "Download icon" 比旧常数 96 px 的预留还宽，之前整行被裁。
+                    let (resp, btn) = ui
+                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let btn = ui
+                                .add_enabled(
+                                    !downloading,
+                                    egui::Button::new(i18n::t("web.download_icon")),
+                                )
+                                .on_hover_text(i18n::t("web.download_hover"));
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut e.icon)
+                                    .hint_text(i18n::t("web.icon_hint"))
+                                    .desired_width(ui.available_width()),
+                            );
+                            (resp, btn)
+                        })
+                        .inner;
                     if resp.lost_focus() {
                         commit = true;
                     }
-                    let btn = ui.add_enabled(
-                        !downloading,
-                        egui::Button::new(i18n::t("web.download_icon")),
-                    );
-                    if btn
-                        .on_hover_text(i18n::t("web.download_hover"))
-                        .clicked()
-                    {
+                    if btn.clicked() {
                         download_row = Some(i);
                     }
                 });
@@ -7579,7 +7621,8 @@ impl LauncherApp {
                 .color(TOAST_ERR),
             );
         }
-        ui.horizontal(|ui| {
+        // 批次 F16：英文 "Restore defaults" 更宽，放不下就折行。
+        ui.horizontal_wrapped(|ui| {
             if ui.button(i18n::t("web.add")).clicked() {
                 add_row = true;
             }
@@ -8789,16 +8832,18 @@ impl LauncherApp {
                             {
                                 let folders = self.file_folders_edit.as_mut().expect("上面刚填过");
                                 for (i, f) in folders.iter_mut().enumerate() {
+                                    // 批次 F16：旧写法把输入框定成 `行宽 - 44`，英文「Delete」
+                                    // 实测 45.1 px + 8 px 列间距 ⇒ 每行溢出 9 px，而 egui 会把溢出
+                                    // 并进内容区宽度、行行继续加宽，整页右缘被裁。改用右缘按钮先
+                                    // 落位的共用排版（见 `trailing_button_edit_row`）。
                                     ui.horizontal(|ui| {
-                                        let resp = ui
-                                            .add(
-                                                egui::TextEdit::singleline(f)
-                                                    .hint_text(
-                                                        i18n::t("files.folder_hint"),
-                                                    )
-                                                    .desired_width(ui.available_width() - 44.0),
-                                            )
-                                            .on_hover_text(i18n::t("files.folder_hover"));
+                                        let (resp, del) = trailing_button_edit_row(
+                                            ui,
+                                            f,
+                                            i18n::t("files.folder_hint"),
+                                            Some(i18n::t("files.folder_hover")),
+                                            i18n::t("common.delete"),
+                                        );
                                         // 路径是打字输入：提交在失焦那刻，不是每个键一写盘一重扫。
                                         // 判据只用 `lost_focus`——`changed()` 只在那帧真有编辑时为真，
                                         // 而失焦落在后来的点击帧，`changed() && lost_focus()` 几乎
@@ -8807,7 +8852,7 @@ impl LauncherApp {
                                             *f = f.trim().to_string();
                                             commit_folders = true;
                                         }
-                                        if ui.button(i18n::t("common.delete")).clicked() {
+                                        if del.clicked() {
                                             remove_row = Some(i);
                                         }
                                     });
@@ -8840,18 +8885,21 @@ impl LauncherApp {
                             {
                                 let exclude = self.file_exclude_edit.as_mut().expect("上面刚填过");
                                 for (i, x) in exclude.iter_mut().enumerate() {
+                                    // 批次 F16：与目录行同一改法（右缘按钮先落位）。
                                     ui.horizontal(|ui| {
-                                        let resp = ui.add(
-                                            egui::TextEdit::singleline(x)
-                                                .hint_text("node_modules")
-                                                .desired_width(ui.available_width() - 44.0),
+                                        let (resp, del) = trailing_button_edit_row(
+                                            ui,
+                                            x,
+                                            "node_modules",
+                                            None,
+                                            i18n::t("common.delete"),
                                         );
                                         // 按目录名整段跳过（大小写不敏感），连它下面的文件一起不进索引。
                                         if resp.lost_focus() {
                                             *x = x.trim().to_string();
                                             commit_exclude = true;
                                         }
-                                        if ui.button(i18n::t("common.delete")).clicked() {
+                                        if del.clicked() {
                                             remove_ex = Some(i);
                                         }
                                     });
@@ -8860,7 +8908,8 @@ impl LauncherApp {
                                     exclude.remove(i);
                                     commit_exclude = true;
                                 }
-                                ui.horizontal(|ui| {
+                                // 批次 F16：英文界面下两个按钮一行放不下就折行。
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button(i18n::t("files.add_exclude")).clicked() {
                                         exclude.push(String::new());
                                         commit_exclude = true;
@@ -8882,7 +8931,9 @@ impl LauncherApp {
                             );
                             ui.separator();
                             ui.label(egui::RichText::new(i18n::t("files.tiers_title")).strong());
-                            ui.horizontal(|ui| {
+                            // 批次 F16：档位行都是「标签 + 若干个按钮」，英文文案比中文长得多
+                            // （如 "180 minutes"），500 px 窗宽下放不下整行 ⇒ 统一允许折行。
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(i18n::t("files.depth_label"));
                                 let mut depth = self.prefs.file_depth;
                                 let before = depth;
@@ -8901,7 +8952,7 @@ impl LauncherApp {
                                     ui.ctx().request_repaint();
                                 }
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(i18n::t("files.cap_label"));
                                 let mut cap = self.prefs.file_max_entries;
                                 let before = cap;
@@ -8919,7 +8970,7 @@ impl LauncherApp {
                                     ui.ctx().request_repaint();
                                 }
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(i18n::t("files.refresh_label"));
                                 let mut mins = self.prefs.file_refresh_minutes;
                                 let before = mins;
@@ -8941,7 +8992,7 @@ impl LauncherApp {
                                     ui.ctx().request_repaint();
                                 }
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(i18n::t("files.minlen_label"));
                                 let mut mql = self.prefs.file_min_query_len;
                                 let before = mql;
@@ -16151,6 +16202,57 @@ mod nav_tests {
         assert_eq!(got.chars().count(), 10);
         assert!(got.ends_with('…'), "截断了要看得出来：{got}");
         assert!(got.starts_with(r"C:\工"));
+    }
+
+    /// 批次 F16（500 px 窗宽下设置页第 5/8/10 页右缘被裁）：那条「输入框 + 右缘按钮」
+    /// 的行，按钮多宽都不许顶出内容区。真机实测（沙箱打点 F16ROW）：500 px 窗宽下这一列
+    /// 内容区只有 364 px，英文「Delete」按钮 45.1 px、列间距 8 px；旧写法把输入框定成
+    /// `行宽 - 44`，每行溢出 9 px，egui 又把溢出并进内容区宽度 ⇒ 越排越宽、整页被裁。
+    #[test]
+    fn trailing_button_edit_row_never_exceeds_the_row_width() {
+        for width in [200.0f32, 300.0, 364.0] {
+            for label in ["Delete", "Download icon"] {
+                let ctx = egui::Context::default();
+                let mut text = String::from(r"%USERPROFILE%\Downloads");
+                let mut edit_rect = egui::Rect::NOTHING;
+                let mut btn_rect = egui::Rect::NOTHING;
+                let mut row_right = 0.0f32;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 80.0),
+                    )),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| {
+                    row_right = ui.max_rect().max.x;
+                    ui.horizontal(|ui| {
+                        let (edit, btn) =
+                            trailing_button_edit_row(ui, &mut text, "path", None, label);
+                        edit_rect = edit.rect;
+                        btn_rect = btn.rect;
+                    });
+                });
+                // 无头跑一帧不会有人消费纹理增量；不 clear 的话 drop 时会 panic。
+                out.textures_delta.clear();
+                assert!(
+                    btn_rect.right() <= row_right + 0.5,
+                    "行宽 {width} / 按钮「{label}」：按钮右缘 {:.1} 顶出内容区右缘 {row_right:.1}",
+                    btn_rect.right()
+                );
+                assert!(
+                    edit_rect.right() <= btn_rect.left() + 0.5,
+                    "行宽 {width} / 按钮「{label}」：输入框右缘 {:.1} 压进按钮左缘 {:.1}",
+                    edit_rect.right(),
+                    btn_rect.left()
+                );
+                assert!(
+                    edit_rect.width() > 60.0,
+                    "行宽 {width} / 按钮「{label}」：输入框被挤成 {:.1} px",
+                    edit_rect.width()
+                );
+            }
+        }
     }
 
     /// 批次 B6（FR-ACT-07）：编辑弹窗把「编码」带进带出。用户改的是那个下拉，
