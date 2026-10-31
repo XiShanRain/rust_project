@@ -454,15 +454,19 @@ enum SettingsTab {
     /// 批次 D2（FR-SRC-11 的缺口）：网页搜索引擎表——列出 / 增删改 / 恢复出厂 / 兜底引擎。第 10 页。
     /// 排在「使用统计」后面：同属低频维护页，且不打断前九页的页号（`-Preferences` 是线性协议）。
     WebEngines,
+    /// 批次 A5（FR-SRC-07）：片段库——增删改 + 触发词 / 正文搜索 / 粘贴方式与延迟。第 11 页。
+    /// 与「网页引擎」同为"用户自己维护的一张表"，追加在末尾同样不动前 10 页的页号。
+    Snippets,
 }
 
 impl SettingsTab {
     /// FR-WIN-08：页码从 1 起（1=通用 2=功能 3=热键 4=数据源 5=文件搜索 6=外观 7=高级
-    /// 8=批量管理 9=使用统计）；越界返回 None，由调用方落回通用。批次 D7 起第 5 页由「外观」
+    /// 8=批量管理 9=使用统计 10=网页引擎 11=片段）；越界返回 None，由调用方落回通用。批次 D7 起第 5 页由「外观」
     /// 改为「文件搜索」，原第 5/6 页顺延——`-Preferences 5/6` 的旧语义随之变，与设置页分类栏一起改口径。
     /// 【批次 D5：第 8 页追加在末尾，1–7 的语义与 `-Preferences` 参数一格不动。】
     /// 【批次 D8：第 9 页同样追加在末尾，1–8 一格不动。】
     /// 【批次 D2（2026-10-29）：第 10 页「网页引擎」同样追加在末尾，1–9 一格不动。】
+    /// 【批次 A5（2026-10-31）：第 11 页「片段」同样追加在末尾，1–10 一格不动。】
     fn from_page(page: u32) -> Option<Self> {
         match page {
             1 => Some(Self::General),
@@ -475,6 +479,7 @@ impl SettingsTab {
             8 => Some(Self::Manage),
             9 => Some(Self::Usage),
             10 => Some(Self::WebEngines),
+            11 => Some(Self::Snippets),
             _ => None,
         }
     }
@@ -1074,6 +1079,15 @@ struct LauncherApp {
     /// 批次 D2：设置页「网页引擎」页的编辑缓冲，跨帧理由与上面两条相同（每帧克隆会把键吞掉）。
     /// `None`＝这一页没在编辑；进页时按 prefs 取一份，离开页/关设置页时整理后回写并丢掉。
     web_engines_edit: Option<Vec<source::websearch::WebEngine>>,
+    /// 批次 A5（FR-SRC-07）：设置页「片段」页的编辑缓冲，跨帧理由同上（每帧克隆会把键吞掉）。
+    /// `None`＝这一页没在编辑；进页时按 `snippets.json` 取一份，离开页/关设置页时校验后写回并丢掉。
+    snippets_edit: Option<Vec<source::snippet::Snippet>>,
+    /// 上一次写进 `snippets.json` 的那一份：用来判断"真的变了"才写盘
+    /// （与网页引擎表那条 `buf != prefs.web_engines` 同一口径：进来看看又出去不该白写一次）。
+    snippets_saved: Vec<source::snippet::Snippet>,
+    /// 片段页那一行红字（校验没过时说清第几条哪里不对）。存的是已渲染好的文案，
+    /// 切语言后由页面重建，不做跨语言缓存。
+    snippets_note: Option<String>,
     prefs: source::application::AppSettings, // 用户偏好（settings.json，目前只有 space_to_run）
     // ---- 批次 F1：FR-UIX-01 主题（`prefs.theme` 是入口名，这里是解析后的生效形态）----
     /// 本帧渲染读的那一套尺寸 / 颜色。换主题时由 [`LauncherApp::sync_theme`] 一次性替换。
@@ -1592,6 +1606,10 @@ const CLIP_OPEN_POLL: Duration = Duration::from_millis(10);
 /// 复制键的主键 vk：`C` 与 `Insert`（后者给控制台类窗口，`Ctrl+C` 在那儿是"中断程序"）。
 const VK_C: u16 = 0x43;
 const VK_INSERT: u16 = 0x2D;
+/// 批次 A5：片段的 Clipboard 模式要发 `Ctrl+V`，`{cursor}` 落点要发左箭头（裸 VK 即可，
+/// 不走 `KEYEVENTF_UNICODE`——方向键没有字符形态）。
+const VK_V: u16 = 0x56;
+const VK_LEFT: u16 = 0x25;
 
 /// 带重试地打开剪贴板。取选区那一路的**每**一次打开都走这里（清空 / 读结果 / 还原），
 /// 免得"某个瞬间被占着"被记成"功能坏了"。
@@ -1865,7 +1883,7 @@ fn restore_clipboard(snapshot: &[ClipFormat]) -> Result<(), String> {
     }
     let _ = unsafe { CloseClipboard() };
     if put == snapshot.len() {
-        log_info!("取选区：剪贴板已还原（{put} 格，全格式快照）");
+        log_info!("剪贴板：已还原（{put} 格，全格式快照）");
         Ok(())
     } else {
         Err(format!(
@@ -1991,9 +2009,15 @@ fn window_title(hwnd: HWND) -> String {
 /// 读的时候按 `CF_UNICODETEXT` 的约定走 NUL 结尾；1Mi 个 UTF-16 单元的上限只是防一份
 /// 没写结尾的坏数据把 UI 线程挂住（正常剪贴板远到不了这个量）。
 fn read_clipboard_text() -> Option<String> {
+    read_clipboard_text_for("参数标记")
+}
+
+/// 同上，`via` 只换日志前缀：批次 A5 的 `{clipboard}` 占位符也读同一份数据，
+/// 让它的日志挂在自己的标签下，排查时不用猜"参数标记"那几行是谁打的。
+fn read_clipboard_text_for(via: &str) -> Option<String> {
     unsafe {
         if OpenClipboard(None).is_err() {
-            log_info!("参数标记：剪贴板打不开（可能正被别的程序占着）⇒ {{%c}} 这次是空值");
+            log_info!("{via}：剪贴板打不开（可能正被别的程序占着）⇒ 这次是空值");
             return None;
         }
         let text = clipboard_text_locked();
@@ -2001,7 +2025,7 @@ fn read_clipboard_text() -> Option<String> {
         if let Some(t) = &text {
             // 长度可以入日志，原文不行（FR-SYS-03）。
             log_info!(
-                "参数标记：呼出快照读到剪贴板 {} 字（原文不落日志）",
+                "{via}：读到剪贴板 {} 字（原文不落日志）",
                 t.chars().count()
             );
         }
@@ -2058,8 +2082,15 @@ fn remember_previous_window(own: Option<HWND>) {
     }
 }
 
-/// 把一串文本**逐字符打字**进 [`PREVIOUS_HWND`] 那个窗口。
-/// 成功返回落点描述（hwnd + 类名，不含内容），失败返回"为什么一个字都没投"。
+/// 已经抢到前台的那个「呼出前的窗口」。`raw` 是存进 [`PREVIOUS_HWND`] 的数值，
+/// 只用于日志与错误文案（句柄本身在 `Debug` 里没有可读形态）。
+struct PrevWindow {
+    hwnd: HWND,
+    raw: usize,
+    class: String,
+}
+
+/// 把焦点还给 [`PREVIOUS_HWND`] 那个窗口。成功返回它，失败返回"为什么还没碰键盘就停了"。
 ///
 /// 三道闸，任何一道不过都还没碰过键盘：
 /// 1. 记到了句柄，且 [`IsWindow`] 说它还在（原窗口已关 ⇒ 清空记账，避免下次还往死句柄上撞）；
@@ -2069,19 +2100,10 @@ fn remember_previous_window(own: Option<HWND>) {
 ///    不等一帧而是**最多等 [`FOCUS_SETTLE_TIMEOUT`]**：换人是异步的，同帧看一眼会把该贴成功的
 ///    那次拒掉（AHK 版在同一个位置等 1 秒，见 `App.FocusPreviousWindow()`）。
 ///
-/// 走 `KEYEVENTF_UNICODE` 而不是 AHK 的"借剪贴板 → `^v` → 还原"：还原之前那一段里用户按
-/// `Ctrl+V` 会贴出错东西，剪贴板内容还会被监听型程序拿走；计算器那串值是短的纯文本，
-/// Unicode 通道 `wVk = 0` ⇒ `Ctrl+Enter` 那颗还按着的 `Ctrl` 不会被折成新的快捷键
-/// （与 [`inject_typeback_char`] 同一套理由，那一条已真机验过记事本与微软拼音）。
-///
-/// 与那条的**唯一区别**：typeback 打的是本程序自己的输入框（呼出时已按 E-05 切过英文），
-/// 这里打的是别人家的窗口，它的输入法状态我不知道 ⇒ 投字那一小段要自己按快照临时切英文、
-/// 投完还回去。少了这一步，中文 IME 会把事件吃掉而 `SendInput` 仍报全部成功（批次 E5 真机
-/// 抓到的，见下面那段注）。
-fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
-    if text.is_empty() {
-        return Err(crate::i18n::t("paste.err.empty").to_string());
-    }
+/// 批次 A5 从 [`paste_text_into_previous_window`] 里抽出来：那条走 Unicode 逐字注入，
+/// 而片段的 Clipboard 模式要先把自己的正文放进剪贴板再发 `Ctrl+V`，两条路的第一步完全相同——
+/// 各写一遍那三道闸，早晚只改一处，让其中一种粘贴方式往别的窗口里打。
+fn focus_previous_window() -> Result<PrevWindow, String> {
     let raw = PREVIOUS_HWND.load(Ordering::Relaxed);
     if raw == 0 {
         return Err(crate::i18n::t("paste.err.no_prev").to_string());
@@ -2094,19 +2116,13 @@ fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
             &[&format!("{raw:x}")],
         ));
     }
-    let target = window_class_name(hwnd);
+    let class = window_class_name(hwnd);
     if unsafe { !SetForegroundWindow(hwnd).as_bool() } {
         return Err(crate::i18n::tfmt(
             "paste.err.foreground_locked",
-            &[&format!("{raw:x}"), &target],
+            &[&format!("{raw:x}"), &class],
         ));
     }
-    // ---- 闸 ③：等焦点真的落到目标窗口，最多 FOCUS_SETTLE_TIMEOUT ----
-    // 只看一帧会误拒：调用这一条的时候本程序的窗还盖在上面（`do_paste` 是投完字才收窗的），
-    // `SetForegroundWindow` 说 TRUE 只是"允许切"，前台换人可能晚几毫秒才在 `GetForegroundWindow`
-    // 上看得见。AHK 版同样是等的（`App.FocusPreviousWindow()` = `WinActivate` +
-    // `WinWaitActive(..., , 1)`），这里把上限收短。等不到才拒——宁可一个字都不投，
-    // 也不往此刻真正拿着焦点的那个窗口里打。
     let mut settle_polls = 0usize;
     let settle_deadline = Instant::now() + FOCUS_SETTLE_TIMEOUT;
     loop {
@@ -2129,9 +2145,60 @@ fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
         settle_polls += 1;
     }
     if settle_polls > 0 {
-        log_info!("paste: 焦点等了 {settle_polls} 次才落到 0x{raw:x}({target})");
+        log_info!("paste: 焦点等了 {settle_polls} 次才落到 0x{raw:x}({class})");
     }
-    let units: Vec<u16> = text.encode_utf16().collect();
+    Ok(PrevWindow { hwnd, raw, class })
+}
+
+/// Type 通道送字前的换行规整：`\r\n` / `\r` / `\n` 一律折成一个 `\r`。
+///
+/// `KEYEVENTF_UNICODE` 的每个单元最终是一条 `WM_CHAR`，而 Edit / RichEdit 只把
+/// `WM_CHAR 0x0D` 当换行，`0x0A` 被丢掉 ⇒ 两行会粘成一行（2026-10-31 真机 B1 抓到）。
+/// 剪贴板通道不走这里：正文进剪贴板后由目标程序自己按 `\n` 折行。
+fn units_for_typing(text: &str) -> Vec<u16> {
+    let mut units = Vec::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                units.push(0x0D);
+            }
+            '\n' => units.push(0x0D),
+            _ => {
+                let mut buf = [0u16; 2];
+                units.extend_from_slice(c.encode_utf16(&mut buf));
+            }
+        }
+    }
+    units
+}
+
+/// 把一串文本**逐字符打字**进 [`PREVIOUS_HWND`] 那个窗口。
+/// 成功返回落点描述（hwnd + 类名，不含内容），失败返回"为什么一个字都没投"。
+///
+/// 前三道闸见 [`focus_previous_window`]。
+///
+/// 走 `KEYEVENTF_UNICODE` 而不是 AHK 的"借剪贴板 → `^v` → 还原"：还原之前那一段里用户按
+/// `Ctrl+V` 会贴出错东西，剪贴板内容还会被监听型程序拿走；计算器那串值是短的纯文本，
+/// Unicode 通道 `wVk = 0` ⇒ `Ctrl+Enter` 那颗还按着的 `Ctrl` 不会被折成新的快捷键
+/// （与 [`inject_typeback_char`] 同一套理由，那一条已真机验过记事本与微软拼音）。
+///
+/// 与那条的**唯一区别**：typeback 打的是本程序自己的输入框（呼出时已按 E-05 切过英文），
+/// 这里打的是别人家的窗口，它的输入法状态我不知道 ⇒ 投字那一小段要自己按快照临时切英文、
+/// 投完还回去。少了这一步，中文 IME 会把事件吃掉而 `SendInput` 仍报全部成功（批次 E5 真机
+/// 抓到的，见下面那段注）。
+fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
+    if text.is_empty() {
+        return Err(crate::i18n::t("paste.err.empty").to_string());
+    }
+    let prev = focus_previous_window()?;
+    let hwnd = prev.hwnd;
+    let raw = prev.raw;
+    let target = prev.class;
+    let units = units_for_typing(text);
     // ---- 批次 E5 真机抓到的根因：`KEYEVENTF_UNICODE` 的事件**先过一遍目标那边的输入法** ----
     // 目标挂着中文模式的 IME 时，`SendInput` 照样返回"全部收下"，字却一个字都不落地——
     // 报成功的假回执，比报错难查得多。第一轮之所以看着是好的，是本程序自己"呼出时切英文"
@@ -2203,6 +2270,130 @@ fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
         units.len()
     );
     Ok(format!("0x{raw:x}({target})"))
+}
+
+// ---- 批次 A5（FR-SRC-07）：片段的 Clipboard 粘贴通道与 `{cursor}` 落点 ----
+
+/// 和弦里两批之间的停顿。25 ms 是沙箱实测稳定的一档（8/8），不是扫出来的最小安全值。
+const PASTE_CHORD_GAP: Duration = Duration::from_millis(25);
+
+/// 一次 `Ctrl+V`，**分三批**投出：`Ctrl↓` / `V↓+V↑` / `Ctrl↑`，批间停 [`PASTE_CHORD_GAP`]。
+///
+/// 为什么不是一批四个事件：2026-10-31 沙箱对照实验里，四个事件塞进同一次 `SendInput` 后
+/// 目标端会把 `Ctrl↑` 排到 `V↓` 前面 ⇒ `Ctrl+V` 退化成打出一个字面量 `v`。分批后 8/8 全中。
+/// 某一批被系统拒收就立刻停手（剩下的不再发），返回值只代表"三批都收下了"。
+fn send_paste_keystroke() -> bool {
+    let ctrl_down = [vk_input(VK_CONTROL.0, false)];
+    let v_tap = [vk_input(VK_V, false), vk_input(VK_V, true)];
+    let ctrl_up = [vk_input(VK_CONTROL.0, true)];
+    let batches: [&[INPUT]; 3] = [&ctrl_down, &v_tap, &ctrl_up];
+    for (i, batch) in batches.iter().enumerate() {
+        let sent = unsafe { SendInput(batch, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != batch.len() {
+            return false;
+        }
+        if i + 1 < batches.len() {
+            thread::sleep(PASTE_CHORD_GAP);
+        }
+    }
+    true
+}
+
+/// 补 `n` 次左箭头（`{cursor}` 之后的字要退回来）。返回真正投全的次数：
+/// 中途被系统拒掉就停，调用方据此报"退了几次"而不是假装全退回去了。
+///
+/// 每个换行算一格：多数编辑器的行首按左键会跳到上一行行尾，与"退一个字"等价。
+fn send_left_arrows(n: usize) -> usize {
+    let mut sent = 0usize;
+    for _ in 0..n {
+        let inputs = [vk_input(VK_LEFT, false), vk_input(VK_LEFT, true)];
+        let k = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+        sent += k / 2;
+        if k != inputs.len() {
+            break;
+        }
+    }
+    sent
+}
+
+/// 借剪贴板把一串文本贴进「呼出前的窗口」：抢焦点 → 全格式快照 → 写正文 → `Ctrl+V` →
+/// 等 `delay`（给目标程序取走内容的时间）→ 按快照还原。
+///
+/// 与 [`paste_text_into_previous_window`] 的分工：那条走 Unicode 逐字注入，不吃剪贴板、
+/// 但长文一段段投得慢；这条适合多行长文，代价是延迟窗口里剪贴板被本程序占着——
+/// 所以快照拿不到就**整条放弃**（不清空、不发键），与取选区那条同一纪律：
+/// 宁可不做，也不能先把用户复制的东西扔掉再失败。
+fn paste_via_clipboard(text: &str, delay: Duration) -> Result<String, String> {
+    if text.is_empty() {
+        return Err(crate::i18n::t("paste.err.empty").to_string());
+    }
+    let prev = focus_previous_window()?;
+    let snapshot = snapshot_clipboard()
+        .map_err(|e| crate::i18n::tfmt("paste.err.snapshot", &[&e]))?;
+    if let Err(e) = copy_to_clipboard(text) {
+        // 写失败时剪贴板已被清空过一次 ⇒ 立刻把快照放回去，别让用户丢了原来那份。
+        let _ = restore_clipboard(&snapshot);
+        return Err(crate::i18n::tfmt("paste.err.copy", &[&e]));
+    }
+    // 闸门通过之后还有两步（全格式快照、写正文）才走到注入，中间任何人抢走前台都会让整批键
+    // 落进别人的窗口。正常路径这一行不写；写了就是"闸门到注入之间换过人"的实证。
+    let fg_now = unsafe { GetForegroundWindow() };
+    if fg_now.0 != prev.hwnd.0 {
+        let cls = if fg_now.0.is_null() {
+            crate::i18n::t("paste.none").to_string()
+        } else {
+            window_class_name(fg_now)
+        };
+        log_info!(
+            "paste: 注入前前台已经不是目标了 = 0x{:x}({cls})",
+            fg_now.0 as usize
+        );
+    }
+    // 2026-10-31 沙箱对照实验（共 30+ 轮，含不经过本程序的纯 SendInput 探针）：四个事件塞进
+    // 同一批 `SendInput` 在这台机器上会被目标端打乱——目标的按键日志里 `Ctrl↑` 抢到 `V↓` 前面，
+    // 于是贴出来的是字面量 `v`；分批、每批之间停 [`PASTE_CHORD_GAP`] 后 8/8 全中。输入法开关
+    // （Type 那条路用的切英文）试过：没用，反而把「什么都不贴」变成「贴出个 v」，故不在这里动它。
+    let key_ok = send_paste_keystroke();
+    if !delay.is_zero() {
+        thread::sleep(delay);
+    }
+    if let Err(e) = restore_clipboard(&snapshot) {
+        log_info!("片段：剪贴板还原不完整（{e}）⇒ 现在里面可能只有刚粘的那段");
+    }
+    if !key_ok {
+        return Err(crate::i18n::tfmt(
+            "paste.err.paste_key",
+            &[&format!("{:x}", prev.raw)],
+        ));
+    }
+    Ok(format!("0x{:x}({})", prev.raw, prev.class))
+}
+
+/// 本机当地历日与时分秒，喂给 [`source::snippet::expand`] 的 `{date}` / `{time}` 一族。
+fn local_time_now() -> source::snippet::LocalTime {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    source::snippet::LocalTime {
+        year: i64::from(t.wYear),
+        month: u32::from(t.wMonth),
+        day: u32::from(t.wDay),
+        hour: u32::from(t.wHour),
+        minute: u32::from(t.wMinute),
+        second: u32::from(t.wSecond),
+    }
+}
+
+/// `{uuid}` 的来源：`CoCreateGuid`（`Win32_System_Com` 早已开着，不为四个连字符引 uuid crate）。
+/// 取不到就返回空串——展开成空比展开成一个假 UUID 诚实。
+fn guid_string() -> String {
+    let Ok(g) = (unsafe { windows::Win32::System::Com::CoCreateGuid() }) else {
+        log_info!("片段：CoCreateGuid 失败 ⇒ {{uuid}} 这次是空值");
+        return String::new();
+    };
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        g.data1, g.data2, g.data3, g.data4[0], g.data4[1], g.data4[2], g.data4[3], g.data4[4],
+        g.data4[5], g.data4[6], g.data4[7]
+    )
 }
 
 // ---- FR-ACT-10 键盘导航的纯计算部分（不碰 egui 状态，可单测）----
@@ -2594,6 +2785,9 @@ fn large_text_of(
                 }
             }
             HeadRow::ScriptHint(hit) => hit.title.clone(),
+            // 片段行的「这段文字本身」＝正文（未展开的原样，与用户写下的那份一致）。
+            HeadRow::Snippet(hit) => hit.text.clone(),
+            HeadRow::SnippetHint(hit) => hit.title.clone(),
             HeadRow::File(hit) => hit.path.clone(),
             HeadRow::Terminal(hit) => hit.command.clone(),
             HeadRow::TermHint(hit) => hit.title.clone(),
@@ -2626,6 +2820,8 @@ fn enter_action_label(row: Option<&HeadRow>) -> &'static str {
         Some(HeadRow::CustomHint(_)) => i18n::t("status.enter.complete_params"),
         Some(HeadRow::Script(_)) => i18n::t("status.enter.run"),
         Some(HeadRow::ScriptHint(_)) => i18n::t("status.enter.complete_params"),
+        Some(HeadRow::Snippet(_)) => i18n::t("status.enter.paste"),
+        Some(HeadRow::SnippetHint(_)) => i18n::t("status.enter.view"),
         Some(HeadRow::File(_)) => i18n::t("status.enter.open"),
         Some(HeadRow::Terminal(_)) => i18n::t("status.enter.run_command"),
         Some(HeadRow::Cheat(_)) => i18n::t("status.enter.view"),
@@ -3854,6 +4050,9 @@ const LOCAL_TAKEN: &[(u32, u32)] = &[
     (HKF_CONTROL | HKF_SHIFT, 0x44), // Ctrl+Shift+D 删除选中项
     (HKF_CONTROL | HKF_SHIFT, 0x4E), // Ctrl+Shift+N 新建快捷项
     (HKF_CONTROL | HKF_SHIFT, 0x50), // Ctrl+Shift+P 置顶 / 取消置顶
+    // 批次 A5（FR-SRC-07）：`Ctrl+Shift+S` 直达设置页「片段」。`S` 在可录集合里
+    // （字母），且本窗口内没有更矮的 `Ctrl+S` 与它抢（`consume_key` 会忽略多余的 Shift）。
+    (HKF_CONTROL | HKF_SHIFT, 0x53), // Ctrl+Shift+S 设置页·片段（批次 A5）
     // 数字行：Ctrl+1..9/0 与 Alt+1..9/0 执行第 N 行（FR-ACT-10）。
     (HKF_CONTROL, 0x30),
     (HKF_CONTROL, 0x31),
@@ -5212,6 +5411,9 @@ impl LauncherApp {
             file_folders_edit: None,
             file_exclude_edit: None,
             web_engines_edit: None,
+            snippets_edit: None,
+            snippets_saved: Vec::new(),
+            snippets_note: None,
             prefs,
             theme,
             theme_applied: None,
@@ -5648,6 +5850,74 @@ impl LauncherApp {
             log_info!("scripts: 查询已在该脚本关键字之后，等待用户输入参数");
         } else {
             self.complete_query(ctx, &hint.completion);
+        }
+    }
+
+    /// 批次 A5（FR-SRC-07）：把一行片段粘回呼出前的窗口。
+    ///
+    /// 先展开占位符（`{date}` / `{clipboard}` / `{uuid}` / `{cursor}` …），再按设置页选的
+    /// 方式送出去：`Clipboard` 借剪贴板 `Ctrl+V`（多行长文的快路，全格式快照后原样还原）、
+    /// `Type` 走 [`paste_text_into_previous_window`] 的逐字注入（不吃剪贴板）。
+    ///
+    /// 成功 ⇒ HUD 回执 + 关到托盘（与 E5 的「粘贴到原窗口」同一口径：用户的下一步在**那个**
+    /// 窗口里）；失败 ⇒ 一个字都没投，Toast 报原因、窗口留在原地。
+    fn run_snippet_paste(&mut self, ctx: &egui::Context, hit: &source::snippet::SnippetHit) {
+        // 只在正文真用到时才去碰剪贴板 / COM：省一次读，也少一条无谓的日志。
+        let clipboard = if hit.text.contains("{clipboard") {
+            read_clipboard_text_for("片段")
+        } else {
+            None
+        };
+        let uuid = if hit.text.contains("{uuid") {
+            guid_string()
+        } else {
+            String::new()
+        };
+        let expanded = source::snippet::expand(
+            &hit.text,
+            &source::snippet::ExpandInput {
+                now: local_time_now(),
+                clipboard: clipboard.as_deref(),
+                uuid,
+            },
+        );
+        let mut full = expanded.before.clone();
+        full.push_str(&expanded.after);
+        let chars = full.chars().count();
+        let mode = self.prefs.snippet_paste_mode_effective();
+        log_info!(
+            "片段：粘贴方式 {}，{chars} 个字符（内容不落日志）",
+            mode.as_str()
+        );
+        let pasted = match mode {
+            source::snippet::PasteMode::Clipboard => paste_via_clipboard(
+                &full,
+                Duration::from_millis(u64::from(self.prefs.snippet_paste_delay())),
+            ),
+            source::snippet::PasteMode::Type => paste_text_into_previous_window(&full),
+        };
+        match pasted {
+            Ok(where_) => {
+                if !expanded.after.is_empty() {
+                    let want = expanded.after.chars().count();
+                    let got = send_left_arrows(want);
+                    log_info!("片段：{{cursor}} 之后还有 {want} 个字符 ⇒ 左箭头投全 {got} 次");
+                }
+                log_info!("片段：已把 {chars} 个字符粘给 {where_}");
+                self.hud.notify(
+                    ctx,
+                    i18n::tf("hud.pasted_chars", &[&chars.to_string()]),
+                    &self.theme,
+                    hud::HOLD_FOREGROUND,
+                    work_for(self.prefs.appearance.show_on),
+                );
+                self.collapse_after_run(ctx);
+            }
+            Err(e) => {
+                log_info!("片段：粘贴未执行：{e}");
+                self.toast = Some((format!("⚠ {e}"), Instant::now() + TOAST_TTL, TOAST_ERR));
+                ctx.request_repaint_after(TOAST_TTL);
+            }
         }
     }
 
@@ -7000,6 +7270,7 @@ impl LauncherApp {
     fn finish_settings_edits(&mut self) {
         self.finish_file_scope_edits();
         self.finish_web_engine_edits();
+        self.finish_snippets_edit();
     }
 
     /// 批次 D2：把「网页引擎」页的编辑缓冲**原样**写回 prefs（不丢行、不去重）。
@@ -7171,6 +7442,325 @@ impl LauncherApp {
         if changed {
             source::application::save_settings(&self.prefs);
         }
+    }
+
+    // ---- 批次 A5（FR-SRC-07）：设置页第 11 页「片段」----
+
+    /// 片段校验失败的一行文案。四个变体与 `snippet::validate` 一一对应，
+    /// 翻成哪种语言由这里一处决定（页面红字与将来的行内提示共用）。
+    fn snippet_error_text(e: source::snippet::ValidateError) -> &'static str {
+        use source::snippet::ValidateError as V;
+        i18n::t(match e {
+            V::EmptyName => "snippet.err.empty_name",
+            V::EmptyText => "snippet.err.empty_text",
+            V::KeywordSpace => "snippet.err.keyword_space",
+            V::AbbrTooLong => "snippet.err.abbr_too_long",
+        })
+    }
+
+    /// 校验整张片段缓冲。整行空白的（刚点「新建」还没填）静默丢掉——那是正常的中间态；
+    /// 其余逐条过 `validate`，名称/关键字按 `sanitize` 的口径去首尾空白，正文原样保留
+    /// （缩进是正文的一部分）。
+    ///
+    /// 返回值：能写盘的那份、第一条坏行的「序号（从 1 起）+ 原因」、坏行总数。
+    fn scan_snippets_edit(
+        &self,
+    ) -> (
+        Vec<source::snippet::Snippet>,
+        Option<(usize, source::snippet::ValidateError)>,
+        usize,
+    ) {
+        let Some(buf) = self.snippets_edit.as_ref() else {
+            return (Vec::new(), None, 0);
+        };
+        let prefix = self.prefs.snippet_keyword_effective();
+        let mut kept = Vec::with_capacity(buf.len());
+        let mut first_bad = None;
+        let mut bad = 0usize;
+        for (i, s) in buf.iter().enumerate() {
+            let blank = s.name.trim().is_empty()
+                && s.keyword.trim().is_empty()
+                && s.text.trim().is_empty();
+            if blank {
+                continue;
+            }
+            match source::snippet::validate(s, prefix) {
+                Ok(()) => {
+                    let mut one = s.clone();
+                    one.name = one.name.trim().to_string();
+                    one.keyword = one.keyword.trim().to_string();
+                    kept.push(one);
+                }
+                Err(e) => {
+                    bad += 1;
+                    if first_bad.is_none() {
+                        first_bad = Some((i + 1, e));
+                    }
+                }
+            }
+        }
+        (kept, first_bad, bad)
+    }
+
+    /// 片段缓冲写盘。返回 `true` ＝ 真写过盘（调用方据此重绘）。
+    ///
+    /// **有坏行就整批不写**：边上那条坏行多半是"名称填了、正文还没填"的正常中间态，这时把
+    /// 其余改动存下去、把这条静默丢掉，用户会以为它存上了——红字说清是哪一条、为什么。
+    fn save_snippets_edit(&mut self) -> bool {
+        if self.snippets_edit.is_none() {
+            return false;
+        }
+        let (kept, first_bad, _) = self.scan_snippets_edit();
+        if let Some((row, why)) = first_bad {
+            self.snippets_note = Some(i18n::tfmt(
+                "snippet.save.bad_row",
+                &[&row, &Self::snippet_error_text(why)],
+            ));
+            return false;
+        }
+        self.snippets_note = None;
+        if kept == self.snippets_saved {
+            return false;
+        }
+        self.persist_snippets(kept);
+        true
+    }
+
+    /// 写盘 + 叫搜索源立刻重读。
+    ///
+    /// 源自己每秒看一次文件时间戳（`SnippetSource::poll`），本来最多差一秒；但设置页保存的
+    /// 那一刻用户往往正盯着列表，等那一秒就是"存了却没生效"的观感 ⇒ 这里直接推一把。
+    /// 源关着时 `path` 还是 `None`（`init` 没跑过），`reload` 自己会返回，不必在这里判开关。
+    fn persist_snippets(&mut self, kept: Vec<source::snippet::Snippet>) {
+        let file = source::snippet::SnippetFile {
+            schema_version: source::snippet::SCHEMA_VERSION,
+            snippets: kept.clone(),
+        };
+        source::application::save_snippets(&file);
+        log_info!(
+            "设置页：片段库已写入 {} 条（名称/正文不落日志）",
+            kept.len()
+        );
+        self.snippets_saved = kept;
+        if let Some(s) = self
+            .sources
+            .iter_mut()
+            .find(|s| s.id() == source::SourceId::Snippets)
+        {
+            s.reload();
+        }
+    }
+
+    /// 离开「片段」页（换分类 / 关设置页）时收尾：坏行不写盘，其余照存；丢了几条走 Toast 说清
+    /// （与网页引擎页同一条反例：静默吞行）。
+    fn finish_snippets_edit(&mut self) {
+        if self.snippets_edit.is_none() {
+            return;
+        }
+        let (kept, _, bad) = self.scan_snippets_edit();
+        self.snippets_edit = None;
+        if bad > 0 {
+            self.hotkey_note(&i18n::tfmt("snippet.drop_incomplete", &[&bad]), false);
+            log_info!("设置页：离开片段页时丢弃 {bad} 条没填完的（名称/正文缺失或触发码不合规）");
+        }
+        if kept != self.snippets_saved {
+            self.persist_snippets(kept);
+        }
+    }
+
+    /// 批次 A5（FR-SRC-07）：设置页第 11 页「片段」——一张表（名称 / 触发码 / 正文）
+    /// ＋ 四格取用设置（触发词、正文搜索、粘贴方式、粘贴延迟）。
+    ///
+    /// 表走跨帧缓冲（理由同 [`Self::file_folders_edit`]）；四格设置直接绑 `prefs`，改完即写
+    /// `settings.json`——触发词与正文搜索由每帧的 `apply_settings` 立刻送到搜索源里，
+    /// 不用重启、也不用等下一轮 `poll`。
+    fn snippets_ui(&mut self, ui: &mut egui::Ui) {
+        use source::snippet;
+
+        ui.label(egui::RichText::new(i18n::t("snippet.title")).strong());
+        ui.label(
+            egui::RichText::new(i18n::t("snippet.help"))
+                .weak()
+                .small(),
+        );
+        ui.separator();
+
+        if self.snippets_edit.is_none() {
+            // 进页取一份盘上的：片段不在 `settings.json` 里，每帧读盘又太浪费，
+            // 所以进页读一次、离开时写回（同文件搜索页的目录清单）。
+            let (file, _bad) = source::application::load_snippets();
+            self.snippets_saved = file.snippets.clone();
+            self.snippets_edit = Some(file.snippets);
+            self.snippets_note = None;
+        }
+        let mut commit = false;
+        let mut remove_row: Option<usize> = None;
+        let mut add_row = false;
+        {
+            let list = self.snippets_edit.as_mut().expect("上面刚填过");
+            for (i, s) in list.iter_mut().enumerate() {
+                // 批次 F16 的零常数重排：删除按钮先落位（right_to_left），触发码定宽，
+                // 名称框吃剩余宽度——英文 "Delete" 一变宽也不会顶出右缘。
+                let (name_resp, kw_resp, del) = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let del = ui.button(i18n::t("common.delete")).clicked();
+                        let kw = ui.add(
+                            egui::TextEdit::singleline(&mut s.keyword)
+                                .hint_text(i18n::t("snippet.field.keyword"))
+                                .desired_width(96.0),
+                        );
+                        let name = ui.add(
+                            egui::TextEdit::singleline(&mut s.name)
+                                .hint_text(i18n::t("snippet.field.name"))
+                                .desired_width(ui.available_width()),
+                        );
+                        (name, kw, del)
+                    })
+                    .inner;
+                let body_resp = ui.add(
+                    egui::TextEdit::multiline(&mut s.text)
+                        .hint_text(i18n::t("snippet.field.text"))
+                        .desired_rows(3)
+                        .desired_width(ui.available_width()),
+                );
+                if name_resp.lost_focus() || kw_resp.lost_focus() || body_resp.lost_focus() {
+                    commit = true;
+                }
+                if del {
+                    remove_row = Some(i);
+                }
+                ui.add_space(2.0);
+            }
+        }
+        if let Some(i) = remove_row {
+            if let Some(list) = self.snippets_edit.as_mut() {
+                if i < list.len() {
+                    list.remove(i);
+                }
+            }
+            commit = true;
+        }
+        // 红字：哪一条没通过校验、为什么。填完（失焦触发下一次保存）自己消失。
+        if let Some(note) = self.snippets_note.as_ref() {
+            ui.label(egui::RichText::new(note).small().color(TOAST_ERR));
+        }
+        // 「新建」按钮必须在处理 `add_row` 之前 —— 旗标是本帧局部变量，放到后面设等于白设。
+        if ui.button(i18n::t("snippet.add")).clicked() {
+            add_row = true;
+        }
+        if add_row {
+            if let Some(list) = self.snippets_edit.as_mut() {
+                list.push(snippet::Snippet::default());
+            }
+            log_info!("设置页：片段库加了一条空行（名称与正文都填了才算数）");
+            ui.ctx().request_repaint();
+        }
+        if commit && self.save_snippets_edit() {
+            ui.ctx().request_repaint();
+        }
+        ui.separator();
+
+        // ---- 触发词 ----
+        ui.horizontal(|ui| {
+            ui.label(i18n::t("snippet.kw.label"));
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.prefs.snippet_keyword)
+                    .hint_text(snippet::DEFAULT_KEYWORD)
+                    .desired_width(110.0),
+            );
+            if resp.lost_focus() {
+                self.prefs.snippet_keyword = self.prefs.snippet_keyword.trim().to_string();
+                // 空串落盘也合法：读侧 `snippet_keyword_effective` 会兜回出厂值，
+                // 留空等于"用出厂那个词"，不用逼用户自己打一遍。
+                source::application::save_settings(&self.prefs);
+                log_info!("设置页：片段触发词已改（现 {} 字，词本身不落日志）",
+                    self.prefs.snippet_keyword.chars().count());
+            }
+        });
+        ui.label(
+            egui::RichText::new(i18n::tf(
+                "snippet.kw.help",
+                &[self.prefs.snippet_keyword_effective()],
+            ))
+            .weak()
+            .small(),
+        );
+
+        // ---- 正文搜索 ----
+        let mut body_search = self.prefs.snippet_body_search;
+        if ui
+            .checkbox(&mut body_search, i18n::t("snippet.body_search"))
+            .changed()
+        {
+            self.prefs.snippet_body_search = body_search;
+            source::application::save_settings(&self.prefs);
+            log_info!(
+                "设置页：片段正文搜索 {}",
+                if body_search { "开" } else { "关" }
+            );
+        }
+        ui.label(
+            egui::RichText::new(i18n::t("snippet.body_search.help"))
+                .weak()
+                .small(),
+        );
+
+        // ---- 粘贴方式 ----
+        let mut mode = self.prefs.snippet_paste_mode_effective();
+        ui.horizontal(|ui| {
+            ui.label(i18n::t("snippet.paste.mode"));
+            for m in snippet::PasteMode::ALL {
+                let label = match m {
+                    snippet::PasteMode::Clipboard => i18n::t("snippet.paste.clipboard"),
+                    snippet::PasteMode::Type => i18n::t("snippet.paste.type"),
+                };
+                ui.selectable_value(&mut mode, m, label);
+            }
+        });
+        if mode != self.prefs.snippet_paste_mode_effective() {
+            self.prefs.snippet_paste_mode = mode.as_str().to_string();
+            source::application::save_settings(&self.prefs);
+            log_info!("设置页：片段粘贴方式 = {}", mode.as_str());
+        }
+        ui.label(
+            egui::RichText::new(i18n::t("snippet.paste.mode.help"))
+                .weak()
+                .small(),
+        );
+
+        // ---- 粘贴延迟（只对剪贴板那档有意义）----
+        let mut delay = self.prefs.snippet_paste_delay() as f32;
+        let dr = ui.add(
+            egui::Slider::new(
+                &mut delay,
+                snippet::MIN_PASTE_DELAY_MS as f32..=snippet::MAX_PASTE_DELAY_MS as f32,
+            )
+            .step_by(10.0)
+            .fixed_decimals(0)
+            .suffix(" ms")
+            .text(i18n::t("snippet.paste.delay")),
+        );
+        if dr.changed() {
+            self.prefs.snippet_paste_delay_ms = delay.round() as u32;
+        }
+        // 拖着走过每帧都在变 ⇒ 只有松手那一帧（或键盘/点击步进改的）才写盘，与历史上限同口径。
+        if dr.drag_stopped() || (dr.changed() && !ui.input(|i| i.pointer.primary_down())) {
+            let v = self.prefs.snippet_paste_delay();
+            self.prefs.snippet_paste_delay_ms = v;
+            source::application::save_settings(&self.prefs);
+            log_info!("设置页：片段粘贴延迟 = {v} ms");
+        }
+        ui.label(
+            egui::RichText::new(i18n::t("snippet.paste.delay.help"))
+                .weak()
+                .small(),
+        );
+        ui.separator();
+        ui.label(
+            egui::RichText::new(i18n::t("snippet.placeholders"))
+                .weak()
+                .small(),
+        );
     }
 
     /// 批次 D5（FR-ACT-09）：设置页第 8 页「批量管理」。
@@ -7951,6 +8541,10 @@ impl LauncherApp {
         if self.settings_tab != SettingsTab::WebEngines {
             self.finish_web_engine_edits();
         }
+        // 批次 A5：换到别的分类 ⇒ 片段页的编辑缓冲校验后写盘并丢掉。
+        if self.settings_tab != SettingsTab::Snippets {
+            self.finish_snippets_edit();
+        }
         // 顶栏空白也是拖动手柄（2026-10-18 用户：「顶部输入框右侧点击空白不能拖动，顶部的不是菜单栏吗？」）。
         // 右边界必须取"整行可用宽度"，不能用 `head_row.response.rect.max.x`：横向行的 response 矩形
         // 只覆盖**已用宽度**（返回按钮 + 标题 ≈ 110px），用它算出来的手柄宽度是负数、被 drag_handle
@@ -8000,6 +8594,7 @@ impl LauncherApp {
                     (i18n::t("settings.tab.manage"), SettingsTab::Manage),
                     (i18n::t("settings.tab.usage"), SettingsTab::Usage),
                     (i18n::t("settings.tab.web_engines"), SettingsTab::WebEngines),
+                    (i18n::t("settings.tab.snippets"), SettingsTab::Snippets),
                 ] {
                     if ui.selectable_label(self.settings_tab == tab, label).clicked() {
                         // 批次 D5：进「批量管理」页时强制重跑一轮路径四态——这一页的状态列就是
@@ -9748,6 +10343,7 @@ impl LauncherApp {
                         SettingsTab::Manage => self.manage_ui(ui),
                         SettingsTab::Usage => self.usage_ui(ui),
                         SettingsTab::WebEngines => self.web_engines_ui(ui),
+                        SettingsTab::Snippets => self.snippets_ui(ui),
                     });
                 }
             );
@@ -12371,6 +12967,9 @@ impl eframe::App for LauncherApp {
         // 批次 A7（FR-SRC-15）：脚本行的「执行」＝按脚本自己的 mode 起进程。
         // 三种 mode 的下场不同（窗口 / 静默 / 捕获输出），真正起进程在帧末 `run_script_hit`。
         let mut script_run: Option<source::scripts::ScriptHit> = None;
+        // 批次 A5（FR-SRC-07）：片段行的「执行」＝展开占位符后粘回呼出前的窗口。
+        // 真正动手在帧末（要先收窗口、再抢焦点），这里只记账。
+        let mut snippet_paste: Option<source::snippet::SnippetHit> = None;
         let mut select_path: Option<String> = None;
         let mut copy_path: Option<String> = None;
         let mut row_actions: Vec<String> = Vec::new();
@@ -12480,6 +13079,12 @@ impl eframe::App for LauncherApp {
             // （B/T/W）同一层取，设置页开着时也跳。
             let hit_ctrl_w =
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W));
+            // 批次 A5（FR-SRC-07）：`Ctrl+Shift+S` 直达设置页「片段」。与 B/T/W 同一层取键
+            // （设置页开着时也跳）。带 Shift 的组合必须在同键的非 Shift 版本之前取，
+            // 本窗口里没有 `Ctrl+S`，排在 W 后面无碍。
+            let hit_ctrl_shift_s = ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S)
+            });
             if hit_comma || hit_f2 {
                 self.settings_open = !self.settings_open;
                 // 批次 D2：这一下是"关掉设置页"时也要回写编辑缓冲。
@@ -12524,6 +13129,14 @@ impl eframe::App for LauncherApp {
                 self.focus_query = true;
                 self.menu_open = false;
                 log_info!("快捷键 Ctrl+W：设置页「网页引擎」");
+                ui.ctx().request_repaint();
+            } else if hit_ctrl_shift_s {
+                // 批次 A5：直达「片段」。同形态；进页时缓冲在 `snippets_ui` 里按盘上那份填。
+                self.settings_open = true;
+                self.settings_tab = SettingsTab::Snippets;
+                self.focus_query = true;
+                self.menu_open = false;
+                log_info!("快捷键 Ctrl+Shift+S：设置页「片段」");
                 ui.ctx().request_repaint();
             } else if !self.settings_open {
                 // ---- 批次 B8（FR-ACT-10 附录 A）：F3 编辑 · F4 打开配置文件 · Ctrl+C 复制这一行 ----
@@ -13361,6 +13974,16 @@ impl eframe::App for LauncherApp {
                                     log_info!("快捷键 数字键 {digit}：选中脚本的补全提示行");
                                     self.script_hint_activate(ui.ctx(), hint);
                                 }
+                                HeadRow::Snippet(hit) => {
+                                    log_info!(
+                                        "快捷键 数字键 {digit}：把片段粘回原窗口（名称不落日志）"
+                                    );
+                                    snippet_paste = Some(hit.clone());
+                                }
+                                HeadRow::SnippetHint(hint) => {
+                                    log_info!("快捷键 数字键 {digit}：选中片段的提示行，不执行");
+                                    self.hint_toast(ui.ctx(), hint.subtitle.as_str());
+                                }
                                 HeadRow::Cheat(hit) => {
                                     // FR-SRC-18：与 Enter 同一语义——打开帮助页，不关窗口。
                                     log_info!(
@@ -13808,6 +14431,10 @@ impl eframe::App for LauncherApp {
                                 HeadRow::ScriptHint(hint) => {
                                     self.script_hint_activate(ui.ctx(), hint)
                                 }
+                                HeadRow::Snippet(hit) => snippet_paste = Some(hit.clone()),
+                                HeadRow::SnippetHint(hint) => {
+                                    self.hint_toast(ui.ctx(), hint.subtitle.as_str())
+                                }
                                 HeadRow::Cheat(hit) => self.help_entry = Some(*hit),
                                 HeadRow::CheatHint(_) => {
                                     self.hint_toast(ui.ctx(), source::cheatsheet::no_match_toast())
@@ -14127,6 +14754,68 @@ impl eframe::App for LauncherApp {
                                         );
                                         if sel.clicked() {
                                             self.script_hint_activate(ui.ctx(), hint);
+                                        }
+                                    });
+                                }
+                                HeadRow::Snippet(hit) => {
+                                    // 批次 A5（FR-SRC-07）：标题是片段名，副标题是「关键字 · 正文预览」。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, i18n::t("row.badge.paste"));
+                                        ui.add_sized(
+                                            [icon, icon],
+                                            egui::Label::new(
+                                                egui::RichText::new("\u{1F4CB}")
+                                                    .size(glyph)
+                                                    .weak(),
+                                            ),
+                                        )
+                                        .on_hover_text(i18n::t("row.hover.snippet"));
+                                        let sel = ui.selectable_label(is_sel, hit.name.clone());
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
+                                        );
+                                        if sel.clicked() {
+                                            snippet_paste = Some(hit.clone());
+                                        }
+                                        // 片段不在清单里 ⇒ 没有"编辑/删除条目"；右键给对它本身
+                                        // 有意义的两条：粘回原窗口 / 只把正文送进剪贴板。
+                                        sel.context_menu(|ui| {
+                                            if ui.button(i18n::t("row.menu.paste_back")).clicked() {
+                                                snippet_paste = Some(hit.clone());
+                                                ui.close();
+                                            }
+                                            if ui.button(i18n::t("row.menu.copy_text")).clicked() {
+                                                copy_text = Some(hit.text.clone());
+                                                ui.close();
+                                            }
+                                        });
+                                    });
+                                }
+                                HeadRow::SnippetHint(hint) => {
+                                    // 不可执行行：点/按只给一句 Toast（副标题就是那句指引）。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, i18n::t("row.badge.view"));
+                                        ui.add_sized(
+                                            [icon, icon],
+                                            egui::Label::new(
+                                                egui::RichText::new("…").monospace().size(glyph).weak(),
+                                            ),
+                                        );
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
+                                        );
+                                        if sel.clicked() {
+                                            self.hint_toast(ui.ctx(), hint.subtitle.as_str());
                                         }
                                     });
                                 }
@@ -15989,6 +16678,12 @@ impl eframe::App for LauncherApp {
             self.remember_history(self.query.clone());
             self.run_script_hit(ui.ctx(), &hit);
         }
+        // 批次 A5（FR-SRC-07）：片段行。查询同样进历史（`snip 词` 是他敲出来又要找回来的串），
+        // 片段本身不进清单、也没有 D8 的统计桶（桶照功能分，片段不单列）。
+        if let Some(hit) = snippet_paste {
+            self.remember_history(self.query.clone());
+            self.run_snippet_paste(ui.ctx(), &hit);
+        }
         if let Some(path) = select_path {
             self.select_in_explorer(ui.ctx(), &path);
         }
@@ -16800,7 +17495,7 @@ mod nav_tests {
     /// 批次 D2：第 10 页「网页引擎」同样追加在末尾，1–9 一格不动。
     /// 这条钉住 1..=10 的整张映射——只测旧值漂没漂是不够的，页号是线性协议，两端都得钉。
     #[test]
-    fn settings_tab_page_mapping_covers_one_through_ten() {
+    fn settings_tab_page_mapping_covers_one_through_eleven() {
         assert_eq!(SettingsTab::from_page(1), Some(SettingsTab::General));
         assert_eq!(SettingsTab::from_page(2), Some(SettingsTab::Features));
         assert_eq!(SettingsTab::from_page(3), Some(SettingsTab::Hotkeys));
@@ -16823,7 +17518,12 @@ mod nav_tests {
             Some(SettingsTab::WebEngines),
             "批次 D2：第 10 页是「网页引擎」"
         );
-        assert_eq!(SettingsTab::from_page(11), None, "越界要给 None，调用方落回通用");
+        assert_eq!(
+            SettingsTab::from_page(11),
+            Some(SettingsTab::Snippets),
+            "批次 A5：第 11 页是「片段」"
+        );
+        assert_eq!(SettingsTab::from_page(12), None, "越界要给 None，调用方落回通用");
         assert_eq!(SettingsTab::from_page(0), None);
     }
 
@@ -18555,6 +19255,25 @@ mod nav_tests {
         // ③ 压根没记下架（这次呼出的前台是空的）⇒ 说的是"没记下"，不是"关掉了"。
         let e = paste_text_into_previous_window("42").unwrap_err();
         assert!(e.contains("没记下"), "{e}");
+    }
+
+    /// 批次 A5 真机 B1 抓到的缺陷：Type 通道原样把 `\n` 送成 `WM_CHAR 0x0A`，
+    /// 而 Edit / RichEdit 只认 `0x0D` ⇒ 两行粘成一行。钉住三种换行写法都折成一个 CR。
+    #[test]
+    fn typing_units_fold_every_newline_spelling_into_one_cr() {
+        assert_eq!(
+            units_for_typing("SIG-LINE1\nSIG-LINE2"),
+            vec![
+                0x53, 0x49, 0x47, 0x2D, 0x4C, 0x49, 0x4E, 0x45, 0x31, 0x0D, 0x53, 0x49, 0x47, 0x2D,
+                0x4C, 0x49, 0x4E, 0x45, 0x32,
+            ]
+        );
+        assert_eq!(units_for_typing("A\r\nB"), vec![0x41, 0x0D, 0x42]);
+        assert_eq!(units_for_typing("A\rB"), vec![0x41, 0x0D, 0x42]);
+        assert_eq!(units_for_typing("A\n\nB"), vec![0x41, 0x0D, 0x0D, 0x42]);
+        // 代理对不能被拆散，也不受换行规整影响。
+        assert_eq!(units_for_typing("🙂"), vec![0xD83D, 0xDE42]);
+        assert!(units_for_typing("").is_empty());
     }
 
     fn work_rect(l: f32, t: f32, r: f32, b: f32) -> egui::Rect {

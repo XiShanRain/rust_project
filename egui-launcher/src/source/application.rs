@@ -21,6 +21,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use super::params;
+use super::snippet;
 use super::usage::UsageStats;
 use super::websearch;
 use crate::dbltap::DblTap;
@@ -505,6 +506,11 @@ fn settings_from_map(
     take_field!(map, s, "", file_min_query_len, usize);
     take_field!(map, s, "", log_level, Option<LogLevel>);
     take_field!(map, s, "", language, Option<Language>);
+    // 批次 A5 的四格：同样要「特值进、特值出」，缺一行就是"设置页改了、下次启动回默认"。
+    take_field!(map, s, "", snippet_keyword, String);
+    take_field!(map, s, "", snippet_body_search, bool);
+    take_field!(map, s, "", snippet_paste_mode, String);
+    take_field!(map, s, "", snippet_paste_delay_ms, u32);
     s
 }
 
@@ -937,6 +943,27 @@ pub struct AppSettings {
     /// 把 `None` 写进文件会让"没选过"和"选成了 null"看起来一样。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<Language>,
+
+    /// 片段的触发词（批次 A5 / FR-SRC-07，需求书 4.2.3 `features.snippets.keyword`）。
+    /// 出厂 `snip`；用户改成 `fj` 之后 `fj 词` 才进片段库。空串 = 回落出厂值
+    /// （见 [`AppSettings::snippet_keyword_effective`]）——一个空触发词会让每条查询都归片段源，
+    /// 那是"配置坏了一半"，不是用户想要的状态。
+    #[serde(default = "default_snippet_keyword")]
+    pub snippet_keyword: String,
+
+    /// 片段正文是否参与搜索（FR-SRC-07「正文搜索 ≥3 字、每个词都出现」）。缺省开。
+    #[serde(default = "default_true")]
+    pub snippet_body_search: bool,
+
+    /// 片段粘回方式（`Clipboard` / `Type`）。存稳定名，与 [`AppSettings::terminal_shell`] 同口径：
+    /// 不认识的名字回落剪贴板（那条路不依赖目标程序对逐字注入的支持，是更稳的默认）。
+    #[serde(default = "default_snippet_paste_mode")]
+    pub snippet_paste_mode: String,
+
+    /// `Clipboard` 模式下 `Ctrl+V` 之后等多久再还原剪贴板（毫秒，需求书 4.2.3 缺省 300）。
+    /// 读侧过 [`AppSettings::snippet_paste_delay`] 夹进区间，读盘时不改写。
+    #[serde(default = "default_snippet_paste_delay")]
+    pub snippet_paste_delay_ms: u32,
 }
 
 fn default_terminal_shell() -> String {
@@ -947,6 +974,21 @@ fn default_terminal_shell() -> String {
 
 fn default_theme() -> String {
     crate::theme::FALLBACK_THEME.to_string()
+}
+
+// 片段四格的缺省（批次 A5）——与 `snippet.rs` 同源，零漂移。
+fn default_snippet_keyword() -> String {
+    crate::source::snippet::DEFAULT_KEYWORD.to_string()
+}
+
+fn default_snippet_paste_mode() -> String {
+    crate::source::snippet::PasteMode::default()
+        .as_str()
+        .to_string()
+}
+
+fn default_snippet_paste_delay() -> u32 {
+    crate::source::snippet::DEFAULT_PASTE_DELAY_MS
 }
 
 fn default_true() -> bool {
@@ -997,6 +1039,11 @@ impl Default for AppSettings {
             log_level: None,
             // 批次 F13：出厂跟随系统 UI 语言。
             language: None,
+            // 批次 A5：片段库的四个缺省。
+            snippet_keyword: default_snippet_keyword(),
+            snippet_body_search: true,
+            snippet_paste_mode: default_snippet_paste_mode(),
+            snippet_paste_delay_ms: default_snippet_paste_delay(),
         }
     }
 }
@@ -1085,6 +1132,31 @@ impl AppSettings {
             }
             _ => false,
         }
+    }
+
+    /// 片段实际用的触发词（FR-SRC-07）：去首尾空白，空串回落出厂值。
+    /// 手改成 `"  "` 也当没填——一个空触发词会让每条查询都归片段源。
+    pub fn snippet_keyword_effective(&self) -> &str {
+        let k = self.snippet_keyword.trim();
+        if k.is_empty() {
+            crate::source::snippet::DEFAULT_KEYWORD
+        } else {
+            k
+        }
+    }
+
+    /// 片段实际的粘回方式：不认识的名字回落 [`PasteMode::default`]。
+    pub fn snippet_paste_mode_effective(&self) -> crate::source::snippet::PasteMode {
+        crate::source::snippet::PasteMode::from_name(&self.snippet_paste_mode).unwrap_or_default()
+    }
+
+    /// 片段实际的粘贴延迟（毫秒）：夹进出厂允许的区间。与 [`history_limit`](Self::history_limit)
+    /// 同一条不变量——**不在读盘时改写配置**，每次用到都过一遍夹子。
+    pub fn snippet_paste_delay(&self) -> u32 {
+        self.snippet_paste_delay_ms.clamp(
+            crate::source::snippet::MIN_PASTE_DELAY_MS,
+            crate::source::snippet::MAX_PASTE_DELAY_MS,
+        )
     }
 }
 
@@ -2087,6 +2159,43 @@ fn save_param_history_at(path: &Path, history: &params::ParamHistory) {
     match serde_json::to_vec_pretty(history) {
         Ok(json) => write_atomic(path, &json, "param_history.json"),
         Err(e) => log_info!("source: 序列化参数历史失败: {e}"),
+    }
+}
+
+// ---- FR-SRC-07 批次 A5：片段库（`snippets.json`）----
+
+/// 片段库与清单同目录（同一个便携判定，句法照 [`param_history_path`]）。
+///
+/// **为什么不塞进 `settings.json`**：片段是用户自己写、可能几十上百条的内容，
+/// 而 settings.json 是"设置页按格改、读盘时逐格容错"的小表；同一份文件里两种写入节奏
+/// 互相覆盖（与搜索历史、参数历史分开存是同一条理由）。
+pub fn snippets_path() -> PathBuf {
+    user_list_path().with_file_name("snippets.json")
+}
+
+/// 读一份片段库。读盘之后过一遍 [`snippet::sanitize`]，手改出来的半截行别让它进列表。
+pub(super) fn load_snippets_at(path: &Path) -> (snippet::SnippetFile, Option<Corrupted>) {
+    let (mut file, bad) = load_or_quarantine::<snippet::SnippetFile>(path);
+    snippet::sanitize(&mut file.snippets);
+    (file, bad)
+}
+
+pub fn load_snippets() -> (snippet::SnippetFile, Option<Corrupted>) {
+    load_snippets_at(&snippets_path())
+}
+
+pub fn save_snippets(file: &snippet::SnippetFile) {
+    save_snippets_at(&snippets_path(), file);
+}
+
+/// 路径参数化的那一份（单测要能指向临时目录，绝不碰用户真实数据目录）。
+/// 写盘前把 `schema_version` 顶到当前值：它只描述"本程序写出来的是哪一版"。
+fn save_snippets_at(path: &Path, file: &snippet::SnippetFile) {
+    let mut out = file.clone();
+    out.schema_version = snippet::SCHEMA_VERSION;
+    match serde_json::to_vec_pretty(&out) {
+        Ok(json) => write_atomic(path, &json, "snippets.json"),
+        Err(e) => log_info!("source: 序列化片段库失败: {e}"),
     }
 }
 
@@ -5724,6 +5833,11 @@ mod config_tests {
         x.log_level = Some(LogLevel::Debug);
         // 批次 F13：同一条理由——`None`（跟随系统）读成 `Some` 或反过来都会静默变味。
         x.language = Some(Language::En);
+        // 批次 A5 的四格：设置页改完片段库的触发词 / 粘回方式，下次启动必须还在。
+        x.snippet_keyword = "fj".to_string();
+        x.snippet_body_search = false;
+        x.snippet_paste_mode = "type".to_string();
+        x.snippet_paste_delay_ms = 1_200;
         x.appearance = Appearance {
             width: 720.0,
             status_bar: false,
@@ -5812,6 +5926,22 @@ mod config_tests {
             got.language,
             Some(Language::En),
             "language（批次 F13：读成 None 就悄悄变回'跟随系统'，英文用户第二启动又跳回中文）"
+        );
+        assert_eq!(
+            got.snippet_keyword_effective(),
+            "fj",
+            "snippet_keyword（批次 A5：读成 snip 就是设置页改完不生效）"
+        );
+        assert!(!got.snippet_body_search, "snippet_body_search（批次 A5）");
+        assert_eq!(
+            got.snippet_paste_mode_effective(),
+            crate::source::snippet::PasteMode::Type,
+            "snippet_paste_mode（批次 A5）"
+        );
+        assert_eq!(
+            got.snippet_paste_delay(),
+            1_200,
+            "snippet_paste_delay（批次 A5：区间内的值要原样）"
         );
         assert_eq!(got.file_scan_scope().depth, 6, "file_scan_scope 汇编");
         assert_eq!(got.file_scan_scope().refresh.as_secs(), 15 * 60);

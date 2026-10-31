@@ -205,6 +205,26 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: Some(1),
     },
     CheatEntry {
+        example_key: "cheat.snippet.example",
+        title_key: "cheat.snippet.title",
+        summary_key: "cheat.snippet.summary",
+        detail_key: "cheat.snippet.detail",
+        tags: "snippet snip 片段 文本 text 粘贴 paste 模板 template enter",
+        group: Group::Syntax,
+        source: Some(SourceId::Snippets),
+        settings_page: Some(11),
+    },
+    CheatEntry {
+        example_key: "cheat.snippet_placeholders.example",
+        title_key: "cheat.snippet_placeholders.title",
+        summary_key: "cheat.snippet_placeholders.summary",
+        detail_key: "cheat.snippet_placeholders.detail",
+        tags: "snippet placeholder 片段 占位符 date time uuid clipboard cursor 日期 时间 剪贴板 光标",
+        group: Group::Syntax,
+        source: Some(SourceId::Snippets),
+        settings_page: Some(11),
+    },
+    CheatEntry {
         example_key: "cheat.path.example",
         title_key: "cheat.path.title",
         summary_key: "cheat.path.summary",
@@ -685,6 +705,16 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: Some(10),
     },
     CheatEntry {
+        example_key: "cheat.snippet_settings.example",
+        title_key: "cheat.snippet_settings.title",
+        summary_key: "cheat.snippet_settings.summary",
+        detail_key: "cheat.snippet_settings.detail",
+        tags: "key snippet 片段 设置 settings 触发词 粘贴方式",
+        group: Group::Keys,
+        source: None,
+        settings_page: Some(11),
+    },
+    CheatEntry {
         example_key: "cheat.global_hotkey.example",
         title_key: "cheat.global_hotkey.title",
         summary_key: "cheat.global_hotkey.summary",
@@ -900,8 +930,9 @@ mod tests {
                 // 【2026-10-28 批次 D5：追加第 8 页「批量管理」，上界 1..=8。】
                 // 【2026-10-28 批次 D8：追加第 9 页「使用统计」，上界 1..=9。】
                 // 【2026-10-29 批次 D2：追加第 10 页「网页引擎」，上界 1..=10。】
+                // 【2026-10-31 批次 A5：追加第 11 页「片段」，上界 1..=11。】
                 assert!(
-                    (1..=10).contains(&page),
+                    (1..=11).contains(&page),
                     "「{}」指向不存在的设置页 {page}",
                     e.title()
                 );
@@ -950,7 +981,9 @@ mod tests {
             all.iter().any(|e| e.example().contains("空格")),
             "`?` 里看不到空格开头的文件模式"
         );
-        for needle in ["file", "文件", "快捷键", "终端", "计算器", "复制", "滚轮", "关于"] {
+        for needle in [
+            "file", "文件", "快捷键", "终端", "计算器", "复制", "滚轮", "关于", "片段", "剪贴板",
+        ] {
             assert!(entries(needle, &all_on).iter().all(|e| matches(e, needle)));
             assert!(
                 !entries(needle, &all_on).is_empty(),

@@ -1,8 +1,8 @@
 //! FR-SRC 数据源模块。每个 provider 一个子模块，统一产出「可搜索的条目快照」。
 //!
-//! 现已落地九个：FR-SRC-02（应用程序源）、FR-SRC-05（自定义命令源）、
-//! FR-SRC-06（路径四态校验）、FR-SRC-10（计算器）、FR-SRC-11（网页搜索）、
-//! FR-SRC-14（文件搜索与目录浏览）、FR-SRC-15（脚本目录 `Scripts\`）、
+//! 现已落地十个：FR-SRC-02（应用程序源）、FR-SRC-05（自定义命令源）、
+//! FR-SRC-06（路径四态校验）、FR-SRC-07（片段 `snip`）、FR-SRC-10（计算器）、
+//! FR-SRC-11（网页搜索）、FR-SRC-14（文件搜索与目录浏览）、FR-SRC-15（脚本目录 `Scripts\`）、
 //! FR-SRC-16（终端命令 `>`）、FR-SRC-18（速查表 `?`，表里每条语法也按所属源的开关过滤）。
 //!
 //! **批次 A10（2026-10-22）起**这几个源不再硬编在 `main.rs::plan()` 的匹配链里，而是实现
@@ -29,6 +29,7 @@ pub mod pathcheck;
 pub mod runflags;
 pub mod scripts;
 pub mod siteicon;
+pub mod snippet;
 pub mod system;
 pub mod terminal;
 pub mod usage;
@@ -48,6 +49,8 @@ pub enum SourceId {
     Apps,
     /// 清单里带参数的命令（`kw 参数`），命中即独占整张列表。
     Custom,
+    /// 片段库（FR-SRC-07）：`snip` 列全部、`snip 词` 只搜片段，回车粘回呼出前窗口。
+    Snippets,
     /// 脚本目录 `Scripts\`（FR-SRC-15）：`.ahk/.ps1/.bat/.cmd/.py` 按文件头注释出条目。
     Scripts,
     /// 网页引擎（`g 词`），内置表 + 用户表。
@@ -66,10 +69,11 @@ impl SourceId {
     /// 注册表的实际顺序（只在单测里用：`default_sources` 的顺序不许漂）。
     /// 与 [`default_sources`] 一致——显式语法（`?` / `>`）最前，其后用户数据压过出厂数据，应用清单殿后。
     #[cfg(test)]
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Cheatsheet,
         Self::Terminal,
         Self::Custom,
+        Self::Snippets,
         Self::Scripts,
         Self::Web,
         Self::Files,
@@ -81,6 +85,7 @@ impl SourceId {
         match self {
             Self::Apps => "apps",
             Self::Custom => "custom",
+            Self::Snippets => "snippets",
             Self::Scripts => "scripts",
             Self::Web => "web",
             Self::Files => "files",
@@ -107,6 +112,10 @@ pub enum SourceRow {
     Custom(custom::CustomHit),
     /// 自定义命令「还缺一个参数」的提示行：不可执行，Enter 补全成 `"kw "`。
     CustomHint(custom::CustomHint),
+    /// 片段库的一行（FR-SRC-07）。「执行」＝展开占位符后粘回呼出前的窗口。
+    Snippet(snippet::SnippetHit),
+    /// 片段库为空 / 这一轮没搜到的提示行：不可执行，只给一句 Toast。
+    SnippetHint(snippet::SnippetHint),
     /// 脚本目录的一行（FR-SRC-15）。「执行」＝按 `@altrun.mode` 起进程。
     /// 独占时（`kw 参数`）`title` 已带参数，`argument` 非空。
     Script(scripts::ScriptHit),
@@ -221,6 +230,9 @@ pub trait DataSource {
     /// 关掉的源不该因为改了设置就在后台读盘。文件源在这里比对扫描范围，
     /// 变了就走「保存即重扫」（`set_scope` 用相等比较去重，同值零成本）。
     fn apply_settings(&mut self, _prefs: &application::AppSettings) {}
+    /// 立刻重读自己的数据文件（批次 A5）：设置页改完片段库要马上看见，
+    /// 不能等 [`poll`](Self::poll) 那一秒一次的时间戳检查。默认什么都不做。
+    fn reload(&mut self) {}
 }
 
 /// 注册表。**顺序就是报文次序**：先按此序问独占，再按此序拼头段，最后按此序取结果。
@@ -243,6 +255,7 @@ pub fn default_sources_with(prefs: &application::AppSettings) -> Vec<Box<dyn Dat
         Box::new(cheatsheet::CheatSource),
         Box::new(terminal::TerminalSource),
         Box::new(custom::CustomSource),
+        Box::new(snippet::SnippetSource::default()),
         Box::new(scripts::ScriptSource::default()),
         Box::new(websearch::WebSource),
         Box::new(filesearch::FileSource::with_scope(prefs.file_scan_scope())),
