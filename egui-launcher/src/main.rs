@@ -881,9 +881,10 @@ fn win_size(hwnd: HWND) -> Option<(i32, i32)> {
 }
 
 /// 批次 F10（FR-UIX-06）：自绘阴影在窗口四周留出的透明带宽度（逻辑像素，四边同宽）。
-/// 面板（圆角 + 边框 + 底色）整体内缩这么多再画，外带只画阴影 ⇒ 窗口外框 = 面板 + 2×12。
-/// 数值取 12：epaint 的 blur 只向外扩 0.5×blur，blur 20 恰好铺满 10px，再留 2px 给偏移。
-const SHADOW_MARGIN: f32 = 12.0;
+/// 面板（圆角 + 边框 + 底色）整体内缩这么多再画，外带只画阴影 ⇒ 窗口外框 = 面板 + 2×8。
+/// 数值取 8（2026-10-31 收窄，见发布说明 §八十）：epaint 的 blur 只向外扩 0.5×blur，
+/// blur 14 恰好铺满 7px，余 1px 留给 `offset`。
+const SHADOW_MARGIN: f32 = 8.0;
 
 /// 阴影中心的黑度（0–255）。边缘由 blur 自然衰减到透明，所以这只是"最深处"。
 const SHADOW_ALPHA: u8 = 110;
@@ -2237,7 +2238,7 @@ fn shadow_alpha(opacity: u8, fade: Option<f32>) -> u8 {
 /// 批次 F10（FR-UIX-06）：把阴影画进面板四周那条透明带里。
 ///
 /// epaint 的 blur 只向矩形外扩 `0.5 × blur`（`RectShape::visual_bounding_rect`），所以
-/// `blur = 20` 恰好铺满 10px，剩下 2px 留给 `offset` 那一格；再大的 blur 会被窗口裁出生硬的边。
+/// `blur = 14` 恰好铺满 7px，剩下 1px 留给 `offset` 那一格；再大的 blur 会被窗口裁出生硬的边。
 /// `alpha` 由调用方乘过淡入进度与「不透明度」，与面板底色保持同一个衰减。
 fn paint_window_shadow(ui: &egui::Ui, panel: egui::Rect, corner: u8, alpha: u8) {
     if alpha == 0 {
@@ -2245,7 +2246,7 @@ fn paint_window_shadow(ui: &egui::Ui, panel: egui::Rect, corner: u8, alpha: u8) 
     }
     let shadow = egui::epaint::Shadow {
         offset: [0, 1],
-        blur: 20,
+        blur: 14,
         spread: 0,
         color: egui::Color32::from_black_alpha(alpha),
     };
@@ -6012,7 +6013,7 @@ impl LauncherApp {
     /// 手柄只贴最外圈，且四边手柄让开四角、四角手柄只占 6×6，与移动手柄的矩形互不重叠。
     fn edge_grips(&mut self, ui: &egui::Ui) {
         const T: f32 = 6.0;
-        // 批次 F10（FR-UIX-06）：窗口最外圈那 12px 是阴影的透明带，命中区要贴面板边。
+        // 批次 F10（FR-UIX-06）：窗口最外圈那 8px 是阴影的透明带，命中区要贴面板边。
         let r = ui.ctx().viewport_rect().shrink(SHADOW_MARGIN);
         let (l, t, rt, b) = (r.min.x, r.min.y, r.max.x, r.max.y);
         let rect = |a: f32, c: f32, d: f32, e: f32| {
@@ -18091,8 +18092,8 @@ mod nav_tests {
         assert_eq!(y, 1040 - 658, "贴底要夹到工作区底边减窗口高");
     }
 
-    /// 批次 F10（FR-UIX-06）：外框 = 面板 + 四周 12px 阴影带，两个方向各 +24。
-    /// 四档面板高（438/498/318/658）换算成外框就是 462/522/342/682。
+    /// 批次 F10（FR-UIX-06）：外框 = 面板 + 四周 8px 阴影带（2026-10-31 收窄，见 §八十），
+    /// 两个方向各 +16。四档面板高（438/498/318/658）换算成外框就是 454/514/334/674。
     #[test]
     fn outer_window_adds_the_shadow_band_on_both_axes() {
         for (panel_w, panel_h) in [(500.0, 438.0), (500.0, 498.0), (500.0, 318.0), (500.0, 658.0)] {
@@ -18101,26 +18102,26 @@ mod nav_tests {
             assert_eq!(outer.y, panel_h + 2.0 * SHADOW_MARGIN);
             assert_eq!(panel_from_outer(outer), egui::vec2(panel_w, panel_h));
         }
-        assert_eq!(shadow_margin_px(1.0), 12);
-        assert_eq!(shadow_margin_px(1.5), 18);
-        assert_eq!(outer_px((500, 438), 1.0), (524, 462));
-        assert_eq!(panel_px((524, 462), 1.0), (500, 438));
+        assert_eq!(shadow_margin_px(1.0), 8);
+        assert_eq!(shadow_margin_px(1.5), 12);
+        assert_eq!(outer_px((500, 438), 1.0), (516, 454));
+        assert_eq!(panel_px((516, 454), 1.0), (500, 438));
     }
 
     /// 批次 F10：`pos_rel` 一直记的是**面板**位置。默认落点 [500,200] 摆到 1920×1040 的
-    /// 工作区上，面板左上角是 (710,208)，窗口（含阴影带）左上角再各减 12。
+    /// 工作区上，面板左上角是 (710,208)，窗口（含阴影带）左上角再各减 8。
     #[test]
     fn window_origin_offsets_the_panel_by_the_shadow_margin() {
         let w = work_rect(0.0, 0.0, 1920.0, 1040.0);
         let outer = outer_px((500, 438), 1.0);
         assert_eq!(
             window_origin_for_rel(w, outer, source::application::POS_REL_DEFAULT, 1.0),
-            (698, 196)
+            (702, 200)
         );
-        // 隐藏时反算：窗口原点 + 12 = 面板原点，尺寸也按面板算 ⇒ 千分比不变。
+        // 隐藏时反算：窗口原点 + 8 = 面板原点，尺寸也按面板算 ⇒ 千分比不变。
         let (x, y) = window_origin_for_rel(w, outer, [500, 200], 1.0);
         assert_eq!(
-            relative_in_work(w, panel_px(outer, 1.0), (x + 12, y + 12)),
+            relative_in_work(w, panel_px(outer, 1.0), (x + 8, y + 8)),
             [500, 200]
         );
     }
