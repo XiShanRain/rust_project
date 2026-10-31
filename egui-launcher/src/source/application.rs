@@ -24,6 +24,7 @@ use super::params;
 use super::usage::UsageStats;
 use super::websearch;
 use crate::dbltap::DblTap;
+use crate::i18n::Language;
 use crate::logging::LogLevel;
 use crate::source::{DataSource, SearchCtx, SourceId};
 use pinyin::ToPinyin;
@@ -503,6 +504,7 @@ fn settings_from_map(
     take_field!(map, s, "", file_refresh_minutes, u64);
     take_field!(map, s, "", file_min_query_len, usize);
     take_field!(map, s, "", log_level, Option<LogLevel>);
+    take_field!(map, s, "", language, Option<Language>);
     s
 }
 
@@ -929,6 +931,12 @@ pub struct AppSettings {
     /// 但会让用户手改配置时看不出"这是没设置"还是"设置成了 null"。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_level: Option<LogLevel>,
+
+    /// 界面语言（批次 F13 / FR-SYS-04）。`None` ＝**跟随系统**（`GetUserDefaultLocaleName`），
+    /// 只有用户显式点过某一档才落盘。与 [`AppSettings::log_level`] 同一条理由：
+    /// 把 `None` 写进文件会让"没选过"和"选成了 null"看起来一样。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
 }
 
 fn default_terminal_shell() -> String {
@@ -987,6 +995,8 @@ impl Default for AppSettings {
             file_min_query_len: default_file_min_query_len(),
             // 批次 G5：出厂"跟随构建"，不替用户在 debug 构建里把 release 机器上的档位定死。
             log_level: None,
+            // 批次 F13：出厂跟随系统 UI 语言。
+            language: None,
         }
     }
 }
@@ -5713,6 +5723,8 @@ mod config_tests {
         x.file_min_query_len = 3;
         // 批次 G5：`Some` 与 `None` 是两种意思，特值用 `Some(Debug)` 才能区分"读回来了"与"没读"。
         x.log_level = Some(LogLevel::Debug);
+        // 批次 F13：同一条理由——`None`（跟随系统）读成 `Some` 或反过来都会静默变味。
+        x.language = Some(Language::En);
         x.appearance = Appearance {
             width: 720.0,
             status_bar: false,
@@ -5796,6 +5808,11 @@ mod config_tests {
             got.log_level,
             Some(LogLevel::Debug),
             "log_level（批次 G5：`Some` 要能读回来；读成 None 就悄悄变回'跟随构建'）"
+        );
+        assert_eq!(
+            got.language,
+            Some(Language::En),
+            "language（批次 F13：读成 None 就悄悄变回'跟随系统'，英文用户第二启动又跳回中文）"
         );
         assert_eq!(got.file_scan_scope().depth, 6, "file_scan_scope 汇编");
         assert_eq!(got.file_scan_scope().refresh.as_secs(), 15 * 60);

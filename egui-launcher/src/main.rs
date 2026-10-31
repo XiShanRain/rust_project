@@ -100,6 +100,7 @@ mod cli;
 mod dbltap;
 mod dpi;
 mod hud;
+mod i18n;
 mod large_type;
 mod matching;
 mod selection;
@@ -401,19 +402,19 @@ enum MenuAction {
 /// 改键要三处一起改——所以这里刻意只写"键名"，不复述语义。
 fn main_menu_content(ui: &mut egui::Ui) -> MenuAction {
     let item = |ui: &mut egui::Ui, text: &str| ui.button(text).clicked();
-    if item(ui, "＋  新建快捷项        Ctrl+Shift+N") {
+    if item(ui, i18n::t("menu.new")) {
         MenuAction::NewItem
-    } else if item(ui, "⟳  批量导入全部    Ctrl+I") {
+    } else if item(ui, i18n::t("menu.batch_import")) {
         MenuAction::BatchImport
-    } else if item(ui, "⚙  启动器设置      Ctrl+,") {
+    } else if item(ui, i18n::t("menu.settings")) {
         MenuAction::Settings
-    } else if item(ui, "❓  速查表          输入 ? 后点行") {
+    } else if item(ui, i18n::t("menu.cheatsheet")) {
         MenuAction::Cheatsheet
-    } else if item(ui, "📄  打开日志") {
+    } else if item(ui, i18n::t("menu.open_log")) {
         MenuAction::OpenLog
     } else {
         ui.separator();
-        if item(ui, "✕  退出") {
+        if item(ui, i18n::t("menu.exit")) {
             MenuAction::Exit
         } else {
             MenuAction::None
@@ -1126,6 +1127,10 @@ struct LauncherApp {
     /// 所以它是「等窗口第一次真被看见」才转成 Toast 的那句话，不是开机就闪一下没了。
     startup_notice: Option<String>,
     tray_rx: mpsc::Receiver<TrayEvent>,
+    /// 批次 F13（FR-SYS-04）：托盘图标本体 + 六个菜单项句柄。换语言时 [`TrayMenu::retranslate`]
+    /// 逐项改字——菜单是活的，不是启动时画死的一张图。`None` ＝ 测试里的 `Default` 构造
+    /// （不在单测里建真托盘，那里没有 shell）。
+    tray_menu: Option<TrayMenu>,
     hotkey_rx: mpsc::Receiver<()>,
     /// 批次 G3：选中内容键的结论（工作线程 → UI）。主窗可能正隐藏着，所以每次回执都带着
     /// 一次 `ctx.request_repaint()`（见 [`spawn_selection_capture`]），否则这一帧根本不会跑。
@@ -2266,16 +2271,11 @@ fn top_drag_strip_w(item_spacing_x: f32) -> f32 {
     TOP_DRAG_GAP + item_spacing_x - 2.0 * TOP_DRAG_INSET
 }
 
-/// 搜索框的占位提示。**批次 F6 起改短**：输入框放大到 22pt 之后，原先那串十来个键名的长提示
-/// 会被输入框右缘裁掉（留半句话比没有更糟）。完整键表有两处入口——☰ 菜单本身（Ctrl+M）
-/// 和查询框打 `?` 的速查表（批次 A8 起有；批次 F6 那阵注释里写的是 37 条，
-/// 2026-10-26 批次 B8 之后 52 条、同批次 C3 加「翻搜索历史」一条后现量 53 条
-/// ——`grep -c '^    CheatEntry {' src/source/cheatsheet.rs` 随时可复量）。
-const SEARCH_HINT: &str = "搜索…（Enter 运行 · Ctrl+M 菜单 · ? 帮助 · Esc 关闭）";
-
-/// 状态栏开着时的占位提示（FR-UIX-08「两者耦合」的定义）：键位说明已经落在状态栏左/右两格，
-/// 输入框这边只留一句「搜索…」。状态栏关掉时回落到 [`SEARCH_HINT`] 那一整句。
-const SEARCH_HINT_SHORT: &str = "搜索…";
+// 搜索框的两句占位提示（批次 F13 起在 `locales\*.json` 里：`app.search_hint` /
+// `app.search_hint_short`）。**批次 F6 起主题提示改短**：输入框放大到 22pt 之后，原先那串
+// 十来个键名的长提示会被输入框右缘裁掉（留半句话比没有更糟）。完整键表有两处入口——
+// ☰ 菜单本身（Ctrl+M）和查询框打 `?` 的速查表（现量 53 条，
+// `grep -c '^    CheatEntry {' src/source/cheatsheet.rs` 随时可复量）。
 
 /// 列表可视区之上的占用：外框 1 + 主题内边距 + 输入框 + 4（行距与分隔线，Light 实测值）。
 fn list_top_h(theme: &theme::Theme) -> f32 {
@@ -2437,9 +2437,9 @@ fn shorten_path(path: &str, max_chars: usize) -> String {
 /// 自己打错了。
 fn hint_message(hint: &source::websearch::EngineHint) -> &'static str {
     if hint.engine_id == "filesearch" {
-        "文件索引还在后台建立，稍等片刻再回车"
+        i18n::t("app.hint_index_building")
     } else {
-        "继续输入关键词后再回车"
+        i18n::t("app.hint_keep_typing")
     }
 }
 
@@ -2462,28 +2462,28 @@ fn status_left_text(
     // 面板里的过滤词是随便打的字，`route()` 认不出浏览态，但**就算**认出也不该拿目录那套
     // Esc 文案骗人——此刻 Esc 的唯一落点是退出面板。
     if panel {
-        return "操作面板 · Esc 或 ← 返回结果".to_string();
+        return i18n::t("status.panel").to_string();
     }
     if let Some((dir, filter)) = browse {
         let esc = if !filter.is_empty() {
-            "Esc 清除筛选"
+            i18n::t("status.esc_clear_filter")
         } else if source::filesearch::parent_query(dir).is_some() {
-            "Esc 返回上级"
+            i18n::t("status.esc_up")
         } else {
-            "Esc 清空"
+            i18n::t("status.esc_clear")
         };
-        return format!("目录 {dir} · {esc}");
+        return i18n::tf("status.dir", &[dir, esc]);
     }
     if file_mode {
-        return "文件模式 · Esc 清空".to_string();
+        return i18n::t("status.file_mode").to_string();
     }
     let mut text = match tab {
-        TabMode::Complete => "Tab 补全 / 下一项",
-        TabMode::Navigate => "Tab 下一项 · Shift+Tab 上一项",
+        TabMode::Complete => i18n::t("status.tab_complete"),
+        TabMode::Navigate => i18n::t("status.tab_navigate"),
     }
     .to_string();
     if basic_scope {
-        text.push_str(" · 分类：基本");
+        text.push_str(i18n::t("status.basic_scope"));
     }
     text
 }
@@ -2551,18 +2551,18 @@ fn large_text_of(
 /// 四类不可执行行跟着徽标说「查看」——它们按下去只给一句话，与徽标说同一件事比换词更不容易误会。
 fn enter_action_label(row: Option<&HeadRow>) -> &'static str {
     match row {
-        None => "运行",
-        Some(HeadRow::Calc(_)) => "复制数字",
-        Some(HeadRow::Search(_)) => "搜索",
+        None => i18n::t("status.enter.run"),
+        Some(HeadRow::Calc(_)) => i18n::t("status.enter.copy_number"),
+        Some(HeadRow::Search(_)) => i18n::t("status.enter.search"),
         Some(HeadRow::Hint(_))
         | Some(HeadRow::TermHint(_))
         | Some(HeadRow::CheatHint(_))
-        | Some(HeadRow::ScopeTags(_)) => "查看",
-        Some(HeadRow::Custom(_)) => "运行",
-        Some(HeadRow::CustomHint(_)) => "补全参数",
-        Some(HeadRow::File(_)) => "打开",
-        Some(HeadRow::Terminal(_)) => "执行命令",
-        Some(HeadRow::Cheat(_)) => "查看",
+        | Some(HeadRow::ScopeTags(_)) => i18n::t("status.enter.view"),
+        Some(HeadRow::Custom(_)) => i18n::t("status.enter.run"),
+        Some(HeadRow::CustomHint(_)) => i18n::t("status.enter.complete_params"),
+        Some(HeadRow::File(_)) => i18n::t("status.enter.open"),
+        Some(HeadRow::Terminal(_)) => i18n::t("status.enter.run_command"),
+        Some(HeadRow::Cheat(_)) => i18n::t("status.enter.view"),
         // 批次 P1（FR-ACT-03）：面板行的 Enter 落点＝执行高亮的那一条动作，词跟着行首徽标走
         // （「Enter 复制」「Enter 删除」——与结果模式同一套"徽标即动作类别"的口径）。
         Some(HeadRow::Action(hit)) => hit.id.badge(),
@@ -2766,7 +2766,7 @@ fn toggle_mark(marked: &mut Vec<String>, path: &str) -> bool {
 
 /// 状态栏左格在有标记时的说法：先说清"现在攒着什么"，再说怎么取消、怎么动手。
 fn marked_hint(count: usize) -> String {
-    format!("已标记 {count} 项 · Insert 取消 · → 批量操作")
+    i18n::tf("status.marked", &[&count.to_string()])
 }
 
 /// 一次按键是否命中某个**窗口内**热键（批次 E3-丙）。
@@ -4797,6 +4797,7 @@ fn search_field_id() -> egui::Id {
 impl LauncherApp {
     fn new(
         tray_rx: mpsc::Receiver<TrayEvent>,
+        tray_menu: Option<TrayMenu>,
         hotkey_rx: mpsc::Receiver<()>,
         ipc_rx: mpsc::Receiver<IpcMsg>,
         notify_tx: mpsc::Sender<Result<String, String>>,
@@ -5147,6 +5148,7 @@ impl LauncherApp {
             theme_gallery,
             icon_rx,
             tray_rx,
+            tray_menu,
             hotkey_rx,
             selection_rx,
             ipc_rx,
@@ -5287,6 +5289,34 @@ impl LauncherApp {
         source::application::save_settings(&self.prefs);
         log_info!("设置页：主题 → {name}（已写 settings.json）");
         self.sync_theme(ctx);
+    }
+
+    /// 批次 F13（FR-SYS-04）：设置页换了界面语言。
+    ///
+    /// 三件事一起做：落盘、换全局语言、把字体与托盘菜单立即重刷。字体那一格有个坑——
+    /// 主题的 `font_name` 多半是 `auto`，`use_theme` 在主题没变时会提前返回，`install_fonts`
+    /// 根本不会跑；所以先把 `theme_font` / `theme_applied` 两格缓存清掉，再走一次 `sync_theme`。
+    fn pick_language(&mut self, ctx: &egui::Context, choice: Option<i18n::Language>) {
+        self.prefs.language = choice;
+        source::application::save_settings(&self.prefs);
+        let lang = i18n::resolve(choice, i18n::system_language());
+        i18n::set_language(lang);
+        log_info!(
+            "设置页：界面语言 → {}（{}，已写 settings.json）",
+            lang.tag(),
+            if choice.is_some() {
+                "手动指定"
+            } else {
+                "跟随系统"
+            }
+        );
+        self.theme_font = None;
+        self.theme_applied = None;
+        self.sync_theme(ctx);
+        if let Some(tray) = &self.tray_menu {
+            tray.retranslate();
+        }
+        ctx.request_repaint();
     }
 
     /// 批次 F11（FR-UIX-12）：「复制为自定义主题」——把当前主题摊平成 24 键全在的 JSON
@@ -7655,7 +7685,7 @@ impl LauncherApp {
         let band = ui.available_rect_before_wrap();
         let mut heading_right = 0.0f32;
         let head_row = ui.horizontal(|ui| {
-            if ui.button("← 返回搜索 (Esc)").clicked() {
+            if ui.button(i18n::t("settings.back")).clicked() {
                 self.settings_open = false;
                 self.manage_checked.clear();
                 // 批次 D2：整页关掉时把所有编辑缓冲回写（这条路上 `settings_ui` 已经不再跑了，
@@ -7663,7 +7693,7 @@ impl LauncherApp {
                 self.finish_settings_edits();
                 self.focus_query = true;
             }
-            heading_right = ui.heading("设置").rect.max.x;
+            heading_right = ui.heading(i18n::t("settings.title")).rect.max.x;
         });
         let r = head_row.response.rect;
         self.drag_handle(
@@ -7687,16 +7717,16 @@ impl LauncherApp {
             ui.vertical(|ui| {
                 ui.set_width(84.0);
                 for (label, tab) in [
-                    ("通用", SettingsTab::General),
-                    ("功能", SettingsTab::Features),
-                    ("热键", SettingsTab::Hotkeys),
-                    ("数据源", SettingsTab::Sources),
-                    ("文件搜索", SettingsTab::FileSearch),
-                    ("外观", SettingsTab::Appearance),
-                    ("高级", SettingsTab::Advanced),
-                    ("批量管理", SettingsTab::Manage),
-                    ("使用统计", SettingsTab::Usage),
-                    ("网页引擎", SettingsTab::WebEngines),
+                    (i18n::t("settings.tab.general"), SettingsTab::General),
+                    (i18n::t("settings.tab.features"), SettingsTab::Features),
+                    (i18n::t("settings.tab.hotkeys"), SettingsTab::Hotkeys),
+                    (i18n::t("settings.tab.sources"), SettingsTab::Sources),
+                    (i18n::t("settings.tab.file_search"), SettingsTab::FileSearch),
+                    (i18n::t("settings.tab.appearance"), SettingsTab::Appearance),
+                    (i18n::t("settings.tab.advanced"), SettingsTab::Advanced),
+                    (i18n::t("settings.tab.manage"), SettingsTab::Manage),
+                    (i18n::t("settings.tab.usage"), SettingsTab::Usage),
+                    (i18n::t("settings.tab.web_engines"), SettingsTab::WebEngines),
                 ] {
                     if ui.selectable_label(self.settings_tab == tab, label).clicked() {
                         // 批次 D5：进「批量管理」页时强制重跑一轮路径四态——这一页的状态列就是
@@ -7721,6 +7751,37 @@ impl LauncherApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.settings_tab {
                         SettingsTab::General => {
+                            // 批次 F13（FR-SYS-04）：界面语言放在通用页最上面。改完立即生效——
+                            // 界面文案、托盘菜单、主题 `font_name = "auto"` 的字体一起换。
+                            // 语言名用各自的语言写（简体中文 / English），认错的成本最低。
+                            ui.label(egui::RichText::new(i18n::t("settings.language")).strong());
+                            let mut choice = self.prefs.language;
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut choice,
+                                    None,
+                                    i18n::t("settings.language.auto"),
+                                );
+                                ui.selectable_value(
+                                    &mut choice,
+                                    Some(i18n::Language::ZhCn),
+                                    i18n::Language::ZhCn.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut choice,
+                                    Some(i18n::Language::En),
+                                    i18n::Language::En.label(),
+                                );
+                            });
+                            if choice != self.prefs.language {
+                                self.pick_language(ui.ctx(), choice);
+                            }
+                            ui.label(
+                                egui::RichText::new(i18n::t("settings.language.help"))
+                                    .weak()
+                                    .small(),
+                            );
+                            ui.separator();
                             ui.label(egui::RichText::new("SendTo 入口").strong());
                             let mut enabled = source::application::sendto_installed();
                             let resp = ui.checkbox(&mut enabled, "右键文件/文件夹 → 发送到 → egui-launcher");
@@ -10258,7 +10319,7 @@ impl LauncherApp {
             log_info!("选中内容：启动器的对话框 / 设置页开着 ⇒ 本次不弹面板（内容已取回但未装载）");
             self.hud.notify(
                 ctx,
-                "先关掉启动器的对话框或设置页，再按一次选中内容热键".to_string(),
+                i18n::t("hud.need_close_windows").to_string(),
                 &self.theme,
                 hud::HOLD_FOREGROUND,
                 work_for(self.prefs.appearance.show_on),
@@ -10487,7 +10548,7 @@ impl LauncherApp {
                 log_info!("{via}：已把 {chars} 个字符投给 {where_}（内容不落日志）");
                 self.hud.notify(
                     ctx,
-                    format!("✓ 已粘贴 {chars} 个字符到原来的窗口"),
+                    i18n::tf("hud.pasted_chars", &[&chars.to_string()]),
                     &self.theme,
                     hud::HOLD_FOREGROUND,
                     work_for(self.prefs.appearance.show_on),
@@ -11370,6 +11431,7 @@ impl Default for LauncherApp {
         let (_t6, r6) = mpsc::channel();
         Self::new(
             r1,
+            None,
             r2,
             r3,
             t4,
@@ -11619,7 +11681,7 @@ impl eframe::App for LauncherApp {
                     );
                     self.hud.notify(
                         ui.ctx(),
-                        format!("没有取到选中内容：{why}"),
+                        i18n::tf("hud.selection_nothing", &[&why]),
                         &self.theme,
                         hud::HOLD_FOREGROUND,
                         work_for(self.prefs.appearance.show_on),
@@ -13029,12 +13091,13 @@ impl eframe::App for LauncherApp {
                 // 批次 P1（FR-ACT-03）：面板借用的是同一个输入框（`query` 当过滤词），
                 // 于是那句「关于〈项标题〉的操作」就落在占位符上——与 AHK 的 `SetCueBanner` 同形态，
                 // 而且只在过滤词为空（刚进面板）时露出来，正是需要它的那一刻。
+                // 两句话的耦合口径没变：状态栏开着时输入框只留「搜索…」，关掉则回落到整句长提示。
                 let hint = match &self.panel {
                     Some(p) => egui::RichText::new(p.target.banner()),
                     None if self.prefs.appearance.status_bar => {
-                        egui::RichText::new(SEARCH_HINT_SHORT)
+                        egui::RichText::new(i18n::t("app.search_hint_short"))
                     }
-                    None => egui::RichText::new(SEARCH_HINT),
+                    None => egui::RichText::new(i18n::t("app.search_hint")),
                 };
                 let resp = ui.add_sized(
                     [edit_w, INPUT_MIN_H],
@@ -13072,7 +13135,7 @@ impl eframe::App for LauncherApp {
                             egui::RichText::new("\u{2630}").size(self.theme.title_font_size + 5.0),
                         ),
                     )
-                    .on_hover_text("主菜单（Ctrl+M）");
+                    .on_hover_text(i18n::t("menu.tooltip"));
                 menu_left = menu_btn.rect.min.x;
                 if menu_btn.clicked() {
                     // 手动翻转：`open_bool` 覆盖了 `Popup::menu` 自带的 memory toggle，
@@ -13099,7 +13162,7 @@ impl eframe::App for LauncherApp {
                     MenuAction::BatchImport => {
                         source::application::spawn_batch_import(self.apps_tx.clone());
                         self.toast = Some((
-                            "✓ 批量导入已启动，完成后自动合并".to_string(),
+                            i18n::t("app.batch_import_started").to_string(),
                             Instant::now() + TOAST_TTL,
                             TOAST_OK,
                         ));
@@ -13185,9 +13248,9 @@ impl eframe::App for LauncherApp {
                 // 更要短路 FR-SRC-23 的「Enter 弹出新增」，否则打一个不存在的动作名按 Enter
                 // 会拿过滤词去建一条快捷项。
                 if self.panel.is_some() {
-                    ui.label("没有匹配的动作——改字再筛，或按 Esc / ← 返回结果列表。");
+                    ui.label(i18n::t("app.empty_panel"));
                 } else if q.is_empty() {
-                    ui.label("清单为空——按 Ctrl+Shift+N、或点右上 ☰ 里的「新建快捷项」，也可按 Ctrl+I 批量导入。");
+                    ui.label(i18n::t("app.empty_list"));
                 // 批次 X：文件模式下"未找到"这三行字会说错两件事——范围（不是"清单里没有"，
                 // 是"索引范围里没有"或"这个目录空/读不到"）与预填（`'报告`、`pic 报告` 这种带
                 // 触发符的串喂给 `from_input` 会生成一条命令行是乱码的条目）。所以另起一格。
@@ -13195,18 +13258,15 @@ impl eframe::App for LauncherApp {
                     if self.prefs.source_on(source::SourceId::Files) {
                         ui.label(match &file_route {
                             source::filesearch::Route::Browse { dir, .. } =>
-                                format!("这个目录为空或读不到：{dir}"),
-                            _ => "文件模式：索引范围（桌面 / 下载 / 文档，四级以内）内没有匹配的文件。"
-                                .to_string(),
+                                i18n::tf("app.file_empty_dir", &[dir.as_str()]),
+                            _ => i18n::t("app.file_no_match").to_string(),
                         });
                     } else {
                         // 2026-10-23 A2：源关着的时候说「索引范围内没有匹配」会把用户
                         // 引向错的地方——此刻根本没有索引，开关就在设置页第 4 页。
-                        ui.label(
-                            "文件搜索已关闭——按 Ctrl+, 进设置，在「数据源」页把「文件搜索」打开后再试。",
-                        );
+                        ui.label(i18n::t("app.file_source_off"));
                     }
-                    if ui.button("＋ 新建快捷项 (Ctrl+Shift+N)").clicked() {
+                    if ui.button(i18n::t("app.new_shortcut")).clicked() {
                         self.dialog = Some(DialogState::blank());
                     }
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -13214,9 +13274,9 @@ impl eframe::App for LauncherApp {
                         self.dialog_enter_armed = true;
                     }
                 } else {
-                    ui.label(format!("未找到「{}」——按 Enter 或点下方按钮弹出新增窗口", self.query.trim()));
+                    ui.label(i18n::tf("app.no_match", &[self.query.trim()]));
                     // FR-SRC-23（2026-10-17 修订）：无匹配 Enter 不再直接运行，而是弹出预填当前输入的 AddDialog，确定即入库。
-                    if ui.button("＋ 添加为快捷项 (Ctrl+Shift+N)").clicked() {
+                    if ui.button(i18n::t("app.add_shortcut")).clicked() {
                         let dq = DialogState::from_input(&self.query);
                         self.dialog = Some(dq);
                     }
@@ -13970,7 +14030,11 @@ impl eframe::App for LauncherApp {
                 status_key_cap(&mut right, "Enter", &self.theme);
                 if panel_ready {
                     right.label(
-                        egui::RichText::new(if marks > 0 { "批量" } else { "操作" })
+                        egui::RichText::new(if marks > 0 {
+                            i18n::t("status.batch")
+                        } else {
+                            i18n::t("status.actions")
+                        })
                             .size(self.theme.title_font_size)
                             .color(self.theme.title),
                     );
@@ -15366,7 +15430,7 @@ impl eframe::App for LauncherApp {
                     // 批次 D8：复制成功才算用了一次（与另外三类执行同一口径）。
                     self.record_usage(source::usage::Bucket::Calc);
                     // FR-UIX-09：主窗随即关到托盘，所以回执只能靠 HUD 送到窗口外。
-                    let msg = format!("✓ 已复制 {text}");
+                    let msg = i18n::tf("hud.copied", &[&text]);
                     self.toast = Some((msg.clone(), Instant::now() + TOAST_TTL, TOAST_OK));
                     self.hud.notify(
                         ui.ctx(),
@@ -15523,7 +15587,32 @@ fn create_tray_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, w, h).expect("Failed to create tray icon")
 }
 
-fn init_tray() -> (TrayIcon, mpsc::Receiver<TrayEvent>) {
+/// 批次 F13（FR-SYS-04）：托盘菜单的文字要能在运行时跟着界面语言换。
+/// `muda::MenuItem` 是 Rc 后端——克隆出来的是同一个菜单项，`set_text` 改的就是托盘里那一行；
+/// 菜单本身归 `TrayIcon` 所有（`with_menu(Box::new(menu))`），所以这里留图标 + 六个句柄。
+/// 托盘图标随 `LauncherApp` 走完整个进程（App 没有 `Send` 约束，收得下这两种 `!Send` 类型）。
+pub struct TrayMenu {
+    _tray: TrayIcon,
+    show: MenuItem,
+    import: MenuItem,
+    settings: MenuItem,
+    log: MenuItem,
+    sysinfo: MenuItem,
+    exit: MenuItem,
+}
+
+impl TrayMenu {
+    fn retranslate(&self) {
+        self.show.set_text(i18n::t("tray.show"));
+        self.import.set_text(i18n::t("tray.import"));
+        self.settings.set_text(i18n::t("tray.settings"));
+        self.log.set_text(i18n::t("tray.open_log"));
+        self.sysinfo.set_text(i18n::t("tray.sysinfo"));
+        self.exit.set_text(i18n::t("tray.exit"));
+    }
+}
+
+fn init_tray() -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
     let (tx, rx) = mpsc::channel();
     let show_id = muda::MenuId("show".to_string());
     let import_id = muda::MenuId("import".to_string());
@@ -15531,12 +15620,13 @@ fn init_tray() -> (TrayIcon, mpsc::Receiver<TrayEvent>) {
     let log_id = muda::MenuId("openlog".to_string());
     let sysinfo_id = muda::MenuId("sysinfo".to_string());
     let exit_id = muda::MenuId("exit".to_string());
-    let show_item = MenuItem::with_id(show_id.clone(), "显示", true, None);
-    let import_item = MenuItem::with_id(import_id.clone(), "批量导入全部", true, None);
-    let settings_item = MenuItem::with_id(settings_id.clone(), "设置…", true, None);
-    let log_item = MenuItem::with_id(log_id.clone(), "打开日志", true, None);
-    let sysinfo_item = MenuItem::with_id(sysinfo_id.clone(), "复制系统信息", true, None);
-    let exit_item = MenuItem::with_id(exit_id.clone(), "退出", true, None);
+    // 初值直接按当前语言取：`init_tray` 只在语言定下来之后调用（见 `main` 的顺序）。
+    let show_item = MenuItem::with_id(show_id.clone(), i18n::t("tray.show"), true, None);
+    let import_item = MenuItem::with_id(import_id.clone(), i18n::t("tray.import"), true, None);
+    let settings_item = MenuItem::with_id(settings_id.clone(), i18n::t("tray.settings"), true, None);
+    let log_item = MenuItem::with_id(log_id.clone(), i18n::t("tray.open_log"), true, None);
+    let sysinfo_item = MenuItem::with_id(sysinfo_id.clone(), i18n::t("tray.sysinfo"), true, None);
+    let exit_item = MenuItem::with_id(exit_id.clone(), i18n::t("tray.exit"), true, None);
     let menu = Menu::new();
     menu.append(&show_item).unwrap();
     menu.append(&import_item).unwrap();
@@ -15573,12 +15663,22 @@ fn init_tray() -> (TrayIcon, mpsc::Receiver<TrayEvent>) {
     let icon = create_tray_icon();
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        // 提示串是产品名 + 按键名，两种语言下写法相同，不翻。
         .with_tooltip("egui Launcher (Ctrl+Alt+Space)")
         .with_icon(icon)
         .with_menu_on_left_click(true)
         .build()
         .expect("Failed to create tray icon");
-    (tray, rx)
+    let menu = TrayMenu {
+        _tray: tray,
+        show: show_item,
+        import: import_item,
+        settings: settings_item,
+        log: log_item,
+        sysinfo: sysinfo_item,
+        exit: exit_item,
+    };
+    (menu, rx)
 }
 
 /// 句柄的生命周期：`SetStdHandle` 只换指针、不接管所有权，`File` 一 drop 句柄就悬空，
@@ -15705,7 +15805,6 @@ fn main() -> eframe::Result {
     };
     let start_visible = intent.visible;
 
-    let (_tray, tray_rx) = init_tray();
     let (hotkey_tx, hotkey_rx) = mpsc::channel();
     // 批次 G3：选中内容键的结论通道（热键线程派工作线程 → UI 在 `ui()` 里收）。
     let (selection_tx, selection_rx) = mpsc::channel();
@@ -15732,6 +15831,21 @@ fn main() -> eframe::Result {
         start_log_level.label(),
         if cfg!(debug_assertions) { "debug" } else { "release" }
     );
+    // 批次 F13（FR-SYS-04）：语言要在**建托盘、装主题字体之前**定下来——
+    // 托盘菜单的初值直接按当前语言取，主题 `font_name = "auto"` 也按语言选字体。
+    // 落一条日志：排查"为什么界面是英文"先看这行，而不是去猜系统设置。
+    let start_language = i18n::resolve(configured.language, i18n::system_language());
+    i18n::set_language(start_language);
+    log_info!(
+        "界面语言：{}（{}）",
+        start_language.tag(),
+        if configured.language.is_some() {
+            "设置页指定"
+        } else {
+            "跟随系统"
+        }
+    );
+    let (tray_menu, tray_rx) = init_tray();
     match &broken {
         Some(Corrupted::Kept(p)) => log_info!(
             "配置损坏：热键线程用的 settings.json 解析失败，已隔离为 {}，本轮按出厂热键注册",
@@ -15814,6 +15928,7 @@ fn main() -> eframe::Result {
             }
             let mut app = LauncherApp::new(
                 tray_rx,
+                Some(tray_menu),
                 hotkey_rx,
                 ipc_rx,
                 notify_tx,

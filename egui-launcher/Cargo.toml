@@ -31,6 +31,9 @@ features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    # 批次 F13（FR-SYS-04 多语言）：`language = auto` 要跟随系统 UI 语言，
+    # `GetUserDefaultLocaleName` 在 Globalization 模块里。
+    "Win32_Globalization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     # 打磨档 G3（选中内容动作面板）：全格式剪贴板快照要用 OLE 的 IDataObject

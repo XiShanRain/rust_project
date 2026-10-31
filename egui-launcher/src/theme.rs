@@ -786,16 +786,19 @@ fn all_names(files: &HashMap<String, ThemeFile>) -> Vec<String> {
     names
 }
 
-/// 把主题字体装进 egui：`auto` = 只装 CJK 回退；其它名字先在 `C:\Windows\Fonts`
-/// 里按原名 / 补扩展名找，找到就放到 Proportional 族首位，CJK 回退仍然追加在后面。
+/// 把主题字体装进 egui：`auto` = 按当前界面语言选（中文 → 微软雅黑，英文 → Segoe UI，
+/// 批次 F13）；其它名字先在 `C:\Windows\Fonts` 里按原名 / 补扩展名找，
+/// 找到就放到 Proportional 族首位，CJK 回退仍然追加在后面。
 pub fn install_fonts(ctx: &egui::Context, font_name: &str) {
     let mut fonts = egui::FontDefinitions::default();
-    let mut preferred = None;
-    if !font_name.eq_ignore_ascii_case("auto") {
-        preferred = find_font(font_name);
-        if preferred.is_none() {
-            log_info!("theme: 找不到字体「{font_name}」，按 auto 处理");
-        }
+    let resolved = if font_name.eq_ignore_ascii_case("auto") {
+        crate::i18n::auto_font()
+    } else {
+        font_name
+    };
+    let preferred = find_font(resolved);
+    if preferred.is_none() {
+        log_info!("theme: 找不到字体「{resolved}」，按 auto 处理");
     }
     if let Some((label, bytes, index)) = preferred {
         let mut data = egui::FontData::from_owned(bytes);
