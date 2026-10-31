@@ -1124,6 +1124,13 @@ struct LauncherApp {
     /// 本帧列表由这几家拼出来，顺序即报文次序。文件源的索引/列目录状态在 `FileSource` 自己
     /// 肚子里，`LauncherApp` 不再持有它那八个字段；开关读 [`AppSettings::sources_off`]。
     sources: Vec<Box<dyn source::DataSource>>,
+    // ---- 批次 A7：脚本目录的收尾回执（FR-SRC-15）----
+    /// 等待线程（`silent` / `output` 脚本）回来的那一句。
+    script_tx: mpsc::Sender<source::scripts::Report>,
+    script_rx: mpsc::Receiver<source::scripts::Report>,
+    /// 窗口当时不可见 ⇒ 这句回执先排队，等下一次真被看见再转成 Toast
+    /// （`on_show()` 会清 toast，所以不能在隐藏时直接塞进去）。
+    script_notice: Option<(String, egui::Color32)>,
     /// E1（批次 X）：配置文件坏过一次的话，这里存那句说明。静默启动时 `ui()` 根本不跑，
     /// 所以它是「等窗口第一次真被看见」才转成 Toast 的那句话，不是开机就闪一下没了。
     startup_notice: Option<String>,
@@ -2565,6 +2572,16 @@ fn large_text_of(
             HeadRow::Custom(hit) => hit.name.clone(),
             // 提示行的标题是「某命令（需要参数）」这种说明文，命令原文才是可展示的内容。
             HeadRow::CustomHint(hit) => hit.command.clone(),
+            // 脚本行的「这段文字本身」＝脚本路径；独占行连参数一起给，粘出去就是一条完整命令。
+            HeadRow::Script(hit) => {
+                let path = hit.path.to_string_lossy();
+                if hit.argument.is_empty() {
+                    path.into_owned()
+                } else {
+                    format!("{path} {}", hit.argument)
+                }
+            }
+            HeadRow::ScriptHint(hit) => hit.title.clone(),
             HeadRow::File(hit) => hit.path.clone(),
             HeadRow::Terminal(hit) => hit.command.clone(),
             HeadRow::TermHint(hit) => hit.title.clone(),
@@ -2595,6 +2612,8 @@ fn enter_action_label(row: Option<&HeadRow>) -> &'static str {
         | Some(HeadRow::ScopeTags(_)) => i18n::t("status.enter.view"),
         Some(HeadRow::Custom(_)) => i18n::t("status.enter.run"),
         Some(HeadRow::CustomHint(_)) => i18n::t("status.enter.complete_params"),
+        Some(HeadRow::Script(_)) => i18n::t("status.enter.run"),
+        Some(HeadRow::ScriptHint(_)) => i18n::t("status.enter.complete_params"),
         Some(HeadRow::File(_)) => i18n::t("status.enter.open"),
         Some(HeadRow::Terminal(_)) => i18n::t("status.enter.run_command"),
         Some(HeadRow::Cheat(_)) => i18n::t("status.enter.view"),
@@ -3232,7 +3251,11 @@ fn wide_z(s: &str) -> Vec<u16> {
 /// 协议/URL/Store，故 FR-ACT-02 要求一律走这里。SEE_MASK_FLAG_NO_UI 抑制系统错误框，失败以 Result 返回。
 /// 批次 A9：Store/MSIX 条目（路径形如 `shell:AppsFolder\<AUMID>`）是唯一的例外——
 /// 它改走 `IApplicationActivationManager`，理由见 `application::activate_uwp`。
-fn shell_execute(file: &str, params: &str, dir: Option<&str>) -> windows::core::Result<()> {
+pub(crate) fn shell_execute(
+    file: &str,
+    params: &str,
+    dir: Option<&str>,
+) -> windows::core::Result<()> {
     shell_execute_verb(file, None, params, dir, SW_SHOWNORMAL.0)
 }
 
@@ -4864,6 +4887,8 @@ impl LauncherApp {
         let data_dir = source::application::data_dir();
         let (apps_tx, apps_rx) = mpsc::channel();
         let (path_tx, path_rx) = mpsc::channel();
+        // 批次 A7（FR-SRC-15）：`silent` / `output` 脚本的收尾通道（等待线程 → UI）。
+        let (script_tx, script_rx) = mpsc::channel();
         // 清单文件不存在（首次运行）→ 用内置系统工具播种一次并落盘；此后它就是一张普通用户清单，
         // 全部可编辑/删除（对标 Delphi WriteDefaultShortCutList）。文件已存在（哪怕被清空）不覆盖。
         //
@@ -5141,6 +5166,9 @@ impl LauncherApp {
             path_in_flight: false,
             path_scanned_at: Instant::now(),
             sources: source::default_sources_with(&prefs),
+            script_tx,
+            script_rx,
+            script_notice: None,
             startup_notice: notice,
             selected: 0,
             scroll_followed: 0,
@@ -5586,6 +5614,124 @@ impl LauncherApp {
             );
         } else {
             self.complete_query(ctx, &hint.completion);
+        }
+    }
+
+    /// 批次 A7（FR-SRC-15）：脚本的「还缺一个参数」提示行——补全成 `"keyword "`；
+    /// 已经补过就只说一句「继续输入参数」。
+    fn script_hint_activate(&mut self, ctx: &egui::Context, hint: &source::scripts::ScriptHint) {
+        if self.query == hint.completion {
+            self.toast = Some((
+                i18n::t("toast.need_param").to_string(),
+                Instant::now() + TOAST_TTL,
+                TOAST_OK,
+            ));
+            ctx.request_repaint_after(TOAST_TTL);
+            log_info!("scripts: 查询已在该脚本关键字之后，等待用户输入参数");
+        } else {
+            self.complete_query(ctx, &hint.completion);
+        }
+    }
+
+    /// 批次 A7（FR-SRC-15）：执行一行脚本。
+    ///
+    /// `window` 与终端行同形态：起来就关到托盘。`silent` / `output` 的进程也起来，
+    /// 只是要等它结束才有一句话——那一刻窗口多半已经藏了，所以回执走 `script_rx`，
+    /// 由下一次有帧时转成 Toast（见 `ui()` 里那段收取）。
+    fn run_script_hit(&mut self, ctx: &egui::Context, hit: &source::scripts::ScriptHit) -> bool {
+        let spawned = match source::scripts::spawn(hit) {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                log_info!("scripts: 启动失败（模式 {}）：{e}", hit.mode.as_str());
+                self.toast = Some((
+                    i18n::tfmt("toast.launch_failed", &[&e]),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_ERR,
+                ));
+                ctx.request_repaint_after(TOAST_TTL);
+                return false;
+            }
+        };
+        match spawned {
+            source::scripts::Spawned::Started => {
+                log_info!("scripts: 已启动（模式 {}，脚本名不落日志）", hit.mode.as_str());
+            }
+            source::scripts::Spawned::Capturing { mut child, out } => {
+                log_info!(
+                    "scripts: 已启动并等待结束（模式 {}，脚本名与输出都不落日志）",
+                    hit.mode.as_str()
+                );
+                let tx = self.script_tx.clone();
+                let ctx = ctx.clone();
+                let title = hit.title.clone();
+                let mode = hit.mode;
+                std::thread::spawn(move || {
+                    let timed_out =
+                        source::scripts::wait_with_timeout(&mut child, source::scripts::SCRIPT_TIMEOUT)
+                            .is_err();
+                    let output = source::scripts::read_last_line(&out);
+                    // `output` 模式的临时文件要留到主线程把它交给默认程序打开；其余几种这里就删。
+                    if mode != source::scripts::ScriptMode::Output || timed_out {
+                        source::scripts::remove_temp(&out);
+                    }
+                    let _ = tx.send(source::scripts::Report {
+                        title,
+                        mode,
+                        out,
+                        output,
+                        timed_out,
+                    });
+                    ctx.request_repaint();
+                });
+            }
+        }
+        self.toast = None;
+        self.clear_query_next_frame = true;
+        self.selected = 0;
+        self.visible = false;
+        self.on_hide();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        true
+    }
+
+    /// 等待线程回来的回执怎么落地。返回 `None` ＝ 这一条不用说话（`output` 模式改去开临时文件）。
+    ///
+    /// 口径照 AHK `ScriptProvider.ahk`：`silent` 拿**最后一行非空**输出当通知文字（一个字都没吐就
+    /// 只说「跑完了」）；`output` 用 `.txt` 的默认程序打开捕获文件，文件留在 `%Temp%` 给用户自己处理；
+    /// 超时则是一句错误 Toast（此时临时文件在等待线程里已经删掉）。日志里只记 mode 与成败
+    /// （标题与输出都是用户内容）。
+    fn script_report_effect(report: &source::scripts::Report) -> Option<(String, egui::Color32)> {
+        if report.timed_out {
+            return Some((i18n::tfmt("toast.script_timeout", &[&report.title]), TOAST_ERR));
+        }
+        match report.mode {
+            // AHK 同口径：`output` 不弹通知，而是把捕获到的全文交给 `.txt` 的默认程序。
+            source::scripts::ScriptMode::Output => {
+                let path = report.out.to_string_lossy();
+                match crate::shell_execute(&path, "", None) {
+                    Ok(()) => None,
+                    Err(e) => Some((
+                        i18n::tfmt("toast.script_output_failed", &[&report.title, &e]),
+                        TOAST_ERR,
+                    )),
+                }
+            }
+            // `window` 模式是前台直接起的，压根不会走到回执通道。
+            source::scripts::ScriptMode::Silent | source::scripts::ScriptMode::Window => {
+                Some(Self::script_silent_text(report))
+            }
+        }
+    }
+
+    /// `silent` 的收尾那句：末行非空就报末行（AHK 的通知口径），一个字都没吐就只说「跑完了」。
+    fn script_silent_text(report: &source::scripts::Report) -> (String, egui::Color32) {
+        if report.output.is_empty() {
+            (i18n::tfmt("toast.script_done", &[&report.title]), TOAST_OK)
+        } else {
+            (
+                i18n::tfmt("toast.script_output", &[&report.title, &report.output]),
+                TOAST_OK,
+            )
         }
     }
 
@@ -11798,6 +11944,27 @@ impl eframe::App for LauncherApp {
             if let Some(msg) = self.startup_notice.take() {
                 self.toast = Some((msg, Instant::now() + TOAST_TTL_STARTUP, TOAST_ERR));
                 ui.ctx().request_repaint_after(TOAST_TTL_STARTUP);
+            } else if let Some((msg, color)) = self.script_notice.take() {
+                // 批次 A7：隐藏期间跑完的 `silent` / `output` 脚本，回执等到这一刻才说。
+                self.toast = Some((msg, Instant::now() + TOAST_TTL, color));
+                ui.ctx().request_repaint_after(TOAST_TTL);
+            }
+        }
+        // 批次 A7（FR-SRC-15）：收后台脚本的收尾回执。窗口藏着的时候 `ui()` 根本不跑，
+        // 所以那些回执会留在通道里，等下一次呼出、走到这里才被取走——正是想要的时机。
+        while let Ok(report) = self.script_rx.try_recv() {
+            log_info!(
+                "scripts: 已结束（模式 {}，{}；标题与输出都不落日志）",
+                report.mode.as_str(),
+                if report.timed_out { "超时已强杀" } else { "正常退出" }
+            );
+            if let Some((msg, color)) = Self::script_report_effect(&report) {
+                if self.visible {
+                    self.toast = Some((msg, Instant::now() + TOAST_TTL, color));
+                    ui.ctx().request_repaint_after(TOAST_TTL);
+                } else {
+                    self.script_notice = Some((msg, color));
+                }
             }
         }
 
@@ -12097,6 +12264,9 @@ impl eframe::App for LauncherApp {
         let mut open_file: Option<source::filesearch::FileHit> = None;
         // 批次 A3：终端行的「执行」＝在新窗口跑命令（日志不记命令原文）。
         let mut open_term: Option<source::terminal::TermHit> = None;
+        // 批次 A7（FR-SRC-15）：脚本行的「执行」＝按脚本自己的 mode 起进程。
+        // 三种 mode 的下场不同（窗口 / 静默 / 捕获输出），真正起进程在帧末 `run_script_hit`。
+        let mut script_run: Option<source::scripts::ScriptHit> = None;
         let mut select_path: Option<String> = None;
         let mut copy_path: Option<String> = None;
         let mut row_actions: Vec<String> = Vec::new();
@@ -13075,6 +13245,17 @@ impl eframe::App for LauncherApp {
                                     log_info!("快捷键 数字键 {digit}：选中的是终端用法行，不执行");
                                     self.hint_toast(ui.ctx(), source::terminal::usage_toast());
                                 }
+                                HeadRow::Script(hit) => {
+                                    log_info!(
+                                        "快捷键 数字键 {digit}：执行脚本（模式 {}，脚本名不落日志）",
+                                        hit.mode.as_str()
+                                    );
+                                    script_run = Some(hit.clone());
+                                }
+                                HeadRow::ScriptHint(hint) => {
+                                    log_info!("快捷键 数字键 {digit}：选中脚本的补全提示行");
+                                    self.script_hint_activate(ui.ctx(), hint);
+                                }
                                 HeadRow::Cheat(hit) => {
                                     // FR-SRC-18：与 Enter 同一语义——打开帮助页，不关窗口。
                                     log_info!(
@@ -13518,6 +13699,10 @@ impl eframe::App for LauncherApp {
                                 HeadRow::TermHint(_) => {
                                     self.hint_toast(ui.ctx(), source::terminal::usage_toast())
                                 }
+                                HeadRow::Script(hit) => script_run = Some(hit.clone()),
+                                HeadRow::ScriptHint(hint) => {
+                                    self.script_hint_activate(ui.ctx(), hint)
+                                }
                                 HeadRow::Cheat(hit) => self.help_entry = Some(*hit),
                                 HeadRow::CheatHint(_) => {
                                     self.hint_toast(ui.ctx(), source::cheatsheet::no_match_toast())
@@ -13775,6 +13960,69 @@ impl eframe::App for LauncherApp {
                                                 ui.close();
                                             }
                                         });
+                                    });
+                                }
+                                HeadRow::Script(hit) => {
+                                    // 批次 A7（FR-SRC-15）：标题来自脚本头 `@altrun.title`，
+                                    // 副标题是文件名——同目录里改过名的两份脚本靠后半句认人。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, i18n::t("row.badge.run"));
+                                        ui.add_sized(
+                                            [icon, icon],
+                                            egui::Label::new(
+                                                egui::RichText::new("▸").monospace().size(glyph).weak(),
+                                            ),
+                                        )
+                                        .on_hover_text(i18n::t("row.hover.script"));
+                                        let sel = ui.selectable_label(is_sel, hit.title.clone());
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
+                                        );
+                                        if sel.clicked() {
+                                            script_run = Some(hit.clone());
+                                        }
+                                        // 脚本不在清单里 ⇒ 没有"编辑/删除条目"；右键给这对
+                                        // 对它本身有意义的事（与文件行同一对键）。
+                                        sel.context_menu(|ui| {
+                                            if ui.button(i18n::t("row.menu.copy_path")).clicked() {
+                                                copy_path =
+                                                    Some(hit.path.to_string_lossy().into_owned());
+                                                ui.close();
+                                            }
+                                            if ui.button(i18n::t("row.menu.reveal")).clicked() {
+                                                select_path =
+                                                    Some(hit.path.to_string_lossy().into_owned());
+                                                ui.close();
+                                            }
+                                        });
+                                    });
+                                }
+                                HeadRow::ScriptHint(hint) => {
+                                    // 不可执行行：点/按都是"补全成 `keyword `"。
+                                    ui.horizontal(|ui| {
+                                        row_badge(ui, h, i18n::t("row.badge.complete"));
+                                        ui.add_sized(
+                                            [icon, icon],
+                                            egui::Label::new(
+                                                egui::RichText::new("…").monospace().size(glyph).weak(),
+                                            ),
+                                        );
+                                        let sel = ui.selectable_label(
+                                            is_sel,
+                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                        );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
+                                        );
+                                        if sel.clicked() {
+                                            self.script_hint_activate(ui.ctx(), hint);
+                                        }
                                     });
                                 }
                                 HeadRow::File(hit) => {
@@ -15586,6 +15834,12 @@ impl eframe::App for LauncherApp {
             if self.run_terminal_hit(ui.ctx(), &hit) {
                 self.record_usage(source::usage::Bucket::Terminal);
             }
+        }
+        // 批次 A7（FR-SRC-15）：脚本行。同样不进清单、不记学习统计；脚本目录本批没有
+        // 自己的统计桶（D8 的桶是照功能分的，脚本目录不单列）。
+        if let Some(hit) = script_run {
+            self.remember_history(self.query.clone());
+            self.run_script_hit(ui.ctx(), &hit);
         }
         if let Some(path) = select_path {
             self.select_in_explorer(ui.ctx(), &path);
@@ -18289,5 +18543,41 @@ mod nav_tests {
             .collect();
         let specs: Vec<String> = icon_jobs(&many).into_iter().map(|(_, s)| s).collect();
         assert_eq!(specs, vec!["folder:".to_string(), "url:".to_string()]);
+    }
+
+    /// 批次 A7（FR-SRC-15）：`silent` 收尾照 AHK 口径——末行非空就报末行，一个字都没吐只报
+    /// 「跑完了」；超时一律错误色。三种都要带脚本标题，否则用户不知道是哪一个跑完了。
+    /// `output` 那一支会去开文件，不在单测里碰（真机验）。
+    #[test]
+    fn a7_silent_report_reports_last_line_or_done_and_timeout_is_an_error() {
+        let mk = |output: &str, timed_out: bool| source::scripts::Report {
+            title: "IP 地址".into(),
+            mode: source::scripts::ScriptMode::Silent,
+            out: std::path::PathBuf::new(),
+            output: output.into(),
+            timed_out,
+        };
+
+        let (msg, color) = LauncherApp::script_report_effect(&mk("192.168.1.7", false))
+            .expect("silent 模式一定有话要说");
+        assert!(
+            msg.contains("IP 地址") && msg.contains("192.168.1.7"),
+            "末行要出现在通知里：{msg}"
+        );
+        assert_eq!(color, TOAST_OK);
+
+        let (msg, color) = LauncherApp::script_report_effect(&mk("", false))
+            .expect("空输出也得有「跑完了」");
+        assert_eq!(
+            msg,
+            i18n::tfmt("toast.script_done", &[&"IP 地址"]),
+            "没有输出就走「跑完了」，不许拼一个空括弧"
+        );
+        assert_eq!(color, TOAST_OK);
+
+        let (msg, color) = LauncherApp::script_report_effect(&mk("192.168.1.7", true))
+            .expect("超时也得说一句");
+        assert!(msg.contains("IP 地址"), "超时通知要带标题：{msg}");
+        assert_eq!(color, TOAST_ERR, "超时是错误色");
     }
 }

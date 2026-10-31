@@ -328,6 +328,15 @@ fn score_item(p: &Parsed, keys: &MatchKeys, wild: Option<&WildPattern>) -> Optio
     best
 }
 
+/// 批次 A7（FR-SRC-15）：非清单源复用同一张七档表——脚本目录没有 `LaunchItem`，
+/// 但它要的「名称 / 关键字 / 拼音首字母」与清单条目是同一套口径。空文本不成键 ⇒ `None`。
+/// 通配符查询不走这里（`*` `?` 只对清单成立，脚本行不做正则）。
+pub fn score_text(p: &Parsed, text: &str) -> Option<(u8, f32)> {
+    let k = Key::new(text)?;
+    let hit = score_key(p, &k, None);
+    (hit.1 > 0.0).then_some(hit)
+}
+
 /// Tab 补全判据（FR-ACT-06，2026-10-18 与用户裁定的「可观测条件分流」）：
 /// 查询首词是**名称或任一别名**的前缀，且名称比该词更长（补全会让查询变长）⇒ 值得补全。
 /// 只看名称前缀不够：敲拼音首字母 `jsq` 要补成「计算器」，二者没有字符前缀关系，

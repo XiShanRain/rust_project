@@ -1,9 +1,9 @@
 //! FR-SRC 数据源模块。每个 provider 一个子模块，统一产出「可搜索的条目快照」。
 //!
-//! 现已落地八个：FR-SRC-02（应用程序源）、FR-SRC-05（自定义命令源）、
+//! 现已落地九个：FR-SRC-02（应用程序源）、FR-SRC-05（自定义命令源）、
 //! FR-SRC-06（路径四态校验）、FR-SRC-10（计算器）、FR-SRC-11（网页搜索）、
-//! FR-SRC-14（文件搜索与目录浏览）、FR-SRC-16（终端命令 `>`）、
-//! FR-SRC-18（速查表 `?`，表里每条语法也按所属源的开关过滤）。
+//! FR-SRC-14（文件搜索与目录浏览）、FR-SRC-15（脚本目录 `Scripts\`）、
+//! FR-SRC-16（终端命令 `>`）、FR-SRC-18（速查表 `?`，表里每条语法也按所属源的开关过滤）。
 //!
 //! **批次 A10（2026-10-22）起**这几个源不再硬编在 `main.rs::plan()` 的匹配链里，而是实现
 //! [`DataSource`]、由 [`default_sources`] 按固定顺序注册；`plan()` 只按注册表走一圈。
@@ -27,6 +27,7 @@ pub mod manage;
 pub mod params;
 pub mod pathcheck;
 pub mod runflags;
+pub mod scripts;
 pub mod siteicon;
 pub mod system;
 pub mod terminal;
@@ -47,6 +48,8 @@ pub enum SourceId {
     Apps,
     /// 清单里带参数的命令（`kw 参数`），命中即独占整张列表。
     Custom,
+    /// 脚本目录 `Scripts\`（FR-SRC-15）：`.ahk/.ps1/.bat/.cmd/.py` 按文件头注释出条目。
+    Scripts,
     /// 网页引擎（`g 词`），内置表 + 用户表。
     Web,
     /// 文件搜索与目录浏览（`'词`、空格开头、路径…）。
@@ -63,10 +66,11 @@ impl SourceId {
     /// 注册表的实际顺序（只在单测里用：`default_sources` 的顺序不许漂）。
     /// 与 [`default_sources`] 一致——显式语法（`?` / `>`）最前，其后用户数据压过出厂数据，应用清单殿后。
     #[cfg(test)]
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Cheatsheet,
         Self::Terminal,
         Self::Custom,
+        Self::Scripts,
         Self::Web,
         Self::Files,
         Self::Calc,
@@ -77,6 +81,7 @@ impl SourceId {
         match self {
             Self::Apps => "apps",
             Self::Custom => "custom",
+            Self::Scripts => "scripts",
             Self::Web => "web",
             Self::Files => "files",
             Self::Calc => "calc",
@@ -102,6 +107,11 @@ pub enum SourceRow {
     Custom(custom::CustomHit),
     /// 自定义命令「还缺一个参数」的提示行：不可执行，Enter 补全成 `"kw "`。
     CustomHint(custom::CustomHint),
+    /// 脚本目录的一行（FR-SRC-15）。「执行」＝按 `@altrun.mode` 起进程。
+    /// 独占时（`kw 参数`）`title` 已带参数，`argument` 非空。
+    Script(scripts::ScriptHit),
+    /// 脚本「还缺一个参数」的提示行：不可执行，Enter 补全成 `"keyword "`。
+    ScriptHint(scripts::ScriptHint),
     /// 文件搜索 / 目录浏览的一行。「执行」＝用系统关联程序打开它。
     File(filesearch::FileHit),
     /// 终端命令的独占行（`>命令`）。「执行」＝在新终端窗口里跑。
@@ -233,6 +243,7 @@ pub fn default_sources_with(prefs: &application::AppSettings) -> Vec<Box<dyn Dat
         Box::new(cheatsheet::CheatSource),
         Box::new(terminal::TerminalSource),
         Box::new(custom::CustomSource),
+        Box::new(scripts::ScriptSource::default()),
         Box::new(websearch::WebSource),
         Box::new(filesearch::FileSource::with_scope(prefs.file_scan_scope())),
         Box::new(calc::CalcSource),
