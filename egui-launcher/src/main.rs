@@ -49,11 +49,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
-    KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR, MapVirtualKeyW,
-    RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_LWIN,
-    VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK, VK_MEDIA_STOP, VK_MENU,
-    VK_RWIN, VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
+    GetAsyncKeyState, GetKeyboardLayout, HOT_KEY_MODIFIERS, HKL, INPUT, INPUT_0, INPUT_KEYBOARD,
+    KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR,
+    MapVirtualKeyW, RegisterHotKey, SendInput, ToUnicodeEx, UnregisterHotKey, VIRTUAL_KEY,
+    VK_CONTROL, VK_LWIN, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK,
+    VK_MEDIA_STOP, VK_MENU, VK_RWIN, VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
     DROPFILES, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -69,7 +69,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId, HHOOK, HWND_BROADCAST,
-    HWND_MESSAGE, IsIconic, IsWindow, KBDLLHOOKSTRUCT, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
+    HWND_MESSAGE, IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow,
@@ -105,6 +105,7 @@ mod large_type;
 mod matching;
 mod selection;
 mod source;
+mod sprint;
 mod sysinfo;
 mod theme;
 mod theme_gallery;
@@ -124,7 +125,7 @@ use source::application::{
     VK_SPACE, VK_Z,
 };
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // 批次 G1（FR-WIN-03）：双击 Ctrl / Shift 的判定是纯函数（`src/dbltap.rs`），
@@ -3893,6 +3894,12 @@ const WM_APP_CLEAR_EXTRA: u32 = WM_APP + 5;
 const WM_APP_SET_DOUBLE_TAP: u32 = WM_APP + 6;
 /// 「清除选中内容热键」（批次 G3）。同一条理由：注销只能在热键线程做。
 const WM_APP_CLEAR_SELECTION: u32 = WM_APP + 7;
+/// 「开始抢跑截字」（批次 FR-WIN-06）。双击呼出那条路本身跑在钩子回调里，
+/// 不在回调里再装一个钩子 ⇒ 它只投这条消息，装钩子仍在热键线程做。
+const WM_APP_SPRINT_ARM: u32 = WM_APP + 8;
+/// 「停止抢跑截字」。`wparam` = 投信时那一轮的代数（见 [`SPRINT_GEN`]）：
+/// 对不上说明已经开了新一轮（用户快速连按两次呼出），这条迟到的停止不照办。
+const WM_APP_SPRINT_STOP: u32 = WM_APP + 9;
 /// 暂停的兜底定时器 id 与时长：注销状态一旦漏掉恢复（比如窗口隐藏后 eframe 不再跑 `ui()`，
 /// UI 侧那条边沿检测就永远不执行），全局呼出会一直不可用。定时器挂在消息窗上，
 /// 由热键线程自己的消息循环驱动 ⇒ 与窗口可见与否无关，这条兜底才是真兜底。
@@ -3970,6 +3977,26 @@ static HOTKEY_RESULT: Mutex<Vec<HotkeyOutcome>> = Mutex::new(Vec::new());
 /// 主热键当前是否处于"录制期临时注销"状态。只有热键线程写它（在 wndproc 里），
 /// UI 侧另有一个"我发过消息没有"的镜像位，两者不互相依赖。
 static HOTKEY_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+// ---- 批次 FR-WIN-06：呼出抢跑截字 ----
+/// 本进程主窗口句柄（存数值）。热键线程判"这一按会不会把窗口显示出来"要问
+/// `IsWindowVisible` / `IsIconic`，两者都收 HWND。窗口建好那一刻写一次，之后只读。
+static SELF_HWND: AtomicUsize = AtomicUsize::new(0);
+/// 抢跑用的低级键盘钩子（0 = 没装）。与 [`TAP_HOOK`] 一样只有热键线程装/卸。
+static SPRINT_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// 钩子回调的快速判据：没在截字就一个字符都不碰。
+static SPRINT_ARMED: AtomicBool = AtomicBool::new(false);
+/// 这一轮截字的代数。UI 投"停止"时带上它——用户快速连按两次呼出时，
+/// 上一条迟到的停止不能把新一轮掐死。
+static SPRINT_GEN: AtomicU64 = AtomicU64::new(0);
+/// 截止时刻（进程内毫秒，零点同 [`tap_now_ms`]）。定时器是正路，钩子回调里也顺手比一次：
+/// 队列里排在定时器消息前面的那几下按键不该再被吞。
+static SPRINT_DEADLINE_MS: AtomicU32 = AtomicU32::new(0);
+/// 截到的字符。钩子线程写、UI 线程取；两边都只持锁几个指令（回调里没有 I/O、没有日志）。
+static SPRINT_BUF: Mutex<sprint::SprintBuf> = Mutex::new(sprint::SprintBuf::new());
+/// 截止兜底定时器 id（消息窗上）。与暂停兜底那条同一种做法：由热键线程自己的消息循环驱动，
+/// UI 起了没起都照样到点。
+const SPRINT_TIMER: usize = 0x5EEF;
 
 /// 一次换键的结果（回执给 UI，由 UI 决定要不要写 settings.json）。
 #[derive(Debug, Clone, Copy)]
@@ -4473,6 +4500,9 @@ unsafe extern "system" fn keyboard_hook_proc(
         // 取键期（设置页正在录主/副热键）不认双击：那会儿用户按 Ctrl 是在**录组合键**，
         // 连着按两下不该把窗口藏起来把录制打断。`HOTKEY_SUSPENDED` 也就跑在本线程，读它免费。
         if decision == TapDecision::Show && !HOTKEY_SUSPENDED.load(Ordering::Relaxed) {
+            // 批次 FR-WIN-06：双击呼出同样是"抢跑"的起点——用户连按两下 Ctrl 之后往往
+            // 立刻开始打字。只投消息，不在这个回调里再装一个钩子。
+            post_sprint_arm();
             // 与主热键**同一条路**（AHK 版双击也是 `SearchWindow.Toggle()`）：
             // 一边是 `HOTKEY_TX` 的"切一次显隐"，一边要唤醒可能已经隐藏的 UI。
             if let Some(tx) = HOTKEY_TX.get() {
@@ -4556,6 +4586,267 @@ fn post_double_tap(mode: DblTap) {
         )
     } {
         log_info!("dbltap: 换档消息投递失败：{e}");
+    }
+}
+
+// ---- 批次 FR-WIN-06（抢跑不丢字符）：临时低级键盘钩子 ----
+
+fn sprint_buf_lock() -> std::sync::MutexGuard<'static, sprint::SprintBuf> {
+    // 与 `tap_lock` 同一条理由：临界区只装几个 Copy 小值、不回调任何代码，
+    // 钩子回调里更不能 panic（那条路径上没有谁来接住它）。
+    SPRINT_BUF.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 拼给 `ToUnicodeEx` 的键盘状态。
+///
+/// **只在本线程用，而且不用 `GetKeyboardState`**：那个函数给的是**调用线程**的键状态，
+/// 而热键线程不处理键盘消息，它的状态可能停在很久以前。`GetAsyncKeyState` 是物理键状态，
+/// 从哪条线程问都对。
+///
+/// Ctrl / Alt / Win 一律不置位：呼出键本身就是这几颗修饰键（出厂 `Ctrl+Alt+Space`），
+/// 用户"按住热键同时打字"时它们还按着，带上就变成 `Ctrl+A = 0x01` 这种控制码。
+/// Shift 与 CapsLock 照实置位——用户要打大写就还是大写。
+unsafe fn sprint_key_state() -> [u8; 256] {
+    let mut state = [0u8; 256];
+    if unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0 {
+        state[0x10] = 0x80;
+    }
+    // CapsLock 的"按下"位不可靠，灯位（最低位）才是它有没有开着
+    if unsafe { GetAsyncKeyState(0x14) } & 1 != 0 {
+        state[0x14] = 0x01;
+    }
+    state
+}
+
+/// 这一颗键此刻会打出什么字。`None` = 我们不认（控制键 / 死键 / 输入法组合中）。
+///
+/// 布局取**前台线程**的那一份：抢跑期间前台还是呼出前的窗口，用户正在用的就是那个布局。
+/// 前台取不到时退回本线程的（`GetKeyboardLayout(0)`）。
+unsafe fn sprint_key_char(vk: u32, scan: u32) -> Option<char> {
+    let state = unsafe { sprint_key_state() };
+    let fg = unsafe { GetForegroundWindow() };
+    let tid = if fg.0.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(fg, None) }
+    };
+    let hkl: HKL = unsafe { GetKeyboardLayout(tid) };
+    let mut buf = [0u16; 8];
+    let n = unsafe { ToUnicodeEx(vk, scan, &state, &mut buf, 0, Some(hkl)) };
+    if n <= 0 {
+        return None;
+    }
+    sprint::captured_char(&buf[..n as usize])
+}
+
+fn sprint_foreground_is_self() -> bool {
+    let raw = SELF_HWND.load(Ordering::Relaxed);
+    raw != 0 && unsafe { GetForegroundWindow().0 as usize } == raw
+}
+
+/// `WH_KEYBOARD_LL` 回调（抢跑截字）。与双击钩子同一个线程、同一条消息队列。
+///
+/// 三条规矩：
+/// · **绝不在回调里写日志**（每一次按键都过一遍磁盘）；
+/// · 修饰键与所有抬起一律放行——它们是"状态"，不是"字"；
+/// · 只吞"认得出字符"的那颗 keydown，以及还没拿到焦点时的控制键（Enter / Tab / Esc /
+///   方向键落到呼出前那个窗口里会替用户点按钮、提交表单）。窗口已经拿到焦点、缓冲也空了
+///   ⇒ 一个键都不碰，交回 egui；有积压时才吞，字符因此不会前后颠倒。
+unsafe extern "system" fn sprint_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        if code < 0
+            || lparam.0 == 0
+            || !SPRINT_ARMED.load(Ordering::Relaxed)
+        {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        if !matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let deadline = SPRINT_DEADLINE_MS.load(Ordering::Relaxed);
+        if deadline != 0 && tap_now_ms() > deadline {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        if sprint::is_modifier(kb.vkCode) {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let focused = sprint_foreground_is_self();
+        // Backspace 改的是"还没送出去的那一截"，不该落到呼出前那个窗口里去删别人的内容。
+        // 退得掉就吞；缓冲本来就空（且窗口也拿到焦点了）就放行。
+        if kb.vkCode == 0x08 {
+            let mut b = sprint_buf_lock();
+            if b.pop() || !focused {
+                return LRESULT(1);
+            }
+            drop(b);
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let Some(ch) = sprint_key_char(kb.vkCode, kb.scanCode) else {
+            // 认不出字符的键：焦点还没回到我们这边时吞掉，免它替用户在旧窗口里做事。
+            return if focused {
+                CallNextHookEx(None, code, wparam, lparam)
+            } else {
+                LRESULT(1)
+            };
+        };
+        let mut b = sprint_buf_lock();
+        if focused && b.is_empty() {
+            // 窗口已在前台、也没有待补的字 ⇒ 直接交给 egui，顺序不会乱。
+            drop(b);
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        if b.push(ch) {
+            LRESULT(1)
+        } else {
+            // 缓冲到顶：不再吞，后面的键照常走
+            drop(b);
+            CallNextHookEx(None, code, wparam, lparam)
+        }
+    }
+}
+
+/// 开始一轮截字。**只能在热键线程调**（钩子的线程归属）。
+///
+/// 幂等：已经在截字就只把截止时间往后推、保留缓冲——用户连按两次呼出时，
+/// 第一次截到的字仍然是用户打的字。
+fn start_sprint_capture() {
+    unsafe {
+        // 钩子先装好再置"截字中"：反过来会让回调在钩子还没挂上时就开始判。
+        if SPRINT_HOOK.load(Ordering::Relaxed) == 0 {
+            let module = match GetModuleHandleW(None) {
+                Ok(m) => m,
+                Err(e) => {
+                    log_info!("抢跑截字：GetModuleHandleW 失败（{e}）⇒ 本次不截");
+                    return;
+                }
+            };
+            match SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(sprint_hook_proc),
+                Some(HINSTANCE(module.0)),
+                0,
+            ) {
+                Ok(h) => SPRINT_HOOK.store(h.0 as usize, Ordering::Relaxed),
+                Err(e) => {
+                    log_info!("抢跑截字：装键盘钩子失败（{e}）⇒ 本次不截，抢跑的字符会落到原窗口");
+                    return;
+                }
+            }
+        }
+        let already = SPRINT_ARMED.swap(true, Ordering::Relaxed);
+        if !already {
+            // 上一轮没送出去的字符属于上一轮，不该迟到地出现在这一次呼出里。
+            sprint_buf_lock().clear();
+            SPRINT_GEN.fetch_add(1, Ordering::Relaxed);
+            log_info!(
+                "抢跑截字：开始（{} ms 内或窗口拿到焦点为止；最多收 {} 字）",
+                sprint::CAPTURE_TIMEOUT_MS,
+                sprint::MAX_CHARS
+            );
+        }
+        SPRINT_DEADLINE_MS.store(
+            tap_now_ms().wrapping_add(sprint::CAPTURE_TIMEOUT_MS),
+            Ordering::Relaxed,
+        );
+        let raw = HOTKEY_HWND.load(Ordering::Relaxed);
+        if raw != 0 {
+            let _ = SetTimer(
+                Some(HWND(raw as *mut _)),
+                SPRINT_TIMER,
+                sprint::CAPTURE_TIMEOUT_MS,
+                None,
+            );
+        }
+    }
+}
+
+/// 停止截字。**只能在热键线程调**（`UnhookWindowsHookEx` 与装是同一个线程）。
+///
+/// 缓冲**不清**：还没被 UI 取走的字符留在那里，下一次 `ui()` 照样补进查询框。
+/// 返回是否真的从"截字中"退下来（没在截字时调用是空操作，不刷日志）。
+fn stop_sprint_capture(reason: &str) -> bool {
+    unsafe {
+        let armed = SPRINT_ARMED.swap(false, Ordering::Relaxed);
+        SPRINT_DEADLINE_MS.store(0, Ordering::Relaxed);
+        let raw = HOTKEY_HWND.load(Ordering::Relaxed);
+        if raw != 0 {
+            let _ = KillTimer(Some(HWND(raw as *mut _)), SPRINT_TIMER);
+        }
+        let hook = SPRINT_HOOK.load(Ordering::Relaxed);
+        if hook != 0 {
+            if let Err(e) = UnhookWindowsHookEx(HHOOK(hook as *mut _)) {
+                log_info!("抢跑截字：卸下键盘钩子失败（{e}）");
+            }
+            SPRINT_HOOK.store(0, Ordering::Relaxed);
+        }
+        if armed {
+            // 只记个数：截到的就是用户敲的字，按 FR-SYS-03 不落原文。
+            log_info!(
+                "抢跑截字：停止（{reason}；缓冲里还剩 {} 个字符等 UI 取走）",
+                sprint_buf_lock().len()
+            );
+        }
+        armed
+    }
+}
+
+/// 热键线程：这一按会不会把窗口显示出来？会 ⇒ 开始截字。
+///
+/// 判据只看系统事实（`IsWindowVisible` / `IsIconic`），不看 UI 的旗标：旗标在 UI 线程，
+/// 而这一刻 UI 可能还睡着（窗口隐藏时 eframe 不跑 `ui()`）。方向与 UI 那边
+/// `hotkey_rx` 分支同源——「显示着 且 没最小化」才是隐藏方向。
+fn sprint_arm_on_toggle() {
+    let raw = SELF_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return; // 窗口还没建出来，没有"抢跑"这回事
+    }
+    let hwnd = HWND(raw as *mut _);
+    let showing = unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() };
+    if showing {
+        start_sprint_capture();
+    } else {
+        // 隐藏方向：正常路径上早就停了，这里只是顺手收掉可能还挂着的那一个。
+        stop_sprint_capture("热键切到隐藏方向");
+    }
+}
+
+/// 给双击呼出那条路用：它本身跑在钩子回调里，不在回调里再装一个钩子，只投消息。
+/// **不写日志**——这条函数唯一的调用点在低级键盘钩子回调里（每次按键都会过一遍）。
+fn post_sprint_arm() {
+    let raw = HOTKEY_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let _ = unsafe {
+        PostMessageW(
+            Some(HWND(raw as *mut _)),
+            WM_APP_SPRINT_ARM,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    };
+}
+
+/// UI → 热键线程：这一轮截字可以停了。带上代数，对不上就让热键线程忽略。
+fn post_sprint_stop() {    let raw = HOTKEY_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let capture_gen = SPRINT_GEN.load(Ordering::Relaxed);
+    if let Err(e) = unsafe {
+        PostMessageW(
+            Some(HWND(raw as *mut _)),
+            WM_APP_SPRINT_STOP,
+            WPARAM(capture_gen as usize),
+            LPARAM(0),
+        )
+    } {
+        log_info!("抢跑截字：停止消息投递失败：{e}");
     }
 }
 
@@ -4650,6 +4941,10 @@ unsafe extern "system" fn hotkey_wndproc(
                 // 批次 G1：「副呼出热键」与主呼出键是同一件事（AHK 版把两个键绑在同一个
                 // `SearchWindow.Toggle()` 上），所以走同一个分支。
                 HOTKEY_TOGGLE | HOTKEY_EXTRA => {
+                    // 批次 FR-WIN-06：必须在 `HOTKEY_TX` 之前——要赶在窗口被显示出来、
+                    // 用户开始在"新焦点"里打字之前把钩子挂上；这一按要是隐藏方向，
+                    // 这里会顺手把可能还挂着的钩子收掉。
+                    sprint_arm_on_toggle();
                     if let Some(tx) = HOTKEY_TX.get() {
                         let _ = tx.send(());
                     }
@@ -4676,6 +4971,23 @@ unsafe extern "system" fn hotkey_wndproc(
         // 全局呼出就会一直停在注销状态。定时器挂在消息窗上、由本线程驱动 ⇒ 与可见性无关。
         if msg == WM_TIMER && wparam.0 as usize == HOTKEY_SUSPEND_TIMER {
             resume_hotkey(hwnd, "兜底超时");
+            return LRESULT(0);
+        }
+        // 批次 FR-WIN-06：截字的截止兜底。正路是 UI 拿到焦点后投 `WM_APP_SPRINT_STOP`；
+        // 窗口因为任何原因没拿到焦点时，这条定时器负责收手——不能一直替用户吞键。
+        if msg == WM_TIMER && wparam.0 as usize == SPRINT_TIMER {
+            stop_sprint_capture("到点");
+            return LRESULT(0);
+        }
+        if msg == WM_APP_SPRINT_ARM {
+            sprint_arm_on_toggle();
+            return LRESULT(0);
+        }
+        if msg == WM_APP_SPRINT_STOP {
+            // 代数对不上说明 UI 那条"停止"是上一轮的（用户快速连按了两次呼出），不照办。
+            if wparam.0 as u64 == SPRINT_GEN.load(Ordering::Relaxed) {
+                stop_sprint_capture("窗口已拿到焦点");
+            }
             return LRESULT(0);
         }
         if msg == WM_APP_SUSPEND_HOTKEY {
@@ -5055,6 +5367,8 @@ fn spawn_hotkey_thread(
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_SELECTION);
         // 钩子不摘的话会一直挂在一条已经退出的线程上（系统只在进程结束时收拾）。
         set_tap_hook(DblTap::Off);
+        // 批次 FR-WIN-06：同一个理由，抢跑钩子也在这里摘。
+        stop_sprint_capture("热键线程退出");
         let _ = KillTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER);
         let _ = DestroyWindow(hwnd);
     });
@@ -5807,6 +6121,35 @@ impl LauncherApp {
         }
         ctx.request_repaint();
         log_info!("{log}");
+    }
+
+    /// 批次 FR-WIN-06：把抢跑钩子截住的字符补进查询框。
+    ///
+    /// 每帧都取——包括窗口还没拿到焦点的那几帧：字符就该在窗口露面时已经躺在框里。
+    /// 只有「窗口真拿到焦点 **且** 缓冲已清空」才投停止消息：还压着字的时候停掉，
+    /// 后续按键会直接进 egui，与还没补进去的那几个字前后颠倒。
+    fn drain_sprint(&mut self, ctx: &egui::Context) {
+        let chunk = sprint_buf_lock().take();
+        if !chunk.is_empty() {
+            let n = chunk.chars().count();
+            // 与 `set_query` 同一条理由：程序化改 `query` 不会带着 TextEditState 的光标走。
+            self.query.push_str(&chunk);
+            self.selected = 0;
+            self.focus_query = true;
+            caret_to_end(ctx, self.query.chars().count());
+            ctx.request_repaint();
+            // 日志只记个数：截到的就是用户敲的字，按 FR-SYS-03 不落原文。
+            log_info!("抢跑截字：已补进查询框 {n} 个字符（原文不落日志）");
+        }
+        if chunk.is_empty()
+            && self.visible
+            && SPRINT_ARMED.load(Ordering::Relaxed)
+            && self
+                .self_hwnd
+                .is_some_and(|me| unsafe { GetForegroundWindow().0 == me.0 })
+        {
+            post_sprint_stop();
+        }
     }
 
     /// 补全：查询换成清单里那条命令的关键字 + 空格。
@@ -10392,6 +10735,17 @@ impl LauncherApp {
         // 批次 F9（FR-UIX-06）：藏着的窗口直接被隐藏时，后面一帧 `ui()` 都不会再跑
         // ⇒ 放行门永远等不到第 2 帧、窗口就一直被 DWM 藏着。这里必须当场放行。
         self.release_cloak();
+        // 批次 FR-WIN-06：隐藏方向不该还在替用户吞键。没在截字时这里只是一次原子读。
+        // 真在截字就投消息让热键线程卸钩（钩子的线程归属 ⇒ UI 线程不能直接卸），
+        // 还没补进框的那几个字符跟着这一轮作废——窗口都藏了，留着只会在下次呼出里
+        // 冒出来一段用户早忘了的字。
+        if SPRINT_ARMED.load(Ordering::Relaxed) {
+            post_sprint_stop();
+            let n = sprint_buf_lock().take().chars().count();
+            if n > 0 {
+                log_info!("抢跑截字：窗口隐藏，丢弃还没补进框的 {n} 个字符（原文不落日志）");
+            }
+        }
         // FR-WIN-04：关闭到托盘时清掉待触发的失焦定时器
         self.hide_at = None;
         self.had_focus_since_show = false;
@@ -12937,6 +13291,9 @@ impl eframe::App for LauncherApp {
         // 录制态会把本帧的按键事件清空，后面那块整体收不到键；即便如此仍显式加 `!recording` 门，
         // 让"录制时不响应任何快捷键"这件事读得出来，而不是依赖清事件这个隐式效果。
         self.hotkey_frame(ui);
+        // 批次 FR-WIN-06：呼出抢跑期间截住的字符，赶在搜索框渲染之前补进去——
+        // 这一帧画出来的框里就该有它们。
+        self.drain_sprint(ui.ctx());
         // 批次 R：补字符键框选键和主热键录制是同一类状态——都在等一次按键，都不该被本程序的
         // 快捷键抢走（`take_keypick` 里的 `take_record_press` 已把整帧 Key 事件清空，这扇门是
         // 让"取键时不响应快捷键"这件事读得出来的那道显式保险）。
@@ -17241,6 +17598,12 @@ fn main() -> eframe::Result {
             if self_hwnd.is_none() {
                 log_info!("IME: 无法获取本机 HWND，E-05 英文模式切换将跳过");
             }
+            // 批次 FR-WIN-06：热键线程判"这一按会不会显示窗口"要问 `IsWindowVisible`，
+            // 那需要一个进程内能读的 HWND 数值。
+            SELF_HWND.store(
+                self_hwnd.map_or(0, |h| h.0 as usize),
+                Ordering::Relaxed,
+            );
             let mut app = LauncherApp::new(
                 tray_rx,
                 Some(tray_menu),
