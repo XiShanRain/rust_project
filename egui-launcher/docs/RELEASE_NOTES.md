@@ -1670,6 +1670,22 @@ AHK 版的 `Ctrl+L` 是「看不清就把这串字放大」，Delphi 版没有�
 | 四格审计 | 新口径（`target/markup-audit.sh`）：工作区 **5 条**（需求书 453；发布说明 1075 / 1076 / 1098；开发计划 674），与按当前 HEAD（`f5e485b`）重建的副本（`target/audit-a7-head/`，`git -C .. archive HEAD egui-launcher/docs`）同 5 条、同身份、同行号，去掉路径前缀后两侧 `diff` 为空；旧口径（`target/old-parity-audit.sh`）：工作区 **21 条**、HEAD 副本 **21 条**，两侧归一化后 `diff` 也为空 ⇒ **本批引入 0 条**。**§八十二 这一节自身 0 条命中**。标题行数对照：需求书 55 / 55、开发计划 35 / 35 一位没动，发布说明 90 / 89，多出的正好是「### 八十二」。原始输出 `target/audit-a7-{new,old}-{wt,head}.txt`，HEAD 侧归一化副本另存 `-norm`。 |
 | 提交 | 代码由用户提交推送 **`f5e485b`**「批次 A7 脚本目录（FR-SRC-15）：Scripts\ 扫描、三种运行模式与收尾回执」；本轮只剩三份文档改动，**未提交**，等用户正文。 |
 
+### 八十三、批次 G5 更新检查：只查不换的「检查更新」（FR-SYS-01 收尾，2026-10-31，用户经选项面板裁定「G5 更新检查（推荐）」）
+
+| 项 | 内容 |
+| --- | --- |
+| 本轮要结的账 | 开发计划 G5 行最后一个未做格「更新检查」。按开发计划 4.5 修订（M6 不实现自动更新）做成**只查不换**：查一次 GitHub Releases 的最新发布，只给用户一个可点的下载页链接，不下载、不替换、不算哈希、不回滚；也**不做启动时自动检查**——免得每次启动多一条联网、多一个结果弹窗。 |
+| 甲 数据层（新文件 `src/update.rs`，11 条单测、零界面代码） | `RELEASES_API` 指向 `XiShanRain/rust_project` 的 `releases/latest`，响应上限 256 KiB；联网复用 `siteicon::fetch_winhttp`（`WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY`，超时 5/5/8/8 s），与「下载站点图标」同一套代理与 TLS 行为。纯函数链：`parse_version`（去 `v` 前缀、点分段、遇非数字即停 ⇒ 预发布后缀按相等处理，宁可说"已是最新"也不误报新版）→ `is_newer`（补零对齐、按数值比较，`0.10 > 0.9`）→ `parse_release`（`tag_name` / `html_url` 必填、URL 必须是 http(s)）→ `classify(FetchReply, current)`（404 ⇒ 暂无发布；其余非 200 ⇒ HTTP 码；`truncated` ⇒ 截断；JSON 解析失败 ⇒ Parse；版本号解析不出 ⇒ Version）。失败种类是 `FailKind::{Network,Http,Parse,Version,Truncated}`，**只带分类不带上游原文**：界面文案由 `message()` 走 i18n，原始错误只进「详细」档日志。 |
+| 乙 接线（`src/main.rs`） | ① 托盘新增第 7 项「检查更新」（`TrayEvent::CheckUpdate`）：先 `show_now` 再起后台线程，结果经通道回主线程；② 设置页「高级」页新增第一段：当前版本号 ＋ 「检查更新」按钮，检查期间按钮禁用、文字变「正在检查…」；③ 结果弹窗四态：已是最新（带发布标签）/ 有新版本（带「打开下载页」按钮）/ 仓库暂无发布 / 检查失败（分类文案）；④ 弹窗期间 `keys_live()` 关闭、失焦不隐藏、主键位块跳过、Esc 链多一档（先收弹窗、再退设置）；⑤ 后台回执待办期间每帧自唤醒（`request_repaint_after 120 ms`），窗口隐藏时回执到达也会 `show_now` —— 与站点图标下载同一条反应式渲染教训。 |
+| 丙 i18n | 两语各 15 个新键（托盘项 1 / 高级页 4 / 弹窗与失败分类 10），英文包沿用 F14 的「无 CJK」守卫；键集一致与占位符一致由既有单测把关。 |
+| 丁 真机（沙箱 `target/g5u-sandbox/`，exe 18:17:44 晚于全部源码） | ① 高级页显示「当前版本：0.1.0」＋「检查更新」；点按后日志两行 `检查更新：开始（GitHub Releases latest，只查不换）` / `检查更新：仓库暂无发布（404）`，弹窗写「仓库还没有发布版本（GitHub 返回 404）。」；② Esc 关弹窗后**设置页仍在**（只收弹窗，没有连带退出）；③ 托盘菜单 7 项齐全（显示 / 批量导入全部 / 设置… / 打开日志 / 复制系统信息 / 检查更新 / 退出），点「检查更新」走同一份实现并出同一个弹窗；④ **隐藏态路径**：窗口已隐藏（窗口矩形 16×16）时点托盘该项 ⇒ 窗口自动呼出（日志 `窗口：放行（画了 2 遍 / 88 ms；清藏成功；DWMWA_CLOAKED 回读 Some(false)）`）且弹窗就在屏上；⑤ 切英文后托盘项变 `Check for updates`、高级页 `Current version: 0.1.0` / `Check for updates`、弹窗 `This repository has no releases yet (GitHub returned 404).`，沙箱 `settings.json` 落 `"language": "en"`。 |
+| 戊 还剩什么没验证（别读成全清） | ① **「有新版本」分支只有单测判据**：本仓库 GitHub Releases 当前为空（真机拿到 404），这一支以及同路的「打开下载页」按钮都没在真机上点过。② **网络失败分支（`FailKind::Network`）没有真机取证**——本机直连成功，失败分类只有单测与代码审读；HTTP 非 200 / 截断 / 坏 JSON / 坏版本号四支同理（`classify` 单测覆盖）。③ 「正在检查…」的禁用态与托盘点击的 Toast 只存在秒级窗口，本轮截图没抓到。 |
+| 快捷键与速查表 | **没有新增**：入口是托盘项与设置页按钮，按「设置页开关类不另配键」记豁免；速查表未动。**没有新配置项**：`settings.json` 结构不变，不自建"自动检查"开关。 |
+| 验证 | `cargo check --all-targets` **零警告**；`cargo test --bins` **504 passed / 0 failed / 1 ignored**（493 → 504：`update.rs` 11 条）。**未跑 `cargo fmt`**（成规）。 |
+| 用户环境复原 | 只起 / 停本轮自建沙箱实例（`target/g5u-sandbox/`，exe ＋ `user_items.json` / `settings.json` 副本）；收尾复查 `%LOCALAPPDATA%\egui-launcher` 两项 mtime 仍是 `2026-10-26 08:16:56` ⇒ 零写入。 |
+| 四格审计 | 新口径（`target/markup-audit.sh`）：工作区 **5 条**（需求书 453；发布说明 1075 / 1076 / 1098；开发计划 674），与按当前 HEAD（`3be6083`）重建的副本（`target/audit-g5u-head/`，`git -C .. archive HEAD egui-launcher/docs`）同 5 条、同身份，去掉路径前缀并抹去行号后两侧 `diff` 为空；旧口径（`target/old-parity-audit.sh`）：工作区 **21 条**、HEAD 副本 **21 条**，两侧同样归一化后 `diff` 为空 ⇒ **本批引入 0 条**。**§八十三 这一节自身 0 条命中**。首跑抓到一条**自伤**：本轮给开发计划 G5 行追加的注记尾部多打了一个 `**` 收尾（726 行报 `** 个数为奇数：23`），删掉后归零、复核该行 22 个成对；这条正好说明判据有牙，一并记下免得下次误以为一轮即净。原始输出 `target/audit-g5u-new.txt` / `-new-head.txt` / `-old.txt` / `-old-head.txt`，归一化副本 `target/n-cur.txt` / `n-head.txt` / `o-cur.txt` / `o-head.txt`。 |
+| 提交 | **未提交**，等用户正文。 |
+
 ### 七十三、批次 G7：验收缺口收口（100 次唤起像素判据 ＋ 滑块真拖拽 ＋ G1 配置路径两条 ＋ G5 遗留两条）（FR-UIX-06 / FR-WIN-02 / FR-SYS-03，2026-10-30，用户经选项面板裁定「验收缺口收口（推荐）」）
 
 | 项 | 内容 |

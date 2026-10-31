@@ -108,6 +108,7 @@ mod source;
 mod sysinfo;
 mod theme;
 mod theme_gallery;
+mod update;
 mod windowfx;
 use source::application::{
     Corrupted, ItemKind, LaunchItem, LearnRank, ListRows, RowDensity, Scope, SpaceRun, TabMode,
@@ -378,6 +379,9 @@ enum TrayEvent {
     OpenLog,  // 批次 P（FR-SYS-03）：需求书托盘原文「打开日志、复制系统信息、退出」里的第一格
     /// 批次 G5（FR-SYS-03）：需求书那三个托盘项的第二格。与设置页「高级」页的按钮同一份实现。
     CopySysInfo,
+    /// 批次 G5（FR-SYS-01）：检查更新。与设置页「高级」页的按钮同一份实现；
+    /// 只查不换（4.5 修订：自动更新 M6 不实现）。
+    CheckUpdate,
     Exit,
 }
 
@@ -1110,6 +1114,14 @@ struct LauncherApp {
     site_icon_tx: mpsc::Sender<(String, Result<source::siteicon::DownloadedIcon, String>)>,
     /// 正在下载的那条引擎（id）。有值时设置页的「下载图标」按钮禁用，避免同一条连点几下发几次。
     site_icon_pending: Option<String>,
+    // ---- 批次 G5（FR-SYS-01）：检查更新（只查不换）----
+    /// 后台线程 → 主线程的回执。联网最长 8 s 一档，所以不能在 `ui()` 里同步等。
+    update_rx: mpsc::Receiver<update::Status>,
+    update_tx: mpsc::Sender<update::Status>,
+    /// 一轮检查在飞（按钮禁用、那一行显示「正在检查…」）。
+    update_pending: bool,
+    /// 结果弹窗（`Some`＝开着）。换语言不重跑检查，模态按当前语言重绘。
+    update_result: Option<update::Status>,
     /// 数据目录（`user_items.json` / `Icons\` 所在处）。`data_dir()` 每调一次都要写一次探针文件，
     /// 不能按帧调 ⇒ 构造时取一次。设置页改过的路径不会立刻生效，与 AHK 那边同口径。
     data_dir: std::path::PathBuf,
@@ -4883,6 +4895,8 @@ impl LauncherApp {
         let (icon_tx, icon_rx) = mpsc::channel();
         // 批次 D2 第二半：「下载站点图标」的回执通道（下载在后台线程，主线程只收）。
         let (site_icon_tx, site_icon_rx) = mpsc::channel();
+        // 批次 G5（FR-SYS-01）：检查更新的回执通道（联网在后台线程，主线程只收）。
+        let (update_tx, update_rx) = mpsc::channel();
         // `data_dir()` 每次调用都写一次探针文件 ⇒ 取一次留在结构体里，别按帧调。
         let data_dir = source::application::data_dir();
         let (apps_tx, apps_rx) = mpsc::channel();
@@ -5159,6 +5173,10 @@ impl LauncherApp {
             site_icon_rx,
             site_icon_tx,
             site_icon_pending: None,
+            update_rx,
+            update_tx,
+            update_pending: false,
+            update_result: None,
             data_dir,
             path_tx,
             path_rx,
@@ -7001,6 +7019,26 @@ impl LauncherApp {
             self.prefs.web_engines.len()
         );
         true
+    }
+
+    /// 批次 G5（FR-SYS-01）：点「检查更新」/ 托盘项的那一刻。联网在后台线程（WinHTTP 最长 8 s
+    /// 一档），主线程不等；回执在 `ui()` 里收。传的版本号是编译期常量，不读配置。
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        if self.update_pending {
+            return;
+        }
+        self.update_pending = true;
+        self.update_result = None;
+        log_info!("检查更新：开始（GitHub Releases latest，只查不换）");
+        let tx = self.update_tx.clone();
+        let thread_ctx = ctx.clone();
+        thread::spawn(move || {
+            let status = update::check(env!("CARGO_PKG_VERSION"));
+            let _ = tx.send(status);
+            // 隐藏时 `ui()` 不跑，联网线程回来自己敲一次门（与站点图标同一个坑）。
+            thread_ctx.request_repaint();
+        });
+        ctx.request_repaint_after(Duration::from_millis(120));
     }
 
     /// 批次 D2 第二半（FR-SRC-11）：「下载站点图标」按下的那一刻。
@@ -9454,6 +9492,34 @@ impl LauncherApp {
                             );
                         }
                         SettingsTab::Advanced => {
+                            // 批次 G5（FR-SYS-01）：检查更新（只查不换，见 `update` 模块）。
+                            ui.label(egui::RichText::new(i18n::t("update.title")).strong());
+                            ui.label(
+                                egui::RichText::new(i18n::t("advanced.update_help"))
+                                    .weak()
+                                    .small(),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(i18n::tfmt(
+                                        "advanced.update_current",
+                                        &[&env!("CARGO_PKG_VERSION")],
+                                    ))
+                                    .small(),
+                                );
+                                let text = if self.update_pending {
+                                    i18n::t("advanced.update_checking")
+                                } else {
+                                    i18n::t("advanced.update_button")
+                                };
+                                if ui
+                                    .add_enabled(!self.update_pending, egui::Button::new(text))
+                                    .clicked()
+                                {
+                                    self.start_update_check(ui.ctx());
+                                }
+                            });
+                            ui.separator();
                             // 批次 G5（FR-SYS-03）：日志级别三选一。
                             ui.label(egui::RichText::new(i18n::t("advanced.log_title")).strong());
                             ui.label(
@@ -11613,6 +11679,7 @@ impl LauncherApp {
             && self.batch_confirm.is_none()
             && self.internal_confirm.is_none()
             && !self.about_open
+            && self.update_result.is_none()
             && self.help_entry.is_none()
     }
 
@@ -11989,6 +12056,12 @@ impl eframe::App for LauncherApp {
                 TrayEvent::CopySysInfo => {
                     self.copy_system_info(ui.ctx());
                 }
+                TrayEvent::CheckUpdate => {
+                    // 批次 G5（FR-SYS-01）：窗口先出来——「正在检查…」的提示与结果弹窗都在窗口里。
+                    self.show_now(ui.ctx());
+                    self.start_update_check(ui.ctx());
+                    self.internal_toast(ui.ctx(), i18n::t("update.checking_toast"), true);
+                }
                 TrayEvent::Exit => {
                     self.on_hide();
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -12101,6 +12174,7 @@ impl eframe::App for LauncherApp {
                 || self.batch_confirm.is_some()
                 || self.internal_confirm.is_some()
                 || self.about_open
+                || self.update_result.is_some()
                 || self.help_entry.is_some()
                 || self.settings_open
                 // FR-UIX-10：大字窗要抢焦点才收得到 Esc，主窗必然"失焦"。
@@ -12148,6 +12222,36 @@ impl eframe::App for LauncherApp {
             if Instant::now() >= *deadline {
                 self.toast = None;
             }
+        }
+
+        // 批次 G5（FR-SYS-01）：检查更新的回执。窗口可能在检查期间被收起（失焦自隐藏），
+        // 结果要看得见 ⇒ 先唤回窗口再开结果弹窗。
+        let updates: Vec<update::Status> = self.update_rx.try_iter().collect();
+        for status in updates {
+            self.update_pending = false;
+            match &status {
+                update::Status::UpToDate { latest } => log_info!(
+                    "检查更新：已是最新（当前 {}，最新 {latest}）",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                update::Status::Newer { latest, .. } => log_info!(
+                    "检查更新：有新版本 {latest}（当前 {}）",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                update::Status::NoRelease => log_info!("检查更新：仓库暂无发布（404）"),
+                update::Status::Failed(kind) => {
+                    log_info!("检查更新：失败（{}）", kind.log_tag())
+                }
+            }
+            self.update_result = Some(status);
+            if !self.visible {
+                self.show_now(ui.ctx());
+            }
+            ui.ctx().request_repaint();
+        }
+        if self.update_pending {
+            // 与站点图标同一条教训：egui 反应式，联网线程回来时不保证有一帧在跑。
+            ui.ctx().request_repaint_after(Duration::from_millis(120));
         }
 
         // 批次 D2 第二半：「下载站点图标」的回执。成功写配置、失败只 Toast（配置一个字不动）。
@@ -12312,6 +12416,7 @@ impl eframe::App for LauncherApp {
             && self.pending_destructive.is_none()
             && self.manage_confirm.is_none()
             && !self.about_open
+            && self.update_result.is_none()
             && self.help_entry.is_none()
         {
             // 键盘缩放（2026-10-18 立规「每个功能都要配快捷键」：拖边缘是鼠标路径，这里补键盘路径）：
@@ -15767,6 +15872,49 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        // ---- 批次 G5（FR-SYS-01）：检查更新的结果 ----
+        if let Some(status) = self.update_result.clone() {
+            let mut open_url: Option<String> = None;
+            let modal = egui::Modal::new(egui::Id::new("update_result")).show(ui.ctx(), |ui| {
+                ui.heading(i18n::t("update.title"));
+                ui.separator();
+                match &status {
+                    update::Status::UpToDate { latest } => {
+                        ui.label(i18n::tfmt("update.up_to_date", &[latest]));
+                    }
+                    update::Status::Newer { latest, url } => {
+                        let current = env!("CARGO_PKG_VERSION");
+                        let latest = latest.as_str();
+                        ui.label(i18n::tfmt("update.newer", &[&current, &latest]));
+                        ui.add_space(6.0);
+                        if ui.button(i18n::t("update.open_page")).clicked() {
+                            open_url = Some(url.clone());
+                        }
+                    }
+                    update::Status::NoRelease => {
+                        ui.label(i18n::t("update.no_release"));
+                    }
+                    update::Status::Failed(kind) => {
+                        ui.label(i18n::tfmt("update.failed", &[&kind.message()]));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.button(i18n::t("common.close_esc")).clicked()
+            });
+            if let Some(url) = open_url {
+                // 地址来自 GitHub 的 JSON，`parse_release` 已限死 http(s)。
+                match shell_execute(&url, "", None) {
+                    Ok(()) => log_info!("检查更新：已在浏览器打开下载页"),
+                    Err(e) => log_info!("检查更新：打开下载页失败（{e}）"),
+                }
+            }
+            if modal.inner {
+                self.update_result = None;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
+            }
+        }
+
         // 运行选中的程序并关闭到托盘（FR-ACT + 用户要求：Enter/点击运行后窗口自动关）。
         // FR-SRC-19：清单项成功启动才累计使用统计（launch_and_hide 失败分支提前 return，走不到这里）。
         if let Some(entry) = launch {
@@ -15963,6 +16111,10 @@ impl eframe::App for LauncherApp {
                 self.about_open = false;
                 self.focus_query = true;
                 ui.ctx().request_repaint();
+            } else if self.update_result.is_some() {
+                self.update_result = None;
+                self.focus_query = true;
+                ui.ctx().request_repaint();
             } else if self.batch_confirm.is_some() {
                 log_info!("全部回收站确认：按 Esc 取消，未删除");
                 self.batch_confirm = None;
@@ -16047,7 +16199,7 @@ fn create_tray_icon() -> tray_icon::Icon {
 
 /// 批次 F13（FR-SYS-04）：托盘菜单的文字要能在运行时跟着界面语言换。
 /// `muda::MenuItem` 是 Rc 后端——克隆出来的是同一个菜单项，`set_text` 改的就是托盘里那一行；
-/// 菜单本身归 `TrayIcon` 所有（`with_menu(Box::new(menu))`），所以这里留图标 + 六个句柄。
+/// 菜单本身归 `TrayIcon` 所有（`with_menu(Box::new(menu))`），所以这里留图标 + 七个句柄。
 /// 托盘图标随 `LauncherApp` 走完整个进程（App 没有 `Send` 约束，收得下这两种 `!Send` 类型）。
 pub struct TrayMenu {
     _tray: TrayIcon,
@@ -16056,6 +16208,8 @@ pub struct TrayMenu {
     settings: MenuItem,
     log: MenuItem,
     sysinfo: MenuItem,
+    /// 批次 G5（FR-SYS-01）：检查更新。只查不换，见 `update` 模块。
+    update: MenuItem,
     exit: MenuItem,
 }
 
@@ -16066,6 +16220,7 @@ impl TrayMenu {
         self.settings.set_text(i18n::t("tray.settings"));
         self.log.set_text(i18n::t("tray.open_log"));
         self.sysinfo.set_text(i18n::t("tray.sysinfo"));
+        self.update.set_text(i18n::t("tray.check_update"));
         self.exit.set_text(i18n::t("tray.exit"));
     }
 }
@@ -16077,6 +16232,7 @@ fn init_tray() -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
     let settings_id = muda::MenuId("settings".to_string());
     let log_id = muda::MenuId("openlog".to_string());
     let sysinfo_id = muda::MenuId("sysinfo".to_string());
+    let check_update_id = muda::MenuId("checkupdate".to_string());
     let exit_id = muda::MenuId("exit".to_string());
     // 初值直接按当前语言取：`init_tray` 只在语言定下来之后调用（见 `main` 的顺序）。
     let show_item = MenuItem::with_id(show_id.clone(), i18n::t("tray.show"), true, None);
@@ -16084,6 +16240,8 @@ fn init_tray() -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
     let settings_item = MenuItem::with_id(settings_id.clone(), i18n::t("tray.settings"), true, None);
     let log_item = MenuItem::with_id(log_id.clone(), i18n::t("tray.open_log"), true, None);
     let sysinfo_item = MenuItem::with_id(sysinfo_id.clone(), i18n::t("tray.sysinfo"), true, None);
+    let check_update_item =
+        MenuItem::with_id(check_update_id.clone(), i18n::t("tray.check_update"), true, None);
     let exit_item = MenuItem::with_id(exit_id.clone(), i18n::t("tray.exit"), true, None);
     let menu = Menu::new();
     menu.append(&show_item).unwrap();
@@ -16091,6 +16249,7 @@ fn init_tray() -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
     menu.append(&settings_item).unwrap();
     menu.append(&log_item).unwrap();
     menu.append(&sysinfo_item).unwrap();
+    menu.append(&check_update_item).unwrap();
     menu.append(&exit_item).unwrap();
     let menu_channel = MenuEvent::receiver();
     thread::spawn(move || {
@@ -16107,6 +16266,8 @@ fn init_tray() -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
                         let _ = tx.send(TrayEvent::OpenLog);
                     } else if event.id == sysinfo_id {
                         let _ = tx.send(TrayEvent::CopySysInfo);
+                    } else if event.id == check_update_id {
+                        let _ = tx.send(TrayEvent::CheckUpdate);
                     } else if event.id == exit_id {
                         let _ = tx.send(TrayEvent::Exit);
                     }
@@ -16134,6 +16295,7 @@ fn init_tray() -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
         settings: settings_item,
         log: log_item,
         sysinfo: sysinfo_item,
+        update: check_update_item,
         exit: exit_item,
     };
     (menu, rx)
