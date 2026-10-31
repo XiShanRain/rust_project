@@ -2419,9 +2419,11 @@ fn result_room(head_len: usize, rows: usize) -> usize {
 }
 
 /// 「10 条」档的截断。**只裁显示与导航用到的 `results`**，`self.items` 一个字不动——
-/// 换回「全部」档立刻就能看到被裁掉的那些。
+/// 换回「全部」档立刻就能看到被裁掉的那些。尾巴（书签）也要占行，先给它让出来。
 fn cap_plan_rows(plan: &mut Plan, rows: usize) {
-    plan.results.truncate(result_room(plan.head.len(), rows));
+    // 头段与尾巴都算「占掉的名额」：两头都有内容时结果只剩很少几行，这正是一屏 10 行的本意。
+    let taken = plan.head.len() + plan.tail.len();
+    plan.results.truncate(result_room(taken, rows));
 }
 
 /// 主窗口默认高度：正好装下 [`LIST_ROWS`] 行。
@@ -2616,8 +2618,77 @@ fn row_badge(ui: &mut egui::Ui, idx: usize, verb: &str) {
     }
 }
 
-/// 批次 F4：置顶角标——在图标槽右上角画一个琥珀色小三角。
-///
+/// 批次 A6（FR-SRC-12）：书签行的共用画法。头段只放说明行，网址行都在尾巴上，
+/// 但两种行共用同一套列宽（徽标 / 图标槽 / 标题 / 「浏览器 · 域名」副标题）。
+/// 返回 `true` ＝ 点中了这一行，调用方据此用默认浏览器打开（点击与 Enter 同一语义）。
+fn bookmark_row(
+    ui: &mut egui::Ui,
+    idx: usize,
+    is_sel: bool,
+    follow_selection: bool,
+    icon: f32,
+    glyph: f32,
+    sub_size: f32,
+    hit: &source::bookmarks::BookmarkHit,
+) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        row_badge(ui, idx, i18n::t("row.badge.open"));
+        ui.add_sized(
+            [icon, icon],
+            egui::Label::new(egui::RichText::new("\u{1F516}").size(glyph).weak()),
+        );
+        let sel = ui.selectable_label(is_sel, egui::RichText::new(hit.title.as_str()));
+        if is_sel && follow_selection {
+            sel.scroll_to_me(Some(egui::Align::Center));
+        }
+        ui.label(
+            egui::RichText::new(hit.subtitle.as_str())
+                .weak()
+                .size(sub_size),
+        );
+        if sel.clicked() {
+            clicked = true;
+        }
+    });
+    clicked
+}
+
+/// 批次 A6：书签说明行（裸 `bm` 的用法 / `bm 词` 没命中）。不可执行，点/按只给一句 Toast。
+fn bookmark_hint_row(
+    ui: &mut egui::Ui,
+    idx: usize,
+    is_sel: bool,
+    follow_selection: bool,
+    icon: f32,
+    glyph: f32,
+    sub_size: f32,
+    hint: &source::bookmarks::BookmarkHint,
+) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        row_badge(ui, idx, i18n::t("row.badge.view"));
+        ui.add_sized(
+            [icon, icon],
+            egui::Label::new(egui::RichText::new("\u{1F516}").size(glyph).weak()),
+        );
+        let sel = ui.selectable_label(is_sel, egui::RichText::new(hint.title.as_str()).weak());
+        if is_sel && follow_selection {
+            sel.scroll_to_me(Some(egui::Align::Center));
+        }
+        ui.label(
+            egui::RichText::new(hint.subtitle.as_str())
+                .weak()
+                .size(sub_size),
+        );
+        if sel.clicked() {
+            clicked = true;
+        }
+    });
+    clicked
+}
+
+/// 批次 F4：置顶角标——在图标槽右上角画一个琥珀色小三角。///
 /// 2026-10-29 之前是名称前加 `📌 `，前缀会把名称挤偏、也让「名称→执行」的列位置随置顶状态跳动；
 /// 角标贴在图标上，宽度不变。没有图标（空槽）时三角照样画在那个空槽的右上角。
 fn paint_pin_badge(ui: &egui::Ui, slot: egui::Rect) {
@@ -2794,6 +2865,9 @@ fn large_text_of(
             HeadRow::TermHint(hit) => hit.title.clone(),
             HeadRow::Cheat(hit) => hit.entry.title().to_string(),
             HeadRow::CheatHint(hit) => hit.title.clone(),
+            // 批次 A6：书签行的「这段文字本身」＝网址（与网页搜索行同口径）。
+            HeadRow::Bookmark(hit) => hit.url.clone(),
+            HeadRow::BookmarkHint(hit) => hit.title.clone(),
             HeadRow::ScopeTags(hit) => hit.title.clone(),
             // 批次 P1：面板行的"这段文字本身"就是动作名——大字要的是"我现在选的是哪一条"。
             HeadRow::Action(hit) => hit.label.clone(),
@@ -2826,6 +2900,9 @@ fn enter_action_label(row: Option<&HeadRow>) -> &'static str {
         Some(HeadRow::File(_)) => i18n::t("status.enter.open"),
         Some(HeadRow::Terminal(_)) => i18n::t("status.enter.run_command"),
         Some(HeadRow::Cheat(_)) => i18n::t("status.enter.view"),
+        // 批次 A6：书签与网页搜索行同一语义（用默认浏览器打开）；说明行只是查看。
+        Some(HeadRow::Bookmark(_)) => i18n::t("status.enter.open"),
+        Some(HeadRow::BookmarkHint(_)) => i18n::t("status.enter.view"),
         // 批次 P1（FR-ACT-03）：面板行的 Enter 落点＝执行高亮的那一条动作，词跟着行首徽标走
         // （「Enter 复制」「Enter 删除」——与结果模式同一套"徽标即动作类别"的口径）。
         Some(HeadRow::Action(hit)) => hit.id.badge(),
@@ -2843,32 +2920,56 @@ fn browse_parent_of(raw: &str) -> Option<String> {
 }
 
 /// 合并行号 → 行。`Head` 里放的是 `Plan::head` 的下标，`Item` 里放的仍是
-/// [`results`](LauncherApp::results) 的名次，不是 `self.items` 的下标。
+/// [`results`](LauncherApp::results) 的名次，不是 `self.items` 的下标；
+/// `Tail`（批次 A6）放的是 `Plan::tail` 的下标，排在结果之后。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     Head(usize),
     Item(usize),
+    Tail(usize),
 }
 
 /// 合并后的总行数。导航键（↑↓ / PgUp/PgDn / Ctrl+N/P / Ctrl+J/K / Tab 的循环那一半）全在这个
 /// 口径里回绕，不必换算名次。
-fn row_count(results_len: usize, head_len: usize) -> usize {
-    results_len + head_len
+fn row_count(results_len: usize, head_len: usize, tail_len: usize) -> usize {
+    results_len + head_len + tail_len
 }
 
 /// 合并行号 → 行。越界返回 `None`，调用方按「什么都不做」处理（与 `space_executes` 那侧同口径）。
-fn row_at(selected: usize, results_len: usize, head_len: usize) -> Option<Row> {
+fn row_at(
+    selected: usize,
+    results_len: usize,
+    head_len: usize,
+    tail_len: usize,
+) -> Option<Row> {
     if selected < head_len {
         return Some(Row::Head(selected));
     }
     let rank = selected - head_len;
-    (rank < results_len).then_some(Row::Item(rank))
+    if rank < results_len {
+        return Some(Row::Item(rank));
+    }
+    let t = rank - results_len;
+    (t < tail_len).then_some(Row::Tail(t))
 }
 
 /// 头段占掉前 `head_len` 行之后，把合并行号换算成 `space_executes` 要的「名次」。
-/// 选中头段（计算器/搜索/提示）时返回 `None`——那些行不是条目，空格不替它们执行任何程序。
-fn item_rank(selected: usize, head_len: usize) -> Option<usize> {
-    (selected >= head_len).then(|| selected - head_len)
+/// 选中头段（计算器/搜索/提示）或尾巴（书签）时返回 `None`——那些行不是条目，
+/// 空格不替它们执行任何程序。
+fn item_rank(selected: usize, results_len: usize, head_len: usize) -> Option<usize> {
+    let rank = selected.checked_sub(head_len)?;
+    (rank < results_len).then_some(rank)
+}
+
+/// 合并行号落在尾巴上时取出那一行（批次 A6）。头段/结果段一律 `None`。
+fn tail_at<'a>(
+    tail: &'a [HeadRow],
+    selected: usize,
+    results_len: usize,
+    head_len: usize,
+) -> Option<&'a HeadRow> {
+    let t = selected.checked_sub(head_len + results_len)?;
+    tail.get(t)
 }
 
 // ---- 批次 P1：操作面板（FR-ACT-03 进出 + FR-ACT-04 动作表）----
@@ -3004,6 +3105,8 @@ fn markable_path(
             let p = it.path.trim();
             (file_like && !p.is_empty()).then(|| p.to_string())
         }
+        // 批次 A6：书签行是网址，不是磁盘上的东西——批量动作（复制/剪切/回收站）对它没有意义。
+        Row::Tail(_) => None,
     }
 }
 
@@ -3259,6 +3362,7 @@ fn panel_for_row(
     row: Row,
     head: &[HeadRow],
     results: &[usize],
+    tail: &[HeadRow],
     items: &[LaunchItem],
     path_states: &std::collections::HashMap<String, source::pathcheck::PathState>,
 ) -> Option<(actions::PanelTarget, PanelOpen)> {
@@ -3282,6 +3386,25 @@ fn panel_for_row(
             batch: Vec::new(),
         }
     };
+    // 批次 A6：书签的对象是网址，动作表与网页搜索行同一套（`Subject::Url`）。
+    // 头段与尾段共用这一份构造：`bm 词` 的独占结果在头段，默认结果的尾巴在尾段，
+    // 两处的「→ 操作面板」必须同一张表，否则同一个书签在两种查询下能力不同。
+    let bookmark_target = |hit: &source::bookmarks::BookmarkHit| -> (actions::PanelTarget, PanelOpen) {
+        (
+            actions::PanelTarget {
+                title: hit.title.clone(),
+                subject: actions::subject_for(ItemKind::Url, &hit.url, false),
+                path: hit.url.clone(),
+                arguments: String::new(),
+                exists: fs_exists(&hit.url),
+                editable: false,
+                uid: None,
+                pinned: false,
+                batch: Vec::new(),
+            },
+            PanelOpen::Path,
+        )
+    };
     match row {
         Row::Item(rank) => {
             let it = items.get(*results.get(rank)?)?;
@@ -3290,8 +3413,7 @@ fn panel_for_row(
         }
         Row::Head(h) => match head.get(h)? {
             // 自定义命令的独占行：`hit.entry` 是已把 `{query}` 填好的副本，uid 仍是清单里那一条。
-            HeadRow::Custom(hit) => {
-                let it = items.iter().find(|i| i.uid() == hit.uid)?;
+            HeadRow::Custom(hit) => {                let it = items.iter().find(|i| i.uid() == hit.uid)?;
                 Some((
                     target_of(it),
                     PanelOpen::Entry {
@@ -3349,7 +3471,14 @@ fn panel_for_row(
                 },
                 PanelOpen::Value,
             )),
+            // 批次 A6：`bm 词` 独占时书签行在头段（`take_over` 的返回值即 `SearchPlan.head`）。
+            HeadRow::Bookmark(hit) => Some(bookmark_target(hit)),
             // 终端 / 各类提示行（`valid=false`）/ 分类行：没有可处置的对象。
+            _ => None,
+        },
+        // 批次 A6：默认结果尾巴上的书签行。
+        Row::Tail(t) => match tail.get(t)? {
+            HeadRow::Bookmark(hit) => Some(bookmark_target(hit)),
             _ => None,
         },
     }
@@ -11480,7 +11609,35 @@ impl LauncherApp {
         true
     }
 
-    /// 批次 X：文件行的「执行」＝用系统关联程序打开这个文件/目录，然后关到托盘。
+    /// 批次 A6（FR-SRC-12）：书签行的「执行」＝用默认浏览器打开网址，然后关到托盘。
+    /// 与 [`open_search_hit`](LauncherApp::open_search_hit) 同一条理由不走 `launch_and_hide`：
+    /// 书签标题与网址都是用户自己的内容（FR-SYS-03），日志只记打开成功与否。
+    fn open_bookmark_hit(
+        &mut self,
+        ctx: &egui::Context,
+        hit: &source::bookmarks::BookmarkHit,
+    ) -> bool {
+        match shell_execute(&hit.url, "", None) {
+            Ok(_) => log_info!("书签：已用默认浏览器打开（标题与网址不落日志）"),
+            Err(e) => {
+                log_info!("书签：打开失败：{e}");
+                self.toast = Some((
+                    i18n::tfmt("toast.open_failed", &[&e]),
+                    Instant::now() + TOAST_TTL,
+                    TOAST_ERR,
+                ));
+                ctx.request_repaint_after(TOAST_TTL);
+                return false;
+            }
+        }
+        self.toast = None;
+        self.clear_query_next_frame = true;
+        self.selected = 0;
+        self.visible = false;
+        self.on_hide();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        true
+    }
     /// 与 [`open_search_hit`](LauncherApp::open_search_hit) 同一条理由**不走 `launch_and_hide`**：
     /// 那条路把 `path` 原样写日志，而这里的每一条路径都是用户从搜索框里现搜出来的——
     /// 可能是他从下载夹里翻出来的一个文件名。FR-SYS-03 的口径是「清单内条目才记 name」，
@@ -11565,8 +11722,14 @@ impl LauncherApp {
     /// （批次 F 补全后光标插错位是同一个坑）。
     fn open_panel(&mut self, ctx: &egui::Context, row: Row) -> bool {
         let plan = self.plan();
-        let Some((target, open)) =
-            panel_for_row(row, &plan.head, &plan.results, &self.items, &self.path_states)
+        let Some((target, open)) = panel_for_row(
+            row,
+            &plan.head,
+            &plan.results,
+            &plan.tail,
+            &self.items,
+            &self.path_states,
+        )
         else {
             log_info!("操作面板：这一行没有可处置的对象（终端 / 提示 / 分类行），不进面板");
             return false;
@@ -11576,6 +11739,8 @@ impl LauncherApp {
         let merged = match row {
             Row::Head(h) => h,
             Row::Item(rank) => plan.head.len() + rank,
+            // 批次 A6：尾巴排在结果之后，合并行号与 `row_at` 同一套算法。
+            Row::Tail(t) => plan.head.len() + plan.results.len() + t,
         };
         let panel_actions = actions::actions_for(&target);
         // FR-SYS-03：只有清单里真实存在的条目才报名字——文件行 / 搜索行的标题是从查询现出来的。
@@ -11918,8 +12083,14 @@ impl LauncherApp {
     fn run_secondary_action(&mut self, ctx: &egui::Context, row: Row) {
         let key = self.prefs.secondary_hotkey.display();
         let plan = self.plan();
-        let Some((target, open)) =
-            panel_for_row(row, &plan.head, &plan.results, &self.items, &self.path_states)
+        let Some((target, open)) = panel_for_row(
+            row,
+            &plan.head,
+            &plan.results,
+            &plan.tail,
+            &self.items,
+            &self.path_states,
+        )
         else {
             log_info!("次级动作 {key}：这一行没有可处置的对象（终端 / 提示 / 分类行）");
             self.toast = Some((
@@ -12821,6 +12992,7 @@ impl LauncherApp {
                     .map(|&i| source::SourceRow::Action(p.actions[i].clone()))
                     .collect(),
                 results: Vec::new(),
+                tail: Vec::new(),
             };
         }
         let started = Instant::now();
@@ -12870,7 +13042,12 @@ impl LauncherApp {
             logging::perf(
                 "search",
                 started.elapsed(),
-                &format!("head {} results {}", plan.head.len(), plan.results.len()),
+                &format!(
+                    "head {} results {} tail {}",
+                    plan.head.len(),
+                    plan.results.len(),
+                    plan.tail.len()
+                ),
             );
         }
         plan
@@ -13316,6 +13493,8 @@ impl eframe::App for LauncherApp {
         let mut copy_text: Option<String> = None;
         // FR-SRC-11：搜索行的「执行」＝打开 URL（独立函数，日志口径见 `open_search_hit`）。
         let mut open_hit: Option<source::websearch::SearchHit> = None;
+        // 批次 A6（FR-SRC-12）：书签行的「执行」＝用默认浏览器打开网址，与搜索行同一语义。
+        let mut open_bookmark: Option<source::bookmarks::BookmarkHit> = None;
         // 批次 X：文件行的三个动作各自一条道（打开 / 在资源管理器里定位 / 复制路径）。
         // 都只带路径字符串而不带 LaunchItem：这三件事都不进清单、不记学习统计。
         let mut open_file: Option<source::filesearch::FileHit> = None;
@@ -13684,10 +13863,10 @@ impl eframe::App for LauncherApp {
                     space_head_len = plan.head.len();
                     space_results = plan.results;
                 }
-                // 批次 S/T：选中行在头段（计算器/搜索/提示）⇒ 空格整体不接管（那些行的执行入口
-                // 是 Enter/点击/数字键）。`item_rank` 同时把「合并行号」换算成 `space_executes`
-                // 要的名次——头段占了前几行时名次得整体后移，否则四档判据会错位。
-                let space_rank = item_rank(self.selected, space_head_len);
+                // 批次 S/T：选中行在头段（计算器/搜索/提示）或尾巴（书签）⇒ 空格整体不接管
+                // （那些行的执行入口是 Enter/点击/数字键）。`item_rank` 同时把「合并行号」换算成
+                // `space_executes` 要的名次——头段占了前几行时名次得整体后移，否则四档判据会错位。
+                let space_rank = item_rank(self.selected, space_results.len(), space_head_len);
                 let space_takes = space_down
                     && !hit_shift_space
                     && space_rank.is_some_and(|rank| {
@@ -13771,14 +13950,24 @@ impl eframe::App for LauncherApp {
                         self.open_batch_panel(ui.ctx());
                     } else {
                         let plan = self.plan();
-                        let row = row_at(self.selected, plan.results.len(), plan.head.len());
+                        let row = row_at(
+                            self.selected,
+                            plan.results.len(),
+                            plan.head.len(),
+                            plan.tail.len(),
+                        );
                         if let Some(row) = row {
                             self.open_panel(ui.ctx(), row);
                         }
                     }
                 } else if secondary_hit {
                     let plan = self.plan();
-                    let row = row_at(self.selected, plan.results.len(), plan.head.len());
+                    let row = row_at(
+                        self.selected,
+                        plan.results.len(),
+                        plan.head.len(),
+                        plan.tail.len(),
+                    );
                     if let Some(row) = row {
                         self.run_secondary_action(ui.ctx(), row);
                     }
@@ -13787,8 +13976,14 @@ impl eframe::App for LauncherApp {
                     // 不绕回开头——用户按 `Insert` 是"接着标下一个"，不是"从头再来"）。
                     // 路径不落日志（FR-SYS-03：这些路径来自查询框现搜出来的结果）。
                     let plan = self.plan();
-                    let row = row_at(self.selected, plan.results.len(), plan.head.len());
-                    let total = row_count(plan.results.len(), plan.head.len());
+                    let row = row_at(
+                        self.selected,
+                        plan.results.len(),
+                        plan.head.len(),
+                        plan.tail.len(),
+                    );
+                    let total =
+                        row_count(plan.results.len(), plan.head.len(), plan.tail.len());
                     let here = self.selected;
                     let path = row.and_then(|r| {
                         markable_path(r, &plan.head, &plan.results, &self.items)
@@ -13833,13 +14028,22 @@ impl eframe::App for LauncherApp {
                     let key_name = if alt_enter_hit { "Alt+Enter" } else { "Ctrl+C" };
                     let text = {
                         let plan = self.plan();
-                        let item = item_rank(self.selected, plan.head.len())
+                        let item = item_rank(self.selected, plan.results.len(), plan.head.len())
                             .and_then(|r| plan.results.get(r))
                             .map(|i| &self.items[*i]);
                         // 第三个参数给空串：`large_text_of` 的"没有选中行"兜底是回落到查询原文，
                         // 那是 Ctrl+L 大字的语义（AHK `_ShowLargeType` 的 `Input.Value`）；
                         // 复制要的是"这一行"，一行都没有时必须什么都不复制（AHK `_CopySelected` 同）。
-                        large_text_of(plan.head.get(self.selected), item, "")
+                        // 尾巴行（书签）走 `tail_at`——它同样是一条"选中行"。
+                        let row = plan.head.get(self.selected).or_else(|| {
+                            tail_at(
+                                &plan.tail,
+                                self.selected,
+                                plan.results.len(),
+                                plan.head.len(),
+                            )
+                        });
+                        large_text_of(row, item, "")
                     };
                     match text {
                         Some(text) => match copy_to_clipboard(&text) {
@@ -13940,10 +14144,18 @@ impl eframe::App for LauncherApp {
                     // 里的 `large_type.showing()`），否则焦点一被大字窗拿走，主窗 50ms 就没了。
                     let text = {
                         let plan = self.plan();
-                        let item = item_rank(self.selected, plan.head.len())
+                        let item = item_rank(self.selected, plan.results.len(), plan.head.len())
                             .and_then(|r| plan.results.get(r))
                             .map(|i| self.items[*i].clone());
-                        large_text_of(plan.head.get(self.selected), item.as_ref(), &self.query)
+                        let row = plan.head.get(self.selected).or_else(|| {
+                            tail_at(
+                                &plan.tail,
+                                self.selected,
+                                plan.results.len(),
+                                plan.head.len(),
+                            )
+                        });
+                        large_text_of(row, item.as_ref(), &self.query)
                     };
                     match text {
                         Some(text) => {
@@ -14015,15 +14227,18 @@ impl eframe::App for LauncherApp {
                             "快捷键 Ctrl+D：在资源管理器中定位文件行（路径由查询现出，不落日志）"
                         );
                     }
-                    let item_row = item_rank(self.selected, plan.head.len());
+                    let item_row = item_rank(self.selected, plan.results.len(), plan.head.len());
                     let results = plan.results;
                     // search 返回下标而不是引用：调用方接下来要改 self.items。
                     let mut sel =
                         item_row.and_then(|r| results.get(r).map(|i| self.items[*i].clone()));
                     if sel.is_none() && (hit_e || hit_del || hit_csd || hit_cdel) {
-                        if let Some(Row::Head(h)) =
-                            row_at(self.selected, results.len(), plan.head.len())
-                        {
+                        if let Some(Row::Head(h)) = row_at(
+                            self.selected,
+                            results.len(),
+                            plan.head.len(),
+                            plan.tail.len(),
+                        ) {
                             sel = plan.head[h]
                                 .custom_uid()
                                 .and_then(|u| self.items.iter().find(|i| i.uid() == u).cloned());
@@ -14115,7 +14330,7 @@ impl eframe::App for LauncherApp {
                 } else if hit_pgup || hit_pgdn {
                     // 翻页/循环全按「合并行号」走：头段那几行也是可停的行。
                     let plan = self.plan();
-                    let len = row_count(plan.results.len(), plan.head.len());
+                    let len = row_count(plan.results.len(), plan.head.len(), plan.tail.len());
                     if len > 0 {
                         // 批次 F6：一页几行由「行密度」决定，不再读主题的 row_height——
                         // 除了「跟随主题」档，那一档下主题才是行高的来源。
@@ -14149,7 +14364,7 @@ impl eframe::App for LauncherApp {
                         "Ctrl+J"
                     };
                     let plan = self.plan();
-                    let len = row_count(plan.results.len(), plan.head.len());
+                    let len = row_count(plan.results.len(), plan.head.len(), plan.tail.len());
                     if len > 0 {
                         let cur = self.selected.min(len - 1);
                         self.selected = if backward {
@@ -14188,8 +14403,9 @@ impl eframe::App for LauncherApp {
                     self.focus_query = true; // egui 把 Tab/Shift+Tab 判给下一个/上一个控件，焦点会跳一帧
                     let plan = self.plan();
                     let head_len = plan.head.len();
+                    let tail_len = plan.tail.len();
                     let results = plan.results;
-                    let len = row_count(results.len(), head_len);
+                    let len = row_count(results.len(), head_len, tail_len);
                     if len > 0 {
                         let cur = self.selected.min(len - 1);
                         let backward = hit_shift_tab;
@@ -14198,11 +14414,13 @@ impl eframe::App for LauncherApp {
                         } else {
                             (cur + 1) % len
                         };
-                        // 选中头段行时补整也不接管 —— 那一下 Tab 只循环到下一行。头段正是查询串
-                        // 的派生物：从计算器/搜索行补成某个应用名，眼前那一行（或整段独占结果）
-                        // 会当场消失，这个"跳行"比导航更难解释。
+                        // 选中头段行 / 尾巴行时补全也不接管 —— 那一下 Tab 只循环到下一行。
+                        // 头段正是查询串的派生物：从计算器/搜索行补成某个应用名，眼前那一行
+                        // （或整段独占结果）会当场消失，这个"跳行"比导航更难解释；尾巴（书签）
+                        // 更不在清单里，补成条目名同样会让这一行消失。
                         let complete_to = if backward
                             || self.selected < head_len
+                            || self.selected >= head_len + results.len()
                             || !matches!(self.prefs.tab_mode, TabMode::Complete)
                         {
                             None
@@ -14258,10 +14476,11 @@ impl eframe::App for LauncherApp {
                 } else if let Some(digit) = hit_digit {
                     let plan = self.plan();
                     let head_len = plan.head.len();
+                    let tail_len = plan.tail.len();
                     let results = plan.results;
-                    let len = row_count(results.len(), head_len);
+                    let len = row_count(results.len(), head_len, tail_len);
                     match digit_index(digit, len) {
-                        Some(idx) => match row_at(idx, results.len(), head_len) {
+                        Some(idx) => match row_at(idx, results.len(), head_len, tail_len) {
                             Some(Row::Head(h)) => match &plan.head[h] {
                                 HeadRow::Calc(hit) => {
                                     // FR-SRC-10：数字键指到计算器行 ⇒ 与 Enter 同一语义（复制）。
@@ -14367,6 +14586,20 @@ impl eframe::App for LauncherApp {
                                     );
                                     panel_action = Some(hit.id);
                                 }
+                                // 批次 A6：`bm 词` 是独占源，`dispatch` 把它整张表放进**头段**
+                                //（`take_over` → `SearchPlan.head`），所以头段确实会有书签行；
+                                // 与尾巴那两臂同一语义，只是日志措辞按"独占"写。
+                                HeadRow::Bookmark(hit) => {
+                                    log_info!(
+                                        "快捷键 数字键 {digit}：打开书签第 {} 行（标题与网址不落日志）",
+                                        idx + 1
+                                    );
+                                    open_bookmark = Some(hit.clone());
+                                }
+                                HeadRow::BookmarkHint(hint) => {
+                                    log_info!("快捷键 数字键 {digit}：选中的是书签说明行，不执行");
+                                    self.hint_toast(ui.ctx(), hint.subtitle.as_str());
+                                }
                             },
                             Some(Row::Item(rank)) => {
                                 let item = self.items[results[rank]].clone();
@@ -14379,6 +14612,21 @@ impl eframe::App for LauncherApp {
                                 launch_from_list = true;
                                 launch_via_digit = true;
                             }
+                            // 批次 A6：数字键也覆盖尾巴上的书签行（与 Enter 同一语义）。
+                            Some(Row::Tail(t)) => match &plan.tail[t] {
+                                HeadRow::Bookmark(hit) => {
+                                    log_info!(
+                                        "快捷键 数字键 {digit}：打开书签第 {} 行（标题与网址不落日志）",
+                                        idx + 1
+                                    );
+                                    open_bookmark = Some(hit.clone());
+                                }
+                                HeadRow::BookmarkHint(hint) => {
+                                    log_info!("快捷键 数字键 {digit}：选中的是书签说明行，不执行");
+                                    self.hint_toast(ui.ctx(), hint.subtitle.as_str());
+                                }
+                                _ => {}
+                            },
                             None => {}
                         },
                         None => log_info!(
@@ -14389,13 +14637,15 @@ impl eframe::App for LauncherApp {
                 } else if hit_space {
                     let plan = self.plan();
                     let head_len = plan.head.len();
+                    let tail_len = plan.tail.len();
                     let results = plan.results;
-                    let len = row_count(results.len(), head_len);
-                    // 选中头段行时 `space_takes` 已为假 ⇒ 这里只可能拿到条目行；None 分支不用管。
+                    let len = row_count(results.len(), head_len, tail_len);
+                    // 选中头段 / 尾巴行时 `space_takes` 已为假 ⇒ 这里只可能拿到条目行；None 分支不用管。
                     if let Some(Row::Item(rank)) = row_at(
                         self.selected.min(len.saturating_sub(1)),
                         results.len(),
                         head_len,
+                        tail_len,
                     ) {
                         let item = self.items[results[rank]].clone();
                         log_info!(
@@ -14662,8 +14912,9 @@ impl eframe::App for LauncherApp {
             let q = self.query.trim().to_lowercase();
             let plan = self.plan();
             let head_len = plan.head.len();
+            let tail_len = plan.tail.len();
             let results = plan.results;
-            let total = row_count(results.len(), head_len);
+            let total = row_count(results.len(), head_len, tail_len);
             let status_shown = self.prefs.appearance.status_bar && total > 0;
             let file_route = self.file_route(&self.query);
             let in_file_mode = !matches!(file_route, source::filesearch::Route::NotOurs);
@@ -14764,7 +15015,7 @@ impl eframe::App for LauncherApp {
                     } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                         self.selected = self.selected.saturating_sub(1);
                     } else if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        match row_at(self.selected, results.len(), head_len) {
+                        match row_at(self.selected, results.len(), head_len, tail_len) {
                             // FR-SRC-10 的 `text` 动作：Enter 只把纯数字放进剪贴板，然后关到托盘。
                             Some(Row::Head(h)) => match &plan.head[h] {
                                 HeadRow::Calc(hit) => copy_text = Some(hit.copy.clone()),
@@ -14804,11 +15055,26 @@ impl eframe::App for LauncherApp {
                                     // **原查询**记录（在 `run_panel_action` 里取 `saved_query`）。
                                     panel_action = Some(hit.id);
                                 }
+                                // 批次 A6：`bm 词` 独占时整张书签表在头段（`take_over` 的返回值
+                                // 就是 `SearchPlan.head`），所以头段这两臂必须真做事——界面上的
+                                // 「Enter 打开」来自 `enter_action_label`，写成空臂就是"有键帽没键"。
+                                HeadRow::Bookmark(hit) => open_bookmark = Some(hit.clone()),
+                                HeadRow::BookmarkHint(hint) => {
+                                    self.hint_toast(ui.ctx(), hint.subtitle.as_str())
+                                }
                             },
                             Some(Row::Item(rank)) => {
                                 launch = Some(self.items[results[rank]].clone());
                                 launch_from_list = true;
                             }
+                            // 批次 A6（FR-SRC-12）：书签行的 Enter ＝ 用默认浏览器打开。
+                            Some(Row::Tail(t)) => match &plan.tail[t] {
+                                HeadRow::Bookmark(hit) => open_bookmark = Some(hit.clone()),
+                                HeadRow::BookmarkHint(hint) => {
+                                    self.hint_toast(ui.ctx(), hint.subtitle.as_str())
+                                }
+                                _ => {}
+                            },
                             None => {}
                         }
                     }
@@ -15355,6 +15621,37 @@ impl eframe::App for LauncherApp {
                                         }
                                     });
                                 }
+                                HeadRow::Bookmark(hit) => {
+                                    // 批次 A6：书签网址行正常只出现在尾巴上（见下面的尾巴循环），
+                                    // 这里保住穷尽性；点击与 Enter 同一语义。
+                                    if bookmark_row(
+                                        ui,
+                                        h,
+                                        is_sel,
+                                        follow_selection,
+                                        icon,
+                                        glyph,
+                                        sub_size,
+                                        hit,
+                                    ) {
+                                        open_bookmark = Some(hit.clone());
+                                    }
+                                }
+                                HeadRow::BookmarkHint(hint) => {
+                                    // 裸 `bm`：一句用法 + 手里有多少书签。点/按只给副标题那句提示。
+                                    if bookmark_hint_row(
+                                        ui,
+                                        h,
+                                        is_sel,
+                                        follow_selection,
+                                        icon,
+                                        glyph,
+                                        sub_size,
+                                        hint,
+                                    ) {
+                                        self.hint_toast(ui.ctx(), hint.subtitle.as_str());
+                                    }
+                                }
                                 HeadRow::ScopeTags(hint) => {
                                     // 批次 G1：裸 `@` 的分类提示行，不可执行；点/按只给用法 Toast。
                                     ui.horizontal(|ui| {
@@ -15522,6 +15819,43 @@ impl eframe::App for LauncherApp {
                                 });
                             });
                         }
+                        // 批次 A6（FR-SRC-12）：尾巴上的书签行——排在一切清单条目之后
+                        //（需求书原话「排在应用/命令之后」）。合并行号接着结果段往下数。
+                        for (t, row) in plan.tail.iter().enumerate() {
+                            let idx = head_len + results.len() + t;
+                            let is_sel = idx == self.selected;
+                            match row {
+                                HeadRow::Bookmark(hit) => {
+                                    if bookmark_row(
+                                        ui,
+                                        idx,
+                                        is_sel,
+                                        follow_selection,
+                                        icon,
+                                        glyph,
+                                        sub_size,
+                                        hit,
+                                    ) {
+                                        open_bookmark = Some(hit.clone());
+                                    }
+                                }
+                                HeadRow::BookmarkHint(hint) => {
+                                    if bookmark_hint_row(
+                                        ui,
+                                        idx,
+                                        is_sel,
+                                        follow_selection,
+                                        icon,
+                                        glyph,
+                                        sub_size,
+                                        hint,
+                                    ) {
+                                        self.hint_toast(ui.ctx(), hint.subtitle.as_str());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     });
                 self.scroll_followed = self.selected;
             }
@@ -15574,9 +15908,10 @@ impl eframe::App for LauncherApp {
                     egui::FontId::proportional(self.theme.title_font_size),
                     self.theme.subtitle,
                 );
-                let selected_row = row_at(self.selected, total - head_len, head_len);
+                let selected_row = row_at(self.selected, results.len(), head_len, tail_len);
                 let action = match selected_row {
                     Some(Row::Head(h)) => enter_action_label(plan.head.get(h)),
+                    Some(Row::Tail(t)) => enter_action_label(plan.tail.get(t)),
                     _ => enter_action_label(None),
                 };
                 // FR-UIX-08 右格原文的后半句「+ `→` 动作」。批次 F8 那颗键帽没画，理由是
@@ -15595,6 +15930,7 @@ impl eframe::App for LauncherApp {
                                 row,
                                 &plan.head,
                                 &results,
+                                &plan.tail,
                                 &self.items,
                                 &self.path_states,
                             )
@@ -17013,6 +17349,13 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        // 批次 A6（FR-SRC-12）：书签行。查询进历史（`bm 词` 是他敲出来又要找回来的串），
+        // 书签本身不进清单、也不单列统计桶（D8 的桶照功能分）。
+        if let Some(hit) = open_bookmark {
+            self.remember_history(self.query.clone());
+            self.open_bookmark_hit(ui.ctx(), &hit);
+        }
+
         // 批次 X：文件行的三个动作（打开 / 在资源管理器中定位 / 复制路径）。与上面三段互斥：
         // 一次按键或点击只会产出其中一个。
         if let Some(hit) = open_file {
@@ -17999,48 +18342,79 @@ mod nav_tests {
     // ---- 头段（计算器/搜索/提示）并入列表后的行模型（批次 S / T）----
 
     #[test]
-    fn row_count_adds_the_head_rows_only_when_present() {
-        assert_eq!(row_count(0, 0), 0, "空清单空查询：一行都没有");
-        assert_eq!(row_count(3, 0), 3);
+    fn row_count_adds_the_head_and_tail_rows_only_when_present() {
+        assert_eq!(row_count(0, 0, 0), 0, "空清单空查询：一行都没有");
+        assert_eq!(row_count(3, 0, 0), 3);
         assert_eq!(
-            row_count(0, 1),
+            row_count(0, 1, 0),
             1,
             "算式没有条目命中时，列表里就只剩计算器那一行"
         );
-        assert_eq!(row_count(3, 1), 4);
-        assert_eq!(row_count(0, 2), 2, "头段可以不止一行（未来多源并列）");
-        assert_eq!(row_count(3, 2), 5);
+        assert_eq!(row_count(3, 1, 0), 4);
+        assert_eq!(row_count(0, 2, 0), 2, "头段可以不止一行（未来多源并列）");
+        assert_eq!(row_count(3, 2, 0), 5);
+        // 批次 A6：尾巴（书签）同样占合并行号，排在结果之后。
+        assert_eq!(row_count(3, 1, 2), 6);
+        assert_eq!(row_count(0, 0, 2), 2, "只有书签时也有两行");
     }
 
     #[test]
     fn row_at_puts_the_head_rows_first_and_offsets_the_items() {
         // 下标表照 MatchIndex::search 的真实产出构造（名次 → self.items 下标）。
         let results = [7, 2, 9];
-        assert_eq!(row_at(0, results.len(), 1), Some(Row::Head(0)));
+        assert_eq!(row_at(0, results.len(), 1, 0), Some(Row::Head(0)));
         assert_eq!(
-            row_at(1, results.len(), 1),
+            row_at(1, results.len(), 1, 0),
             Some(Row::Item(0)),
             "第 1 行是第 0 名"
         );
-        assert_eq!(row_at(3, results.len(), 1), Some(Row::Item(2)));
+        assert_eq!(row_at(3, results.len(), 1, 0), Some(Row::Item(2)));
         assert_eq!(
-            row_at(4, results.len(), 1),
+            row_at(4, results.len(), 1, 0),
             None,
             "越界不给行，调用方什么都不做"
         );
         // 头段不在场时，合并行号就是名次——这条是"批次 S 之前的行为一个字没变"的证据。
-        assert_eq!(row_at(0, results.len(), 0), Some(Row::Item(0)));
-        assert_eq!(row_at(2, results.len(), 0), Some(Row::Item(2)));
-        assert_eq!(row_at(3, results.len(), 0), None);
+        assert_eq!(row_at(0, results.len(), 0, 0), Some(Row::Item(0)));
+        assert_eq!(row_at(2, results.len(), 0, 0), Some(Row::Item(2)));
+        assert_eq!(row_at(3, results.len(), 0, 0), None);
         assert_eq!(
-            row_at(0, 0, 1),
+            row_at(0, 0, 1, 0),
             Some(Row::Head(0)),
             "只有计算器一行时第 0 行仍在"
         );
         // 头段两行（假想的多源并列）：第 0/1 行归头段，应用从第 2 行起。
-        assert_eq!(row_at(1, results.len(), 2), Some(Row::Head(1)));
-        assert_eq!(row_at(2, results.len(), 2), Some(Row::Item(0)));
-        assert_eq!(row_at(4, results.len(), 2), Some(Row::Item(2)));
+        assert_eq!(row_at(1, results.len(), 2, 0), Some(Row::Head(1)));
+        assert_eq!(row_at(2, results.len(), 2, 0), Some(Row::Item(0)));
+        assert_eq!(row_at(4, results.len(), 2, 0), Some(Row::Item(2)));
+        // 批次 A6：尾巴接在结果之后（这里 1 行头段 + 3 条结果 ⇒ 尾巴从第 4 行起）。
+        assert_eq!(row_at(4, results.len(), 1, 2), Some(Row::Tail(0)));
+        assert_eq!(row_at(5, results.len(), 1, 2), Some(Row::Tail(1)));
+        assert_eq!(row_at(6, results.len(), 1, 2), None, "尾巴越界同样不给行");
+        // 没有结果时尾巴紧接头段，不能拿名次去换它。
+        assert_eq!(row_at(1, 0, 1, 1), Some(Row::Tail(0)));
+    }
+
+    /// 批次 A6：`tail_at` 只认尾巴那一段（Ctrl+C / Ctrl+L 用它取"选中的那一行"）。
+    #[test]
+    fn tail_at_reads_only_the_tail_segment() {
+        let tail = vec![
+            HeadRow::Bookmark(source::bookmarks::BookmarkHit {
+                title: "Rust".into(),
+                url: "https://www.rust-lang.org/".into(),
+                subtitle: "Chrome · rust-lang.org".into(),
+            }),
+            HeadRow::Bookmark(source::bookmarks::BookmarkHit {
+                title: "Docs".into(),
+                url: "https://docs.rs/".into(),
+                subtitle: "Chrome · docs.rs".into(),
+            }),
+        ];
+        assert!(tail_at(&tail, 0, 3, 1).is_none(), "头段行不归尾巴");
+        assert!(tail_at(&tail, 3, 3, 1).is_none(), "结果行不归尾巴");
+        assert!(matches!(tail_at(&tail, 4, 3, 1), Some(HeadRow::Bookmark(h)) if h.title == "Rust"));
+        assert!(matches!(tail_at(&tail, 5, 3, 1), Some(HeadRow::Bookmark(h)) if h.title == "Docs"));
+        assert!(tail_at(&tail, 6, 3, 1).is_none(), "越界同样是 None");
     }
 
     // 批次 A10：`drop_hinted` 的判据已并入 `source::dispatch` 第 4 段，
@@ -18114,13 +18488,15 @@ mod nav_tests {
     #[test]
     fn item_rank_refuses_head_rows_and_renumbers_the_rest() {
         // 空格四档与"编辑/删除/置顶/开目录"这四档都要它：选中头段 ⇒ None（不接管）。
-        assert_eq!(item_rank(0, 1), None);
-        assert_eq!(item_rank(0, 0), Some(0), "头段不在场，第 0 行就是第 0 名");
-        assert_eq!(item_rank(1, 1), Some(0));
-        assert_eq!(item_rank(5, 1), Some(4));
+        assert_eq!(item_rank(0, 9, 1), None);
+        assert_eq!(item_rank(0, 1, 0), Some(0), "头段不在场，第 0 行就是第 0 名");
+        assert_eq!(item_rank(1, 1, 1), Some(0));
+        assert_eq!(item_rank(5, 5, 1), Some(4));
         // 关键一行：头段两行时 selected=1 也算头段，减法不许下溢。
-        assert_eq!(item_rank(1, 2), None);
-        assert_eq!(item_rank(2, 2), Some(0));
+        assert_eq!(item_rank(1, 9, 2), None);
+        assert_eq!(item_rank(2, 9, 2), Some(0));
+        // 批次 A6：尾巴排在结果之后 ⇒ 只认结果段的它天然不接管书签行（书签不是磁盘对象）。
+        assert_eq!(item_rank(3, 2, 1), None);
     }
 
     #[test]
@@ -18147,20 +18523,30 @@ mod nav_tests {
         // 数字键走的是「合并行号」：计算器在场时按 1 复制数字，按 2 才是原来的第一条。
         let results = [7, 2];
         let head_len = 1;
-        let len = row_count(results.len(), head_len);
+        let len = row_count(results.len(), head_len, 0);
         assert_eq!(
-            row_at(digit_index(1, len).unwrap(), results.len(), head_len),
+            row_at(digit_index(1, len).unwrap(), results.len(), head_len, 0),
             Some(Row::Head(0))
         );
         assert_eq!(
-            row_at(digit_index(2, len).unwrap(), results.len(), head_len),
+            row_at(digit_index(2, len).unwrap(), results.len(), head_len, 0),
             Some(Row::Item(0))
         );
         assert_eq!(
-            row_at(digit_index(3, len).unwrap(), results.len(), head_len),
+            row_at(digit_index(3, len).unwrap(), results.len(), head_len, 0),
             Some(Row::Item(1))
         );
         assert_eq!(digit_index(4, len), None, "共三行时按 4 不该指到任何行");
+        // 批次 A6：尾巴上的书签也占数字键位（1 头段 / 2-3 结果 / 4 起是书签）。
+        let len_with_tail = row_count(results.len(), head_len, 2);
+        assert_eq!(
+            row_at(digit_index(4, len_with_tail).unwrap(), results.len(), head_len, 2),
+            Some(Row::Tail(0))
+        );
+        assert_eq!(
+            row_at(digit_index(5, len_with_tail).unwrap(), results.len(), head_len, 2),
+            Some(Row::Tail(1))
+        );
     }
 
     #[test]
@@ -18486,6 +18872,8 @@ mod nav_tests {
         // 名次越界 ⇒ None，不 panic（选中行与计划不同帧时宁可什么都不做）。
         assert_eq!(markable_path(Row::Item(9), &head, &results, &items), None);
         assert_eq!(markable_path(Row::Head(9), &head, &results, &items), None);
+        // 批次 A6：书签行是网址，批量动作对它没有意义。
+        assert_eq!(markable_path(Row::Tail(0), &head, &results, &items), None);
     }
 
     /// `Insert` 的切换口径：大小写不敏感（Windows 路径）、重复标记＝取消、次序按首次加入。
@@ -18645,7 +19033,7 @@ mod nav_tests {
         }];
         let states = std::collections::HashMap::new();
         let no_panel = |row: Row, head: &[HeadRow]| {
-            panel_for_row(row, head, &[0], &items, &states).is_some()
+            panel_for_row(row, head, &[0], &[], &items, &states).is_some()
         };
         // 条目行永远有面板（哪怕路径是裸命令名，`exists` 走的是"没扫到当作在"那一格）。
         assert!(no_panel(Row::Item(0), &[]));
@@ -18678,7 +19066,7 @@ mod nav_tests {
             is_dir: false,
             subtitle: String::new(),
         });
-        let (target, open) = panel_for_row(Row::Head(0), &[file], &[], &items, &states)
+        let (target, open) = panel_for_row(Row::Head(0), &[file], &[], &[], &items, &states)
             .expect("文件行应有面板");
         assert_eq!(target.subject, actions::Subject::File);
         assert!(!target.editable);
@@ -18693,7 +19081,7 @@ mod nav_tests {
             subtitle: String::new(),
             copy: "1,024".into(),
         });
-        let (target, open) = panel_for_row(Row::Head(0), &[calc], &[], &items, &states)
+        let (target, open) = panel_for_row(Row::Head(0), &[calc], &[], &[], &items, &states)
             .expect("计算器行应有文本那张表");
         assert_eq!(target.subject, actions::Subject::Text);
         // `path` 里放的是**那一串值**（`copy`，不带等号），标题原样留着只给大字与面板抬头看。
@@ -18702,6 +19090,38 @@ mod nav_tests {
         assert!(!target.editable);
         assert!(target.uid.is_none());
         assert!(matches!(open, PanelOpen::Value));
+
+        // 批次 A6：尾巴上的书签行给的是网址那张表（与网页搜索行同一套），不是文件、不谈编辑置顶。
+        let bookmark = HeadRow::Bookmark(source::bookmarks::BookmarkHit {
+            title: "Rust 官网".into(),
+            url: "https://www.rust-lang.org/".into(),
+            subtitle: "Chrome · rust-lang.org".into(),
+        });
+        let (target, open) =
+            panel_for_row(Row::Tail(0), &[], &[], &[bookmark.clone()], &items, &states)
+                .expect("书签行应有网址那张表");
+        assert_eq!(target.subject, actions::Subject::Url);
+        assert_eq!(target.path, "https://www.rust-lang.org/");
+        assert!(!target.editable);
+        assert!(target.uid.is_none());
+        assert!(matches!(open, PanelOpen::Path));
+        assert!(
+            panel_for_row(Row::Tail(1), &[], &[], &[], &items, &states).is_none(),
+            "尾巴越界 ⇒ 没有面板"
+        );
+
+        // 批次 A6 真机抓到的缺陷：`bm 词` 是独占源，`dispatch` 把它整张表放进**头段**
+        // （`take_over` 的返回值就是 `SearchPlan.head`），所以同一个书签身在头段时
+        // 「→ 操作面板」必须给同一张表。原先头段走 `_ => None`，界面上有键帽没键。
+        let (target, open) =
+            panel_for_row(Row::Head(0), &[bookmark], &[], &[], &items, &states)
+                .expect("独占书签行（头段）也应有网址那张表");
+        assert_eq!(target.subject, actions::Subject::Url);
+        assert_eq!(target.path, "https://www.rust-lang.org/");
+        assert_eq!(target.title, "Rust 官网");
+        assert!(!target.editable);
+        assert!(target.uid.is_none());
+        assert!(matches!(open, PanelOpen::Path));
     }
 
     #[test]

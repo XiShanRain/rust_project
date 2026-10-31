@@ -17,6 +17,7 @@
 //! 顺序即报文次序：越靠前越先问「你要不要独占」，头段行也按这个次序拼接。
 
 pub mod application;
+pub mod bookmarks;
 pub mod calc;
 pub mod cheatsheet;
 pub mod custom;
@@ -63,13 +64,15 @@ pub enum SourceId {
     Terminal,
     /// 速查表（`?`、`? 词`）。
     Cheatsheet,
+    /// 浏览器书签（FR-SRC-12）：`bm 词` 独占，直接输书签名则排在结果尾巴上。
+    Bookmarks,
 }
 
 impl SourceId {
     /// 注册表的实际顺序（只在单测里用：`default_sources` 的顺序不许漂）。
     /// 与 [`default_sources`] 一致——显式语法（`?` / `>`）最前，其后用户数据压过出厂数据，应用清单殿后。
     #[cfg(test)]
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Cheatsheet,
         Self::Terminal,
         Self::Custom,
@@ -79,6 +82,7 @@ impl SourceId {
         Self::Files,
         Self::Calc,
         Self::Apps,
+        Self::Bookmarks,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -92,6 +96,7 @@ impl SourceId {
             Self::Calc => "calc",
             Self::Terminal => "terminal",
             Self::Cheatsheet => "cheatsheet",
+            Self::Bookmarks => "bookmarks",
         }
     }
 }
@@ -131,6 +136,11 @@ pub enum SourceRow {
     Cheat(cheatsheet::CheatHit),
     /// `? 词` 一条也没命中时的提示行：不可执行，只给一句 Toast。
     CheatHint(cheatsheet::CheatHint),
+    /// 浏览器书签的一行（FR-SRC-12）。「执行」＝用默认浏览器打开网址。
+    /// 只出现在 `bm 词` 的独占结果与默认结果尾巴上。
+    Bookmark(bookmarks::BookmarkHit),
+    /// 书签的说明行（裸 `bm` 的用法、`bm 词` 没命中的说明）：不可执行。
+    BookmarkHint(bookmarks::BookmarkHint),
     /// 裸 `@` 的分类提示行（批次 G1）：不可执行，点/按只给一句用法 Toast。
     ScopeTags(application::ScopeTagHint),
     /// 操作面板的一行（批次 P1，FR-ACT-03）。**不是数据源的产物**：面板开着时
@@ -182,10 +192,14 @@ pub struct SearchCtx<'a> {
 }
 
 /// 本帧列表的完整计划。原先叫 `Plan`、定义在 `main.rs`；批次 A10 搬到数据源层。
+///
+/// 批次 A6 新增 [`tail`](Self::tail)：排在普通结果**之后**的行。需求书要求书签
+/// 「排在应用/命令之后」，而头段按架构永远在结果之前 ⇒ 书签只能走这段。
 #[derive(Debug, Default, Clone)]
 pub struct SearchPlan {
     pub head: Vec<SourceRow>,
     pub results: Vec<usize>,
+    pub tail: Vec<SourceRow>,
 }
 
 /// 一个数据源。默认实现全是"不参与" ⇒ 新源只写自己需要的那几个方法。
@@ -219,6 +233,11 @@ pub trait DataSource {
     }
     /// 普通结果（`items` 的下标）。正常情况下只有应用清单这一个源会给非空。
     fn rows(&mut self, _cx: &mut SearchCtx<'_>) -> Vec<usize> {
+        Vec::new()
+    }
+    /// 排在普通结果**之后**的尾巴行（批次 A6）。默认无；调用方在 `rows` 之后按注册序收集。
+    /// 只有"天生该排在用户清单之后"的源才用它——头段行永远在结果之前。
+    fn tail(&mut self, _cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {
         Vec::new()
     }
     /// 「重建索引」类内置动作（FR-SRC-17 自身命令组）的挂点，默认什么都不做。
@@ -261,6 +280,9 @@ pub fn default_sources_with(prefs: &application::AppSettings) -> Vec<Box<dyn Dat
         Box::new(filesearch::FileSource::with_scope(prefs.file_scan_scope())),
         Box::new(calc::CalcSource),
         Box::new(application::AppsSource),
+        // 书签压轴：它只在 `bm 词` 时独占，其余时候走尾巴，排在清单结果之后。
+        // 放最后也意味着用户给 `bm` 建的自定义命令能抢走这个前缀（用户数据压过出厂数据）。
+        Box::new(bookmarks::BookmarkSource::default()),
     ]
 }
 
@@ -295,6 +317,7 @@ pub fn dispatch(
             return SearchPlan {
                 head: rows,
                 results: Vec::new(),
+                tail: Vec::new(),
             };
         }
     }
@@ -331,8 +354,21 @@ pub fn dispatch(
         }
     }
 
-    // 5) 补位：一条都没有时才问（FR-QRY-08 的网页兜底），第一个给出内容的胜出。
-    if head.is_empty() && results.is_empty() {
+    // 5) 尾巴：需求书里明确「排在应用/命令之后」的行（目前只有书签）。
+    //    在补位之前收，这样"只有尾巴有内容"也算有结果，不该再弹网页兜底。
+    let mut tail: Vec<SourceRow> = Vec::new();
+    for s in sources.iter_mut() {
+        let id = s.id();
+        if !on(id) {
+            continue;
+        }
+        if let Some(mut rows) = guarded(id, || s.tail(&mut *cx)) {
+            tail.append(&mut rows);
+        }
+    }
+
+    // 6) 补位：一条都没有时才问（FR-QRY-08 的网页兜底），第一个给出内容的胜出。
+    if head.is_empty() && results.is_empty() && tail.is_empty() {
         for s in sources.iter_mut() {
             let id = s.id();
             if !on(id) {
@@ -347,7 +383,11 @@ pub fn dispatch(
         }
     }
 
-    SearchPlan { head, results }
+    SearchPlan {
+        head,
+        results,
+        tail,
+    }
 }
 
 #[cfg(test)]
