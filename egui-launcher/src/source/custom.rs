@@ -152,8 +152,8 @@ fn hint_for(item: &LaunchItem, typed: &str) -> CustomHint {
     let kw = keyword_word(item, typed).unwrap_or(typed);
     CustomHint {
         uid: item.uid(),
-        title: format!("{}（需要参数）", item.name),
-        subtitle: format!("在 '{kw} ' 后输入，然后回车"),
+        title: crate::i18n::tfmt("custom.hint_title", &[&item.name]),
+        subtitle: crate::i18n::tfmt("custom.hint_subtitle", &[&kw]),
         completion: format!("{kw} "),
         command: [item.path.as_str(), item.arguments.as_str()]
             .join(" ")
@@ -218,7 +218,7 @@ fn build_hit(item: &LaunchItem, query: &str) -> Option<CustomHit> {
     entry.arguments = arguments;
     entry.working_dir = working_dir;
     // 走到这里必定是含 `{query}` 的条目——[`exclusive`] 已把没有占位符的挡在外面。
-    let subtitle = "回车运行（参数已填入）".to_string();
+    let subtitle = crate::i18n::t("custom.ready_subtitle").to_string();
     Some(CustomHit {
         uid: item.uid(),
         name: item.name.clone(),
@@ -256,11 +256,11 @@ impl DataSource for CustomSource {
     }
 
     fn label(&self) -> &'static str {
-        "自定义命令"
+        crate::i18n::t("source.custom.label")
     }
 
     fn note(&self) -> &'static str {
-        "`关键字 参数` 独占整张列表；`关键字` 打全但还缺参数时在头部给补全提示。关掉之后这些命令只剩普通搜索结果。"
+        crate::i18n::t("source.custom.note")
     }
 
     fn take_over(&mut self, cx: &mut SearchCtx<'_>) -> Option<Vec<SourceRow>> {

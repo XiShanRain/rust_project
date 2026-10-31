@@ -67,11 +67,11 @@ impl DblTap {
 
     /// 设置页显示名。
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "关闭",
-            Self::Ctrl => "双击 Ctrl",
-            Self::Shift => "双击 Shift",
-        }
+        crate::i18n::t(match self {
+            Self::Off => "dbltap.off",
+            Self::Ctrl => "dbltap.ctrl",
+            Self::Shift => "dbltap.shift",
+        })
     }
 
     /// `WM_APP_SET_DOUBLE_TAP` 的 `wparam`。只在这条消息上用，不落盘。

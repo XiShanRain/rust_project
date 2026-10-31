@@ -202,8 +202,19 @@ pub fn tr(lang: Language, key: &'static str) -> &'static str {
 /// 带占位符的文案：`tf("app.no_match", &[query])` 把 `{1}` 换成 `query`。
 pub fn tf(key: &'static str, args: &[&str]) -> String {
     let mut text = t(key).to_string();
-    for (i, arg) in args.iter().enumerate() {
+    // 从后往前替换：`{1}` 是 `{10}` 的前缀，正序替换会先吃掉后者的一位。
+    for (i, arg) in args.iter().enumerate().rev() {
         text = text.replace(&format!("{{{}}}", i + 1), arg);
+    }
+    text
+}
+
+/// 同 [`tf`]，但参数可以是任意 `Display`（数字、路径、错误……）：
+/// `tfmt("toast.copied", &[&n, &path])`。占位符同样是 `{1}{2}…`。
+pub fn tfmt(key: &'static str, args: &[&dyn std::fmt::Display]) -> String {
+    let mut text = t(key).to_string();
+    for (i, arg) in args.iter().enumerate().rev() {
+        text = text.replace(&format!("{{{}}}", i + 1), &arg.to_string());
     }
     text
 }
@@ -260,6 +271,21 @@ mod tests {
         let en = keys(Language::En);
         assert!(!zh.is_empty(), "zh-CN 语言包不许为空");
         assert_eq!(zh, en, "两语言键集必须完全一致");
+    }
+
+    /// 英文包里不许留中文：`＋` 这类全角符号在 U+FF00 段、是排版符号不算中文，
+    /// 所以只查 CJK 统一表意文字与 CJK 标点两段。
+    #[test]
+    fn english_locale_has_no_cjk() {
+        for (key, text) in locales()[index(Language::En)].strings.iter() {
+            let bad: Vec<char> = text
+                .chars()
+                .filter(|c| {
+                    ('\u{3400}'..='\u{9fff}').contains(c) || ('\u{3000}'..='\u{303f}').contains(c)
+                })
+                .collect();
+            assert!(bad.is_empty(), "英文键 {key} 仍含中文：{bad:?} / {text}");
+        }
     }
 
     #[test]

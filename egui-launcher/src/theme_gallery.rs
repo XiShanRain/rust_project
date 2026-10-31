@@ -120,7 +120,10 @@ pub fn cell(
         ui.visuals().text_color(),
     );
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(format!("{}（点击应用）", item.name))
+        .on_hover_text(crate::i18n::tfmt(
+            "gallery.apply_hint",
+            &[&item.name],
+        ))
 }
 
 fn paint_window(p: &egui::Painter, rect: egui::Rect, t: &Theme) {

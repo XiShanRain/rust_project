@@ -75,14 +75,14 @@ impl ItemKind {
         ItemKind::File,
     ];
     pub fn label(self) -> &'static str {
-        match self {
-            ItemKind::App => "应用",
-            ItemKind::Command => "命令",
-            ItemKind::Url => "网址/协议",
-            ItemKind::Folder => "文件夹",
-            ItemKind::File => "文件",
-            ItemKind::Internal => "系统命令",
-        }
+        crate::i18n::t(match self {
+            ItemKind::App => "item.kind.app",
+            ItemKind::Command => "item.kind.command",
+            ItemKind::Url => "item.kind.url",
+            ItemKind::Folder => "item.kind.folder",
+            ItemKind::File => "item.kind.file",
+            ItemKind::Internal => "item.kind.internal",
+        })
     }
 }
 
@@ -1237,7 +1237,7 @@ impl HotkeySpec {
             VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN | VK_OEM_3 | VK_OEM_5
         );
         if !(function || letterish) {
-            return Err("只收字母、数字、空格、回车、反引号 `、反斜杠 \\ 与 F1–F24");
+            return Err(crate::i18n::t("hotkey.err.allowed_chars"));
         }
         if function {
             return Ok(());
@@ -1246,10 +1246,10 @@ impl HotkeySpec {
         if m == HKF_SHIFT {
             return if self.vk == VK_OEM_3 {
                 Err(
-                    "单带 Shift 的 ` 就是 ~，挂成全局键会连波浪号一起吞掉；要带就带 Ctrl、Alt 或 Win",
+                    crate::i18n::t("hotkey.err.shift_backtick"),
                 )
             } else {
-                Err("只带 Shift 的键都只是打字，不能当全局热键")
+                Err(crate::i18n::t("hotkey.err.shift_only"))
             };
         }
         if m == 0 {
@@ -1258,10 +1258,10 @@ impl HotkeySpec {
             return self
                 .backtick_bare()
                 .then_some(())
-                .ok_or("不带修饰键的全局热键只允许 ` 这一个键");
+                .ok_or(crate::i18n::t("hotkey.err.bare_only_backtick"));
         }
         if m & (HKF_CONTROL | HKF_ALT | HKF_WIN) == 0 {
-            return Err("这个键要当全局热键，至少得带 Ctrl、Alt 或 Win");
+            return Err(crate::i18n::t("hotkey.err.need_ctrl_alt_win"));
         }
         Ok(())
     }
@@ -1277,10 +1277,10 @@ impl HotkeySpec {
     pub fn check_typeback(&self, toggle: &HotkeySpec) -> Result<(), &'static str> {
         self.check()?;
         if self.mods_named() == 0 {
-            return Err("补字符热键必须带修饰键：不带修饰的话，吞掉字符的就换成它自己");
+            return Err(crate::i18n::t("hotkey.err.typeback_needs_mod"));
         }
         if (self.mods_named(), self.vk) == (toggle.mods_named(), toggle.vk) {
-            return Err("补字符热键不能和呼出热键是同一组：系统只会把它当成呼出键");
+            return Err(crate::i18n::t("hotkey.err.typeback_same_as_toggle"));
         }
         Ok(())
     }
@@ -1295,14 +1295,14 @@ impl HotkeySpec {
     ) -> Result<(), &'static str> {
         self.check()?;
         if self.mods_named() == 0 {
-            return Err("副呼出热键必须带修饰键：裸键会把那一颗键从全系统吞掉");
+            return Err(crate::i18n::t("hotkey.err.extra_needs_mod"));
         }
         if (self.mods_named(), self.vk) == (toggle.mods_named(), toggle.vk) {
-            return Err("副呼出热键不能和呼出热键是同一组：系统只会把它当成呼出键");
+            return Err(crate::i18n::t("hotkey.err.extra_same_as_toggle"));
         }
         if let Some(tb) = typeback {
             if (self.mods_named(), self.vk) == (tb.mods_named(), tb.vk) {
-                return Err("副呼出热键不能和补字符热键同一组：同组时系统只认先注册的那一个");
+                return Err(crate::i18n::t("hotkey.err.extra_same_as_typeback"));
             }
         }
         Ok(())
@@ -1322,20 +1322,20 @@ impl HotkeySpec {
         if self.mods_named() == 0 {
             // `check()` 只为裸 `` ` `` 开了口子，这里补上这一条：裸 `\` 压根过不了 check，
             // 但裸 `` ` `` 能过 ⇒ 判据得自己再说一遍，不依赖上游的例外集。
-            return Err("选中内容热键必须带修饰键：裸键会把那一颗键从全系统吞掉");
+            return Err(crate::i18n::t("hotkey.err.selection_needs_mod"));
         }
         let mine = (self.mods_named(), self.vk);
         if mine == (toggle.mods_named(), toggle.vk) {
-            return Err("选中内容热键不能和呼出热键是同一组：系统只会把它当成呼出键");
+            return Err(crate::i18n::t("hotkey.err.selection_same_as_toggle"));
         }
         if let Some(tb) = typeback {
             if mine == (tb.mods_named(), tb.vk) {
-                return Err("选中内容热键不能和补字符热键同一组：同组时系统只认先注册的那一个");
+                return Err(crate::i18n::t("hotkey.err.selection_same_as_typeback"));
             }
         }
         if let Some(ex) = extra {
             if mine == (ex.mods_named(), ex.vk) {
-                return Err("选中内容热键不能和副呼出热键同一组：同组时系统只认先注册的那一个");
+                return Err(crate::i18n::t("hotkey.err.selection_same_as_extra"));
             }
         }
         Ok(())
@@ -1364,24 +1364,24 @@ impl HotkeySpec {
             VK_A..=VK_Z | VK_0..=VK_9 | VK_SPACE | VK_RETURN | VK_OEM_3 | VK_OEM_5
         );
         if !(function || letterish) {
-            return Err("只收字母、数字、空格、回车、反引号 `、反斜杠 \\ 与 F1–F24");
+            return Err(crate::i18n::t("hotkey.err.allowed_chars"));
         }
         if m & HKF_WIN != 0 {
-            return Err("窗口内热键用不了 Win 键：egui 在 Windows 上不把 Win 传上来，设了也永远匹配不到");
+            return Err(crate::i18n::t("hotkey.err.secondary_no_win"));
         }
         if m & (HKF_CONTROL | HKF_ALT) == 0 {
-            return Err("窗口内热键必须带 Ctrl 或 Alt：裸键与单带 Shift 的键都只是打字，抢走就再也打不出来");
+            return Err(crate::i18n::t("hotkey.err.secondary_need_ctrl_alt"));
         }
         if (m, self.vk) == (toggle.mods_named(), toggle.vk) {
-            return Err("不能和全局呼出热键同一组：那个组合被系统整条吞掉，窗口里永远收不到");
+            return Err(crate::i18n::t("hotkey.err.secondary_same_as_toggle"));
         }
         if let Some(t) = typeback {
             if (m, self.vk) == (t.mods_named(), t.vk) {
-                return Err("不能和补字符热键同一组：那颗键要留给把字符还回去");
+                return Err(crate::i18n::t("hotkey.err.secondary_same_as_typeback"));
             }
         }
         if self.conflicts_local(local_table) {
-            return Err("这组键已被本程序的固定快捷键占用（完整键表见 ? 速查表）");
+            return Err(crate::i18n::t("hotkey.err.secondary_local_taken"));
         }
         Ok(())
     }
@@ -1494,8 +1494,9 @@ impl<'de> serde::Deserialize<'de> for SpaceRun {
         use serde::de::Error;
         match SpaceRunWire::deserialize(d)? {
             SpaceRunWire::Legacy(b) => Ok(if b { Self::Always } else { Self::Off }),
-            SpaceRunWire::Name(n) => Self::from_name(&n)
-                .ok_or_else(|| D::Error::custom(format!("未知的 space_to_run 档位：{n:?}"))),
+            SpaceRunWire::Name(n) => Self::from_name(&n).ok_or_else(|| {
+                D::Error::custom(crate::i18n::tfmt("config.err.unknown_space_run", &[&n]))
+            }),
         }
     }
 }
@@ -1630,10 +1631,10 @@ impl SecondaryAction {
 
     /// 设置页单选用的显示名。
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Shortcut => "快捷键版",
-            Self::Panel => "面板版",
-        }
+        crate::i18n::t(match self {
+            Self::Shortcut => "secondary.shortcut",
+            Self::Panel => "secondary.panel",
+        })
     }
 }
 
@@ -1663,10 +1664,10 @@ impl Scope {
 
     /// 设置页单选用的显示名。
     pub fn label(self) -> &'static str {
-        match self {
-            Self::All => "全部",
-            Self::Basic => "基本",
-        }
+        crate::i18n::t(match self {
+            Self::All => "scope.all",
+            Self::Basic => "scope.basic",
+        })
     }
 }
 
@@ -1697,11 +1698,11 @@ impl ShowOn {
 
     /// 设置页单选的显示名。
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Mouse => "鼠标所在屏",
-            Self::Primary => "主屏",
-            Self::Active => "活动窗口所在屏",
-        }
+        crate::i18n::t(match self {
+            Self::Mouse => "show_on.mouse",
+            Self::Primary => "show_on.primary",
+            Self::Active => "show_on.active",
+        })
     }
 }
 
@@ -1798,11 +1799,11 @@ impl DataSource for AppsSource {
     }
 
     fn label(&self) -> &'static str {
-        "应用程序清单"
+        crate::i18n::t("source.apps.label")
     }
 
     fn note(&self) -> &'static str {
-        "主清单的模糊匹配（名称 / 关键字 / 学习别名）。关掉之后清单里一条都搜不出来，只剩计算器、文件、网页这些头段。"
+        crate::i18n::t("source.apps.note")
     }
 
     fn rows(&mut self, cx: &mut SearchCtx<'_>) -> Vec<usize> {
@@ -2546,14 +2547,14 @@ pub struct ScopeTagHint {
 impl ScopeTagHint {
     pub fn from_counts(counts: &std::collections::BTreeMap<String, usize>) -> Self {
         let title = if counts.is_empty() {
-            "还没有分类".to_string()
+            crate::i18n::t("scope.hint_empty").to_string()
         } else {
             let list: Vec<String> = counts.iter().map(|(k, v)| format!("{k} {v}")).collect();
-            format!("分类：{}", list.join(" · "))
+            crate::i18n::tfmt("scope.hint_title", &[&list.join(" · ")])
         };
         Self {
             title,
-            subtitle: "敲 @分类 只看这一类（@维护 @开发 并集），@ 是分类总览".to_string(),
+            subtitle: crate::i18n::t("scope.hint_subtitle").to_string(),
         }
     }
 }
@@ -3313,28 +3314,27 @@ pub fn sendto_installed() -> bool {
 /// 关闭开关=删除 SendTo 入口。**只删自己创建的**（需求书安全规则）：
 /// 解析失败或 target 不是本 exe 一律拒删并说明；不存在则视为已关闭。
 pub fn uninstall_sendto() -> Result<String, String> {
-    let link = sendto_link_path().ok_or("缺 APPDATA 环境变量")?;
+    let link = sendto_link_path().ok_or(crate::i18n::t("lnk.err.no_appdata"))?;
     if !link.exists() {
-        return Ok("SendTo 入口本就不存在，无需删除".to_string());
+        return Ok(crate::i18n::t("sendto.none_to_remove").to_string());
     }
     let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe 失败: {e}"))?
+        .map_err(|e| crate::i18n::tfmt("lnk.err.current_exe", &[&e]))?
         .to_string_lossy()
         .into_owned();
-    let dir = link.parent().ok_or("SendTo 路径异常")?.to_path_buf();
+    let dir = link.parent().ok_or(crate::i18n::t("sendto.err.bad_path"))?.to_path_buf();
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let r = (|| -> Result<String, String> {
         let (target, args) =
-            unsafe { read_link_target(&link) }.ok_or("解析既有 .lnk 失败，无法确认归属，未删除")?;
+            unsafe { read_link_target(&link) }.ok_or(crate::i18n::t("lnk.err.unparsed"))?;
         if !(target == exe && (args.trim().is_empty() || args.trim() == "%1")) {
-            return Err(format!(
-                "「{}」不是本程序创建的，按安全规则不删除",
-                link.file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            ));
+            let name = link
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Err(crate::i18n::tfmt("sendto.not_ours", &[&name]));
         }
-        std::fs::remove_file(&link).map_err(|e| format!("删除失败: {e}"))?;
+        std::fs::remove_file(&link).map_err(|e| crate::i18n::tfmt("lnk.err.delete", &[&e]))?;
         let witem = wide_null(&link.to_string_lossy());
         let wdir = wide_null(&dir.to_string_lossy());
         unsafe {
@@ -3351,7 +3351,7 @@ pub fn uninstall_sendto() -> Result<String, String> {
                 None,
             );
         }
-        Ok("SendTo 入口已删除（归属已验证）".to_string())
+        Ok(crate::i18n::t("sendto.removed").to_string())
     })();
     if hr.is_ok() {
         unsafe { CoUninitialize() };
@@ -3371,12 +3371,12 @@ pub fn spawn_sendto_install(tx: mpsc::Sender<Result<String, String>>) {
 
 fn install_sendto_link() -> Result<String, String> {
     let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe 失败: {e}"))?
+        .map_err(|e| crate::i18n::tfmt("lnk.err.current_exe", &[&e]))?
         .to_string_lossy()
         .into_owned();
-    let appdata = std::env::var_os("APPDATA").ok_or("缺 APPDATA 环境变量")?;
+    let appdata = std::env::var_os("APPDATA").ok_or(crate::i18n::t("lnk.err.no_appdata"))?;
     let dir = Path::new(&appdata).join(r"Microsoft\Windows\SendTo");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建 SendTo 目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| crate::i18n::tfmt("sendto.err.mkdir", &[&e]))?;
     // 菜单显示名=文件名去后缀，定名 egui-launcher（对齐 FR-SRC-20「发送到 egui-launcher」口径）。
     let link_path = dir.join(SENDTO_LINK_NAME);
 
@@ -3433,15 +3433,15 @@ unsafe fn write_sendto_link(exe: &str, link_path: &Path) -> Result<String, Strin
         if link_path.exists() {
             if let Some((target, args)) = read_link_target(link_path) {
                 if target == exe && args.trim().is_empty() {
-                    return Ok(format!(
-                        "SendTo 入口已存在且未变化，未重写: {}",
-                        link_path.display()
+                    return Ok(crate::i18n::tfmt(
+                        "sendto.unchanged",
+                        &[&link_path.display()],
                     ));
                 }
             }
         }
         let shell: IShellLinkW = CoCreateInstance(&CLSID_SHELL_LINK, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| format!("CoCreateInstance(ShellLink) 失败: {e}"))?;
+            .map_err(|e| crate::i18n::tfmt("lnk.err.cocreate", &[&e]))?;
         let wexe = wide_null(exe);
         shell
             .SetPath(PCWSTR(wexe.as_ptr()))
@@ -3449,7 +3449,7 @@ unsafe fn write_sendto_link(exe: &str, link_path: &Path) -> Result<String, Strin
         shell
             .SetIconLocation(PCWSTR(wexe.as_ptr()), 0)
             .map_err(|e| format!("SetIconLocation: {e}"))?;
-        let wdesc = wide_null("添加到 egui-launcher 快捷项");
+        let wdesc = wide_null(crate::i18n::t("sendto.link_desc"));
         shell
             .SetDescription(PCWSTR(wdesc.as_ptr()))
             .map_err(|e| format!("SetDescription: {e}"))?;
@@ -3459,9 +3459,9 @@ unsafe fn write_sendto_link(exe: &str, link_path: &Path) -> Result<String, Strin
         let wlink = wide_null(&link_path.to_string_lossy());
         pf.Save(PCWSTR(wlink.as_ptr()), true)
             .map_err(|e| format!("Save: {e}"))?;
-        Ok(format!(
-            "SendTo 入口已安装：右键文件 → 发送到 → 「egui-launcher」（{}）",
-            link_path.display()
+        Ok(crate::i18n::tfmt(
+            "sendto.installed",
+            &[&link_path.display()],
         ))
     }
 }
@@ -3532,30 +3532,29 @@ pub fn startup_installed() -> bool {
 
 /// 关闭开关=删除启动夹入口。解析不出归属一律拒删。
 pub fn uninstall_startup() -> Result<String, String> {
-    let link = startup_link_path().ok_or("缺 APPDATA 环境变量")?;
+    let link = startup_link_path().ok_or(crate::i18n::t("lnk.err.no_appdata"))?;
     if !link.exists() {
-        return Ok("开机自启入口本就不存在，无需删除".to_string());
+        return Ok(crate::i18n::t("startup.none_to_remove").to_string());
     }
     let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe 失败: {e}"))?
+        .map_err(|e| crate::i18n::tfmt("lnk.err.current_exe", &[&e]))?
         .to_string_lossy()
         .into_owned();
-    let dir = link.parent().ok_or("启动夹路径异常")?.to_path_buf();
+    let dir = link.parent().ok_or(crate::i18n::t("startup.err.bad_path"))?.to_path_buf();
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let r = (|| -> Result<String, String> {
         let (target, args) =
-            unsafe { read_link_target(&link) }.ok_or("解析既有 .lnk 失败，无法确认归属，未删除")?;
+            unsafe { read_link_target(&link) }.ok_or(crate::i18n::t("lnk.err.unparsed"))?;
         if !is_our_startup_link(&exe, &target, &args) {
-            return Err(format!(
-                "「{}」（target={target} 参数={args}）不是本程序创建的开机自启项，按安全规则不删除",
-                link.file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            ));
+            let name = link
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Err(crate::i18n::tfmt("startup.not_ours", &[&name]));
         }
-        std::fs::remove_file(&link).map_err(|e| format!("删除失败: {e}"))?;
+        std::fs::remove_file(&link).map_err(|e| crate::i18n::tfmt("lnk.err.delete", &[&e]))?;
         notify_shell(&link, &dir);
-        Ok("开机自启项已删除（归属已验证）".to_string())
+        Ok(crate::i18n::t("startup.removed").to_string())
     })();
     if hr.is_ok() {
         unsafe { CoUninitialize() };
@@ -3573,12 +3572,12 @@ pub fn spawn_startup_install(tx: mpsc::Sender<Result<String, String>>) {
 
 fn install_startup_link() -> Result<String, String> {
     let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe 失败: {e}"))?
+        .map_err(|e| crate::i18n::tfmt("lnk.err.current_exe", &[&e]))?
         .to_string_lossy()
         .into_owned();
-    let appdata = std::env::var_os("APPDATA").ok_or("缺 APPDATA 环境变量")?;
+    let appdata = std::env::var_os("APPDATA").ok_or(crate::i18n::t("lnk.err.no_appdata"))?;
     let dir = Path::new(&appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建启动夹目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| crate::i18n::tfmt("startup.err.mkdir", &[&e]))?;
     let link_path = dir.join(STARTUP_LINK_NAME);
 
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -3618,15 +3617,15 @@ unsafe fn write_startup_link(exe: &str, link_path: &Path) -> Result<String, Stri
         if link_path.exists() {
             if let Some((target, args)) = read_link_target(link_path) {
                 if is_our_startup_link(exe, &target, &args) {
-                    return Ok(format!(
-                        "开机自启项已存在且未变化，未重写: {}",
-                        link_path.display()
+                    return Ok(crate::i18n::tfmt(
+                        "startup.unchanged",
+                        &[&link_path.display()],
                     ));
                 }
             }
         }
         let shell: IShellLinkW = CoCreateInstance(&CLSID_SHELL_LINK, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| format!("CoCreateInstance(ShellLink) 失败: {e}"))?;
+            .map_err(|e| crate::i18n::tfmt("lnk.err.cocreate", &[&e]))?;
         let wexe = wide_null(exe);
         shell
             .SetPath(PCWSTR(wexe.as_ptr()))
@@ -3638,7 +3637,7 @@ unsafe fn write_startup_link(exe: &str, link_path: &Path) -> Result<String, Stri
         shell
             .SetIconLocation(PCWSTR(wexe.as_ptr()), 0)
             .map_err(|e| format!("SetIconLocation: {e}"))?;
-        let wdesc = wide_null("登录时静默启动 egui-launcher（不弹窗口）");
+        let wdesc = wide_null(crate::i18n::t("startup.link_desc"));
         shell
             .SetDescription(PCWSTR(wdesc.as_ptr()))
             .map_err(|e| format!("SetDescription: {e}"))?;
@@ -3648,9 +3647,9 @@ unsafe fn write_startup_link(exe: &str, link_path: &Path) -> Result<String, Stri
         let wlink = wide_null(&link_path.to_string_lossy());
         pf.Save(PCWSTR(wlink.as_ptr()), true)
             .map_err(|e| format!("Save: {e}"))?;
-        Ok(format!(
-            "开机自启项已写入：{}（参数 {STARTUP_ARGS}，登录后托盘常驻、不弹窗口）",
-            link_path.display()
+        Ok(crate::i18n::tfmt(
+            "startup.installed",
+            &[&link_path.display(), &STARTUP_ARGS],
         ))
     }
 }

@@ -397,23 +397,23 @@ struct DownloadFaults {
 /// 太大 > 全连不上 > 全都不是图片 > 全都没有 > 混杂（把三类都摊开）。
 fn failure_message(f: DownloadFaults) -> String {
     if f.tried == 0 {
-        return "站点上没有可用的图标地址".to_string();
+        return crate::i18n::t("icon.err.no_address").to_string();
     }
     if f.too_big > 0 {
-        return format!("图标超过 1 MB（试了 {} 个地址）", f.tried);
+        return crate::i18n::tfmt("icon.err.too_big", &[&f.tried]);
     }
     if f.unreachable == f.tried {
-        return format!("连不上这个站点（试了 {} 个地址，检查网络或代理）", f.tried);
+        return crate::i18n::tfmt("icon.err.unreachable", &[&f.tried]);
     }
     if f.not_image == f.tried {
-        return "站点给的图标不是图片（认不出 PNG/ICO/JPG/GIF/BMP）".to_string();
+        return crate::i18n::t("icon.err.not_image").to_string();
     }
     if f.missing == f.tried {
-        return format!("站点上没找到能用的图标（{} 个地址都没有）", f.tried);
+        return crate::i18n::tfmt("icon.err.missing", &[&f.tried]);
     }
-    format!(
-        "没找到能用的图标（{} 个地址：{} 个没有、{} 个连不上、{} 个不是图片）",
-        f.tried, f.missing, f.unreachable, f.not_image
+    crate::i18n::tfmt(
+        "icon.err.mixed",
+        &[&f.tried, &f.missing, &f.unreachable, &f.not_image],
     )
 }
 
@@ -431,7 +431,7 @@ pub fn download_icon(
     fetch: Fetcher<'_>,
 ) -> Result<DownloadedIcon, String> {
     let page = fill_for_icon(address);
-    let origin = origin_of(&page).ok_or_else(|| "不是网页地址（要 http:// 或 https:// 开头）".to_string())?;
+    let origin = origin_of(&page).ok_or_else(|| crate::i18n::t("icon.err.not_web_address").to_string())?;
 
     let mut candidates: Vec<String> = Vec::new();
     if let Ok(reply) = fetch(&format!("{origin}/"), MAX_PAGE_BYTES) {
@@ -472,14 +472,14 @@ pub fn download_icon(
             continue;
         }
         let folder = data_dir.join("Icons");
-        std::fs::create_dir_all(&folder).map_err(|e| format!("建不了 Icons 目录：{e}"))?;
+        std::fs::create_dir_all(&folder).map_err(|e| crate::i18n::tfmt("icon.err.mkdir", &[&e]))?;
         // 同名而格式不同的旧图标先删掉——否则 `Icons\g.png` 与 `Icons\g.ico` 会同时躺着，
         // 换一条引擎时谁也说不清现在用的是哪张。
         for old in ["png", "ico", "jpg", "gif", "bmp"] {
             let _ = std::fs::remove_file(folder.join(format!("{name}.{old}")));
         }
         std::fs::write(folder.join(format!("{name}.{ext}")), &reply.body)
-            .map_err(|e| format!("写不了图标文件：{e}"))?;
+            .map_err(|e| crate::i18n::tfmt("icon.err.write", &[&e]))?;
         return Ok(DownloadedIcon {
             relative: format!("Icons\\{name}.{ext}"),
             ext: ext.to_string(),

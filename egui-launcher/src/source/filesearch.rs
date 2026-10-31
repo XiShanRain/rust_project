@@ -374,8 +374,8 @@ impl FileSource {
                     return Some(vec![SourceRow::Hint(
                         crate::source::websearch::EngineHint {
                             engine_id: "filesearch".to_string(),
-                            title: "文件索引建立中".to_string(),
-                            subtitle: "首次扫描正在后台进行，稍后再试一次".to_string(),
+                            title: crate::i18n::t("filesearch.indexing_title").to_string(),
+                            subtitle: crate::i18n::t("filesearch.indexing_subtitle").to_string(),
                             completion: String::new(),
                         },
                     )]);
@@ -405,11 +405,11 @@ impl DataSource for FileSource {
     }
 
     fn label(&self) -> &'static str {
-        "文件搜索"
+        crate::i18n::t("source.files.label")
     }
 
     fn note(&self) -> &'static str {
-        "`'词`、空格开头、`open|find|file|folder|doc|pic…` 与路径形态会独占列表。关掉之后这些输入回到普通搜索（不起索引、不读磁盘）。"
+        crate::i18n::t("source.files.note")
     }
 
     fn init(&mut self) {

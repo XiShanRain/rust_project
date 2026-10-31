@@ -43,36 +43,45 @@ pub struct SystemFacts {
 
 /// 排版成一段纯文本。行序固定、每行 `标签：值`，用户整段粘出去即可。
 pub fn build_report(f: &SystemFacts) -> String {
+    use crate::i18n::{t, tfmt};
     let mut out = String::new();
-    out.push_str(&format!(
-        "egui Launcher {} · {} 构建\n",
-        f.version, f.build_kind
-    ));
-    out.push_str(&format!("日志级别：{}\n", f.log_level));
-    out.push_str(&format!("系统：{}\n", f.os));
-    out.push_str(&format!("架构：{}\n", f.arch));
-    out.push_str(&format!("渲染：{}\n", f.backend));
-    out.push_str(&format!("缩放：{}\n", f.dpi));
-    out.push_str(&format!("外观：{}\n", f.appearance));
-    out.push_str("路径：\n");
+    out.push_str(&tfmt("sysinfo.header", &[&f.version, &f.build_kind]));
+    out.push('\n');
+    for (key, value) in [
+        ("sysinfo.log_level", &f.log_level),
+        ("sysinfo.os", &f.os),
+        ("sysinfo.arch", &f.arch),
+        ("sysinfo.backend_line", &f.backend),
+        ("sysinfo.dpi", &f.dpi),
+        ("sysinfo.appearance", &f.appearance),
+    ] {
+        out.push_str(&tfmt(key, &[value]));
+        out.push('\n');
+    }
+    out.push_str(t("sysinfo.paths"));
+    out.push('\n');
     for (label, value) in &f.paths {
         out.push_str(&format!("  {label} {value}\n"));
     }
+    let sep = t("sysinfo.sep");
     let counts = f
         .counts
         .iter()
         .map(|(label, n)| format!("{label} {n}"))
         .collect::<Vec<_>>()
-        .join("｜");
-    out.push_str(&format!("计数：{counts}\n"));
-    out.push_str(&format!("数据源：{}\n", f.sources));
+        .join(sep);
+    out.push_str(&tfmt("sysinfo.counts", &[&counts]));
+    out.push('\n');
+    out.push_str(&tfmt("sysinfo.sources", &[&f.sources]));
+    out.push('\n');
     let hotkeys = f
         .hotkeys
         .iter()
         .map(|(label, key)| format!("{label} {key}"))
         .collect::<Vec<_>>()
-        .join("｜");
-    out.push_str(&format!("热键：{hotkeys}\n"));
+        .join(sep);
+    out.push_str(&tfmt("sysinfo.hotkeys", &[&hotkeys]));
+    out.push('\n');
     out
 }
 
@@ -176,7 +185,7 @@ pub fn os_version() -> String {
     let build = reg_string("CurrentBuildNumber");
     let ubr = reg_u32("UBR");
     if name.is_none() && build.is_none() {
-        return "Windows（版本未知）".to_string();
+        return crate::i18n::t("sysinfo.no_version").to_string();
     }
     let mut head = name.unwrap_or_else(|| "Windows".to_string());
     if let Some(v) = display {
@@ -184,8 +193,8 @@ pub fn os_version() -> String {
         head.push_str(&v);
     }
     match (build, ubr) {
-        (Some(b), Some(u)) => format!("{head}（构建 {b}.{u}）"),
-        (Some(b), None) => format!("{head}（构建 {b}）"),
+        (Some(b), Some(u)) => crate::i18n::tfmt("sysinfo.build_ubr", &[&head, &b, &u]),
+        (Some(b), None) => crate::i18n::tfmt("sysinfo.build", &[&head, &b]),
         _ => head,
     }
 }

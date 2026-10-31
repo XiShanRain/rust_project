@@ -235,9 +235,12 @@ pub fn evaluate(raw: &str, today: i64) -> Option<CalcHit> {
     let mut hit = format_value(parse(&toks)?)?;
     if let Some((v, _)) = radix_only(&toks) {
         let n = v as i64;
-        hit.subtitle = format!("十六进制 {n:X} · 八进制 {n:o} · 二进制 {n:b}");
+        hit.subtitle = crate::i18n::tfmt(
+            "calc.radix_subtitle",
+            &[&format!("{n:X}"), &format!("{n:o}"), &format!("{n:b}")],
+        );
     } else if hit.subtitle.is_empty() {
-        hit.subtitle = format!("{ROW_TAG} · Enter 复制数字");
+        hit.subtitle = crate::i18n::tfmt("calc.subtitle", &[&row_tag()]);
     }
     Some(hit)
 }
@@ -749,12 +752,14 @@ fn format_value(v: Val) -> Option<CalcHit> {
             // 单位一律写在副标题，标题与 copy 只有数字（FR-SRC-10「Enter 复制纯数字」）。
             let subtitle = match unit.dim {
                 Dim::Temp => format!("{} {}", fmt_num(disp, false), disp_sym(unit.sym)),
-                _ => format!(
-                    "{} {} ＝ {} {}",
-                    fmt_num(disp, true),
-                    disp_sym(unit.sym),
-                    fmt_num(base, true),
-                    unit.base_sym()
+                _ => crate::i18n::tfmt(
+                    "calc.convert_subtitle",
+                    &[
+                        &fmt_num(disp, true),
+                        &disp_sym(unit.sym),
+                        &fmt_num(base, true),
+                        &unit.base_sym(),
+                    ],
                 ),
             };
             Some(CalcHit {
@@ -814,9 +819,17 @@ fn group_thousands(digits: &str) -> String {
 }
 
 fn weekday_name(d: i64) -> &'static str {
-    const NAMES: [&str; 7] = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+    const KEYS: [&str; 7] = [
+        "calc.weekday.mon",
+        "calc.weekday.tue",
+        "calc.weekday.wed",
+        "calc.weekday.thu",
+        "calc.weekday.fri",
+        "calc.weekday.sat",
+        "calc.weekday.sun",
+    ];
     // 日序 0 是 1970-01-01（周四）⇒ 偏移 3 才让 0 落在周一这一格
-    NAMES[(d + 3).rem_euclid(7) as usize]
+    crate::i18n::t(KEYS[(d + 3).rem_euclid(7) as usize])
 }
 
 // ---------------------------------------------------------------- 公历换算
@@ -884,7 +897,9 @@ pub fn today_day() -> i64 {
 }
 
 /// 结果行标题右侧的固定标识（界面上一眼看出这行不是快捷项）。
-pub const ROW_TAG: &str = "计算器";
+pub fn row_tag() -> &'static str {
+    crate::i18n::t("calc.row_tag")
+}
 
 /// 批次 A10：把本模块接进数据源注册表。只贡献头段一行（不出结果集）。
 #[derive(Debug, Default)]
@@ -896,11 +911,11 @@ impl DataSource for CalcSource {
     }
 
     fn label(&self) -> &'static str {
-        "计算器"
+        crate::i18n::t("source.calc.label")
     }
 
     fn note(&self) -> &'static str {
-        "查询能求成一个数时在列表头段加一行（`1+2`、`100 usd`、`today+3`），`Enter` 复制结果。关掉之后这些查询回到普通搜索。"
+        crate::i18n::t("source.calc.note")
     }
 
     fn head(&mut self, cx: &mut SearchCtx<'_>) -> Vec<SourceRow> {

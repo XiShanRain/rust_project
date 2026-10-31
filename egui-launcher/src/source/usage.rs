@@ -73,15 +73,15 @@ impl Bucket {
     }
 
     pub fn label(self) -> &'static str {
-        match self {
-            Bucket::Item => "清单项",
-            Bucket::Internal => "系统命令",
-            Bucket::Calc => "计算器",
-            Bucket::Web => "网页搜索",
-            Bucket::Custom => "自定义命令",
-            Bucket::File => "文件与目录",
-            Bucket::Terminal => "终端命令",
-        }
+        crate::i18n::t(match self {
+            Bucket::Item => "usage.bucket.item",
+            Bucket::Internal => "usage.bucket.internal",
+            Bucket::Calc => "usage.bucket.calc",
+            Bucket::Web => "usage.bucket.web",
+            Bucket::Custom => "usage.bucket.custom",
+            Bucket::File => "usage.bucket.file",
+            Bucket::Terminal => "usage.bucket.terminal",
+        })
     }
 }
 

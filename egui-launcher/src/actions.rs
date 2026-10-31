@@ -109,7 +109,7 @@ pub struct PanelTarget {
 impl PanelTarget {
     /// 面板顶栏那句提示（FR-ACT-03 原文「输入框清空并显示"关于〈项标题〉的操作"」）。
     pub fn banner(&self) -> String {
-        format!("关于「{}」的操作", self.title)
+        crate::i18n::tfmt("panel.banner", &[&self.title])
     }
 
     /// 「复制名称」的内容：标题为空时退回路径末段（头段行的标题就是文件名，一般非空）。
@@ -304,35 +304,39 @@ pub fn subject_for(kind: ItemKind, path: &str, is_dir: bool) -> Subject {
 pub fn batch_actions(t: &PanelTarget) -> Vec<Action> {
     let n = t.batch.len();
     let mut out = Vec::new();
-    out.push(row(ActionId::OpenAll, &format!("依次打开这 {n} 项"), "Enter"));
+    out.push(row(
+        ActionId::OpenAll,
+        &crate::i18n::tfmt("panel.sub.open_all", &[&n]),
+        "Enter",
+    ));
     out.push(row(
         ActionId::CopyFiles,
-        "以文件对象放进剪贴板，可在资源管理器粘贴",
+        crate::i18n::t("panel.sub.copy_files"),
         "",
     ));
     out.push(row(
         ActionId::CutFiles,
-        "粘贴时把原件移走（会写剪切标记）",
+        crate::i18n::t("panel.sub.cut_files"),
         "",
     ));
     out.push(row(
         ActionId::CopyPaths,
-        &format!("{n} 条路径，每行一条"),
+        &crate::i18n::tfmt("panel.sub.copy_paths", &[&n]),
         "",
     ));
     out.push(row(
         ActionId::CopyTo,
-        "选一个文件夹，把这一批复制过去",
+        crate::i18n::t("panel.sub.copy_to"),
         "",
     ));
     out.push(row(
         ActionId::AddAll,
-        "每一项存成一条快捷命令（已有的跳过）",
+        crate::i18n::t("panel.sub.add_all"),
         "",
     ));
     out.push(row(
         ActionId::RecycleAll,
-        "移入回收站（可还原），执行前再确认一次",
+        crate::i18n::t("panel.sub.recycle_all"),
         "",
     ));
     out
@@ -352,13 +356,21 @@ pub fn batch_actions(t: &PanelTarget) -> Vec<Action> {
 fn text_actions(t: &PanelTarget) -> Vec<Action> {
     let n = t.path.chars().count();
     vec![
-        row(ActionId::CopyText, "只带这一串值，与 Enter 同一条", "Enter"),
+        row(
+            ActionId::CopyText,
+            crate::i18n::t("panel.sub.copy_text"),
+            "Enter",
+        ),
         row(
             ActionId::PasteText,
-            &format!("打进呼出前的那个窗口，不碰你的剪贴板（{n} 个字符）"),
+            &crate::i18n::tfmt("panel.sub.paste_text", &[&n]),
             "",
         ),
-        row(ActionId::LargeType, "铺满屏幕中央放大显示", "Ctrl+L"),
+        row(
+            ActionId::LargeType,
+            crate::i18n::t("panel.sub.large_type"),
+            "Ctrl+L",
+        ),
     ]
 }
 
@@ -385,7 +397,11 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
     let on_disk = fs && (file_like || dir_like);
 
     let mut out = Vec::new();
-    out.push(row(ActionId::Open, "启动器照常执行它", "Enter"));
+    out.push(row(
+        ActionId::Open,
+        crate::i18n::t("panel.sub.open"),
+        "Enter",
+    ));
 
     // 以管理员运行。两条通道：① 真实可执行文件（文件行、指向全路径的应用条目）；
     // ② 应用/命令条目整体——出厂命令大多是裸名（`calc.exe`、`notepad.exe`），本程序不做
@@ -397,11 +413,15 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
             Subject::Url | Subject::StoreApp | Subject::Namespace
         );
     if runnable && (t.subject == Subject::App || (on_disk && can_elevate(&t.path))) {
-        out.push(row(ActionId::RunAs, "弹 UAC 提权后运行", ""));
+        out.push(row(ActionId::RunAs, crate::i18n::t("panel.sub.run_as"), ""));
     }
     // 打开方式：`OpenAs_RunDLL` 是给文件用的；AHK 同样要求此刻真的存在。
     if on_disk && !dir_like && t.exists {
-        out.push(row(ActionId::OpenWith, "系统的「打开方式」对话框", ""));
+        out.push(row(
+            ActionId::OpenWith,
+            crate::i18n::t("panel.sub.open_with"),
+            "",
+        ));
     }
     if on_disk {
         out.push(row(ActionId::Reveal, &display_path(t), "Ctrl+D"));
@@ -424,12 +444,12 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
         // 本程序没有那个上下文 ⇒ 单行版仍只有批量面板那条「复制到…」（FR-ACT-05 偏差①已登记）。
         out.push(row(
             ActionId::CopyFiles,
-            "以文件对象放进剪贴板，可在资源管理器粘贴",
+            crate::i18n::t("panel.sub.copy_files"),
             "",
         ));
         out.push(row(
             ActionId::CutFiles,
-            "粘贴时把原件移走（会写剪切标记）",
+            crate::i18n::t("panel.sub.cut_files"),
             "",
         ));
         let dir = if dir_like {
@@ -437,21 +457,47 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
         } else {
             parent_dir(&t.path)
         };
-        out.push(row(ActionId::OpenTerminal, &format!("在该目录开终端：{dir}"), ""));
-        out.push(row(ActionId::Properties, "系统的属性对话框", ""));
+        out.push(row(
+            ActionId::OpenTerminal,
+            &crate::i18n::tfmt("panel.sub.open_terminal", &[&dir]),
+            "",
+        ));
+        out.push(row(
+            ActionId::Properties,
+            crate::i18n::t("panel.sub.properties"),
+            "",
+        ));
         if !is_path_root(&t.path) {
-            out.push(row(ActionId::Recycle, "移入回收站（可从回收站还原）", ""));
+            out.push(row(
+                ActionId::Recycle,
+                crate::i18n::t("panel.sub.recycle"),
+                "",
+            ));
         }
     }
 
     // 尾部：编辑/新增、删除、置顶、大字显示（AHK 的收尾顺序）。
     if t.editable {
-        out.push(row(ActionId::Edit, "改名称、目标与别名", "Ctrl+E"));
-        out.push(row(ActionId::Delete, "删除前会再确认一次", "Ctrl+Shift+D"));
+        out.push(row(
+            ActionId::Edit,
+            crate::i18n::t("panel.sub.edit"),
+            "Ctrl+E",
+        ));
+        out.push(row(
+            ActionId::Delete,
+            crate::i18n::t("panel.sub.delete"),
+            "Ctrl+Shift+D",
+        ));
         let (label, sub) = if t.pinned {
-            ("取消置顶", "回到按学习排序的位置")
+            (
+                crate::i18n::t("panel.sub.unpin_label"),
+                crate::i18n::t("panel.sub.unpin"),
+            )
         } else {
-            ("置顶", "恒排在结果前列（图标右上角角标）")
+            (
+                crate::i18n::t("panel.sub.pin_label"),
+                crate::i18n::t("panel.sub.pin"),
+            )
         };
         out.push(Action {
             id: ActionId::TogglePin,
@@ -461,9 +507,17 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
         });
     } else if t.subject != Subject::Internal {
         // 头段行（文件行 / 搜索行）没有可编辑的条目，给用户一条「存成命令」的通道。
-        out.push(row(ActionId::AddCommand, "把它存成一条快捷命令", "Ctrl+Shift+N"));
+        out.push(row(
+            ActionId::AddCommand,
+            crate::i18n::t("panel.sub.add_command"),
+            "Ctrl+Shift+N",
+        ));
     }
-    out.push(row(ActionId::LargeType, "铺满屏幕中央放大显示", "Ctrl+L"));
+    out.push(row(
+        ActionId::LargeType,
+        crate::i18n::t("panel.sub.large_type"),
+        "Ctrl+L",
+    ));
     out
 }
 
@@ -509,37 +563,37 @@ impl ActionId {
     /// 面板里的标题。置顶的正反两态在 [`actions_for`] 里直接产出文案，所以这里只给
     /// 「当前未置顶」那一句。
     pub fn label(self) -> &'static str {
-        match self {
-            ActionId::Open => "打开",
-            ActionId::RunAs => "以管理员运行",
-            ActionId::OpenWith => "打开方式…",
-            ActionId::Reveal => "所在位置",
-            ActionId::CopyPath => "复制路径",
-            ActionId::CopyUrl => "复制网址",
-            ActionId::CopyName => "复制名称",
-            ActionId::OpenTerminal => "在终端打开",
-            ActionId::Properties => "属性",
-            ActionId::Recycle => "移入回收站",
-            ActionId::Edit => "编辑",
-            ActionId::AddCommand => "添加为命令",
-            ActionId::Delete => "删除",
-            ActionId::TogglePin => "置顶",
-            ActionId::LargeType => "大字显示",
-            ActionId::OpenAll => "全部打开",
-            ActionId::CopyFiles => "复制文件",
-            ActionId::CutFiles => "剪切文件",
-            ActionId::CopyPaths => "复制全部路径",
-            ActionId::CopyTo => "复制到…",
-            ActionId::AddAll => "全部加入命令",
-            ActionId::RecycleAll => "全部回收站",
-            ActionId::PasteText => "粘贴到原窗口",
-            ActionId::CopyText => "复制这一串",
-        }
+        crate::i18n::t(match self {
+            ActionId::Open => "action.open.label",
+            ActionId::RunAs => "action.run_as.label",
+            ActionId::OpenWith => "action.open_with.label",
+            ActionId::Reveal => "action.reveal.label",
+            ActionId::CopyPath => "action.copy_path.label",
+            ActionId::CopyUrl => "action.copy_url.label",
+            ActionId::CopyName => "action.copy_name.label",
+            ActionId::OpenTerminal => "action.open_terminal.label",
+            ActionId::Properties => "action.properties.label",
+            ActionId::Recycle => "action.recycle.label",
+            ActionId::Edit => "action.edit.label",
+            ActionId::AddCommand => "action.add_command.label",
+            ActionId::Delete => "action.delete.label",
+            ActionId::TogglePin => "action.pin.label",
+            ActionId::LargeType => "action.large_type.label",
+            ActionId::OpenAll => "action.open_all.label",
+            ActionId::CopyFiles => "action.copy_files.label",
+            ActionId::CutFiles => "action.cut_files.label",
+            ActionId::CopyPaths => "action.copy_paths.label",
+            ActionId::CopyTo => "action.copy_to.label",
+            ActionId::AddAll => "action.add_all.label",
+            ActionId::RecycleAll => "action.recycle_all.label",
+            ActionId::PasteText => "action.paste_text.label",
+            ActionId::CopyText => "action.copy_text.label",
+        })
     }
 
     /// 行首徽标词（与结果行的「打开 / 复制 / 搜索」同一口径）。
     pub fn badge(self) -> &'static str {
-        match self {
+        crate::i18n::t(match self {
             ActionId::Open
             | ActionId::RunAs
             | ActionId::OpenWith
@@ -548,19 +602,19 @@ impl ActionId {
             | ActionId::Properties
             | ActionId::Edit
             | ActionId::AddCommand
-            | ActionId::LargeType => "执行",
-            ActionId::CopyPath | ActionId::CopyUrl | ActionId::CopyName => "复制",
-            ActionId::CopyText => "复制",
-            ActionId::PasteText => "粘贴",
-            ActionId::Delete => "删除",
-            ActionId::Recycle => "回收",
-            ActionId::TogglePin => "置顶",
-            ActionId::OpenAll | ActionId::AddAll => "执行",
-            ActionId::CopyFiles | ActionId::CopyTo => "复制",
-            ActionId::CutFiles => "剪切",
-            ActionId::CopyPaths => "复制",
-            ActionId::RecycleAll => "回收",
-        }
+            | ActionId::LargeType => "action.badge.run",
+            ActionId::CopyPath | ActionId::CopyUrl | ActionId::CopyName => "action.badge.copy",
+            ActionId::CopyText => "action.badge.copy",
+            ActionId::PasteText => "action.badge.paste",
+            ActionId::Delete => "action.badge.delete",
+            ActionId::Recycle => "action.badge.recycle",
+            ActionId::TogglePin => "action.badge.pin",
+            ActionId::OpenAll | ActionId::AddAll => "action.badge.run",
+            ActionId::CopyFiles | ActionId::CopyTo => "action.badge.copy",
+            ActionId::CutFiles => "action.badge.cut",
+            ActionId::CopyPaths => "action.badge.copy",
+            ActionId::RecycleAll => "action.badge.recycle",
+        })
     }
 
     /// 英文别名表。FR-ACT-03 那句「输入即在动作集里模糊过滤」：本项目的动作标题全是指定

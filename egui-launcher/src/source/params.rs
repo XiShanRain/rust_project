@@ -73,22 +73,22 @@ impl ParamType {
     ];
 
     pub fn label(self) -> &'static str {
-        match self {
-            ParamType::None => "无参数",
-            ParamType::NoEncoding => "参数不编码",
-            ParamType::UrlQuery => "URL 编码",
-            ParamType::Utf8Query => "UTF-8 编码",
-        }
+        crate::i18n::t(match self {
+            ParamType::None => "param.type.none.label",
+            ParamType::NoEncoding => "param.type.raw.label",
+            ParamType::UrlQuery => "param.type.url.label",
+            ParamType::Utf8Query => "param.type.utf8.label",
+        })
     }
 
     /// 下拉框右侧那句解释（也是编辑弹窗里那行提示的正文）。
     pub fn hint(self) -> &'static str {
-        match self {
-            ParamType::None => "回车直接启动；命令行里的参数标记不会展开",
-            ParamType::NoEncoding => "参数原样代入（本地程序、带空格的文件名都走这一档）",
-            ParamType::UrlQuery => "按 URL 查询串编码（空格→+，中文按 UTF-8 百分号）",
-            ParamType::Utf8Query => "同 URL 编码（保留第四档只为认得 Delphi 的旧配置）",
-        }
+        crate::i18n::t(match self {
+            ParamType::None => "param.type.none.hint",
+            ParamType::NoEncoding => "param.type.raw.hint",
+            ParamType::UrlQuery => "param.type.url.hint",
+            ParamType::Utf8Query => "param.type.utf8.hint",
+        })
     }
 }
 

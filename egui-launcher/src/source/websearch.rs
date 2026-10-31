@@ -309,7 +309,7 @@ pub fn exclusive_rows(engines: &[WebEngine], keyword: &str, rest: &str) -> Exclu
         return Exclusive::Hints(vec![EngineHint {
             engine_id: engine.id.clone(),
             title: format!("{}  {}", engine.keyword, engine.title),
-            subtitle: "继续输入关键词，回车打开搜索结果".to_string(),
+            subtitle: crate::i18n::t("web.hint_subtitle").to_string(),
             completion: format!("{} ", engine.keyword),
         }]);
     };
@@ -318,12 +318,12 @@ pub fn exclusive_rows(engines: &[WebEngine], keyword: &str, rest: &str) -> Exclu
     let title = if word.is_empty() {
         engine.title.clone()
     } else {
-        format!("{}「{}」", engine.title, word)
+        crate::i18n::tfmt("web.hit_title", &[&engine.title, &word])
     };
     Exclusive::Rows(vec![SearchHit {
         engine_id: engine.id.clone(),
         title,
-        subtitle: format!("{} · 回车用默认浏览器打开", host_of(&url)),
+        subtitle: crate::i18n::tfmt("web.hit_subtitle", &[&host_of(&url)]),
         url,
     }])
 }
@@ -356,8 +356,8 @@ pub fn fallback_rows(engines: &[WebEngine], fallback: &[String], query: &str) ->
         .filter_map(|engine| {
             Some(SearchHit {
                 engine_id: engine.id.clone(),
-                title: format!("{}「{}」", engine.title, word),
-                subtitle: format!("兜底搜索 · {}", host_of(&engine.url)),
+                title: crate::i18n::tfmt("web.hit_title", &[&engine.title, &word]),
+                subtitle: crate::i18n::tfmt("web.fallback_subtitle", &[&host_of(&engine.url)]),
                 url: fill_template(&engine.url, word)?,
             })
         })
@@ -384,11 +384,11 @@ impl DataSource for WebSource {
     }
 
     fn label(&self) -> &'static str {
-        "网页搜索"
+        crate::i18n::t("source.web.label")
     }
 
     fn note(&self) -> &'static str {
-        "`引擎关键字 词` 独占整张列表；一条结果都没有时按 `google → bing` 兜底。关掉之后这两条都停。"
+        crate::i18n::t("source.web.note")
     }
 
     fn take_over(&mut self, cx: &mut SearchCtx<'_>) -> Option<Vec<SourceRow>> {

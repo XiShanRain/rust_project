@@ -7,7 +7,9 @@
 use std::process::Command;
 
 /// `>` 后面什么都没有时点/按回的那句话。
-pub const USAGE_TOAST: &str = "继续输入命令，例：>ipconfig /all";
+pub fn usage_toast() -> &'static str {
+    crate::i18n::t("terminal.usage_toast")
+}
 
 /// 用哪个 shell 跑。名字是**稳定名**：写进 `settings.json` 的 `terminal_shell`，
 /// 与 `sources_off` 同一口径——不认识的名字就回落默认，不让整份配置判坏（E1 的形状）。
@@ -159,7 +161,7 @@ impl TermHit {
             shell,
             command: command.to_string(),
             title: command.to_string(),
-            subtitle: format!("在新窗口里执行（{}，执行完停在窗口里）", shell.as_str()),
+            subtitle: crate::i18n::tfmt("terminal.hit_subtitle", &[&shell.as_str()]),
         }
     }
 }
@@ -174,11 +176,8 @@ pub struct TermHint {
 impl TermHint {
     pub fn usage(shell: TermShell) -> Self {
         Self {
-            title: "用法：>命令".to_string(),
-            subtitle: format!(
-                "例：>ipconfig /all　当前 shell：{}（设置页「功能」可改）",
-                shell.as_str()
-            ),
+            title: crate::i18n::t("terminal.usage_title").to_string(),
+            subtitle: crate::i18n::tfmt("terminal.usage_subtitle", &[&shell.as_str()]),
         }
     }
 }
@@ -191,11 +190,11 @@ impl super::DataSource for TerminalSource {
     }
 
     fn label(&self) -> &'static str {
-        "终端命令"
+        crate::i18n::t("source.terminal.label")
     }
 
     fn note(&self) -> &'static str {
-        "`>命令` 在新终端窗口里执行（例：`>ipconfig /all`），执行完停在窗口里；只敲 `>` 给用法行。用哪个 shell 在这页上面的「终端 shell」里选。关掉之后 `>` 回到普通搜索。"
+        crate::i18n::t("source.terminal.note")
     }
 
     fn take_over(&mut self, cx: &mut super::SearchCtx<'_>) -> Option<Vec<super::SourceRow>> {

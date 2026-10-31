@@ -39,18 +39,18 @@ impl LogLevel {
 
     /// 设置页显示名。
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Debug => "详细",
-            Self::Info => "标准",
-        }
+        crate::i18n::t(match self {
+            Self::Debug => "log.level.detailed",
+            Self::Info => "log.level.standard",
+        })
     }
 
     /// 设置页说明（一句话：多出来的是哪些行）。
     pub fn hint(self) -> &'static str {
-        match self {
-            Self::Debug => "再加逐条 / 逐键诊断与 `perf:` 计时行（排障时用）",
-            Self::Info => "生命周期、用户动作、写盘结果与失败",
-        }
+        crate::i18n::t(match self {
+            Self::Debug => "log.level.detailed_hint",
+            Self::Info => "log.level.standard_hint",
+        })
     }
 
     /// 档位序号：数字越小越啰嗦（闸门只比大小，不认名字）。
