@@ -109,6 +109,7 @@ mod hud;
 mod i18n;
 mod large_type;
 mod matching;
+mod mem;
 mod selection;
 mod source;
 mod sprint;
@@ -12736,6 +12737,23 @@ impl LauncherApp {
         let ppp = ctx.pixels_per_point();
         // 批次 F10：报面板尺寸（与设置项里的宽度同口径），不是含阴影带的外框。
         let size = panel_from_outer(ctx.content_rect().size());
+        // 批次 REL（E-09 / NFR-03）：内存与 GDI 两格。读不到报「—」而不是 0——
+        // `0 MB` 会被读成"这程序真省"，而事实是"没读到"，两回事。
+        let memory = match mem::memory() {
+            Some((now, peak, caliber)) => i18n::tfmt(
+                "sysinfo.memory_fmt",
+                &[
+                    &mem::mib_text(now),
+                    &mem::mib_text(peak),
+                    &i18n::t(match caliber {
+                        mem::Caliber::PrivateWorkingSet => "sysinfo.caliber.private",
+                        mem::Caliber::WorkingSet => "sysinfo.caliber.working_set",
+                    }),
+                ],
+            ),
+            None => "—".to_string(),
+        };
+        let gdi = mem::gdi_objects().to_string();
         let facts = sysinfo::SystemFacts {
             version: env!("CARGO_PKG_VERSION").to_string(),
             build_kind: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
@@ -12769,6 +12787,8 @@ impl LauncherApp {
                     &format!("{:.0}", size.y),
                 ],
             ),
+            memory,
+            gdi,
             paths: vec![
                 (i18n::t("sysinfo.path.exe"), sysinfo::redact(&exe, &profile)),
                 (i18n::t("sysinfo.path.data"), sysinfo::redact(&self.data_dir, &profile)),

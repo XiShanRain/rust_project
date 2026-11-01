@@ -54,6 +54,10 @@ features = [
     "Win32_System_SystemInformation",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    # 批次 REL（E-09 / NFR-03）：`GetProcessMemoryInfo` + `PROCESS_MEMORY_COUNTERS_EX2`
+    # 在 ProcessStatus 模块里。GDI 对象数那条 `GetGuiResources` 不走这里，
+    # 它已经在开着的 `Win32_System_Threading` 里。本批净新增 1 条 feature。
+    "Win32_System_ProcessStatus",
     # 批次 D2 第二半「下载站点图标」：WinHTTP 直调（AHK 那边用 WinHttpRequest COM）。
     # 只在这里出网，也就是用户点「下载图标」那一刻。
     "Win32_Networking_WinHttp",
@@ -69,4 +73,27 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+# 批次 REL（M6-6 / NFR-06）：发布档收紧。四行各有理由，写在旁边。
+#
+# 【绝不加 `panic = "abort"`】A10 那条「单个数据源 panic 只记日志、跳过它继续搜」
+# 靠 `catch_unwind` 接住（`src/source/mod.rs:294` 就钉着这句话）。改成 abort 换来的是
+# 一个脚本源崩一下、整个启动器跟着没——省的那点体积买不起这个。
+#
+# 【代价登记】`strip = true` 去掉符号表 ⇒ release 崩溃时 `RUST_BACKTRACE` 只剩地址。
+# 排障口径本来就是「复制系统信息」+ `launcher.log`，不是拿调试器读栈，所以认这条代价。
+[profile.release]
+# release 缺省本就是 3；写出来是让下面三行不像顺手加的。
+opt-level = 3
+# 跨 crate 全量链接期优化：启动耗时的大头在 eframe/wgpu/egui 这条调用链上。
+# 【2026-11-01 实测回填】这条买到的比预期少：`perf: startup`（进程起点→首帧）warm 四轮
+# 均值 285.8 → 268.1 ms（−6.2%），专用工作集 103.4 → 103.5 MB（**在抖动内，等于没变**）。
+# 真正的收益是体积 −7.5%（20,505,600 → 18,964,992 字节）——而代价记在下面【代价登记】那条
+# 旁边：全量 `cargo build --release` 从 2m41s 涨到 8m48s（增量只改本 crate 时 3m57s，
+# 大头是 fat LTO 的链接）。也就是说这一档是"构建机时间 + 产物体积"的交换，
+# 不是性能招数，别把它当成 NFR-01/03 的达标手段。
+lto = "fat"
+# 单 codegen unit ⇒ 编译时间换更好的内联，只影响构建机，不影响用户。
+codegen-units = 1
+strip = true
 

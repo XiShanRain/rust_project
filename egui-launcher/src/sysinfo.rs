@@ -31,6 +31,11 @@ pub struct SystemFacts {
     pub dpi: String,
     /// 主题 / 字体 / 行高 / 行密度 / 窗口尺寸，一行说完。
     pub appearance: String,
+    /// 批次 REL（E-09 / NFR-03）：本进程的专用工作集与峰值，已经拼成展示串
+    /// （含口径来源，例：`118.3 / 131.0 MB（专用工作集）`）。读不到 ⇒ `—`。
+    pub memory: String,
+    /// GDI 对象数（同批，NFR-03 那句"不持续增长"要的是能读出这颗数）。
+    pub gdi: String,
     /// 落盘位置。键是短标签（`程序` / `数据` / `日志`），值**必须**已经过 [`redact_path`]。
     pub paths: Vec<(&'static str, String)>,
     /// 各类条目数。顺序即排版顺序。
@@ -54,6 +59,8 @@ pub fn build_report(f: &SystemFacts) -> String {
         ("sysinfo.backend_line", &f.backend),
         ("sysinfo.dpi", &f.dpi),
         ("sysinfo.appearance", &f.appearance),
+        ("sysinfo.memory", &f.memory),
+        ("sysinfo.gdi", &f.gdi),
     ] {
         out.push_str(&tfmt(key, &[value]));
         out.push('\n');
@@ -265,6 +272,8 @@ mod tests {
             backend: "OpenGL（wgpu GL 后端）".to_string(),
             dpi: "150%（1.50 px/pt）".to_string(),
             appearance: "Modern｜字号 22｜行高 40｜甲·紧凑｜窗口 500×438".to_string(),
+            memory: "118.3 / 131.0 MB（专用工作集）".to_string(),
+            gdi: "37".to_string(),
             paths: vec![
                 ("程序", r"C:\app\egui-launcher.exe".to_string()),
                 ("数据", r"C:\app".to_string()),
@@ -284,6 +293,8 @@ mod tests {
 渲染：OpenGL（wgpu GL 后端）\n\
 缩放：150%（1.50 px/pt）\n\
 外观：Modern｜字号 22｜行高 40｜甲·紧凑｜窗口 500×438\n\
+内存：118.3 / 131.0 MB（专用工作集）\n\
+GDI 对象：37\n\
 路径：\n  \
 程序 C:\\app\\egui-launcher.exe\n  \
 数据 C:\\app\n\
