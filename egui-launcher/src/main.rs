@@ -18983,6 +18983,25 @@ fn create_tray_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, w, h).expect("Failed to create tray icon")
 }
 
+/// 批次 ICON：窗口 / 任务栏 / Alt-Tab 的图标。
+///
+/// 为什么光有 exe 里那份 `.ico` 资源不够：资源只管资源管理器认文件图标那一步；winit 注册窗口
+/// 类时 `hIcon`/`hIconSm` 写死 0（`event_loop.rs:920`），没人发 `WM_SETICON`，`WM_GETICON`
+/// 就由系统兜回默认应用图标——本机拿零资源旧版与带资源新版两个 exe 同场对照，窗口图标像素哈希
+/// 逐字节相同，证的就是这条。
+///
+/// 贴片与 `.ico` 出自同一张原图、同一套抠底与预乘面积平均缩放，只是字节序换成 `IconData`
+/// 要的 R,G,B,A。eframe 的 `AppTitleIconSetter` 每帧重试直到拿到活动窗口，再按 `SM_CXICON`
+/// 与 `SM_CXSMICON` 各自缩一次发 `WM_SETICON`，所以一张 64×64 同时管大小两个槽。
+fn window_icon_data() -> egui::IconData {
+    const RGBA: &[u8] = include_bytes!("../assets/app-icon-64.rgba");
+    egui::IconData {
+        rgba: RGBA.to_vec(),
+        width: 64,
+        height: 64,
+    }
+}
+
 /// 批次「系统消息三件」（FR-SYS-01）：托盘悬停提示 = 产品名 + 版本号 + **真正生效的**呼出键；
 /// 以管理员身份运行时追加 `(Administrator)`（原文那句「管理员运行时提示与版本号后缀」）。
 /// 纯函数——键串与提权标志都由调用方给，Win32 只留在 `set_tooltip` 那一句，所以能单测。
@@ -19355,6 +19374,7 @@ fn main() -> eframe::Result {
         .with_decorations(false)
         .with_always_on_top()
         .with_transparent(true)
+        .with_icon(window_icon_data())
         .with_visible(start_visible);
     // 批次 F8（FR-UIX-03 RememberPosition）的位置改由批次 F3 接管：`settings.json` 里存的是
     // 工作区千分比，得等窗口真的存在才能按 `show_on` 选屏摆位（见 `LauncherApp::new` 末尾
@@ -19437,6 +19457,42 @@ mod nav_tests {
         let a = tray_tooltip("Ctrl+Alt+Space", true);
         assert!(a.ends_with(" (Administrator)"), "后缀挂在末尾，实得：{a}");
         assert!(a.contains("Ctrl+Alt+Space"), "加了后缀不能把键挤掉");
+    }
+
+    /// 批次 ICON：窗口图标贴片的三条护栏。
+    /// 第一条最阴：eframe 的 `AppTitleIconSetter::new` 把 `IconData::default()` 判成"用户
+    /// 明确不要图标"直接丢弃，于是任务栏静默回到系统默认图标，而编译与其余测试全绿。
+    /// 字节数那条管住贴片重画后尺寸与 `IconData` 声明不一致（`from_rgba` 那侧会拒收，
+    /// 但 eframe 走的是另一条路径，未必喊得出来）；全透明那条管住抠底把主体也吃掉。
+    #[test]
+    fn window_icon_blob_is_sized_opaque_and_not_the_eframe_no_icon_sentinel() {
+        let icon = window_icon_data();
+        assert_eq!(icon.width % 4, 0, "IconData 要求边长是 4 的倍数");
+        assert_eq!(icon.height % 4, 0, "IconData 要求边长是 4 的倍数");
+        assert_eq!(
+            icon.rgba.len(),
+            (icon.width * icon.height * 4) as usize,
+            "字节数要严等于 宽×高×4"
+        );
+        assert_ne!(
+            icon,
+            egui::IconData::default(),
+            "贴片等于默认值＝eframe 当成没设图标，任务栏会静默留系统默认"
+        );
+        let (mut opaque, mut clear) = (0usize, 0usize);
+        for px in icon.rgba.chunks_exact(4) {
+            if px[3] > 247 {
+                opaque += 1;
+            } else if px[3] < 8 {
+                clear += 1;
+            }
+        }
+        let total = (icon.width * icon.height) as usize;
+        assert!(
+            opaque > total / 8,
+            "不透明像素只有 {opaque}/{total}，主体多半被抠掉了"
+        );
+        assert!(clear > 0, "一个全透明像素都没有＝圆角外会带一圈底色");
     }
 
     /// 批次 G3：快照要把"内存块格式"抄字节、把"句柄格式"跳过。跳错一侧的后果不对称——

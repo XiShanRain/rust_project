@@ -1,0 +1,10 @@
+// 本批「给程序加自己的图标」的资源脚本，由 build.rs 交给 Windows SDK 的 rc.exe 编译。
+//
+// 只有一行是有意义的：`1 ICON "app.ico"`。写 ID 而不写名字，rc.exe 会把 .ico 里的每个
+// 尺寸拆成若干 RT_ICON 条目，并自动补一个 RT_GROUP_ICON —— 资源管理器取"exe 的第一个
+// 图标组"当文件图标，靠的就是这个组；少一个字段都不会出图。
+//
+// "app.ico" 按相对本文件的路径解析，所以 .ico 必须和 .rc 同在 assets\ 下。
+// 这里刻意不加 VERSIONINFO：那是另一件事（右键属性里的产品名/版本号），不在本批范围内。
+
+1 ICON "app.ico"

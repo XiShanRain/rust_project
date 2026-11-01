@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git -C \"d:/D10-Project/Personal/Github_XiShanRain/Rust_Project\" ls-files egui-launcher/target)"
+      "Bash(git -C \"d:/D10-Project/Personal/Github_XiShanRain/Rust_Project\" ls-files egui-launcher/target)",
+      "Read(//d/GreenTool/02-网络应用/\\\\[Phone\\\\]scrcpy-win64-v4.0/**)",
+      "PowerShell(python -m py_compile \"d:\\\\GreenTool\\\\02-网络应用\\\\[Phone]scrcpy-win64-v4.0\\\\20260506-scrcpy控屏工具-v4.py\")"
+    ],
+    "additionalDirectories": [
+      "d:\\GreenTool\\02-网络应用\\[Phone]scrcpy-win64-v4.0"
     ]
   }
 }
