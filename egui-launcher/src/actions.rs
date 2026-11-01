@@ -214,6 +214,21 @@ pub fn parent_dir(text: &str) -> String {
     with_sep_if_drive(up)
 }
 
+/// 批次 B2（FR-ACT-05 偏差②）：「复制到…」的**选择框起点**，也就是本程序里"当前目录"的替身。
+///
+/// AHK 那边读的是 QuickSwitch 报上来的"文件管理器此刻开在哪"，本程序按产品决策没有 QuickSwitch
+/// ⇒ 只能从来源自己推：只有一条来源 ⇒ 它的父目录（单行面板副标题写的就是同一个 `parent_dir`，
+/// 写上去的与真打开的不会两处各说各话）；多条来源可能散在各处，没有"当前目录"可言 ⇒ `None`，
+/// 选择框回系统默认位置。目录对象也取父级而不是它自己：把 `D:\docs` 复制进 `D:\docs` 会被
+/// `same_or_under` 那道闸挡掉，起点停在 `D:\` 才刚好是"挑一个同级目录"的位置。
+pub fn copy_destination_hint(paths: &[String]) -> Option<String> {
+    if paths.len() != 1 {
+        return None;
+    }
+    let dir = parent_dir(&paths[0]);
+    (!dir.is_empty()).then_some(dir)
+}
+
 /// `C:` 这种夹在中间的盘符根补回分隔符（`C:\a` 的父目录是 `C:\`，不是 `C:`）。
 fn with_sep_if_drive(text: &str) -> String {
     let b = text.as_bytes();
@@ -441,7 +456,10 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
         // 同一件事的两种形态（差别只在剪不剪）。批量版（FR-ACT-05，批次 E4）用的就是
         // 同一对 `ActionId`，所以两种形态在剪贴板上写的东西一模一样。
         // AHK 的「复制到/移动到」（同函数 317-326 行）依赖 QuickSwitch 的"当前文件管理器目录"，
-        // 本程序没有那个上下文 ⇒ 单行版仍只有批量面板那条「复制到…」（FR-ACT-05 偏差①已登记）。
+        // 本程序没有那个上下文。批次 B2 收口：「移动到」仍不做（那是改路径，不是复制）；
+        // 「复制到」补上，"当前目录"换成来源自己所在的这一级——这里写的 `parent_dir` 与执行臂
+        // 里的 [`copy_destination_hint`] 是同一个算法（单条来源 ⇒ 父目录），副标题上的目录和
+        // 选择框真打开的目录不会各说各话。
         out.push(row(
             ActionId::CopyFiles,
             crate::i18n::t("panel.sub.copy_files"),
@@ -450,6 +468,11 @@ pub fn actions_for(t: &PanelTarget) -> Vec<Action> {
         out.push(row(
             ActionId::CutFiles,
             crate::i18n::t("panel.sub.cut_files"),
+            "",
+        ));
+        out.push(row(
+            ActionId::CopyTo,
+            &crate::i18n::tfmt("panel.sub.copy_to_one", &[&parent_dir(&t.path)]),
             "",
         ));
         let dir = if dir_like {
@@ -863,6 +886,8 @@ mod tests {
             ActionId::Recycle,
             ActionId::CopyFiles,
             ActionId::CutFiles,
+            // 批次 B2：「复制到」是把这一条搬到别处去，原件不在盘上时无从搬起。
+            ActionId::CopyTo,
         ] {
             assert!(!has(&gone, id), "不存在的路径不该有 {id:?}");
         }
@@ -905,6 +930,69 @@ mod tests {
         // 指向真实全路径的应用条目**有**（它就是盘上的一个文件，AHK 的判据只看形状与存在）。
         let real = target(Subject::App, "C:\\Windows\\System32\\notepad.exe");
         assert!(has(&real, ActionId::CopyFiles) && has(&real, ActionId::CutFiles));
+    }
+
+    /// 批次 B2（FR-ACT-05 偏差②收口）：单行面板也给一条「复制到…」，紧排在剪切之后，
+    /// 副标题带上来源所在的目录——本程序没有 QuickSwitch 那个"文件管理器开在哪"的上下文，
+    /// "当前目录"只能从来源自己推（同一个 `parent_dir`，所以写上去的目录＝选择框打开的目录）。
+    /// 两条证伪：删掉那一行 push ⇒ 紧跟剪切的断言红；副标题里的 `parent_dir` 换成别的串
+    /// （比如 `t.path` 本身）⇒ 目录断言红。
+    #[test]
+    fn a_single_row_panel_offers_copy_to_at_the_source_directory() {
+        let t = target(Subject::File, "D:\\tmp\\report.docx");
+        let got = ids(&t);
+        let pos = |id: ActionId| got.iter().position(|a| *a == id).unwrap();
+        assert_eq!(pos(ActionId::CutFiles) + 1, pos(ActionId::CopyTo), "{got:?}：要紧跟剪切");
+        assert!(pos(ActionId::CopyTo) < pos(ActionId::OpenTerminal), "{got:?}：要在终端打开之前");
+        let sub = |t: &PanelTarget| {
+            actions_for(t)
+                .into_iter()
+                .find(|a| a.id == ActionId::CopyTo)
+                .map(|a| a.subtitle)
+                .unwrap_or_default()
+        };
+        assert!(sub(&t).contains("D:\\tmp"), "{}：副标题要写来源所在的目录", sub(&t));
+        // 目录对象取父级而不是它自己：起点停在同级才是"挑一个别处"的位置，
+        // 原地复制会被 `same_or_under` 那道闸挡掉。
+        let dir = target(Subject::Folder, "D:\\tmp");
+        let s = sub(&dir);
+        assert!(s.contains("D:\\"), "{s}：目录对象的起点是它的父级");
+        assert!(!s.contains("D:\\tmp\\"), "{s}：不该是它自己");
+        // 非盘上路径一律没有这一条（与 E6 那两格同一道门）。
+        for path in [
+            "https://example.com/?q=1",
+            "internal:lock",
+            "calc.exe",
+            "shell:RecycleBinFolder",
+        ] {
+            let subject = match path {
+                "https://example.com/?q=1" => Subject::Url,
+                "internal:lock" => Subject::Internal,
+                "calc.exe" => Subject::App,
+                _ => Subject::Namespace,
+            };
+            assert!(!has(&target(subject, path), ActionId::CopyTo), "{path} 不该有复制到");
+        }
+    }
+
+    #[test]
+    fn the_copy_to_starting_point_only_exists_for_one_source() {
+        // 一条来源 ⇒ 它所在的目录；多条散在各处 ⇒ 没有"当前目录"，让选择框回系统默认位置。
+        assert_eq!(
+            copy_destination_hint(&["D:\\tmp\\report.docx".to_string()]),
+            Some("D:\\tmp".to_string())
+        );
+        assert_eq!(
+            copy_destination_hint(&["D:\\a.txt".to_string(), "E:\\b.txt".to_string()]),
+            None,
+            "两条来源各有父目录，随便取第一条会骗人"
+        );
+        assert_eq!(copy_destination_hint(&[]), None);
+        // 盘根/共享根的父目录是它自己 ⇒ "当前目录"就是它，照给。
+        assert_eq!(
+            copy_destination_hint(&["C:\\".to_string()]),
+            Some("C:\\".to_string())
+        );
     }
 
     #[test]
@@ -976,9 +1064,9 @@ mod tests {
                 .collect()
         };
         // 子串：中文标题直接命中。批次 E6 起「复制」在文件行命中三格（多出「复制文件」），
-        // 而「剪切文件」一格都不命中——它的标题、别名（cut/move/files/cf）里没有「复制」，
-        // 这正是别名表要防的串味。
-        assert_eq!(hit("复制"), ["复制路径", "复制名称", "复制文件"]);
+        // 批次 B2 起命中四格（单行面板也有「复制到…」了）；而「剪切文件」一格都不命中——
+        // 它的标题、别名（cut/move/files/cf）里没有「复制」，这正是别名表要防的串味。
+        assert_eq!(hit("复制"), ["复制路径", "复制名称", "复制文件", "复制到…"]);
         assert_eq!(hit("剪切"), ["剪切文件"]);
         // 多词是 AND：`复制 路径` 只剩复制路径。
         assert_eq!(hit("复制 路径"), ["复制路径"]);

@@ -504,6 +504,7 @@ fn settings_from_map(
     take_field!(map, s, "", file_max_entries, usize);
     take_field!(map, s, "", file_refresh_minutes, u64);
     take_field!(map, s, "", file_min_query_len, usize);
+    take_field!(map, s, "", file_type_words, Vec<String>);
     take_field!(map, s, "", log_level, Option<LogLevel>);
     take_field!(map, s, "", language, Option<Language>);
     // 批次 A5 的四格：同样要「特值进、特值出」，缺一行就是"设置页改了、下次启动回默认"。
@@ -930,6 +931,13 @@ pub struct AppSettings {
     #[serde(default = "default_file_min_query_len")]
     pub file_min_query_len: usize,
 
+    /// 类型词表（批次 D7 / AHK `TypeFilters`）：每行 `关键字 = 扩展名 …`，`doc 报告` 只搜这些扩展名。
+    /// 缺省＝[`filesearch::default_type_word_lines`] 的 AHK 原文七行；空数组＝一个类型词都不认
+    /// （还剩 `open`/`find`/`file`/`folder`/`ext=` 那几个出口），是合法的用户选择。
+    /// 解析口径在 [`filesearch::parse_type_word_line`]，畸形行整行忽略。
+    #[serde(default = "default_file_type_words")]
+    pub file_type_words: Vec<String>,
+
     /// 日志级别（批次 G5 / FR-SYS-03）。`None` = **跟随构建**：debug 构建记详细、
     /// release 构建只记标准（见 [`LogLevel::fallback`]）。
     ///
@@ -1065,6 +1073,7 @@ impl Default for AppSettings {
             file_max_entries: default_file_max_entries(),
             file_refresh_minutes: default_file_refresh_minutes(),
             file_min_query_len: default_file_min_query_len(),
+            file_type_words: default_file_type_words(),
             // 批次 G5：出厂"跟随构建"，不替用户在 debug 构建里把 release 机器上的档位定死。
             log_level: None,
             // 批次 F13：出厂跟随系统 UI 语言。
@@ -1116,6 +1125,11 @@ fn default_file_refresh_minutes() -> u64 {
 
 fn default_file_min_query_len() -> usize {
     crate::source::filesearch::MIN_QUERY_LEN
+}
+
+/// 批次 D7 的第七格：类型词表出厂七行（AHK `TypeFilters` 原文）。
+fn default_file_type_words() -> Vec<String> {
+    crate::source::filesearch::default_type_word_lines()
 }
 
 impl AppSettings {
@@ -5884,6 +5898,8 @@ mod config_tests {
         x.file_max_entries = 100_000;
         x.file_refresh_minutes = 15;
         x.file_min_query_len = 3;
+        // 第五批（零散偏差收口）：类型词表第七格。特值故意只有一行，读回来是七行就说明漏了 take_field!。
+        x.file_type_words = vec!["probe = zzz".to_string()];
         // 批次 G5：`Some` 与 `None` 是两种意思，特值用 `Some(Debug)` 才能区分"读回来了"与"没读"。
         x.log_level = Some(LogLevel::Debug);
         // 批次 F13：同一条理由——`None`（跟随系统）读成 `Some` 或反过来都会静默变味。
@@ -5976,6 +5992,11 @@ mod config_tests {
         assert_eq!(got.file_max_entries, 100_000, "file_max_entries");
         assert_eq!(got.file_refresh_minutes, 15, "file_refresh_minutes");
         assert_eq!(got.file_min_query_len, 3, "file_min_query_len");
+        assert_eq!(
+            got.file_type_words,
+            vec!["probe = zzz".to_string()],
+            "file_type_words（第五批：读成缺省七行就说明 take_field! 漏了这一格）"
+        );
         assert_eq!(
             got.log_level,
             Some(LogLevel::Debug),

@@ -22,7 +22,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
-    CoUninitialize,
+    CoUninitialize, IBindCtx,
 };
 use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
 use windows::core::{PCWSTR, PWSTR};
@@ -59,10 +59,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{
     DROPFILES, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING,
     FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FO_COPY, FO_DELETE, FileOpenDialog,
-    IFileOpenDialog, SEE_MASK_FLAG_NO_UI,
-    SHFILEOPSTRUCTW, SHFileOperationW, SHObjectProperties, SHOP_FILEPATH, SHELLEXECUTEINFOW,
-    SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW,
-    SIGDN_FILESYSPATH, ShellExecuteExW,
+    IFileOpenDialog, IShellItem, SEE_MASK_FLAG_NO_UI,
+    SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW, SHObjectProperties,
+    SHOP_FILEPATH, SHELLEXECUTEINFOW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
+    SHEmptyRecycleBinW, SIGDN_FILESYSPATH, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallNextHookEx, ChangeWindowMessageFilterEx,
@@ -1081,6 +1081,8 @@ struct LauncherApp {
     /// `None`＝这一页没在编辑；进页时按 prefs 取一份，离开页/关设置页时回写并丢掉。
     file_folders_edit: Option<Vec<String>>,
     file_exclude_edit: Option<Vec<String>>,
+    /// 第五批（FR-SRC-14 类型词表）：同页第三串编辑缓冲，跨帧理由与上面两条相同。
+    file_type_words_edit: Option<Vec<String>>,
     /// 批次 D2：设置页「网页引擎」页的编辑缓冲，跨帧理由与上面两条相同（每帧克隆会把键吞掉）。
     /// `None`＝这一页没在编辑；进页时按 prefs 取一份，离开页/关设置页时整理后回写并丢掉。
     web_engines_edit: Option<Vec<source::websearch::WebEngine>>,
@@ -3234,6 +3236,10 @@ fn enter_action_label(row: Option<&HeadRow>) -> &'static str {
 
 /// 目录浏览时 Esc 的落点：先把当前的过滤词去掉（留在本目录），再逐级上溯。
 /// 盘根 / UNC 共享根 / 不是浏览态一律 `None`——调用方保持"清空查询"的旧行为。
+///
+/// 这里直接走 [`route`](source::filesearch::route)（出厂词表）而不是 [`file_route`](LauncherApp::file_route)
+/// 不是漏改：浏览态在 [`route_at`] 的第一个分支就返回了，配置词表那一支根本走不到，
+/// 两边给出的 `Browse` 必然相同。
 fn browse_parent_of(raw: &str) -> Option<String> {
     match source::filesearch::route(raw) {
         source::filesearch::Route::Browse { dir, filter } if !filter.is_empty() => Some(dir),
@@ -4046,10 +4052,13 @@ fn recycle_path(path: &str) -> Result<(), u16> {
 /// `false` ⇒ `FOS_FILEMUSTEXIST`（只能挑已存在的文件，防止手打一个不存在的名字）。
 /// 返回 `Ok(None)` = 用户取消（这不是故障，调用方要说「已取消」而不是「失败」）。
 ///
+/// 批次 B2：`initial` = 打开时所在的目录（「复制到」用它把框带到来源那一层）。设不上只是
+/// 回到系统默认位置，不是故障 ⇒ 记一句照常弹框；把整个「复制到」掐掉才是故障。
+///
 /// 走 COM 而不是 `SHBrowseForFolder`：后者是 IE 时代的老对话框，没有地址栏、不能贴路径，
 /// 用户要挑一个深层目录时几乎没法用。COM 公寓在这里补一次 STA（与 `show_properties` 同一口径，
 /// 已初始化/被别人设成别的公寓都不影响 in-proc，所以**不配对 `CoUninitialize`**）。
-fn pick_path(want_dir: bool) -> Result<Option<String>, String> {
+fn pick_path(want_dir: bool, initial: Option<&str>) -> Result<Option<String>, String> {
     let what = if want_dir {
         crate::i18n::t("pick.what.dir")
     } else {
@@ -4071,6 +4080,20 @@ fn pick_path(want_dir: bool) -> Result<Option<String>, String> {
         dialog
             .SetOptions(opts)
             .map_err(|e| crate::i18n::tfmt("pick.err.set_options", &[&e]))?;
+        if let Some(dir) = initial.map(str::trim).filter(|s| !s.is_empty()) {
+            let w = wide_z(dir);
+            match SHCreateItemFromParsingName::<PCWSTR, Option<&IBindCtx>, IShellItem>(
+                PCWSTR(w.as_ptr()),
+                None,
+            ) {
+                Ok(item) => {
+                    if let Err(e) = dialog.SetFolder(&item) {
+                        log_info!("选择框：起点设置失败（{e}），改用系统默认位置");
+                    }
+                }
+                Err(e) => log_info!("选择框：起点解析失败（{e}），改用系统默认位置"),
+            }
+        }
         // 1223 = 用户点「取消」。它不是错误 ⇒ 返回 None，让上层说「已取消」。
         if let Err(e) = dialog.Show(None) {
             return if e.code() == windows::core::HRESULT::from_win32(1223) {
@@ -4092,13 +4115,14 @@ fn pick_path(want_dir: bool) -> Result<Option<String>, String> {
 }
 
 /// 批次 E4（FR-ACT-05）「复制到」的入口：只要目录。
-fn pick_folder() -> Result<Option<String>, String> {
-    pick_path(true)
+/// 批次 B2：起点 = 来源所在目录（`None` 时回到系统默认位置）。
+fn pick_folder(initial: Option<&str>) -> Result<Option<String>, String> {
+    pick_path(true, initial)
 }
 
 /// 批次 D4（FR-CFG-06）「选文件…」的入口：只要文件。
 fn pick_file() -> Result<Option<String>, String> {
-    pick_path(false)
+    pick_path(false, None)
 }
 
 /// `path` 是否就是 `dest` 或位于 `dest` 之下（不分大小写，尾分隔符先剥掉）。
@@ -6713,6 +6737,7 @@ impl LauncherApp {
             settings_tab,
             file_folders_edit: None,
             file_exclude_edit: None,
+            file_type_words_edit: None,
             web_engines_edit: None,
             snippets_edit: None,
             snippets_saved: Vec::new(),
@@ -8583,16 +8608,40 @@ impl LauncherApp {
         true
     }
 
+    /// 「文件搜索」页**类型词表**的同一条回写路径。改词表**不重扫索引**（它只改"首词怎么认"，
+    /// 与索引里有什么无关）；但文件源那边会作废按查询串存的命中缓存
+    /// （见 `FileSource::apply_settings`），否则 `pic 报告` 会拿上一份词表的答案。
+    fn commit_file_type_words_edit(&mut self) -> bool {
+        let Some(buf) = self.file_type_words_edit.as_ref() else {
+            return false;
+        };
+        if *buf == self.prefs.file_type_words {
+            return false;
+        }
+        self.prefs.file_type_words = buf.clone();
+        source::application::save_settings(&self.prefs);
+        log_info!(
+            "设置页：文件类型词表已改（现 {} 行）",
+            self.prefs.file_type_words.len()
+        );
+        true
+    }
+
     /// 离开「文件搜索」页（换分类 / 关设置页）时收尾：先把"没失焦就走了"的编辑回写掉，
     /// 再丢缓冲 —— 下次进页按 prefs 重新取（`-Preferences 5` 从别处改过的值也能看到）。
     fn finish_file_scope_edits(&mut self) {
-        if self.file_folders_edit.is_none() && self.file_exclude_edit.is_none() {
+        if self.file_folders_edit.is_none()
+            && self.file_exclude_edit.is_none()
+            && self.file_type_words_edit.is_none()
+        {
             return;
         }
         self.commit_file_folders_edit();
         self.commit_file_exclude_edit();
+        self.commit_file_type_words_edit();
         self.file_folders_edit = None;
         self.file_exclude_edit = None;
+        self.file_type_words_edit = None;
     }
 
     /// 关设置页 / 切页时的统一收尾：把**所有**页的编辑缓冲回写掉。
@@ -11256,6 +11305,62 @@ impl LauncherApp {
                                     .weak()
                                     .small(),
                             );
+                            ui.separator();
+                            // 第五批（FR-SRC-14 类型词表 / AHK `TypeFilters`）：每行 `关键字 = 扩展名 …`。
+                            // 畸形行整行忽略（口径见 `filesearch::parse_type_word_line`），界面不替用户
+                            // 判错、也不改写原文——用户手写的那一行要能原样看回来。
+                            ui.label(egui::RichText::new(i18n::t("files.type_title")).strong());
+                            if self.file_type_words_edit.is_none() {
+                                self.file_type_words_edit =
+                                    Some(self.prefs.file_type_words.clone());
+                            }
+                            let mut commit_types = false;
+                            let mut remove_type: Option<usize> = None;
+                            {
+                                let types =
+                                    self.file_type_words_edit.as_mut().expect("上面刚填过");
+                                for (i, line) in types.iter_mut().enumerate() {
+                                    // 与目录 / 排除两串同一套右缘按钮排版（批次 F16）。
+                                    ui.horizontal(|ui| {
+                                        let (resp, del) = trailing_button_edit_row(
+                                            ui,
+                                            line,
+                                            i18n::t("files.type_hint"),
+                                            None,
+                                            i18n::t("common.delete"),
+                                        );
+                                        if resp.lost_focus() {
+                                            *line = line.trim().to_string();
+                                            commit_types = true;
+                                        }
+                                        if del.clicked() {
+                                            remove_type = Some(i);
+                                        }
+                                    });
+                                }
+                                if let Some(i) = remove_type {
+                                    types.remove(i);
+                                    commit_types = true;
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button(i18n::t("files.add_type")).clicked() {
+                                        types.push(String::new());
+                                        commit_types = true;
+                                    }
+                                    if ui.button(i18n::t("files.restore_types")).clicked() {
+                                        *types = source::filesearch::default_type_word_lines();
+                                        commit_types = true;
+                                    }
+                                });
+                            }
+                            if commit_types && self.commit_file_type_words_edit() {
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(i18n::t("files.type_help"))
+                                    .weak()
+                                    .small(),
+                            );
                         }
                         SettingsTab::Appearance => {
                             // 批次 F8（FR-UIX-02/03/07/08）：窗口小节。宽度即时生效；记住位置、
@@ -12020,7 +12125,7 @@ impl LauncherApp {
     } else {
         crate::i18n::t("pick.what.file")
     };
-        let picked = if want_dir { pick_folder() } else { pick_file() };
+        let picked = if want_dir { pick_folder(None) } else { pick_file() };
         match picked {
             Ok(Some(path)) => {
                 let fill = source::import::fill_from_pick(&path, want_dir);
@@ -13558,21 +13663,37 @@ impl LauncherApp {
                 PanelOutcome::Stay
             }
             actions::ActionId::CopyTo => {
-                let n = target.batch.len();
-                let outcome = match pick_folder() {
+                // 批次 B2（FR-ACT-05 偏差②收口）：「复制到」现在两张表都有 ⇒ 载荷与上面
+                // `CopyFiles` 那一臂同一条规则（单行面板的 `batch` 恒空，取它自己那一条）。
+                // 前缀也跟着改成中性：原来四行硬写「批量面板」，单行版走进来就会把一行日志
+                // 记成批量操作，事后翻日志分不清是哪张表按的。
+                let paths: Vec<String> = if target.batch.is_empty() {
+                    vec![target.path.clone()]
+                } else {
+                    target.batch.clone()
+                };
+                let n = paths.len();
+                let via = if target.batch.is_empty() {
+                    "操作面板"
+                } else {
+                    "批量面板"
+                };
+                // 「当前目录」在本程序里没有 QuickSwitch 那个上下文可抄，改成从**来源自己**推
+                // （[`copy_destination_hint`](actions::copy_destination_hint)）：一条来源 ⇒
+                // 选择框开在它所在的目录；多条 ⇒ 没有"当前目录"可言，回到系统默认位置。
+                let initial = actions::copy_destination_hint(&paths);
+                let outcome = match pick_folder(initial.as_deref()) {
                     Ok(None) => {
-                        log_info!("批量面板：复制到 — 用户在文件夹选择框里取消，未复制");
+                        log_info!("{via}：复制到 — 用户在文件夹选择框里取消，未复制");
                         (i18n::t("panel.copy_cancelled").to_string(), TOAST_OK)
                     }
-                    Ok(Some(dest)) => match copy_many_to(&target.batch, &dest) {
+                    Ok(Some(dest)) => match copy_many_to(&paths, &dest) {
                         Ok(0) => {
-                            log_info!("批量面板：复制到 — 全部来源都在目标目录里，没有可复制的项");
+                            log_info!("{via}：复制到 — 全部来源都在目标目录里，没有可复制的项");
                             (i18n::t("panel.all_in_dest").to_string(), TOAST_OK)
                         }
                         Ok(done) => {
-                            log_info!(
-                                "批量面板：复制到完成 {done}/{n} 项（目标目录名不落日志）"
-                            );
+                            log_info!("{via}：复制到完成 {done}/{n} 项（目标目录名不落日志）");
                             (
                                 i18n::tfmt(
                                     "panel.copied_to",
@@ -13582,16 +13703,16 @@ impl LauncherApp {
                             )
                         }
                         Err(1223) => {
-                            log_info!("批量面板：复制到 — 用户在系统复制里取消");
+                            log_info!("{via}：复制到 — 用户在系统复制里取消");
                             (i18n::t("panel.copy_cancelled").to_string(), TOAST_OK)
                         }
                         Err(code) => {
-                            log_info!("批量面板：复制到失败（系统返回 {code}）");
+                            log_info!("{via}：复制到失败（系统返回 {code}）");
                             (i18n::tfmt("panel.copied_to_failed", &[&code]), TOAST_ERR)
                         }
                     },
                     Err(e) => {
-                        log_info!("批量面板：文件夹选择框失败：{e}");
+                        log_info!("{via}：文件夹选择框失败：{e}");
                         (format!("⚠ {e}"), TOAST_ERR)
                     }
                 };
@@ -13792,14 +13913,16 @@ impl LauncherApp {
             && self.help_entry.is_none()
     }
 
-    /// 本查询在不在文件模式（批次 D7：最小字数可配了）。判据与 `FileSource::plan` 必须同一档：
-    /// 两者都读 `settings.json` 那一格、都过 [`ScanScope::clamp_min_query_len`] 这道夹子——
-    /// 以前 `route()` 全局一个缺省值，无所谓；现在界面这边的"在不在文件模式"若用缺省 2 字、
-    /// 源那边用配置值，配成 1 或 3 时两边的答案就会分叉。
+    /// 本查询在不在文件模式（批次 D7：最小字数与类型词表都可配了）。判据与
+    /// `FileSource::plan` 必须同一档：两者都读 `settings.json` 那两格、都过
+    /// [`ScanScope::clamp_min_query_len`] 这道夹子——以前 `route()` 全局一份缺省值，
+    /// 无所谓；现在界面这边的"在不在文件模式"若用缺省值、源那边用配置值，两边就会分叉
+    /// （比如把 `doc` 从词表里删了，源不再认它是类型词，界面还当在文件模式里）。
     fn file_route(&self, raw: &str) -> source::filesearch::Route {
         source::filesearch::route_at(
             raw,
             source::filesearch::ScanScope::clamp_min_query_len(self.prefs.file_min_query_len),
+            &self.prefs.file_type_words,
         )
     }
 

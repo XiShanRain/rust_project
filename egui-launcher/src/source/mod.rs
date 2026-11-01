@@ -277,7 +277,10 @@ pub fn default_sources_with(prefs: &application::AppSettings) -> Vec<Box<dyn Dat
         Box::new(snippet::SnippetSource::default()),
         Box::new(scripts::ScriptSource::default()),
         Box::new(websearch::WebSource),
-        Box::new(filesearch::FileSource::with_scope(prefs.file_scan_scope())),
+        Box::new(filesearch::FileSource::with_scope(
+            prefs.file_scan_scope(),
+            prefs.file_type_words.clone(),
+        )),
         Box::new(calc::CalcSource),
         Box::new(application::AppsSource),
         // 书签压轴：它只在 `bm 词` 时独占，其余时候走尾巴，排在清单结果之后。

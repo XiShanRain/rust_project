@@ -289,7 +289,7 @@ pub const ENTRIES: &[CheatEntry] = &[
         title_key: "cheat.types.title",
         summary_key: "cheat.types.summary",
         detail_key: "cheat.types.detail",
-        tags: "file type 类型 扩展名 doc pic video audio zip exe cad",
+        tags: "file type 类型 扩展名 ext doc pic video audio zip exe cad",
         group: Group::Files,
         source: Some(SourceId::Files),
         settings_page: None,

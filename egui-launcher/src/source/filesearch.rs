@@ -135,33 +135,66 @@ impl ScanScope {
     }
 }
 
-/// 第四式的类型词表：需求书 FR-SRC-14 那张表原样（`doc`/`pic`/`video`/`audio`/`zip`/`exe`/`cad`）。
-pub const TYPE_WORDS: [(&str, &[&str]); 7] = [
-    (
-        "doc",
-        &[
-            "doc", "docx", "xls", "xlsx", "xlsm", "csv", "ppt", "pptx", "pdf", "txt", "md", "rtf",
-            "odt", "ods",
-        ],
-    ),
-    (
-        "pic",
-        &[
-            "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "svg", "ico", "heic",
-        ],
-    ),
-    (
-        "video",
-        &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"],
-    ),
-    ("audio", &["mp3", "wav", "flac", "aac", "m4a", "ogg", "wma"]),
-    (
-        "zip",
-        &["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "iso"],
-    ),
-    ("exe", &["exe", "msi", "bat", "cmd", "ps1", "lnk"]),
-    ("cad", &["dwg", "dxf", "dgn", "dwf", "rvt", "ifc", "skp"]),
+/// 第四式的类型词表出厂值：AHK `AppSettings.ahk` 的 `TypeFilters` 七行原样。
+/// 批次 D7 起这一格可配（[`AppSettings::file_type_words`](crate::source::application::AppSettings::file_type_words)）。
+///
+/// 存成"行"而不是解析后的表：设置页给用户看和改的也是行，两边同一份文本，才不会出现
+/// 「界面改了、缺省没改」；解析口径见 [`parse_type_word_line`]。
+pub const DEFAULT_TYPE_WORD_LINES: [&str; 7] = [
+    "doc = doc docx xls xlsx xlsm csv ppt pptx pdf txt md rtf odt ods",
+    "pic = jpg jpeg png gif bmp tif tiff webp svg ico heic",
+    "video = mp4 mkv avi mov wmv flv webm m4v",
+    "audio = mp3 wav flac aac m4a ogg wma",
+    "zip = zip rar 7z tar gz tgz bz2 xz iso",
+    "exe = exe msi bat cmd ps1 lnk",
+    "cad = dwg dxf dgn dwf rvt ifc skp",
 ];
+
+/// 出厂行表的 `Vec<String>` 形态：`AppSettings` 的缺省值、设置页「恢复默认」共用一份。
+pub fn default_type_word_lines() -> Vec<String> {
+    DEFAULT_TYPE_WORD_LINES.iter().map(|s| s.to_string()).collect()
+}
+
+/// 一行 `关键字 = 扩展名 …` → `(关键字, 扩展名清单)`，畸形行返回 `None`。
+///
+/// 口径照 AHK `FileSearchProvider.ParseTypeFilter`：`^\s*([^=\s]+)\s*=\s*(.+)$`
+/// ——关键字是一个不含空白/等号的词，必须有 `=`，右边不能是空的；关键字与扩展名都转小写。
+/// 扩展名那半按 `[\s,;]+` 切、去掉开头的 `*.`、去重、空项丢弃（见 [`explicit_exts`]）。
+pub fn parse_type_word_line(line: &str) -> Option<(String, Vec<String>)> {
+    let (head, rest) = line.split_at(line.find('=')?);
+    let head = head.trim();
+    if head.is_empty() || head.contains(char::is_whitespace) {
+        return None;
+    }
+    let exts = explicit_exts(&rest[1..]);
+    if exts.is_empty() {
+        return None;
+    }
+    Some((head.to_lowercase(), exts))
+}
+
+/// 扩展名写法的规整：`ext=pdf,docx` / `pdf;docx` / `*.pdf` 同一套。
+/// 按 `[\s,;]+` 切、去掉开头的 `*.`、转小写、去重、空项丢弃。
+/// 批次 A1 的 `ext=` 与批次 D7 词表里等号右边共用这一份 ⇒ 两处写法不会分叉。
+pub fn explicit_exts(spec: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in spec.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        let ext = tok.trim_start_matches(['*', '.']).to_lowercase();
+        if ext.is_empty() || out.contains(&ext) {
+            continue;
+        }
+        out.push(ext);
+    }
+    out
+}
+
+/// 首词是不是某个类型词：是 ⇒ 返回它的扩展名清单。**先出现的那行说了算**（AHK 同口径）。
+fn type_word_exts(type_word_lines: &[String], head: &str) -> Option<Vec<String>> {
+    type_word_lines.iter().find_map(|line| {
+        let (k, exts) = parse_type_word_line(line)?;
+        (k == head).then_some(exts)
+    })
+}
 
 /// 第三式的动词前缀（需求书：`open|find|file report`）。
 const FILE_WORDS: [&str; 3] = ["open", "find", "file"];
@@ -266,6 +299,9 @@ pub struct FileSource {
     /// `scope`：在途期间改了范围时 `scope` 已是新值，拿它给旧索引贴标签会写出
     /// 「清单 6 个目录 / 1109 条」这种把两轮数据混在一行的谎（2026-10-28 真机抓到的）。
     in_flight_scope: Option<ScanScope>,
+    /// 类型词表的原文行（批次 D7）。**不进 [`ScanScope`]**：改词表只影响"首词怎么认"，
+    /// 与索引里有什么无关，跟着重扫三万条纯属白烧。
+    type_words: Vec<String>,
 }
 
 impl Default for FileSource {
@@ -283,15 +319,18 @@ impl Default for FileSource {
             scope: ScanScope::default(),
             scope_pending: false,
             in_flight_scope: None,
+            type_words: default_type_word_lines(),
         }
     }
 }
 
 impl FileSource {
     /// 按给定范围造一个源（批次 D7：冷启动就按配置扫，不经历"先按缺省扫一轮再推倒重来"）。
-    pub fn with_scope(scope: ScanScope) -> Self {
+    /// 类型词表一并带进来：第一天就得按用户那份认首词，否则要等第一次 `apply_settings`。
+    pub fn with_scope(scope: ScanScope, type_words: Vec<String>) -> Self {
         let mut s = Self::default();
         s.scope = scope;
+        s.type_words = type_words;
         s
     }
 
@@ -352,7 +391,7 @@ impl FileSource {
     /// 本查询该不该由文件源独占整张列表。返回 `None` = 没有触发符，普通合并照常。
     /// 最小字数用自己那份 [`ScanScope::min_query_len`]，不是 [`route`] 的缺省值。
     fn plan(&mut self, query: &str) -> Option<Vec<SourceRow>> {
-        let route = route_at(query, self.scope.min_query_len);
+        let route = route_at(query, self.scope.min_query_len, &self.type_words);
         match route {
             Route::NotOurs => None,
             Route::Browse { dir, filter } => {
@@ -423,8 +462,17 @@ impl DataSource for FileSource {
 
     /// 批次 D7「保存即重扫」：设置里的扫描范围变了就换。`set_scope` 自己做相等去重，
     /// 同值的帧零成本；在途轮的补扫账也由它记。
+    ///
+    /// 类型词表（同批第二格）**不触发重扫**——它只改"首词怎么认"，索引里有什么不受影响。
+    /// 但它必须把 `hits_cache` 清掉：那份缓存按查询串存，词表换了 `pic 报告` 该命中的
+    /// 就是另一批文件，接着用旧命中等于拿上一份配置的答案糊弄用户。
     fn apply_settings(&mut self, prefs: &crate::source::application::AppSettings) {
         self.set_scope(prefs.file_scan_scope());
+        if self.type_words != prefs.file_type_words {
+            self.type_words = prefs.file_type_words.clone();
+            self.hits_cache = None;
+            log_info!("文件类型词表：已更新（{} 行）", self.type_words.len());
+        }
     }
 
     fn poll(&mut self) -> bool {
@@ -497,13 +545,17 @@ fn is_apostrophe(c: char) -> bool {
 }
 
 /// 五式触发 → [`Route`]。判据只看查询串本身（当帧可观测状态），不看索引、不看磁盘。
-/// 最小字数取缺省档 [`MIN_QUERY_LEN`]；`FileSource` 走 [`route_at`] 用自己那份可配值。
+/// 最小字数取缺省档 [`MIN_QUERY_LEN`]、类型词表取出厂七行；`FileSource` 走 [`route_at`]
+/// 用自己那份可配的两种值。
 pub fn route(raw: &str) -> Route {
-    route_at(raw, MIN_QUERY_LEN)
+    static LINES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    route_at(raw, MIN_QUERY_LEN, LINES.get_or_init(default_type_word_lines))
 }
 
-/// 同 [`route`]，但最小字数由调用方给（批次 D7 起可配）。
-pub fn route_at(raw: &str, min_query_len: usize) -> Route {
+/// 同 [`route`]，但最小字数与类型词表由调用方给（批次 D7 起两格都可配）。
+/// 类型词表是**行**不是解析后的表：只有真到了"首词可能是类型词"那一步才解析，
+/// 单字查询与动词前缀一分钱不花。
+pub fn route_at(raw: &str, min_query_len: usize, type_word_lines: &[String]) -> Route {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Route::NotOurs;
@@ -539,8 +591,15 @@ pub fn route_at(raw: &str, min_query_len: usize) -> Route {
     let mut prefix_word = false;
     if words.len() >= 2 {
         let head = words[0].as_str();
-        if let Some((_, list)) = TYPE_WORDS.iter().find(|(k, _)| *k == head) {
-            exts = list.iter().map(|s| s.to_string()).collect();
+        // 批次 A1：`ext=pdf,docx` 直接指定扩展名（AHK 那边是 Everything 的 `ext:` 透传，
+        // 本程序没有 Everything 就自实现；分隔符、`*.` 前缀、大小写都按 [`explicit_exts`]
+        // 规整）。空表或全是垃圾 ⇒ 只是"不限类型"，不静默变成普通搜索。
+        if let Some(spec) = head.strip_prefix("ext=") {
+            exts = explicit_exts(spec);
+            words.remove(0);
+            prefix_word = true;
+        } else if let Some(list) = type_word_exts(type_word_lines, head) {
+            exts = list;
             words.remove(0);
             prefix_word = true;
         } else if head == FOLDER_WORD {
@@ -944,11 +1003,7 @@ mod tests {
     }
 
     fn extension_list(word: &str) -> Vec<String> {
-        TYPE_WORDS
-            .iter()
-            .find(|(k, _)| *k == word)
-            .map(|(_, list)| list.iter().map(|s| s.to_string()).collect())
-            .unwrap_or_default()
+        type_word_exts(&default_type_word_lines(), word).unwrap_or_default()
     }
 
     #[test]
@@ -1277,13 +1332,127 @@ mod tests {
 
     #[test]
     fn route_at_respects_the_configured_min_query_len() {
+        let types = default_type_word_lines();
         // 缺省档（2 字）下单字不进文件模式；配成 1 字就该进。
-        assert_eq!(route_at("'x", 2), Route::NotOurs);
-        assert!(matches!(route_at("'x", 1), Route::Search { .. }));
+        assert_eq!(route_at("'x", 2, &types), Route::NotOurs);
+        assert!(matches!(route_at("'x", 1, &types), Route::Search { .. }));
         // 配成 3 字 ⇒ 两字词也不进。
-        assert_eq!(route_at("'报 告", 3), Route::NotOurs);
-        assert!(matches!(route_at("'报 告", 2), Route::Search { .. }));
-        assert_eq!(route("'x"), route_at("'x", MIN_QUERY_LEN));
+        assert_eq!(route_at("'报 告", 3, &types), Route::NotOurs);
+        assert!(matches!(route_at("'报 告", 2, &types), Route::Search { .. }));
+        assert_eq!(route("'x"), route_at("'x", MIN_QUERY_LEN, &types));
+    }
+
+    /// 批次 A1：`ext=pdf,docx` 直接指定扩展名。与 `pic 报告` 同一套落点（`Route::Search.exts`），
+    /// 只是清单由用户当场给，不查类型词表。
+    #[test]
+    fn ext_prefix_takes_an_explicit_extension_list() {
+        let types = default_type_word_lines();
+        assert_eq!(
+            route_at("ext=pdf 报告", MIN_QUERY_LEN, &types),
+            Route::Search {
+                words: words("报告"),
+                exts: vec!["pdf".to_string()],
+                dirs_only: false
+            }
+        );
+        // 多值：逗号 / 分号 / 空白三种分隔都认，`*.` 前缀去掉，大小写归一，重复项只留一份。
+        assert_eq!(
+            route_at("ext=*.PDF,docx;XLS 报告", MIN_QUERY_LEN, &types),
+            Route::Search {
+                words: words("报告"),
+                exts: vec!["pdf".to_string(), "docx".to_string(), "xls".to_string()],
+                dirs_only: false
+            }
+        );
+        // 空值 / 全垃圾 ⇒ 进了文件模式但**不限类型**（不是静默退回普通搜索）。
+        for q in ["ext= 报告", "ext=,. 报告"] {
+            assert_eq!(
+                route_at(q, MIN_QUERY_LEN, &types),
+                Route::Search {
+                    words: words("报告"),
+                    exts: vec![],
+                    dirs_only: false
+                },
+                "{q:?} 应是「进了文件模式、不限类型」"
+            );
+        }
+        // 与其它四式一样要过最小字数闸，而且首词剥掉之后得还剩过滤词：
+        // `ext=pdf` 单打仍是普通查询（同 `pic` 单打），配成 1 字才认单字的过滤词。
+        assert_eq!(route_at("ext=pdf", MIN_QUERY_LEN, &types), Route::NotOurs);
+        assert!(matches!(
+            route_at("ext=p 报", 1, &types),
+            Route::Search { .. }
+        ));
+        // 只认首词；`报告 ext=pdf` 里那个是普通过滤词，不剥。
+        assert_eq!(route_at("报告 ext=pdf", MIN_QUERY_LEN, &types), Route::NotOurs);
+    }
+
+    /// 批次 D7：类型词表降格成配置行——认哪几个关键字、每个关键字管哪些扩展名，全由那几行说。
+    #[test]
+    fn type_word_lines_are_parsed_like_ahk() {
+        // 畸形行整行忽略：没有 `=`、关键字带空格、等号右边空。
+        assert_eq!(parse_type_word_line("doc docx"), None);
+        assert_eq!(parse_type_word_line("my doc = pdf"), None);
+        assert_eq!(parse_type_word_line("doc = "), None);
+        assert_eq!(parse_type_word_line(""), None);
+        // 关键词大小写不敏感（AHK `StrLower(m[1])`），扩展名同理。
+        assert_eq!(
+            parse_type_word_line("  DOC  =  *.PDF, Pdf ; docx  "),
+            Some((
+                "doc".to_string(),
+                vec!["pdf".to_string(), "docx".to_string()]
+            ))
+        );
+        // 出厂七行与需求书那张表逐条一致（零漂移）。
+        assert_eq!(parse_type_word_line(DEFAULT_TYPE_WORD_LINES[1]), Some(("pic".to_string(), extension_list("pic"))));
+        assert_eq!(default_type_word_lines().len(), 7);
+    }
+
+    /// 词表换了，路由跟着换：删掉 `pic` 它就不再是类型词；新加 `doc2` 立刻能认。
+    #[test]
+    fn a_custom_type_word_table_replaces_the_builtin_one() {
+        let custom = vec![
+            "doc2 = pdf, ofd".to_string(),
+            "pic = png".to_string(),
+            "坏行没有等号".to_string(),
+        ];
+        assert_eq!(
+            route_at("doc2 报告", MIN_QUERY_LEN, &custom),
+            Route::Search {
+                words: words("报告"),
+                exts: vec!["pdf".to_string(), "ofd".to_string()],
+                dirs_only: false
+            }
+        );
+        // 出厂表里的 `doc` 在这份表里没有 ⇒ 它退回普通前缀（整串当过滤词）。
+        assert_eq!(route_at("doc 报告", MIN_QUERY_LEN, &custom), Route::NotOurs);
+        // 空表 ⇒ 只剩动词 / folder / `ext=` 三个出口。
+        assert_eq!(route_at("pic 报告", MIN_QUERY_LEN, &[]), Route::NotOurs);
+        assert!(matches!(
+            route_at("open 报告", MIN_QUERY_LEN, &[]),
+            Route::Search { .. }
+        ));
+    }
+
+    /// 文件源换词表：**不重扫**（索引跟词表无关），但命中缓存要作废
+    /// （`pic 报告` 换词表后该命中另一批文件，拿旧缓存就是拿上一条配置的答案）。
+    #[test]
+    fn changing_the_type_word_table_does_not_rescan_but_drops_the_hit_cache() {
+        let mut src = FileSource::default();
+        src.hits_cache = Some(("pic 报告".to_string(), Vec::new()));
+        let prefs = crate::source::application::AppSettings {
+            file_type_words: vec!["pic = png".to_string()],
+            ..Default::default()
+        };
+        src.apply_settings(&prefs);
+        assert_eq!(src.type_words, vec!["pic = png".to_string()]);
+        assert!(src.hits_cache.is_none(), "换词表必须丢掉按查询串存的旧命中");
+        assert!(!src.rebuild_in_flight, "换词表不该派重扫");
+
+        // 同值再来一次：什么都不动（缓存已经是 None 也就不可能被重新填上）。
+        src.hits_cache = Some(("pic 报告".to_string(), Vec::new()));
+        src.apply_settings(&prefs);
+        assert!(src.hits_cache.is_some(), "词表没变就不该动缓存");
     }
 
     #[test]
