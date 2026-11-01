@@ -69,10 +69,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowLongW, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, GUITHREADINFO, GWL_STYLE, HHOOK, HWND_BROADCAST,
+    GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId, GUITHREADINFO, GWL_STYLE, HHOOK, HWND_BROADCAST,
     IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, KillTimer, MSG, MSGFLT_ALLOW,
     PostMessageW, PostQuitMessage,
-    RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE,
+    RegisterClassExW, SC_MONITORPOWER, SM_CXSMICON, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow,
     SetTimer, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
@@ -18974,7 +18974,49 @@ impl eframe::App for LauncherApp {
     }
 }
 
+/// 托盘那一格要的资源 id：`assets\app.rc` 里 `1 ICON "app.ico"` 行首那个 1。
+/// 两处各写一份（.rc 里是文本、这里是数字），所以由单测
+/// `tray_icon_resource_id_matches_the_rc` 拿 .rc 源码核对——抄错的后果不是编译失败，
+/// 是 `from_resource` 返回 `Err` 后静默走回落档，托盘看着"有图标"却是另一张图。
+const TRAY_ICON_RESOURCE_ID: u16 = 1;
+
+/// 通知区域那一格的像素边长。`SM_CXSMICON` 是系统给"小图标"槽的度量，托盘图标按它要尺寸
+/// 才不会被二次缩放；返回 0 只可能是度量调用本身失败，那就按 32 要（旧版硬塞的就是 32×32，
+/// 系统会自己缩到槽宽——本机那个平涂方块一直是这么显示的，所以这条兜底不算未验证的路径）。
+fn tray_icon_slot_px() -> u32 {
+    // SAFETY：`GetSystemMetrics` 只收一个枚举值、无指针入参，读的是进程级度量，任何线程都能调。
+    let px = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    if px > 0 { px as u32 } else { 32 }
+}
+
+/// 批次 TRAY（FR-SYS-01「图标内嵌资源不依赖外部文件」）：托盘那一格换成程序自己的图标。
+///
+/// 三档退路，顺序不许倒：
+/// ① exe 里的 `.ico` 资源（`from_resource` → `LoadImageW` 按托盘槽宽挑最接近的一帧）。
+///    这是唯一不失真的一档：`.ico` 里本来就有 16/24/32/48/256 五种尺寸，系统挑同一尺寸直接贴。
+/// ② `assets\app-icon-64.rgba` 贴片——批次 ICON 给任务栏加的那份，同一张原图、同一套字节。
+///    `build.rs` 找不到 `rc.exe` 时资源段是空的，①必然 `Err`，这一档保证「凡是本机编译出来的
+///    产物，托盘就是真图标」，代价是 64 缩到 16 由 shell 做、边缘会糊。
+/// ③ 平涂方块——前两条都拿不出东西时的兜底，只管「托盘不能是空白」，不管好看。
+///
+/// 旧版只有③：整块 `[0,120,215,255]` 平涂、0 个透明像素，所以「回落档有没有真换上贴片」
+/// 这条判据是像素可分辨的（滚动哈希 + 透明像素计数两路），不必靠肉眼比两张截图。
 fn create_tray_icon() -> tray_icon::Icon {
+    let px = tray_icon_slot_px();
+    let from_resource = tray_icon::Icon::from_resource(TRAY_ICON_RESOURCE_ID, Some((px, px)));
+    if let Ok(icon) = from_resource {
+        log_info!("托盘图标：内嵌资源（{px} px）");
+        return icon;
+    }
+    // 贴片档直接复用 `window_icon_data()`，不再第二次 `include_bytes!`——两条通道读的是同一份
+    // 字节，就不会出现「任务栏换了、托盘还是旧的」这种两边各自漂移。
+    let blob = window_icon_data();
+    let from_blob = tray_icon::Icon::from_rgba(blob.rgba, blob.width, blob.height);
+    if let Ok(icon) = from_blob {
+        log_info!("托盘图标：资源缺席（{px} px），回落 64 px 贴片");
+        return icon;
+    }
+    log_info!("托盘图标：两条都拿不到，平涂方块兜底");
     let (w, h) = (32u32, 32u32);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for _ in 0..(w * h) {
@@ -19493,6 +19535,34 @@ mod nav_tests {
             "不透明像素只有 {opaque}/{total}，主体多半被抠掉了"
         );
         assert!(clear > 0, "一个全透明像素都没有＝圆角外会带一圈底色");
+    }
+
+    /// 批次 TRAY：`TRAY_ICON_RESOURCE_ID` 必须与 `assets\app.rc` 那行 `1 ICON "app.ico"` 的
+    /// 行首数字一致。为什么值得一条单测而不是"看一眼就知道"：抄错的后果不是编译失败，是
+    /// `from_resource` 返回 `Err` ⇒ 静默走回落档，托盘照样有图（只是那张靠贴片不是靠资源），
+    /// 于是「内嵌资源不依赖外部文件」这条验收会自己给自己打勾。
+    /// 只扫非注释行——`.rc` 第 3 行的注释里同样写着 `1 ICON "app.ico"`，整文件抓数字会跟着
+    /// 注释走；将来有人把 id 改成 2 而注释没改，这种"扫到两个 id"必须当场失败而不是挑第一个。
+    #[test]
+    fn tray_icon_resource_id_matches_the_rc() {
+        let ids: Vec<u16> = include_str!("../assets/app.rc")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .filter_map(|line| line.split_whitespace().next()?.parse::<u16>().ok())
+            .collect();
+        assert_eq!(ids, vec![TRAY_ICON_RESOURCE_ID], "资源脚本里有效的 id 行要与常量一致");
+    }
+
+    /// 批次 TRAY：向 `LoadImageW` 要尺寸时传 0 不等于"随便"——它带 `LR_DEFAULTSIZE`，
+    /// 0 会被换成**大图标**尺寸（`SM_CXICON`，100% 缩放下 32 px）再塞进 16 px 的托盘槽，
+    /// 白付一次缩放。这条断言管住 `tray_icon_slot_px()` 的兜底分支：度量取不到也要给一个
+    /// 能直接请求的正数。（它测的是"我给的尺寸不会是 0"，不是"托盘真按这个尺寸出图"——
+    /// 后半句留给真机那格 BitBlt。）
+    #[test]
+    fn tray_icon_slot_px_is_never_zero() {
+        let px = tray_icon_slot_px();
+        assert!((8..=256).contains(&px), "托盘槽宽实测 {px}，不在可请求范围内");
     }
 
     /// 批次 G3：快照要把"内存块格式"抄字节、把"句柄格式"跳过。跳错一侧的后果不对称——
