@@ -511,6 +511,10 @@ fn settings_from_map(
     take_field!(map, s, "", snippet_body_search, bool);
     take_field!(map, s, "", snippet_paste_mode, String);
     take_field!(map, s, "", snippet_paste_delay_ms, u32);
+    // 批次 A5 后半段（FR-SRC-08）的三格：同一条理由。
+    take_field!(map, s, "", snippet_auto_expand, bool);
+    take_field!(map, s, "", snippet_expand_prefix, String);
+    take_field!(map, s, "", snippet_expand_exclude, String);
     s
 }
 
@@ -641,7 +645,9 @@ fn shape_fault(path: &Path, got: &serde_json::Value) -> Option<Corrupted> {
 /// - 语法坏 / 顶层不是对象 ⇒ 留证（`Corrupted`）+ 默认值，**不写盘**（写盘会覆盖唯一证据）；
 /// - 读得动 ⇒ 需要迁移就先备份再逐步迁，**只有真的动了这份树才回写一次**；
 ///   纯读永远不改盘（保住"未知键"与更高版本戳，也避免每次启动都产生一次写）。
-fn load_settings_at(path: &Path) -> (AppSettings, Option<Corrupted>) {
+/// 批次 A5 后半段起改 `pub(crate)`：热键线程那条「片段库 / 展开设置变了就重算」不是 UI 线程，
+/// 又要走与启动路径完全同一套字段容错与迁移，不能自己再解析一遍 JSON。
+pub(crate) fn load_settings_at(path: &Path) -> (AppSettings, Option<Corrupted>) {
     let (tree, fault) = load_or_quarantine::<serde_json::Value>(path);
     if let Some(e) = fault {
         return (AppSettings::default(), Some(e));
@@ -964,6 +970,21 @@ pub struct AppSettings {
     /// 读侧过 [`AppSettings::snippet_paste_delay`] 夹进区间，读盘时不改写。
     #[serde(default = "default_snippet_paste_delay")]
     pub snippet_paste_delay_ms: u32,
+
+    /// FR-SRC-08（批次 A5 后半段）：在任意程序里敲 `;keyword` 是否自动展开。缺省开。
+    /// 每条片段自己还有 `auto_expand` 一格——这一个是总闸，关掉它一条都不触发。
+    #[serde(default = "default_true")]
+    pub snippet_auto_expand: bool,
+
+    /// 自动展开的前缀（需求书 4.2.2 的 `;keyword` 那个 `;`）。空串 / 带空白回落出厂值，
+    /// 见 [`AppSettings::snippet_expand_prefix`]——一个空前缀等于"打什么都可能触发"。
+    #[serde(default = "default_snippet_expand_prefix")]
+    pub snippet_expand_prefix: String,
+
+    /// 不展开的窗口名单，写法照 AHK 的 `ExpandExclude`：逗号分隔，
+    /// `ahk_exe x.exe` / `ahk_class y` / 其余整条按标题子串。
+    #[serde(default = "default_snippet_expand_exclude")]
+    pub snippet_expand_exclude: String,
 }
 
 fn default_terminal_shell() -> String {
@@ -989,6 +1010,15 @@ fn default_snippet_paste_mode() -> String {
 
 fn default_snippet_paste_delay() -> u32 {
     crate::source::snippet::DEFAULT_PASTE_DELAY_MS
+}
+
+// 自动展开三格的缺省（批次 A5 后半段）——与 `expander.rs` 同源，零漂移。
+fn default_snippet_expand_prefix() -> String {
+    crate::expander::DEFAULT_PREFIX.to_string()
+}
+
+fn default_snippet_expand_exclude() -> String {
+    crate::expander::DEFAULT_EXCLUDE.to_string()
 }
 
 fn default_true() -> bool {
@@ -1044,6 +1074,9 @@ impl Default for AppSettings {
             snippet_body_search: true,
             snippet_paste_mode: default_snippet_paste_mode(),
             snippet_paste_delay_ms: default_snippet_paste_delay(),
+            snippet_auto_expand: true,
+            snippet_expand_prefix: default_snippet_expand_prefix(),
+            snippet_expand_exclude: default_snippet_expand_exclude(),
         }
     }
 }
@@ -1157,6 +1190,25 @@ impl AppSettings {
             crate::source::snippet::MIN_PASTE_DELAY_MS,
             crate::source::snippet::MAX_PASTE_DELAY_MS,
         )
+    }
+
+    /// 自动展开实际用的前缀（FR-SRC-08）：去首尾空白；空串、带空白、带反引号一律回落出厂 `;`。
+    ///
+    /// 三种坏值走同一条兜底而不是"用坏值也行"：空前缀等于"打什么字都可能触发"，
+    /// 带空白的前缀永远拼不出能触发的缩写（缩写在敲下空格前就得命中）——都是功能静默死掉。
+    pub fn snippet_expand_prefix(&self) -> &str {
+        let p = self.snippet_expand_prefix.trim();
+        if p.is_empty() || p.chars().any(char::is_whitespace) || p.contains('`') {
+            crate::expander::DEFAULT_PREFIX
+        } else {
+            p
+        }
+    }
+
+    /// 排除名单解析成规则表。每次展开判一次就重解析一遍是几微秒的事，
+    /// 不缓存——缓存就得管"设置页改了要失效"，那是另一条会漏的路。
+    pub fn snippet_expand_rules(&self) -> Vec<crate::expander::ExcludeRule> {
+        crate::expander::parse_exclude(&self.snippet_expand_exclude)
     }
 }
 
@@ -1885,7 +1937,10 @@ impl DataSource for AppsSource {
 }
 
 /// 偏好文件与清单同目录（复用 `user_list_path` 已解析好的便携判定）。
-fn settings_path() -> PathBuf {
+///
+/// 批次 A5 后半段起改 `pub`：热键线程那条常驻的「片段文件变了就重注册」要看它的 mtime，
+/// 而它不是 UI 线程。
+pub fn settings_path() -> PathBuf {
     user_list_path().with_file_name("settings.json")
 }
 
@@ -5838,6 +5893,10 @@ mod config_tests {
         x.snippet_body_search = false;
         x.snippet_paste_mode = "type".to_string();
         x.snippet_paste_delay_ms = 1_200;
+        // 批次 A5 后半段的三格：总闸 / 前缀 / 排除名单，同样是"特值进、特值出"。
+        x.snippet_auto_expand = false;
+        x.snippet_expand_prefix = ";;".to_string();
+        x.snippet_expand_exclude = "ahk_exe probe.exe".to_string();
         x.appearance = Appearance {
             width: 720.0,
             status_bar: false,
@@ -5943,6 +6002,20 @@ mod config_tests {
             1_200,
             "snippet_paste_delay（批次 A5：区间内的值要原样）"
         );
+        assert!(
+            !got.snippet_auto_expand,
+            "snippet_auto_expand（批次 A5 后半段：读成 true 就是关掉的总闸自己又开了）"
+        );
+        assert_eq!(
+            got.snippet_expand_prefix(),
+            ";;",
+            "snippet_expand_prefix（批次 A5 后半段：读成 ; 就是设置页改完不生效）"
+        );
+        assert_eq!(
+            got.snippet_expand_rules(),
+            vec![crate::expander::ExcludeRule::Exe("probe.exe".to_string())],
+            "snippet_expand_exclude（批次 A5 后半段：读成出厂三条就是用户加的排除名单被吞了）"
+        );
         assert_eq!(got.file_scan_scope().depth, 6, "file_scan_scope 汇编");
         assert_eq!(got.file_scan_scope().refresh.as_secs(), 15 * 60);
     }
@@ -5967,6 +6040,25 @@ mod config_tests {
         assert_eq!(g.max_entries, 1_000);
         assert_eq!(g.refresh, std::time::Duration::from_secs(60));
         assert_eq!(g.min_query_len, 1);
+    }
+
+    /// 批次 A5 后半段：展开前缀的兜底。空前缀 / 带空白 / 带反引号都回落出厂 `;`
+    /// ——这三种坏值各自都会让功能静默死掉（打什么都可能触发 / 永远拼不出缩写），
+    /// 所以不"照用"。
+    #[test]
+    fn snippet_expand_prefix_falls_back_for_bad_values() {
+        let mut s = AppSettings::default();
+        assert_eq!(s.snippet_expand_prefix(), crate::expander::DEFAULT_PREFIX);
+        s.snippet_expand_prefix = "   ".to_string();
+        assert_eq!(s.snippet_expand_prefix(), ";");
+        s.snippet_expand_prefix = "a b".to_string();
+        assert_eq!(s.snippet_expand_prefix(), ";");
+        s.snippet_expand_prefix = "`".to_string();
+        assert_eq!(s.snippet_expand_prefix(), ";");
+        s.snippet_expand_prefix = ";;".to_string();
+        assert_eq!(s.snippet_expand_prefix(), ";;", "合法值原样（去首尾空白）");
+        s.snippet_expand_prefix = " ;; ".to_string();
+        assert_eq!(s.snippet_expand_prefix(), ";;");
     }
 
     /// 「缺失项补默认」＋批次 J 那次的老写法：`space_to_run` 曾是布尔。

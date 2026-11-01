@@ -225,6 +225,16 @@ pub const ENTRIES: &[CheatEntry] = &[
         settings_page: Some(11),
     },
     CheatEntry {
+        example_key: "cheat.snippet_expand.example",
+        title_key: "cheat.snippet_expand.title",
+        summary_key: "cheat.snippet_expand.summary",
+        detail_key: "cheat.snippet_expand.detail",
+        tags: "snippet expand 片段 自动展开 缩写 abbreviation hotstring 任意程序 any program 全局",
+        group: Group::Syntax,
+        source: Some(SourceId::Snippets),
+        settings_page: Some(11),
+    },
+    CheatEntry {
         example_key: "cheat.path.example",
         title_key: "cheat.path.title",
         summary_key: "cheat.path.summary",

@@ -25,7 +25,7 @@ use windows::Win32::System::Com::{
     CoUninitialize,
 };
 use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 // FR-SRC-10：计算器结果行 Enter ＝「把纯数字写进剪贴板」。三件套在 DataExchange，
 // GlobalAlloc/GlobalLock 在 Memory（该模块没有 feature 门，已随 Win32_Foundation 白送）。
 // 批次 E4（FR-ACT-05）：「Preferred DropEffect」是**运行时注册的自定义格式**，
@@ -44,15 +44,16 @@ use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, Glo
 // 少起一个进程，也就没有控制台窗口闪烁那一档事。
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::System::Threading::{
-    CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
-    WaitForSingleObject,
+    CreateMutexW, GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyboardLayout, HOT_KEY_MODIFIERS, HKL, INPUT, INPUT_0, INPUT_KEYBOARD,
     KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR,
     MapVirtualKeyW, RegisterHotKey, SendInput, ToUnicodeEx, UnregisterHotKey, VIRTUAL_KEY,
-    VK_CONTROL, VK_LWIN, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK,
+    VK_BACK, VK_CONTROL, VK_LWIN, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK,
     VK_MEDIA_STOP, VK_MENU, VK_RWIN, VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
@@ -67,16 +68,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CallNextHookEx, ChangeWindowMessageFilterEx,
     CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, HHOOK, HWND_BROADCAST,
-    HWND_MESSAGE, IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, KillTimer, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage,
+    GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowLongW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, GUITHREADINFO, GWL_STYLE, HHOOK, HWND_BROADCAST,
+    HWND_MESSAGE, IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, KillTimer, MSG, MSGFLT_ALLOW,
+    PostMessageW, PostQuitMessage,
     RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow,
     SetTimer, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_SYSCOMMAND, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+    WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSEXW,
 };
 
 /// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
@@ -99,6 +102,7 @@ mod actions;
 mod cli;
 mod dbltap;
 mod dpi;
+mod expander;
 mod hud;
 mod i18n;
 mod large_type;
@@ -2192,13 +2196,30 @@ fn units_for_typing(text: &str) -> Vec<u16> {
 /// 投完还回去。少了这一步，中文 IME 会把事件吃掉而 `SendInput` 仍报全部成功（批次 E5 真机
 /// 抓到的，见下面那段注）。
 fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
+    // 空串必须在问句柄之前挡下（批次 E5 的单测钉着这一次序）。
     if text.is_empty() {
         return Err(crate::i18n::t("paste.err.empty").to_string());
     }
     let prev = focus_previous_window()?;
+    type_text_into_window(&prev, text, 0)
+}
+
+/// 同一条 Unicode 逐字通道，但目标窗口由调用方给定（不抢焦点、不改「呼出前的窗口」记账）。
+///
+/// 批次 A5 后半段（FR-SRC-08）的自动展开用这条：触发时目标就在前台，抢焦点反而会打断用户；
+/// `mark` 是写进每个 `INPUT.dwExtraInfo` 的记号，自家键盘钩子看到它就当没看见这颗键
+/// （`KEYEVENTF_UNICODE` 的抬起也带同一个记号），否则刚投出去的正文会立刻被喂回触发缓冲。
+fn type_text_into_window(
+    prev: &PrevWindow,
+    text: &str,
+    mark: usize,
+) -> Result<String, String> {
+    if text.is_empty() {
+        return Err(crate::i18n::t("paste.err.empty").to_string());
+    }
     let hwnd = prev.hwnd;
     let raw = prev.raw;
-    let target = prev.class;
+    let target = prev.class.clone();
     let units = units_for_typing(text);
     // ---- 批次 E5 真机抓到的根因：`KEYEVENTF_UNICODE` 的事件**先过一遍目标那边的输入法** ----
     // 目标挂着中文模式的 IME 时，`SendInput` 照样返回"全部收下"，字却一个字都不落地——
@@ -2226,7 +2247,7 @@ fn paste_text_into_previous_window(text: &str) -> Result<String, String> {
                         KEYEVENTF_UNICODE
                     },
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: mark,
                 },
             },
         };
@@ -2283,10 +2304,13 @@ const PASTE_CHORD_GAP: Duration = Duration::from_millis(25);
 /// 为什么不是一批四个事件：2026-10-31 沙箱对照实验里，四个事件塞进同一次 `SendInput` 后
 /// 目标端会把 `Ctrl↑` 排到 `V↓` 前面 ⇒ `Ctrl+V` 退化成打出一个字面量 `v`。分批后 8/8 全中。
 /// 某一批被系统拒收就立刻停手（剩下的不再发），返回值只代表"三批都收下了"。
-fn send_paste_keystroke() -> bool {
-    let ctrl_down = [vk_input(VK_CONTROL.0, false)];
-    let v_tap = [vk_input(VK_V, false), vk_input(VK_V, true)];
-    let ctrl_up = [vk_input(VK_CONTROL.0, true)];
+fn send_paste_keystroke(mark: usize) -> bool {
+    let ctrl_down = [vk_input_with(VK_CONTROL.0, false, mark)];
+    let v_tap = [
+        vk_input_with(VK_V, false, mark),
+        vk_input_with(VK_V, true, mark),
+    ];
+    let ctrl_up = [vk_input_with(VK_CONTROL.0, true, mark)];
     let batches: [&[INPUT]; 3] = [&ctrl_down, &v_tap, &ctrl_up];
     for (i, batch) in batches.iter().enumerate() {
         let sent = unsafe { SendInput(batch, std::mem::size_of::<INPUT>() as i32) };
@@ -2304,10 +2328,33 @@ fn send_paste_keystroke() -> bool {
 /// 中途被系统拒掉就停，调用方据此报"退了几次"而不是假装全退回去了。
 ///
 /// 每个换行算一格：多数编辑器的行首按左键会跳到上一行行尾，与"退一个字"等价。
-fn send_left_arrows(n: usize) -> usize {
+fn send_left_arrows(n: usize, mark: usize) -> usize {
     let mut sent = 0usize;
     for _ in 0..n {
-        let inputs = [vk_input(VK_LEFT, false), vk_input(VK_LEFT, true)];
+        let inputs = [
+            vk_input_with(VK_LEFT, false, mark),
+            vk_input_with(VK_LEFT, true, mark),
+        ];
+        let k = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+        sent += k / 2;
+        if k != inputs.len() {
+            break;
+        }
+    }
+    sent
+}
+
+/// 退格 `n` 次。批次 A5 后半段（FR-SRC-08）：自动展开命中时先把用户敲进去的缩写删掉。
+///
+/// 一次一个按键、按下抬起成对投：中文输入法开着时 `VK_BACK` 仍能删掉最后一个已完成/未完成的
+/// 编码单元，成对投也是键盘事件的最常见形态。返回真正投全的次数（中途被拒就停）。
+fn send_backspaces(n: usize, mark: usize) -> usize {
+    let mut sent = 0usize;
+    for _ in 0..n {
+        let inputs = [
+            vk_input_with(VK_BACK.0, false, mark),
+            vk_input_with(VK_BACK.0, true, mark),
+        ];
         let k = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
         sent += k / 2;
         if k != inputs.len() {
@@ -2329,6 +2376,20 @@ fn paste_via_clipboard(text: &str, delay: Duration) -> Result<String, String> {
         return Err(crate::i18n::t("paste.err.empty").to_string());
     }
     let prev = focus_previous_window()?;
+    paste_via_clipboard_into(&prev, text, delay, 0)
+}
+
+/// 同一条剪贴板通道，目标与「呼出前的窗口」记账由调用方给定。
+/// `mark` 与 [`type_text_into_window`] 同一口径：自家钩子靠它把 `Ctrl+V` 与退格认成自己的动作。
+fn paste_via_clipboard_into(
+    prev: &PrevWindow,
+    text: &str,
+    delay: Duration,
+    mark: usize,
+) -> Result<String, String> {
+    if text.is_empty() {
+        return Err(crate::i18n::t("paste.err.empty").to_string());
+    }
     let snapshot = snapshot_clipboard()
         .map_err(|e| crate::i18n::tfmt("paste.err.snapshot", &[&e]))?;
     if let Err(e) = copy_to_clipboard(text) {
@@ -2354,7 +2415,7 @@ fn paste_via_clipboard(text: &str, delay: Duration) -> Result<String, String> {
     // 同一批 `SendInput` 在这台机器上会被目标端打乱——目标的按键日志里 `Ctrl↑` 抢到 `V↓` 前面，
     // 于是贴出来的是字面量 `v`；分批、每批之间停 [`PASTE_CHORD_GAP`] 后 8/8 全中。输入法开关
     // （Type 那条路用的切英文）试过：没用，反而把「什么都不贴」变成「贴出个 v」，故不在这里动它。
-    let key_ok = send_paste_keystroke();
+    let key_ok = send_paste_keystroke(mark);
     if !delay.is_zero() {
         thread::sleep(delay);
     }
@@ -3941,6 +4002,13 @@ fn run_console_tool(exe: &str, args: &[&str]) -> std::io::Result<()> {
 /// 一个键盘 `INPUT` 事件。抽出来是因为「按下 + 抬起」与「`Ctrl` + 主键」两处都要造同一种结构，
 /// 抄两份只会让两边的字段漂开。
 fn vk_input(vk: u16, up: bool) -> INPUT {
+    vk_input_with(vk, up, 0)
+}
+
+/// 同上，但给每个事件盖一个 `dwExtraInfo` 记号。批次 A5 后半段的自动展开靠它让自家
+/// 键盘钩子认出"这几颗键是本程序自己投的"——钩子回调里没有可靠的时序可以把它们排除掉
+/// （`SendInput` 返回之后事件还可能排在钩子线程的队列里）。
+fn vk_input_with(vk: u16, up: bool, mark: usize) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -3953,7 +4021,7 @@ fn vk_input(vk: u16, up: bool) -> INPUT {
                     KEYBD_EVENT_FLAGS(0)
                 },
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: mark,
             },
         },
     }
@@ -4029,6 +4097,13 @@ const WM_APP_SPRINT_ARM: u32 = WM_APP + 8;
 /// 「停止抢跑截字」。`wparam` = 投信时那一轮的代数（见 [`SPRINT_GEN`]）：
 /// 对不上说明已经开了新一轮（用户快速连按两次呼出），这条迟到的停止不照办。
 const WM_APP_SPRINT_STOP: u32 = WM_APP + 9;
+/// 「片段自动展开命中了一条」（批次 A5 后半段，FR-SRC-08）。钩子回调里只把待办塞进
+/// [`EXPAND_PENDING`] 并投这条消息，真正退格与粘贴由工作线程做——回调里不能等粘贴延迟，
+/// 更不能写日志。`wparam`/`lparam` 都空着，参数走队列。
+const WM_APP_EXPAND: u32 = WM_APP + 10;
+/// 「片段库 / 展开设置变了，重新算一遍可展开表」。设置页保存后投它；钩子装卸也在这条消息里做
+/// （低级钩子的线程归属）。`wparam` 无意义。
+const WM_APP_EXPAND_REFRESH: u32 = WM_APP + 11;
 /// 暂停的兜底定时器 id 与时长：注销状态一旦漏掉恢复（比如窗口隐藏后 eframe 不再跑 `ui()`，
 /// UI 侧那条边沿检测就永远不执行），全局呼出会一直不可用。定时器挂在消息窗上，
 /// 由热键线程自己的消息循环驱动 ⇒ 与窗口可见与否无关，这条兜底才是真兜底。
@@ -4979,6 +5054,505 @@ fn post_sprint_stop() {    let raw = HOTKEY_HWND.load(Ordering::Relaxed);
     }
 }
 
+// ---- 批次 A5 后半段（FR-SRC-08）：`;keyword` 全局自动展开 ----
+//
+// 与 AHK `SnippetExpander.ahk` 同一个口径，三件东西缺一不可：
+// ① 两个常驻低级钩子（键盘 + 鼠标）挂在热键线程上——低级钩子的回调只跑在装钩子的那条线程，
+//    所以装卸也只能在那里做（与双击、抢跑截字同一条规矩）；
+// ② 钩子回调只做"攒字 + 比对"，命中后把待办塞进队列、投一条 `WM_APP_EXPAND` 就返回。
+//    回调里有系统硬超时，绝不能在那里等粘贴延迟、更不能写日志；
+// ③ 真正退格 + 粘贴由一次性工作线程做（粘贴延迟最多 3 秒，不能堵住热键线程的消息循环）。
+//
+// 不吞"最后一颗字"（AHK 的 `*?` 同款）：那一下照常落进目标窗口，工作线程等
+// [`EXPAND_SETTLE`] 之后退"缩写字符数"格、再粘正文。吞掉的话退格数就得比实际落地的少一格，
+// 一旦时序有偏差就会多删一个用户本来想留的字。
+
+/// 本程序自己投的键盖的记号（ASCII "EGLA"）。钩子看到 `dwExtraInfo` 等于它就整颗跳过。
+const EXPAND_SEND_MARK: usize = 0x4547_4C41;
+/// 命中后等最后一颗字落进目标窗口的时长。只与"按键投递"有关，不是给目标程序留的粘贴延迟。
+const EXPAND_SETTLE: Duration = Duration::from_millis(30);
+/// 片段库 / 展开设置的兜底轮询。设置页保存会直接投 `WM_APP_EXPAND_REFRESH` 抢在它前面，
+/// 这条只兜"用户手改了 snippets.json / settings.json"。
+const EXPAND_REFRESH_TIMER: usize = 0x5EF1;
+const EXPAND_REFRESH_EVERY: u32 = 1_000;
+
+/// 自动展开用的键盘钩子（0 = 没装）。只有热键线程装/卸。
+static EXPAND_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// 自动展开用的鼠标钩子（0 = 没装）。只用来"点一下/滚一下就把打字缓冲作废"。
+static EXPAND_MOUSE_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// 钩子回调的快速判据：没有可展开的片段就一个字符都不碰（关闭档连钩子都不装）。
+static EXPAND_ARMED: AtomicBool = AtomicBool::new(false);
+/// 可展开表 + 排除名单 + 粘贴参数 + 打字缓冲。热键线程写表、钩子回调攒字、工作线程读一条待办；
+/// 临界区里只做复制/清空，绝不持锁去开进程或投键。
+static EXPAND_STATE: Mutex<ExpandState> = Mutex::new(ExpandState::new());
+/// 命中后排队的待办。钩子回调只 push，热键线程的消息循环取走并派工作线程。
+static EXPAND_PENDING: Mutex<Vec<PendingExpand>> = Mutex::new(Vec::new());
+
+struct ExpandState {
+    abbrs: Vec<expander::Abbr>,
+    rules: Vec<expander::ExcludeRule>,
+    mode: source::snippet::PasteMode,
+    delay: Duration,
+    buffer: expander::TypeBuffer,
+    settings_stamp: Option<SystemTime>,
+    snippets_stamp: Option<SystemTime>,
+}
+
+impl ExpandState {
+    const fn new() -> Self {
+        Self {
+            abbrs: Vec::new(),
+            rules: Vec::new(),
+            mode: source::snippet::PasteMode::Clipboard,
+            delay: Duration::ZERO,
+            buffer: expander::TypeBuffer::new(),
+            settings_stamp: None,
+            snippets_stamp: None,
+        }
+    }
+}
+
+/// 一次命中之后要做的全部事情。正文在这里就复制出来——工作线程运行期间用户可能改片段库。
+struct PendingExpand {
+    target: usize,
+    /// 该退几格（按原样大小写的缩写数字符）。
+    key_len: usize,
+    body: String,
+    mode: source::snippet::PasteMode,
+    delay: Duration,
+}
+
+fn expand_lock() -> std::sync::MutexGuard<'static, ExpandState> {
+    EXPAND_STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn expand_pending_lock() -> std::sync::MutexGuard<'static, Vec<PendingExpand>> {
+    EXPAND_PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 装 / 卸自动展开的两个低级钩子。**只能在热键线程调**。
+/// 关闭档不装：一个按键事件都看不见，代价为零（与双击档同一条）。
+fn set_expand_hooks(on: bool) {
+    unsafe {
+        if !on {
+            for (raw, what) in [
+                (EXPAND_HOOK.swap(0, Ordering::Relaxed), "键盘"),
+                (EXPAND_MOUSE_HOOK.swap(0, Ordering::Relaxed), "鼠标"),
+            ] {
+                if raw != 0 {
+                    if let Err(e) = UnhookWindowsHookEx(HHOOK(raw as *mut _)) {
+                        log_info!("expand: 卸下{what}钩子失败（{e}）");
+                    }
+                }
+            }
+            expand_lock().buffer.clear();
+            return;
+        }
+        if EXPAND_HOOK.load(Ordering::Relaxed) != 0
+            && EXPAND_MOUSE_HOOK.load(Ordering::Relaxed) != 0
+        {
+            return;
+        }
+        let module = match GetModuleHandleW(None) {
+            Ok(m) => m,
+            Err(e) => {
+                log_info!("expand: GetModuleHandleW 失败（{e}）⇒ 自动展开不可用");
+                return;
+            }
+        };
+        if EXPAND_HOOK.load(Ordering::Relaxed) == 0 {
+            match SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(expand_keyboard_hook_proc),
+                Some(HINSTANCE(module.0)),
+                0,
+            ) {
+                Ok(h) => {
+                    EXPAND_HOOK.store(h.0 as usize, Ordering::Relaxed);
+                    log_info!("expand: 已装键盘钩子（自动展开监听中）");
+                }
+                Err(e) => {
+                    log_info!("expand: 装键盘钩子失败（{e}）⇒ 本次自动展开不可用")
+                }
+            }
+        }
+        if EXPAND_MOUSE_HOOK.load(Ordering::Relaxed) == 0 {
+            match SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(expand_mouse_hook_proc),
+                Some(HINSTANCE(module.0)),
+                0,
+            ) {
+                Ok(h) => {
+                    EXPAND_MOUSE_HOOK.store(h.0 as usize, Ordering::Relaxed);
+                    log_info!("expand: 已装鼠标钩子（点击 / 滚轮会清空打字缓冲）");
+                }
+                Err(e) => {
+                    log_info!("expand: 装鼠标钩子失败（{e}）⇒ 点鼠标不会清空打字缓冲")
+                }
+            }
+        }
+    }
+}
+
+/// 重算可展开表并同步钩子状态。**只能在热键线程调**（钩子装卸的线程归属）。
+///
+/// `force = false` 时只看两份文件的 mtime：没变就直接返回，1 秒一次的轮询不会把 JSON
+/// 反复解析一遍。`force = true` 用于启动与设置页保存——保存那一刻用户正等着效果。
+fn refresh_expand(force: bool) {
+    let settings_path = source::application::settings_path();
+    let snippets_path = source::application::snippets_path();
+    let settings_stamp = std::fs::metadata(&settings_path)
+        .and_then(|m| m.modified())
+        .ok();
+    let snippets_stamp = std::fs::metadata(&snippets_path)
+        .and_then(|m| m.modified())
+        .ok();
+    let was_count = {
+        let st = expand_lock();
+        if !force && st.settings_stamp == settings_stamp && st.snippets_stamp == snippets_stamp {
+            return;
+        }
+        st.abbrs.len()
+    };
+    let (prefs, _) = source::application::load_settings_at(&settings_path);
+    let (file, _) = source::application::load_snippets();
+    let abbrs = expander::build(&file.snippets, prefs.snippet_expand_prefix());
+    let rules = prefs.snippet_expand_rules();
+    let count = abbrs.len();
+    let enabled = prefs.snippet_auto_expand && count > 0;
+    let mode = prefs.snippet_paste_mode_effective();
+    let delay = Duration::from_millis(u64::from(prefs.snippet_paste_delay()));
+    {
+        let mut st = expand_lock();
+        st.abbrs = abbrs;
+        st.rules = rules;
+        st.mode = mode;
+        st.delay = delay;
+        st.settings_stamp = settings_stamp;
+        st.snippets_stamp = snippets_stamp;
+        if !enabled {
+            st.buffer.clear();
+        }
+    }
+    let was_armed = EXPAND_ARMED.swap(enabled, Ordering::Relaxed);
+    set_expand_hooks(enabled);
+    if enabled != was_armed || (enabled && count != was_count) {
+        if enabled {
+            log_info!("expand: 自动展开已启用（{count} 条片段带「自动展开」；前缀与关键字不落日志）");
+        } else if !prefs.snippet_auto_expand {
+            log_info!("expand: 自动展开已关闭（设置页开关）");
+        } else {
+            log_info!("expand: 自动展开待命中没有可用片段（0 条带「自动展开」）");
+        }
+    }
+}
+
+/// UI → 热键线程：片段库或展开设置变了，立刻重算。
+///
+/// 不写日志：调用点是设置页每次失焦保存，失败也只是"最多晚 1 秒（轮询）生效"。
+fn post_expand_refresh() {
+    let raw = HOTKEY_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let _ = unsafe {
+        PostMessageW(
+            Some(HWND(raw as *mut _)),
+            WM_APP_EXPAND_REFRESH,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    };
+}
+
+/// 这个窗口该不该自动展开。只在**真命中**之后、由工作线程调（钩子回调里不做：开进程、
+/// 跨进程读窗口标题都可能把回调拖过系统超时）。
+///
+/// 三条排除（需求书 FR-SRC-08）：本程序自己的窗口（按进程判，HUD / 设置页也算）、
+/// 密码框、`expand_exclude` 名单。窗口标题只读来比对，**绝不进日志**。
+fn expand_target_allowed(fg: HWND) -> bool {
+    if fg.0.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    if pid != 0 && pid == unsafe { GetCurrentProcessId() } {
+        return false;
+    }
+    if let Some((class, style)) = focused_control(fg) {
+        if expander::is_password_control(&class, style) {
+            return false;
+        }
+    }
+    let rules = expand_lock().rules.clone();
+    if rules.is_empty() {
+        return true;
+    }
+    let exe = window_process_path(fg).unwrap_or_default();
+    let class = window_class_name(fg);
+    let title = window_title(fg);
+    !expander::is_excluded(
+        &rules,
+        &expander::WindowFacts {
+            exe: &exe,
+            class: &class,
+            title: &title,
+        },
+    )
+}
+
+/// 窗口所属进程的 exe 全路径。取不到就 `None`（排除名单里按 exe 的规则这次不生效，
+/// 按类名 / 标题的规则照常判）。不落日志：路径里可能带用户名。
+fn window_process_path(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(handle);
+        if ok.is_err() {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..size as usize]))
+    }
+}
+
+/// 目标窗口那条 UI 线程此刻的焦点控件（类名 + 样式位）。取不到就 `None`。
+/// 只用来判密码框，类名不落日志。
+fn focused_control(hwnd: HWND) -> Option<(String, u32)> {
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd, None);
+        if tid == 0 {
+            return None;
+        }
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(tid, &mut info).is_err() || info.hwndFocus.0.is_null() {
+            return None;
+        }
+        let style = GetWindowLongW(info.hwndFocus, GWL_STYLE) as u32;
+        Some((window_class_name(info.hwndFocus), style))
+    }
+}
+
+/// `WH_KEYBOARD_LL` 回调（自动展开）。跑在热键线程，与双击、抢跑截字共用一条消息队列。
+///
+/// · **绝不在回调里写日志**；
+/// · 带 [`EXPAND_SEND_MARK`] 的键一律放行——那是自己刚刚投出去的退格 / 正文 / `Ctrl+V`；
+/// · 只攒 keydown，不吞任何键：命中时最后一颗字照常落进目标窗口（`*?` 语义）；
+/// · 在本程序自己的窗口里打字不攒前缀（搜索框里敲 `;today` 不该被记住）。
+unsafe extern "system" fn expand_keyboard_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        if code < 0 || lparam.0 == 0 || !EXPAND_ARMED.load(Ordering::Relaxed) {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        if !matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        if kb.dwExtraInfo == EXPAND_SEND_MARK {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let fg = GetForegroundWindow();
+        let self_raw = SELF_HWND.load(Ordering::Relaxed);
+        if self_raw != 0 && fg.0 as usize == self_raw {
+            expand_lock().buffer.clear();
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        if sprint::is_modifier(kb.vkCode) {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        if expander::is_break_key(kb.vkCode) {
+            expand_lock().buffer.clear();
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        if kb.vkCode == VK_BACK.0 as u32 {
+            expand_lock().buffer.backspace();
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        // 按住 Ctrl / Alt / Win 时敲的键不是"打字"：不攒字符、也不触发。
+        // 反例是真的：Excel 的 `Ctrl+;` 插当天日期——不挡的话缓冲里会平白多一个 `;`，
+        // 紧接着打一个普通字母就可能凑出一条缩写。
+        if GetAsyncKeyState(VK_CONTROL.0 as i32) < 0
+            || GetAsyncKeyState(VK_MENU.0 as i32) < 0
+            || GetAsyncKeyState(VK_LWIN.0 as i32) < 0
+            || GetAsyncKeyState(VK_RWIN.0 as i32) < 0
+        {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let Some(ch) = sprint_key_char(kb.vkCode, kb.scanCode) else {
+            return CallNextHookEx(None, code, wparam, lparam);
+        };
+        let hit = {
+            let mut st = expand_lock();
+            st.buffer.push(ch);
+            st.buffer.matched(&st.abbrs)
+        };
+        let Some(idx) = hit else {
+            return CallNextHookEx(None, code, wparam, lparam);
+        };
+        let pending = {
+            let mut st = expand_lock();
+            let Some((key_len, body)) = st
+                .abbrs
+                .get(idx)
+                .map(|a| (a.display.chars().count(), a.body.clone()))
+            else {
+                st.buffer.clear();
+                return CallNextHookEx(None, code, wparam, lparam);
+            };
+            let p = PendingExpand {
+                target: fg.0 as usize,
+                key_len,
+                body,
+                mode: st.mode,
+                delay: st.delay,
+            };
+            st.buffer.clear();
+            p
+        };
+        // 这里只做**便宜**的判据（取进程 exe 路径、读窗口标题都要跨进程，钩子回调有硬超时）；
+        // 排除名单与密码框的判定留给工作线程，投递前那一刻再问一次。
+        let raw = HOTKEY_HWND.load(Ordering::Relaxed);
+        if raw != 0 {
+            expand_pending_lock().push(pending);
+            let _ = PostMessageW(
+                Some(HWND(raw as *mut _)),
+                WM_APP_EXPAND,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+/// `WH_MOUSE_LL` 回调（自动展开）：点击 / 滚轮会移动焦点或光标位置，攒了一半的缩写就此作废。
+/// 与键盘钩子同线程；同样不写日志、不吞任何鼠标事件。
+unsafe extern "system" fn expand_mouse_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        if code >= 0
+            && lparam.0 != 0
+            && matches!(
+                wparam.0 as u32,
+                WM_LBUTTONDOWN
+                    | WM_RBUTTONDOWN
+                    | WM_MBUTTONDOWN
+                    | WM_XBUTTONDOWN
+                    | WM_MOUSEWHEEL
+                    | WM_MOUSEHWHEEL
+            )
+        {
+            expand_lock().buffer.clear();
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+/// 命中之后的一次性工作线程：等最后一颗字落地 → 退格删掉缩写 → 按设置页定的通道粘正文。
+///
+/// 不抢焦点：触发时目标就在前台，抢焦点只会把用户的视线 / 光标拽走。前台一旦换人就整条放弃
+/// （宁可不展开，也不能把正文投进陌生窗口）。
+fn spawn_expand_worker(p: PendingExpand) {
+    thread::spawn(move || {
+        thread::sleep(EXPAND_SETTLE);
+        let hwnd = HWND(p.target as *mut _);
+        if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            log_info!("expand: 目标窗口已关闭 ⇒ 本次不展开（缩写留在原处）");
+            return;
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.0 != hwnd.0 {
+            log_info!("expand: 触发后前台已换人 ⇒ 本次不展开（缩写留在原处）");
+            return;
+        }
+        // 排除三条在这里判：钩子回调里跨进程取 exe 路径 / 窗口标题有把消息循环拖过
+        // 系统超时的风险（超时会被系统静默摘钩），挪到本线程来问。
+        if !expand_target_allowed(hwnd) {
+            log_info!("expand: 目标窗口在排除名单里、是密码框，或属于本程序 ⇒ 本次不展开（缩写留在原处）");
+            return;
+        }
+        // 占位符只在这一步展开：`{clipboard}` 是"命中那一刻"的剪贴板，与手动粘回同一口径。
+        let clipboard = if p.body.contains("{clipboard") {
+            read_clipboard_text_for("expand")
+        } else {
+            None
+        };
+        let uuid = if p.body.contains("{uuid") {
+            guid_string()
+        } else {
+            String::new()
+        };
+        let expanded = source::snippet::expand(
+            &p.body,
+            &source::snippet::ExpandInput {
+                now: local_time_now(),
+                clipboard: clipboard.as_deref(),
+                uuid,
+            },
+        );
+        let mut full = expanded.before.clone();
+        full.push_str(&expanded.after);
+        let chars = full.chars().count();
+        let target = PrevWindow {
+            hwnd,
+            raw: p.target,
+            class: window_class_name(hwnd),
+        };
+        let back = send_backspaces(p.key_len, EXPAND_SEND_MARK);
+        if back != p.key_len {
+            log_info!(
+                "expand: 退格只投出 {back}/{} 次 ⇒ 停止展开（不把正文接在残留前缀后面）",
+                p.key_len
+            );
+            return;
+        }
+        let pasted = match p.mode {
+            source::snippet::PasteMode::Clipboard => {
+                paste_via_clipboard_into(&target, &full, p.delay, EXPAND_SEND_MARK)
+            }
+            source::snippet::PasteMode::Type => {
+                type_text_into_window(&target, &full, EXPAND_SEND_MARK)
+            }
+        };
+        match pasted {
+            Ok(where_) => {
+                if !expanded.after.is_empty() {
+                    let want = expanded.after.chars().count();
+                    let got = send_left_arrows(want, EXPAND_SEND_MARK);
+                    log_info!("expand: {{cursor}} 之后还有 {want} 个字符 ⇒ 左箭头投全 {got} 次");
+                }
+                log_info!(
+                    "expand: 已展开一条片段（缩写 {} 字、正文 {chars} 字，粘给 {where_}；内容不落日志）",
+                    p.key_len
+                );
+            }
+            Err(e) => log_info!("expand: 展开未完成：{e}"),
+        }
+    });
+}
+
 /// vk → 这个键在**当前键盘布局**下不带修饰打出的字符。用 `MapVirtualKeyW` 而不是写死一张表：
 /// 用户丢掉的字符由布局决定，跟着系统走才不会补错。两种"没有字符"的返回都要挡：
 /// 0 = 这个键不产生字符；最高位（0x8000）= 死键（要连按两下才出字那种）。
@@ -5117,6 +5691,23 @@ unsafe extern "system" fn hotkey_wndproc(
             if wparam.0 as u64 == SPRINT_GEN.load(Ordering::Relaxed) {
                 stop_sprint_capture("窗口已拿到焦点");
             }
+            return LRESULT(0);
+        }
+        // 批次 A5 后半段（FR-SRC-08）：命中一次 ⇒ 派工作线程做退格 + 粘贴。
+        // 钩子回调里不能等粘贴延迟（最多 3 秒），否则热键线程的消息循环会被堵住。
+        if msg == WM_APP_EXPAND {
+            if let Some(p) = expand_pending_lock().pop() {
+                spawn_expand_worker(p);
+            }
+            return LRESULT(0);
+        }
+        // 设置页保存了片段库 / 展开设置 ⇒ 立刻重算（不必等 1 秒一次的兜底轮询）。
+        if msg == WM_APP_EXPAND_REFRESH {
+            refresh_expand(true);
+            return LRESULT(0);
+        }
+        if msg == WM_TIMER && wparam.0 as usize == EXPAND_REFRESH_TIMER {
+            refresh_expand(false);
             return LRESULT(0);
         }
         if msg == WM_APP_SUSPEND_HOTKEY {
@@ -5476,6 +6067,10 @@ fn spawn_hotkey_thread(
         // 批次 G1：双击呼出。钩子必须在**本线程**装（回调跑在装钩子的线程），
         // 而本线程此刻正好要进 `GetMessageW` 循环 ⇒ 时机就是这里。关闭档不装。
         set_tap_hook(dbl_tap);
+        // 批次 A5 后半段（FR-SRC-08）：自动展开。先按盘上的配置算一次，再挂 1 秒的 mtime 轮询——
+        // 用户手改 `snippets.json` 照样生效；设置页保存会额外投 `WM_APP_EXPAND_REFRESH` 抢先。
+        refresh_expand(true);
+        let _ = SetTimer(Some(hwnd), EXPAND_REFRESH_TIMER, EXPAND_REFRESH_EVERY, None);
         // FR-WIN-11：本实例若以管理员运行，普通权限的次进程（再双击 exe、资源管理器「发送到」）
         // 发来的 WM_COPYDATA 会被 UIPI 静默丢弃 ⇒ 只对该消息窗放行 WM_COPYDATA 这一条，
         // 不放开其它消息、不改完整性级别（放行范围＝这个 hwnd 的消息队列）。
@@ -5498,6 +6093,9 @@ fn spawn_hotkey_thread(
         set_tap_hook(DblTap::Off);
         // 批次 FR-WIN-06：同一个理由，抢跑钩子也在这里摘。
         stop_sprint_capture("热键线程退出");
+        // 批次 A5 后半段：自动展开的两个钩子同一条线程归属，也在这里摘。
+        set_expand_hooks(false);
+        let _ = KillTimer(Some(hwnd), EXPAND_REFRESH_TIMER);
         let _ = KillTimer(Some(hwnd), HOTKEY_SUSPEND_TIMER);
         let _ = DestroyWindow(hwnd);
     });
@@ -6372,7 +6970,7 @@ impl LauncherApp {
             Ok(where_) => {
                 if !expanded.after.is_empty() {
                     let want = expanded.after.chars().count();
-                    let got = send_left_arrows(want);
+                    let got = send_left_arrows(want, 0);
                     log_info!("片段：{{cursor}} 之后还有 {want} 个字符 ⇒ 左箭头投全 {got} 次");
                 }
                 log_info!("片段：已把 {chars} 个字符粘给 {where_}");
@@ -8014,6 +8612,8 @@ impl LauncherApp {
             kept.len()
         );
         self.snippets_saved = kept;
+        // 批次 A5 后半段（FR-SRC-08 验收「改完片段立即重注册」）：不靠源自己的 1 秒轮询。
+        post_expand_refresh();
         if let Some(s) = self
             .sources
             .iter_mut()
@@ -8040,8 +8640,9 @@ impl LauncherApp {
         }
     }
 
-    /// 批次 A5（FR-SRC-07）：设置页第 11 页「片段」——一张表（名称 / 触发码 / 正文）
-    /// ＋ 四格取用设置（触发词、正文搜索、粘贴方式、粘贴延迟）。
+    /// 批次 A5（FR-SRC-07）：设置页第 11 页「片段」——一张表（名称 / 触发码 / 正文 / 自动展开）
+    /// ＋ 四格取用设置（触发词、正文搜索、粘贴方式、粘贴延迟）。批次 A5 后半段（FR-SRC-08）
+    /// 在页底补三格：自动展开总闸、前缀、不展开的窗口名单。
     ///
     /// 表走跨帧缓冲（理由同 [`Self::file_folders_edit`]）；四格设置直接绑 `prefs`，改完即写
     /// `settings.json`——触发词与正文搜索由每帧的 `apply_settings` 立刻送到搜索源里，
@@ -8068,6 +8669,8 @@ impl LauncherApp {
         let mut commit = false;
         let mut remove_row: Option<usize> = None;
         let mut add_row = false;
+        // 每行的「敲 `;触发码`」预览要按当前生效的前缀来算（前缀在页底可改）。
+        let expand_prefix = self.prefs.snippet_expand_prefix().to_string();
         {
             let list = self.snippets_edit.as_mut().expect("上面刚填过");
             for (i, s) in list.iter_mut().enumerate() {
@@ -8095,6 +8698,42 @@ impl LauncherApp {
                         .desired_rows(3)
                         .desired_width(ui.available_width()),
                 );
+                // FR-SRC-08 的逐条开关。单独一行：塞进 F16 那条 right_to_left 行会挤掉
+                // 输入框的宽度（英文 "Auto-expand" 比中文长得多）。
+                let mut auto = s.auto_expand;
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .checkbox(&mut auto, i18n::t("snippet.expand.row"))
+                        .changed()
+                    {
+                        commit = true;
+                    }
+                    if auto {
+                        match expander::abbreviation(&expand_prefix, s) {
+                            Some(abbr) => {
+                                ui.label(
+                                    egui::RichText::new(i18n::tf(
+                                        "snippet.expand.preview",
+                                        &[abbr.as_str()],
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                            // 勾了却拼不出缩写：说清为什么，别让它静默地永远不触发。
+                            None => {
+                                ui.label(
+                                    egui::RichText::new(i18n::t("snippet.expand.row_bad"))
+                                        .small()
+                                        .color(TOAST_ERR),
+                                );
+                            }
+                        }
+                    }
+                });
+                if auto != s.auto_expand {
+                    s.auto_expand = auto;
+                }
                 if name_resp.lost_focus() || kw_resp.lost_focus() || body_resp.lost_focus() {
                     commit = true;
                 }
@@ -8192,6 +8831,8 @@ impl LauncherApp {
         if mode != self.prefs.snippet_paste_mode_effective() {
             self.prefs.snippet_paste_mode = mode.as_str().to_string();
             source::application::save_settings(&self.prefs);
+            // 自动展开复用同一套粘贴参数：不改这一步，热键线程那边还按旧通道粘。
+            post_expand_refresh();
             log_info!("设置页：片段粘贴方式 = {}", mode.as_str());
         }
         ui.label(
@@ -8220,12 +8861,97 @@ impl LauncherApp {
             let v = self.prefs.snippet_paste_delay();
             self.prefs.snippet_paste_delay_ms = v;
             source::application::save_settings(&self.prefs);
+            post_expand_refresh();
             log_info!("设置页：片段粘贴延迟 = {v} ms");
         }
         ui.label(
             egui::RichText::new(i18n::t("snippet.paste.delay.help"))
                 .weak()
                 .small(),
+        );
+        ui.separator();
+
+        // ---- 自动展开（FR-SRC-08）----
+        // 三格都属于「热键线程要用的设置」：改完除了写盘，还要投 `WM_APP_EXPAND_REFRESH`
+        // 让常驻钩子立刻重算（文件 mtime 轮询只是兜底，最多晚一秒）。
+        ui.label(
+            egui::RichText::new(i18n::t("snippet.expand.title"))
+                .strong(),
+        );
+        ui.label(
+            egui::RichText::new(i18n::t("snippet.expand.help"))
+                .weak()
+                .small(),
+        );
+        let mut auto_expand = self.prefs.snippet_auto_expand;
+        if ui
+            .checkbox(&mut auto_expand, i18n::t("snippet.expand.master"))
+            .changed()
+        {
+            self.prefs.snippet_auto_expand = auto_expand;
+            source::application::save_settings(&self.prefs);
+            post_expand_refresh();
+            log_info!(
+                "设置页：片段自动展开总闸 {}",
+                if auto_expand { "开" } else { "关" }
+            );
+        }
+        // 点进输入框再点走也算一次 lost_focus：只有真改过才写盘 + 重投刷新，
+        // 不然日志会平白多一条"已改"、热键线程也白重算一遍。
+        let prefix_before = self.prefs.snippet_expand_prefix.clone();
+        ui.horizontal(|ui| {
+            ui.label(i18n::t("snippet.expand.prefix"));
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.prefs.snippet_expand_prefix)
+                    .hint_text(expander::DEFAULT_PREFIX)
+                    .desired_width(64.0),
+            );
+            if resp.lost_focus() {
+                // 空串 / 带空白 / 反引号都由读侧回落出厂值，不逼用户重新打一遍；
+                // 下一行的「当前生效」会把真实值亮出来。
+                self.prefs.snippet_expand_prefix =
+                    self.prefs.snippet_expand_prefix.trim().to_string();
+                if self.prefs.snippet_expand_prefix != prefix_before {
+                    source::application::save_settings(&self.prefs);
+                    post_expand_refresh();
+                    log_info!(
+                        "设置页：自动展开前缀已改（生效 {} 字，前缀本身不落日志）",
+                        self.prefs.snippet_expand_prefix().chars().count()
+                    );
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(i18n::tf(
+                "snippet.expand.prefix.help",
+                &[self.prefs.snippet_expand_prefix()],
+            ))
+            .weak()
+            .small(),
+        );
+        ui.add_space(2.0);
+        ui.label(i18n::t("snippet.expand.exclude.label"));
+        let exclude_before = self.prefs.snippet_expand_exclude.clone();
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut self.prefs.snippet_expand_exclude)
+                .desired_rows(3)
+                .desired_width(ui.available_width()),
+        );
+        if resp.lost_focus() && self.prefs.snippet_expand_exclude != exclude_before {
+            source::application::save_settings(&self.prefs);
+            post_expand_refresh();
+            log_info!(
+                "设置页：自动展开排除名单已改（现 {} 条规则，内容不落日志）",
+                self.prefs.snippet_expand_rules().len()
+            );
+        }
+        ui.label(
+            egui::RichText::new(i18n::tfmt(
+                "snippet.expand.exclude.help",
+                &[&self.prefs.snippet_expand_rules().len()],
+            ))
+            .weak()
+            .small(),
         );
         ui.separator();
         ui.label(
