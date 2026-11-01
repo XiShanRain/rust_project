@@ -2662,20 +2662,46 @@ fn row_num_label(idx: usize) -> Option<&'static str> {
         .copied()
 }
 
+/// 行号徽标列宽。列宽恒定，标记行的竖线（FR-UIX-03）画在这 14 px 的最左边 3 px 里——
+/// 不另开一列，否则带标记与不带标记的行、以及书签行 / 头部行会整体错位。
+const BADGE_W: f32 = 14.0;
+/// 标记行左缘竖线宽。
+const ROW_EDGE_W: f32 = 3.0;
+
+/// 竖线的实际矩形：宽 3 px，上下各缩一点，不顶到相邻行。
+fn row_edge_rect(slot: egui::Rect) -> egui::Rect {
+    let inset = (slot.height() * 0.18).clamp(1.0, 3.0);
+    egui::Rect::from_min_max(
+        egui::pos2(slot.min.x, slot.min.y + inset),
+        egui::pos2(slot.min.x + ROW_EDGE_W, slot.max.y - inset),
+    )
+}
+
 /// 行号徽标 + 悬停说明，计算器行与条目行共用这一个画法（两行的左缘才可能对得齐）。
 /// `verb` 只有两种：条目行「执行」、计算器行「复制」——第 0 行按 1 复制数字，不是跑程序。
 /// 高度跟随主题行高（`interact_size.y`，列表画之前由 `theme.row_height` 赋值）。
 fn row_badge(ui: &mut egui::Ui, idx: usize, verb: &str) {
-    match row_num_label(idx) {
-        Some(num) => {
-            let h = ui.spacing().interact_size.y.max(14.0);
-            ui.add_sized(
-                [14.0, h],
-                egui::Label::new(egui::RichText::new(num).monospace().weak()),
-            )
-            .on_hover_text(crate::i18n::tfmt("row.hover_digit", &[&num, &verb]));
-        }
-        None => ui.add_space(14.0),
+    row_badge_with_edge(ui, idx, verb, None);
+}
+
+/// `edge` 只有标记行才给（FR-UIX-03 的「标记⇒行左缘高亮色竖线」）。
+fn row_badge_with_edge(ui: &mut egui::Ui, idx: usize, verb: &str, edge: Option<egui::Color32>) {
+    let h = ui.spacing().interact_size.y.max(14.0);
+    let (slot, _) = ui.allocate_exact_size(egui::vec2(BADGE_W, h), egui::Sense::hover());
+    if let Some(color) = edge {
+        ui.painter()
+            .rect_filled(row_edge_rect(slot), egui::CornerRadius::same(1), color);
+    }
+    if let Some(num) = row_num_label(idx) {
+        let num_rect = egui::Rect::from_min_max(
+            egui::pos2(slot.min.x + ROW_EDGE_W, slot.min.y),
+            slot.max,
+        );
+        ui.put(
+            num_rect,
+            egui::Label::new(egui::RichText::new(num).monospace().weak()),
+        )
+        .on_hover_text(crate::i18n::tfmt("row.hover_digit", &[&num, &verb]));
     }
 }
 
@@ -2699,15 +2725,19 @@ fn bookmark_row(
             [icon, icon],
             egui::Label::new(egui::RichText::new("\u{1F516}").size(glyph).weak()),
         );
-        let sel = ui.selectable_label(is_sel, egui::RichText::new(hit.title.as_str()));
+        let sub = egui::RichText::new(hit.subtitle.as_str())
+            .weak()
+            .size(sub_size);
+        let sel = title_button(
+            ui,
+            is_sel,
+            egui::RichText::new(hit.title.as_str()).into(),
+            trailing_width(ui, &[sub.clone().into()]),
+        );
         if is_sel && follow_selection {
             sel.scroll_to_me(Some(egui::Align::Center));
         }
-        ui.label(
-            egui::RichText::new(hit.subtitle.as_str())
-                .weak()
-                .size(sub_size),
-        );
+        ui.label(sub);
         if sel.clicked() {
             clicked = true;
         }
@@ -2733,15 +2763,19 @@ fn bookmark_hint_row(
             [icon, icon],
             egui::Label::new(egui::RichText::new("\u{1F516}").size(glyph).weak()),
         );
-        let sel = ui.selectable_label(is_sel, egui::RichText::new(hint.title.as_str()).weak());
+        let sub = egui::RichText::new(hint.subtitle.as_str())
+            .weak()
+            .size(sub_size);
+        let sel = title_button(
+            ui,
+            is_sel,
+            egui::RichText::new(hint.title.as_str()).weak().into(),
+            trailing_width(ui, &[sub.clone().into()]),
+        );
         if is_sel && follow_selection {
             sel.scroll_to_me(Some(egui::Align::Center));
         }
-        ui.label(
-            egui::RichText::new(hint.subtitle.as_str())
-                .weak()
-                .size(sub_size),
-        );
+        ui.label(sub);
         if sel.clicked() {
             clicked = true;
         }
@@ -2749,21 +2783,62 @@ fn bookmark_hint_row(
     clicked
 }
 
-/// 批次 F4：置顶角标——在图标槽右上角画一个琥珀色小三角。///
+/// 图钉的几何：圆头 + 帽檐 + 针，整体塞进图标槽的右下角 `side` 见方里（FR-UIX-03）。
+///
+/// 抽成纯函数是为了钉死两条几何前提：任何一点都不得出 `slot`（否则会盖到相邻行的图标），
+/// 且整体贴右下角（改回右上角就是需求倒退）。
+struct PinShape {
+    head: egui::Pos2,
+    head_r: f32,
+    collar: [egui::Pos2; 2],
+    needle: [egui::Pos2; 2],
+}
+
+fn pin_shape(slot: egui::Rect) -> PinShape {
+    // 上限 16 点免得大图标上糊一大块，下限 8 点保住可辨认度；
+    // 再压回图标槽本身——槽小于下限时宁可画小，也不能溢到相邻行去。
+    let side = (slot.width() * 0.55)
+        .clamp(8.0, 16.0)
+        .min(slot.width().min(slot.height()));
+    let (right, bottom) = (slot.right(), slot.bottom());
+    let head = egui::pos2(right - side * 0.5, bottom - side * 0.70);
+    let head_r = side * 0.30;
+    let collar_y = head.y + head_r * 0.92;
+    PinShape {
+        head,
+        head_r,
+        collar: [
+            egui::pos2(head.x - side * 0.32, collar_y),
+            egui::pos2(head.x + side * 0.32, collar_y),
+        ],
+        needle: [
+            egui::pos2(head.x, collar_y),
+            egui::pos2(head.x, bottom - side * 0.02),
+        ],
+    }
+}
+
+/// 批次 F4 / 批次 R1：置顶角标——图标**右下角**一枚琥珀色图钉。
+///
 /// 2026-10-29 之前是名称前加 `📌 `，前缀会把名称挤偏、也让「名称→执行」的列位置随置顶状态跳动；
-/// 角标贴在图标上，宽度不变。没有图标（空槽）时三角照样画在那个空槽的右上角。
+/// 角标贴在图标上，宽度不变。没有图标（空槽）时图钉照样画在那个空槽的右下角。
 fn paint_pin_badge(ui: &egui::Ui, slot: egui::Rect) {
-    let side = (slot.width() * 0.45).clamp(6.0, 14.0);
-    let (r, t) = (slot.right(), slot.top());
-    let pts = vec![
-        egui::pos2(r - side, t),
-        egui::pos2(r, t),
-        egui::pos2(r, t + side),
-    ];
-    ui.painter().add(egui::Shape::convex_polygon(
-        pts,
-        egui::Color32::from_rgb(255, 176, 32),
-        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(140)),
+    let pin = pin_shape(slot);
+    let ink = egui::Color32::from_rgb(255, 176, 32);
+    let painter = ui.painter();
+    painter.add(egui::Shape::line_segment(
+        pin.needle,
+        egui::Stroke::new((pin.head_r * 0.45).max(1.0), ink),
+    ));
+    painter.add(egui::Shape::line_segment(
+        pin.collar,
+        egui::Stroke::new((pin.head_r * 0.60).max(1.0), ink),
+    ));
+    painter.add(egui::Shape::circle_filled(pin.head, pin.head_r, ink));
+    painter.add(egui::Shape::circle_stroke(
+        pin.head,
+        pin.head_r,
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(150)),
     ));
 }
 
@@ -2828,6 +2903,58 @@ fn highlighted_title(
 fn push_title_seg(job: &mut egui::text::LayoutJob, chars: &[char], format: egui::TextFormat) {
     let s: String = chars.iter().collect();
     job.append(&s, 0.0, format);
+}
+
+/// FR-UIX-04：标题可用宽度。行尾还有路径状态标签时留一个控件间距；
+/// 下限 32 点——极窄窗口下宁可按钮顶出去，也不能把宽度算成负数。
+fn title_width_budget(available: f32, item_spacing: f32, trailing: f32) -> f32 {
+    let reserved = if trailing > 0.0 {
+        item_spacing + trailing
+    } else {
+        0.0
+    };
+    (available - reserved).max(32.0)
+}
+
+/// FR-UIX-04：标题按钮。宽到预算就截断加 `…`；短标题按内容宽出按钮，
+/// 行尾的状态标签因此仍然紧跟标题，而不是被推到行末。
+///
+/// 宽度不能交给 `add_sized`：它用 `centered_and_justified`，会把短标题也拉满整行、
+/// 点击区跟着变宽。这里保留父行布局，只给子 ui 一个宽度上限。
+fn title_button(
+    ui: &mut egui::Ui,
+    is_sel: bool,
+    title: egui::WidgetText,
+    trailing: f32,
+) -> egui::Response {
+    let budget = title_width_budget(ui.available_width(), ui.spacing().item_spacing.x, trailing);
+    let height = ui.available_height();
+    ui.allocate_ui_with_layout(egui::vec2(budget, height), *ui.layout(), |ui| {
+        ui.add(egui::Button::selectable(is_sel, title).truncate())
+    })
+    .inner
+}
+
+/// 行尾标签的实宽（截断预算用）。量的是稍后要 `ui.label` 的那份 `WidgetText`，
+/// 字体 / 字号 / 等宽与否照原样走，免得另拍一套口径跟实际排版对不上。
+fn widget_text_width(ui: &egui::Ui, text: egui::WidgetText) -> f32 {
+    text.into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    )
+    .size()
+    .x
+}
+
+fn trailing_width(ui: &egui::Ui, parts: &[egui::WidgetText]) -> f32 {
+    let gaps = ui.spacing().item_spacing.x * parts.len().saturating_sub(1) as f32;
+    parts
+        .iter()
+        .map(|p| widget_text_width(ui, p.clone()))
+        .sum::<f32>()
+        + gaps
 }
 
 /// FR-SRC-06：路径四态在行尾的颜色。Offline 是"介质不在"（提示性），Not found 才像"写错了"。
@@ -15912,13 +16039,19 @@ impl eframe::App for LauncherApp {
                                             ),
                                         )
                                         .on_hover_text(source::calc::row_tag());
-                                        let sel = ui.selectable_label(is_sel, hit.title.clone());
+                                        let sub = egui::RichText::new(hit.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
+                                            is_sel,
+                                            hit.title.clone().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
+                                        );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             copy_text = Some(hit.copy.clone());
                                         }
@@ -15945,13 +16078,19 @@ impl eframe::App for LauncherApp {
                                             });
                                         engine_icon_slot(ui, icon, "\u{1F50D}", glyph, tex)
                                             .on_hover_text(i18n::t("row.hover.websearch"));
-                                        let sel = ui.selectable_label(is_sel, hit.title.clone());
+                                        let sub = egui::RichText::new(hit.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
+                                            is_sel,
+                                            hit.title.clone().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
+                                        );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             open_hit = Some(hit.clone());
                                         }
@@ -15979,16 +16118,19 @@ impl eframe::App for LauncherApp {
                                                 entry.texture.id()
                                             });
                                         engine_icon_slot(ui, icon, "…", glyph, tex);
-                                        let sel = ui.selectable_label(
+                                        let sub = egui::RichText::new(hint.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                            egui::RichText::new(hint.title.as_str()).weak().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             self.hint_toast(ui.ctx(), hint_message(hint));
                                         }
@@ -16005,25 +16147,36 @@ impl eframe::App for LauncherApp {
                                             ),
                                         )
                                         .on_hover_text(i18n::t("row.hover.custom"));
-                                        let sel = ui.selectable_label(is_sel, hit.name.clone());
-                                        if is_sel && follow_selection {
-                                            sel.scroll_to_me(Some(egui::Align::Center));
-                                        }
                                         let state = self
                                             .path_states
                                             .get(&hit.uid)
                                             .copied()
                                             .unwrap_or_default();
-                                        if state.is_problem() {
-                                            ui.label(
-                                                egui::RichText::new(state.label())
-                                                    .small()
-                                                    .color(path_state_color(state)),
-                                            );
+                                        let sub = egui::RichText::new(hit.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let mut trailing = vec![sub.clone().into()];
+                                        let state_label = state.is_problem().then(|| {
+                                            egui::RichText::new(state.label())
+                                                .small()
+                                                .color(path_state_color(state))
+                                        });
+                                        if let Some(label) = &state_label {
+                                            trailing.insert(0, label.clone().into());
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
+                                        let sel = title_button(
+                                            ui,
+                                            is_sel,
+                                            hit.name.clone().into(),
+                                            trailing_width(ui, &trailing),
                                         );
+                                        if is_sel && follow_selection {
+                                            sel.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                        if let Some(label) = state_label {
+                                            ui.label(label);
+                                        }
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             launch = Some(hit.entry.clone());
                                             launch_uid = Some(hit.uid.clone());
@@ -16051,26 +16204,34 @@ impl eframe::App for LauncherApp {
                                                 egui::RichText::new("…").monospace().size(glyph).weak(),
                                             ),
                                         );
-                                        let sel = ui.selectable_label(
+                                        let sub = egui::RichText::new(hint.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        // 把"我是清单里哪一条"写在脸上：只报「需要参数」会被当成
+                                        // 系统自带的另一条同名命令（2026-10-21 真人反馈）。
+                                        let command = (!hint.command.is_empty()).then(|| {
+                                            egui::RichText::new(hint.command.as_str())
+                                                .monospace()
+                                                .weak()
+                                                .size(sub_size)
+                                        });
+                                        let mut trailing = vec![sub.clone().into()];
+                                        if let Some(command) = &command {
+                                            trailing.insert(0, command.clone().into());
+                                        }
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                            egui::RichText::new(hint.title.as_str()).weak().into(),
+                                            trailing_width(ui, &trailing),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        // 把"我是清单里哪一条"写在脸上：只报「需要参数」会被当成
-                                        // 系统自带的另一条同名命令（2026-10-21 真人反馈）。
-                                        if !hint.command.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new(hint.command.as_str())
-                                                    .monospace()
-                                                    .weak()
-                                                    .size(sub_size),
-                                            );
+                                        if let Some(command) = command {
+                                            ui.label(command);
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             self.custom_hint_activate(ui.ctx(), hint);
                                         }
@@ -16106,13 +16267,19 @@ impl eframe::App for LauncherApp {
                                             ),
                                         )
                                         .on_hover_text(i18n::t("row.hover.script"));
-                                        let sel = ui.selectable_label(is_sel, hit.title.clone());
+                                        let sub = egui::RichText::new(hit.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
+                                            is_sel,
+                                            hit.title.clone().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
+                                        );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             script_run = Some(hit.clone());
                                         }
@@ -16142,16 +16309,19 @@ impl eframe::App for LauncherApp {
                                                 egui::RichText::new("…").monospace().size(glyph).weak(),
                                             ),
                                         );
-                                        let sel = ui.selectable_label(
+                                        let sub = egui::RichText::new(hint.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                            egui::RichText::new(hint.title.as_str()).weak().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             self.script_hint_activate(ui.ctx(), hint);
                                         }
@@ -16170,13 +16340,19 @@ impl eframe::App for LauncherApp {
                                             ),
                                         )
                                         .on_hover_text(i18n::t("row.hover.snippet"));
-                                        let sel = ui.selectable_label(is_sel, hit.name.clone());
+                                        let sub = egui::RichText::new(hit.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
+                                            is_sel,
+                                            hit.name.clone().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
+                                        );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             snippet_paste = Some(hit.clone());
                                         }
@@ -16204,16 +16380,19 @@ impl eframe::App for LauncherApp {
                                                 egui::RichText::new("…").monospace().size(glyph).weak(),
                                             ),
                                         );
-                                        let sel = ui.selectable_label(
+                                        let sub = egui::RichText::new(hint.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                            egui::RichText::new(hint.title.as_str()).weak().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             self.hint_toast(ui.ctx(), hint.subtitle.as_str());
                                         }
@@ -16248,13 +16427,19 @@ impl eframe::App for LauncherApp {
                                         } else {
                                             hit.title.clone()
                                         };
-                                        let sel = ui.selectable_label(is_sel, shown);
+                                        let sub = egui::RichText::new(hit.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
+                                            is_sel,
+                                            shown.into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
+                                        );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             open_file = Some(hit.clone());
                                         }
@@ -16294,16 +16479,19 @@ impl eframe::App for LauncherApp {
                                             ),
                                         )
                                         .on_hover_text(i18n::t("row.hover.terminal"));
-                                        let sel = ui.selectable_label(
+                                        let sub = egui::RichText::new(hit.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hit.title.as_str()).monospace(),
+                                            egui::RichText::new(hit.title.as_str()).monospace().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             open_term = Some(hit.clone());
                                         }
@@ -16319,16 +16507,19 @@ impl eframe::App for LauncherApp {
                                                 egui::RichText::new(">").monospace().size(glyph).weak(),
                                             ),
                                         );
-                                        let sel = ui.selectable_label(
+                                        let sub = egui::RichText::new(hint.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                            egui::RichText::new(hint.title.as_str()).weak().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str()).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             self.hint_toast(ui.ctx(), source::terminal::usage_toast());
                                         }
@@ -16348,23 +16539,26 @@ impl eframe::App for LauncherApp {
                                             "cheat.prefix",
                                             &[hit.entry.group.label()],
                                         ));
-                                        let sel = ui.selectable_label(
+                                        let group = egui::RichText::new(hit.entry.group.label())
+                                            .weak()
+                                            .size(11.0);
+                                        let summary = egui::RichText::new(hit.entry.summary())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hit.entry.example()).monospace(),
+                                            egui::RichText::new(hit.entry.example()).monospace().into(),
+                                            trailing_width(
+                                                ui,
+                                                &[group.clone().into(), summary.clone().into()],
+                                            ),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.entry.group.label())
-                                                .weak()
-                                                .size(11.0),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(hit.entry.summary())
-                                                .weak()
-                                                .size(sub_size),
-                                        );
+                                        ui.label(group);
+                                        ui.label(summary);
                                         if sel.clicked() {
                                             self.help_entry = Some(*hit);
                                         }
@@ -16380,16 +16574,19 @@ impl eframe::App for LauncherApp {
                                                 egui::RichText::new("?").monospace().size(glyph).weak(),
                                             ),
                                         );
-                                        let sel = ui.selectable_label(
+                                        let sub = egui::RichText::new(hint.subtitle)
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                            egui::RichText::new(hint.title.as_str()).weak().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hint.subtitle).weak().size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             self.hint_toast(
                                                 ui.ctx(),
@@ -16439,18 +16636,19 @@ impl eframe::App for LauncherApp {
                                                 egui::RichText::new("@").monospace().size(glyph).weak(),
                                             ),
                                         );
-                                        let sel = ui.selectable_label(
+                                        let sub = egui::RichText::new(hint.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let sel = title_button(
+                                            ui,
                                             is_sel,
-                                            egui::RichText::new(hint.title.as_str()).weak(),
+                                            egui::RichText::new(hint.title.as_str()).weak().into(),
+                                            trailing_width(ui, &[sub.clone().into()]),
                                         );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hint.subtitle.as_str())
-                                                .weak()
-                                                .size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             self.hint_toast(ui.ctx(), hint.subtitle.as_str());
                                         }
@@ -16471,23 +16669,32 @@ impl eframe::App for LauncherApp {
                                             ),
                                         )
                                         .on_hover_text(i18n::t("row.hover.panel"));
-                                        let sel = ui.selectable_label(is_sel, hit.label.clone());
+                                        let keys = (!hit.keys.is_empty()).then(|| {
+                                            egui::RichText::new(hit.keys)
+                                                .monospace()
+                                                .small()
+                                                .weak()
+                                        });
+                                        let sub = egui::RichText::new(hit.subtitle.as_str())
+                                            .weak()
+                                            .size(sub_size);
+                                        let mut trailing = vec![sub.clone().into()];
+                                        if let Some(keys) = &keys {
+                                            trailing.insert(0, keys.clone().into());
+                                        }
+                                        let sel = title_button(
+                                            ui,
+                                            is_sel,
+                                            hit.label.clone().into(),
+                                            trailing_width(ui, &trailing),
+                                        );
                                         if is_sel && follow_selection {
                                             sel.scroll_to_me(Some(egui::Align::Center));
                                         }
-                                        if !hit.keys.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new(hit.keys)
-                                                    .monospace()
-                                                    .small()
-                                                    .weak(),
-                                            );
+                                        if let Some(keys) = keys {
+                                            ui.label(keys);
                                         }
-                                        ui.label(
-                                            egui::RichText::new(hit.subtitle.as_str())
-                                                .weak()
-                                                .size(sub_size),
-                                        );
+                                        ui.label(sub);
                                         if sel.clicked() {
                                             panel_action = Some(hit.id);
                                         }
@@ -16512,9 +16719,16 @@ impl eframe::App for LauncherApp {
                             let item = &self.items[hit];
                             let is_sel = idx == self.selected;
                             ui.horizontal(|ui| {
+                                // FR-UIX-03：标记行在左缘画一道高亮色竖线（选中行用选中色）。
+                                let marked = is_marked(&self.marked, &item.path);
+                                let edge = marked.then_some(if is_sel {
+                                    self.theme.selected_highlight
+                                } else {
+                                    self.theme.highlight
+                                });
                                 // 行号徽标（2026-10-18 用户要求：数字键没有可见对应物）：
                                 // 前 10 行标 1-9/0，第 11 行起留白——那里没有按键，标了反而误导。
-                                row_badge(ui, idx, i18n::t("row.badge.exec"));
+                                row_badge_with_edge(ui, idx, i18n::t("row.badge.exec"), edge);
                                 // 批次 F4：图标按缓存键取（一堆 .pdf 共用一张纹理），
                                 // 画出来的同时把 LRU 时刻刷新成本帧的 tick。
                                 let slot = match source::icon::cache_key(icon_spec_of(item))
@@ -16534,14 +16748,13 @@ impl eframe::App for LauncherApp {
                                     )
                                     .1,
                                 };
-                                // FR-SRC-19：置顶项在图标右上角画角标（2026-10-29 批次 F4
+                                // FR-SRC-19：置顶项在图标右下角画图钉（2026-10-29 批次 F4
                                 // 从「名称前 📌」改来——前缀会把名称挤偏，角标贴图标不占字宽）。
                                 if item.pinned {
                                     paint_pin_badge(ui, slot.rect);
                                 }
                                 // 批次 E4：标记项用名称前 `✓` 前缀，不另开列宽。
                                 // 批次 B6：带参项在名称前加 `*`（最近名字，先于 ✓）。
-                                let marked = is_marked(&self.marked, &item.path);
                                 let mark = param_row_mark(item);
                                 let mut shown = format!("{}{}", mark, item.name);
                                 if marked {
@@ -16568,20 +16781,36 @@ impl eframe::App for LauncherApp {
                                     ),
                                     _ => shown.into(),
                                 };
-                                let sel = ui.selectable_label(is_sel, title);
+                                // FR-SRC-06：路径四态只在异常时露出来（OK/- 不占版面）。
+                                // 它要占宽度，所以先量宽、再排标题（FR-UIX-04 的截断预算要用）。
+                                let uid = item.uid();
+                                let state = self
+                                    .path_states
+                                    .get(&uid)
+                                    .copied()
+                                    .filter(|s| s.is_problem());
+                                let trailing = state.map_or(0.0, |st| {
+                                    let font = egui::TextStyle::Small.resolve(ui.style());
+                                    ui.ctx().fonts_mut(|f| {
+                                        f.layout_no_wrap(
+                                            st.label().to_string(),
+                                            font,
+                                            path_state_color(st),
+                                        )
+                                        .size()
+                                        .x
+                                    })
+                                });
+                                let sel = title_button(ui, is_sel, title, trailing);
                                 if is_sel && follow_selection {
                                     sel.scroll_to_me(Some(egui::Align::Center));
                                 }
-                                // FR-SRC-06：路径四态只在异常时露出来（OK/- 不占版面）。
-                                let uid = item.uid();
-                                if let Some(state) = self.path_states.get(&uid) {
-                                    if state.is_problem() {
-                                        ui.label(
-                                            egui::RichText::new(state.label())
-                                                .small()
-                                                .color(path_state_color(*state)),
-                                        );
-                                    }
+                                if let Some(st) = state {
+                                    ui.label(
+                                        egui::RichText::new(st.label())
+                                            .small()
+                                            .color(path_state_color(st)),
+                                    );
                                 }
                                 if sel.clicked() {
                                     launch = Some(item.clone());
@@ -18871,7 +19100,151 @@ mod nav_tests {
         }
     }
 
-    /// 批次 B6（FR-ACT-07）：编辑弹窗把「编码」带进带出。用户改的是那个下拉，
+    /// 批次 R1（FR-UIX-03）：图钉贴在图标槽的**右下角**，且任何一点都不得越出图标槽
+    /// （越出去会盖到相邻行 / 相邻列的图标）。两个尺寸钉住 clamp 的两端。
+    #[test]
+    fn pin_shape_hugs_the_icon_slot_bottom_right_without_spilling() {
+        for (w, expected_head_r) in [(6.0f32, 1.8), (18.0, 2.97), (64.0, 4.8)] {
+            let slot = egui::Rect::from_min_size(egui::pos2(10.0, 40.0), egui::vec2(w, w));
+            let pin = pin_shape(slot);
+            // 圆头整圆在槽内
+            assert!(pin.head.x - pin.head_r >= slot.left() - 0.01, "w={w} 圆头越左");
+            assert!(pin.head.x + pin.head_r <= slot.right() + 0.01, "w={w} 圆头越右");
+            assert!(pin.head.y - pin.head_r >= slot.top() - 0.01, "w={w} 圆头越上");
+            assert!(pin.head.y + pin.head_r <= slot.bottom() + 0.01, "w={w} 圆头越下");
+            // 帽檐与针也在槽内
+            for p in [pin.collar[0], pin.collar[1], pin.needle[0], pin.needle[1]] {
+                assert!(
+                    slot.contains(p),
+                    "w={w} 图钉的部件 {p:?} 越出图标槽 {slot:?}"
+                );
+            }
+            // 贴右下角：整枚图钉落在槽的右半边，针尖落到底部
+            // （槽小于 8 点时图钉被压到与槽同宽，圆心就不再"严格偏右"了）
+            assert!(
+                pin.head.x + pin.head_r > slot.center().x,
+                "w={w} 图钉应贴在右半边"
+            );
+            assert!((pin.needle[1].y - slot.bottom()).abs() <= 1.0, "w={w} 针尖应到底");
+            assert!(
+                (pin.head_r - expected_head_r).abs() < 0.01,
+                "w={w} 圆头半径 {:.2} 不等于 {expected_head_r}（clamp 档位变了）",
+                pin.head_r
+            );
+        }
+    }
+
+    /// 批次 R1（FR-UIX-03）：标记竖线整个落在徽标列最左边的 3 px 里，上下都不顶到相邻行。
+    #[test]
+    fn row_edge_bar_sits_in_the_badge_gutter() {
+        for h in [14.0f32, 20.0, 28.0] {
+            let slot = egui::Rect::from_min_size(egui::pos2(7.0, 100.0), egui::vec2(BADGE_W, h));
+            let bar = row_edge_rect(slot);
+            assert_eq!(bar.width(), ROW_EDGE_W, "竖线宽度必须正好是槽宽");
+            assert!((bar.left() - slot.left()).abs() < 0.01, "竖线要贴行左缘");
+            assert!(bar.right() <= slot.left() + BADGE_W, "竖线不得越出徽标列");
+            assert!(bar.top() > slot.top() && bar.bottom() < slot.bottom(), "竖线要上下留缝");
+            assert!(bar.height() > slot.height() * 0.5, "竖线太短就看不出是标记");
+        }
+    }
+
+    /// 批次 R1（FR-UIX-04）：标题预算要扣掉行尾标签与一个控件间距；极窄时留 32 点下限，
+    /// 不能算出负数（负宽度会让 egui 的 debug_assert 直接炸）。
+    #[test]
+    fn title_budget_leaves_room_for_the_trailing_label() {
+        assert_eq!(title_width_budget(300.0, 8.0, 0.0), 300.0, "没有行尾标签不扣间距");
+        assert_eq!(title_width_budget(300.0, 8.0, 50.0), 242.0);
+        assert_eq!(title_width_budget(20.0, 8.0, 50.0), 32.0, "极窄时取下限");
+        assert!(title_width_budget(f32::MIN, 8.0, 50.0) >= 32.0);
+    }
+
+    /// 批次 R1（FR-UIX-04）：拿真实 egui 排一帧——长标题必须被截断且不顶出行右缘，
+    /// 短标题则按内容宽出按钮（不把整行宽度都占了，否则点击区会变成整行）。
+    #[test]
+    fn long_title_is_truncated_within_the_row() {
+        let ctx = egui::Context::default();
+        let mut row_right = 0.0f32;
+        let mut long_rect = egui::Rect::NOTHING;
+        let mut long_intrinsic = 0.0f32;
+        let mut short_rect = egui::Rect::NOTHING;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 60.0),
+            )),
+            ..Default::default()
+        };
+        let long = "Calculator Deluxe Edition for Windows 专业版 ".repeat(3);
+        let mut out = ctx.run_ui(raw, |ui| {
+            row_right = ui.max_rect().max.x;
+            ui.horizontal(|ui| {
+                row_badge(ui, 0, "exec");
+                let r = title_button(ui, false, long.as_str().into(), 50.0);
+                long_rect = r.rect;
+                long_intrinsic = r.intrinsic_size().unwrap_or_default().x;
+                ui.label("Not found");
+            });
+            ui.horizontal(|ui| {
+                row_badge(ui, 1, "exec");
+                short_rect = title_button(ui, false, "计算器".into(), 0.0).rect;
+            });
+        });
+        out.textures_delta.clear();
+        assert!(
+            long_rect.right() <= row_right + 0.5,
+            "长标题右缘 {:.1} 顶出行右缘 {row_right:.1}",
+            long_rect.right()
+        );
+        assert!(
+            long_intrinsic > long_rect.width() + 1.0,
+            "长标题没被截断（整串宽 {long_intrinsic:.1}、按钮只占 {:.1}）",
+            long_rect.width()
+        );
+        assert!(
+            short_rect.width() < 120.0,
+            "短标题「计算器」占了 {:.1} px，按钮被拉满了",
+            short_rect.width()
+        );
+    }
+
+    /// 批次 R1（FR-UIX-04）：行尾标签的预算要和实际排版同口径——整宽由 `into_galley` 量出，
+    /// 段与段之间只加 `item_spacing.x`（`ui.horizontal` 里的真实间隔），不多算也不少算。
+    #[test]
+    fn trailing_width_matches_the_labels_it_feeds() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 60.0),
+            )),
+            ..Default::default()
+        };
+        let mut empty = -1.0f32;
+        let mut one = 0.0f32;
+        let mut one_sum = 0.0f32;
+        let mut two = 0.0f32;
+        let mut two_sum = 0.0f32;
+        let mut gap = 0.0f32;
+        let mut out = ctx.run_ui(raw, |ui| {
+            gap = ui.spacing().item_spacing.x;
+            empty = trailing_width(ui, &[]);
+            let a: egui::WidgetText = egui::RichText::new("Not found").weak().small().into();
+            let b: egui::WidgetText = egui::RichText::new("exec").monospace().into();
+            one_sum = widget_text_width(ui, a.clone());
+            two_sum = one_sum + widget_text_width(ui, b.clone());
+            one = trailing_width(ui, &[a.clone()]);
+            two = trailing_width(ui, &[a, b]);
+        });
+        out.textures_delta.clear();
+        assert_eq!(empty, 0.0, "没有行尾标签时预算必须是 0，否则标题白扣一格间距");
+        assert!(one > 0.0 && gap > 0.0);
+        assert!((one - one_sum).abs() < 0.01, "单段不该多算间距");
+        assert!(
+            (two - (two_sum + gap)).abs() < 0.01,
+            "两段合计 {two:.2} ≠ 两段宽 {two_sum:.2} + 间距 {gap:.2}"
+        );
+    }
+
     /// 提交时必须落回 `LaunchItem.param_type`——`to_item` 漏这一格的话，
     /// 界面上改完、存盘回来还是「无参数」，光看界面看不出来。
     #[test]
