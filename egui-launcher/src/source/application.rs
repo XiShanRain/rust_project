@@ -491,6 +491,8 @@ fn settings_from_map(
     take_field!(map, s, "", hidden, Vec<String>);
     take_field!(map, s, "", hidden_stash, Vec<LaunchItem>);
     take_field!(map, s, "", confirm_actions, bool);
+    // 批次「系统消息三件」③：缺这一行就是"设置页关掉了托盘、下次启动图标又回来"。
+    take_field!(map, s, "", show_tray_icon, bool);
     take_field!(map, s, "", terminal_shell, String);
     take_field!(map, s, "", theme, String);
     take_field!(map, s, "", list_rows, ListRows);
@@ -860,6 +862,14 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub confirm_actions: bool,
 
+    /// 托盘图标是否显示（FR-SYS-01，需求书 4.1「`show_tray_icon=false` 时完全隐藏托盘图标」）。
+    /// **默认开**：关掉它之后，窗口又恰好处于隐藏态，就没有任何入口能把程序叫回来
+    /// （全局热键是唯一活着的路），所以"看不见图标"必须是用户主动选的状态，不能是缺省。
+    /// 关掉只是 `set_visible(false)`——进程照跑、热键照装、菜单项的翻译照更新，
+    /// 不是"退出到后台"。
+    #[serde(default = "default_true")]
+    pub show_tray_icon: bool,
+
     /// `>` 终端用哪个 shell（FR-SRC-16）。存 [`terminal::TermShell::as_str`] 的稳定名，
     /// 与 `sources_off` 同一口径：本程序不认识的名字回落 `cmd`，不让整份配置判坏。
     #[serde(default = "default_terminal_shell")]
@@ -1060,6 +1070,7 @@ impl Default for AppSettings {
             hidden: Vec::new(),
             hidden_stash: Vec::new(),
             confirm_actions: true,
+            show_tray_icon: true,
             terminal_shell: default_terminal_shell(),
             theme: default_theme(),
             list_rows: ListRows::default(),
@@ -5572,6 +5583,9 @@ mod hotkey_tests {
             Some(HotkeySpec::SELECTION_DEFAULT),
             "缺字段 = 出厂即用 Ctrl+Alt+\\"
         );
+        // 批次 M（FR-SYS-01）：老文件没有这一格 ⇒ 托盘图标照旧显示。
+        // 默认必须是"显示"：关掉托盘 + 窗口隐藏 = 只剩全局热键一条路，不能让用户升级完突然找不到入口。
+        assert!(s.show_tray_icon, "缺字段 = 出厂显示托盘图标");
 
         let custom = AppSettings {
             toggle_hotkey: HotkeySpec {
@@ -5885,6 +5899,8 @@ mod config_tests {
             ..Default::default()
         }];
         x.confirm_actions = false;
+        // 批次「系统消息三件」：出厂开、特值进 false 才测得出"读盘真的读了这一格"。
+        x.show_tray_icon = false;
         x.terminal_shell = "pwsh".to_string();
         x.theme = "Dark".to_string();
         x.list_rows = ListRows::Ten;

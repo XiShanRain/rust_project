@@ -59,7 +59,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{
     DROPFILES, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_WANTNUKEWARNING,
     FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FO_COPY, FO_DELETE, FileOpenDialog,
-    IFileOpenDialog, IShellItem, SEE_MASK_FLAG_NO_UI,
+    IFileOpenDialog, IShellItem, IsUserAnAdmin, SEE_MASK_FLAG_NO_UI,
     SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW, SHObjectProperties,
     SHOP_FILEPATH, SHELLEXECUTEINFOW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
     SHEmptyRecycleBinW, SIGDN_FILESYSPATH, ShellExecuteExW,
@@ -70,16 +70,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClassNameW, GetCursorPos,
     GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowLongW, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, GUITHREADINFO, GWL_STYLE, HHOOK, HWND_BROADCAST,
-    HWND_MESSAGE, IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, KillTimer, MSG, MSGFLT_ALLOW,
+    IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, KillTimer, MSG, MSGFLT_ALLOW,
     PostMessageW, PostQuitMessage,
     RegisterClassExW, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow,
     SetTimer, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-    WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SYSCOMMAND, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSEXW,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_APP,
+    WM_COPYDATA, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+    WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUERYENDSESSION, WM_RBUTTONDOWN, WM_SETTINGCHANGE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 /// 全局呼出 / 隐藏那一组（`RegisterHotKey` 的 id）。批次 R 起系统里同时最多装着两个热键，
@@ -102,6 +103,7 @@ mod actions;
 mod cli;
 mod dbltap;
 mod dpi;
+mod envsync;
 mod expander;
 mod hud;
 mod i18n;
@@ -189,6 +191,17 @@ enum IpcMsg {
 }
 
 static IPC_TX: std::sync::OnceLock<mpsc::Sender<IpcMsg>> = std::sync::OnceLock::new();
+
+/// 热键线程的消息窗替系统转达的两件事。窗口过程里**只做一次 `send`**，
+/// 读注册表、改进程环境、重建索引、落盘全在 UI 线程做（与低级钩子同一纪律：回调零 I/O）。
+enum SysSignal {
+    /// `WM_SETTINGCHANGE` 且区域名正是 `Environment` ⇒ 有人在系统里改了环境变量。
+    Environment,
+    /// `WM_QUERYENDSESSION` / `WM_ENDSESSION` ⇒ 系统要关机或注销，走既有退出路径收尾。
+    EndSession,
+}
+
+static SYS_TX: std::sync::OnceLock<mpsc::Sender<SysSignal>> = std::sync::OnceLock::new();
 
 /// 「发送到」递来的路径 → 弹窗预填（FR-SRC-20① 增强，2026-10-17）：
 /// 存在的 `.lnk` 先解析真实目标（`resolve_lnk` 内已带 E-03 四条约束），命令行写实际 exe、
@@ -1172,12 +1185,20 @@ struct LauncherApp {
     /// 逐项改字——菜单是活的，不是启动时画死的一张图。`None` ＝ 测试里的 `Default` 构造
     /// （不在单测里建真托盘，那里没有 shell）。
     tray_menu: Option<TrayMenu>,
+    /// 批次「系统消息三件」（FR-SYS-01）：上一帧真正落到 shell 的托盘显隐与提示串。
+    /// `None` = 还没应用过（首帧一定应用一次）。这两个缓存不是省时间的装饰：
+    /// `set_visible(false)` 在已经摘掉的情况下会再发一次 `NIM_DELETE`，shell 回 `FALSE`，
+    /// tray-icon 就往 stderr 打一行「Error removing system tray icon」⇒ 日志里全是假故障。
+    tray_shown: Option<bool>,
+    tray_tooltip: Option<String>,
     hotkey_rx: mpsc::Receiver<()>,
     /// 批次 G3：选中内容键的结论（工作线程 → UI）。主窗可能正隐藏着，所以每次回执都带着
     /// 一次 `ctx.request_repaint()`（见 [`spawn_selection_capture`]），否则这一帧根本不会跑。
     selection_rx: mpsc::Receiver<SelectionOutcome>,
     // FR-SRC-21：主实例收二次进程转发（Activate/AddPath/Ping/Preferences/AddBatch）。
     ipc_rx: mpsc::Receiver<IpcMsg>,
+    /// 批次「系统消息三件」：热键线程消息窗转达的系统广播（环境变量变了 / 系统要关机）。
+    sys_rx: mpsc::Receiver<SysSignal>,
     ipc_pending: Vec<DialogState>,
     pending_batch: Vec<String>, // FR-WIN-08 多路径 SendTo：首帧批量入库并去重
     hide_pending: bool,         // eframe 首帧后会强制显示窗口，静默启动需在首帧末盖回隐藏
@@ -2585,7 +2606,7 @@ fn top_drag_strip_w(item_spacing_x: f32) -> f32 {
 // 搜索框的两句占位提示（批次 F13 起在 `locales\*.json` 里：`app.search_hint` /
 // `app.search_hint_short`）。**批次 F6 起主题提示改短**：输入框放大到 22pt 之后，原先那串
 // 十来个键名的长提示会被输入框右缘裁掉（留半句话比没有更糟）。完整键表有两处入口——
-// ☰ 菜单本身（Ctrl+M）和查询框打 `?` 的速查表（现量 53 条，
+// ☰ 菜单本身（Ctrl+M）和查询框打 `?` 的速查表（现量 72 条，
 // `grep -c '^    CheatEntry {' src/source/cheatsheet.rs` 随时可复量）。
 
 /// 列表可视区之上的占用：外框 1 + 主题内边距 + 输入框 + 4（行距与分隔线，Light 实测值）。
@@ -5916,6 +5937,18 @@ fn inject_typeback_char() {
     );
 }
 
+/// 消息窗 → UI 线程的唯一出口：塞一个信号，再催 `ui()` 跑一帧。
+/// 少了后一脚，隐藏态下这条信号会一直攒到下一次呼出才被收走——
+/// eframe 在 `Visible(false)` 之后根本不调 `ui()`（需求书 E 附录那条老坑）。
+fn notify_sys(sig: SysSignal) {
+    if let Some(tx) = SYS_TX.get() {
+        let _ = tx.send(sig);
+    }
+    if let Some(ctx) = CTX.get() {
+        ctx.request_repaint();
+    }
+}
+
 unsafe extern "system" fn hotkey_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -5952,6 +5985,46 @@ unsafe extern "system" fn hotkey_wndproc(
                     }
                 }
                 _ => {}
+            }
+            return LRESULT(0);
+        }
+        // 批次「系统消息三件」①（FR-SYS-07）：有人在系统里改了环境变量 ⇒ 只认区域名
+        // `Environment`（大小写不敏感，判据在 `envsync::is_environment_str`）。
+        // `lParam` 为 NULL 或别的区域名（主题、鼠标方案……）一概不理：那是"某个设置变了"，
+        // 不是"环境块变了"。这里只读那块内存做比较，不碰磁盘、不动进程环境——
+        // 读注册表和 `set_var` 都在 UI 线程做（与低级钩子同一纪律：回调零 I/O）。
+        if msg == WM_SETTINGCHANGE {
+            if lparam.0 != 0 {
+                // 串长是系统给的，只能扫到 NUL；上限 256 格是给"指针指到不该指的地方"
+                // 那种情况留的闸——区域名从来没那么长。
+                let p = lparam.0 as *const u16;
+                let mut units: Vec<u16> = Vec::with_capacity(32);
+                for i in 0..256isize {
+                    let c = *p.offset(i);
+                    if c == 0 {
+                        break;
+                    }
+                    units.push(c);
+                }
+                if envsync::is_environment_str(&String::from_utf16_lossy(&units)) {
+                    notify_sys(SysSignal::Environment);
+                }
+            }
+            return LRESULT(0);
+        }
+        // 批次「系统消息三件」②（NFR-06）：系统问"能关机吗"。永远答能（`LRESULT(1)` = TRUE）——
+        // 本程序没有任何"不保存就丢数据"的东西（配置是每改一次落一次盘），
+        // 为一条关机否决把用户的注销/关机卡住是最糟糕的取舍。
+        // 真正收尾在 `WM_ENDSESSION`，但这里就发信号：答完 TRUE 之后那条**不保证还会来**
+        // （超时或被强杀），而 UI 侧要做的事本身是幂等的。
+        if msg == WM_QUERYENDSESSION {
+            notify_sys(SysSignal::EndSession);
+            return LRESULT(1);
+        }
+        if msg == WM_ENDSESSION {
+            // `wParam == FALSE` = 关机被别的程序否决了，本次作废 ⇒ 什么都不做。
+            if wparam.0 != 0 {
+                notify_sys(SysSignal::EndSession);
             }
             return LRESULT(0);
         }
@@ -6163,8 +6236,14 @@ fn spawn_hotkey_thread(
             return;
         }
         let win_name: Vec<u16> = "EguiLauncherHotkey\0".encode_utf16().collect();
+        // 批次「系统消息三件」：这里从"消息窗"换成"从不显示的顶层窗"。
+        // 原因是硬性的：`HWND_BROADCAST` 与关机问询都只发给**顶层窗口**，
+        // 挂在 `HWND_MESSAGE` 下面的窗一条都收不到（原来那颗 `WM_COPYDATA` 是定向投递，
+        // 所以一直没暴露这个问题）。
+        // `WS_EX_TOOLWINDOW` 让它不进 Alt-Tab，`WS_EX_NOACTIVATE` 让它抢不到焦点，
+        // 而不调 `ShowWindow` ⇒ 不进任务栏、看不见、不占屏幕。托盘那条窗就是同一套做法。
         let hwnd = match CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(win_name.as_ptr()),
             WINDOW_STYLE(0),
@@ -6172,7 +6251,7 @@ fn spawn_hotkey_thread(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            Some(HWND_MESSAGE),
+            None,
             None,
             Some(module.into()),
             None,
@@ -6417,6 +6496,8 @@ impl LauncherApp {
         broken_settings: Option<Corrupted>,
         // 批次 G3：选中内容键取回来的结论（热键线程派的工作线程往这里塞）。
         selection_rx: mpsc::Receiver<SelectionOutcome>,
+        // 批次「系统消息三件」：消息窗转达的系统广播（环境变量 / 会话结束）。
+        sys_rx: mpsc::Receiver<SysSignal>,
     ) -> Self {
         let (icon_tx, icon_rx) = mpsc::channel();
         // 批次 D2 第二半：「下载站点图标」的回执通道（下载在后台线程，主线程只收）。
@@ -6753,9 +6834,13 @@ impl LauncherApp {
             icon_rx,
             tray_rx,
             tray_menu,
+            // 批次「系统消息三件」：`None` = 还没往 shell 应用过 ⇒ 首帧必定应用一次（见 `sync_tray`）。
+            tray_shown: None,
+            tray_tooltip: None,
             hotkey_rx,
             selection_rx,
             ipc_rx,
+            sys_rx,
             ipc_pending: Vec::new(),
             pending_batch: intent.batch,
             hide_pending: !intent.visible,
@@ -7939,6 +8024,31 @@ impl LauncherApp {
     /// ② 首帧把显示口径对齐到"系统里真正装着的那两组"；③ 取键（录主热键 / 给补字符键选键）
     /// 独占本帧按键；④ 把"取键期间临时注销全局键"这条边沿发给热键线程。
     /// 必须排在快捷键分支之前——否则录制时按 Ctrl+I 会先被「批量导入」抢走。
+    /// 批次「系统消息三件」（FR-SYS-01）：托盘的两件事跟着配置与真实呼出键走——
+    /// 显隐（`show_tray_icon`）与悬停提示（产品名 + 版本号 + 键 + 管理员后缀）。
+    /// 每帧调，但只在值真的变了的那一帧才碰 shell：`set_visible(false)` 重复发就是
+    /// 一次失败的 `NIM_DELETE`（tray-icon 会往 stderr 打「Error removing system tray icon」），
+    /// `set_tooltip` 重复发是一次没用的 `NIM_MODIFY`。
+    /// 挂在 `hotkey_frame` 之后是有意的：那里刚把 `hotkey_active` 按线程回执校正过，
+    /// 提示串要的正是校正后的那一份。
+    fn sync_tray(&mut self) {
+        let Some(tray) = &self.tray_menu else {
+            return;
+        };
+        let shown = self.prefs.show_tray_icon;
+        if self.tray_shown != Some(shown) {
+            self.tray_shown = Some(shown);
+            tray.set_shown(shown);
+        }
+        let tip = tray_tooltip(&self.hotkey_active.display(), is_admin());
+        // 图标摘着的时候 `NIM_MODIFY` 必定失败（shell 那一项已经不在了）⇒ 这一帧不改提示、
+        // **也不更新缓存**：挂回去的那一帧缓存仍是旧的，这段自然会把最新串补上。
+        if shown && self.tray_tooltip.as_deref() != Some(tip.as_str()) {
+            tray.set_tip(&tip);
+            self.tray_tooltip = Some(tip);
+        }
+    }
+
     fn hotkey_frame(&mut self, ui: &mut egui::Ui) {
         // 先 take 出来再遍历：`for o in std::mem::take(&mut *hotkey_lock(..))` 会把那个 MutexGuard
         // 存活到整个循环体结束（for 的 scrutinee 临时量就是循环作用域），期间热键线程想 push 一条
@@ -10563,6 +10673,33 @@ impl LauncherApp {
                                 ))
                                 .weak()
                                 .small(),
+                            );
+                            ui.separator();
+                            // FR-SYS-01（批次「系统消息三件」）：托盘图标显隐。开关类不另配快捷键（批次 K 成规）。
+                            // 生效是即时的（下一帧 `sync_tray` 比对缓存后发一次 `set_visible`），不用重启。
+                            ui.label(
+                                egui::RichText::new(i18n::t("settings.general.tray_title"))
+                                    .strong(),
+                            );
+                            let mut show_tray = self.prefs.show_tray_icon;
+                            if ui
+                                .checkbox(
+                                    &mut show_tray,
+                                    i18n::t("settings.general.tray_label"),
+                                )
+                                .changed()
+                            {
+                                self.prefs.show_tray_icon = show_tray;
+                                source::application::save_settings(&self.prefs);
+                                log_info!(
+                                    "设置页：show_tray_icon = {show_tray}（已写 settings.json）"
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            ui.label(
+                                egui::RichText::new(i18n::t("settings.general.tray_help"))
+                                    .weak()
+                                    .small(),
                             );
                         }
                         SettingsTab::Features => {
@@ -14053,6 +14190,7 @@ impl Default for LauncherApp {
         let (t4, _r4) = mpsc::channel();
         let (_t5, r5) = mpsc::channel();
         let (_t6, r6) = mpsc::channel();
+        let (_t7, r7) = mpsc::channel();
         Self::new(
             r1,
             None,
@@ -14073,6 +14211,7 @@ impl Default for LauncherApp {
             source::application::AppSettings::default(),
             None,
             r6,
+            r7,
         )
     }
 }
@@ -14347,6 +14486,49 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        // 批次「系统消息三件」：消息窗只负责"听见"，两条广播的处理全在这里（UI 线程）。
+        // 回调里读注册表 / 改环境 / 重扫索引都是不该做的事，所以那一侧只塞了一个信号。
+        while let Ok(sig) = self.sys_rx.try_recv() {
+            match sig {
+                // ①（FR-SYS-07）系统环境块变了 ⇒ 增量补进本进程，再重判依赖它的两处。
+                SysSignal::Environment => {
+                    let out = envsync::refresh_now();
+                    let applied = out.applied;
+                    log_info!("{}", out.log_line());
+                    if applied == 0 {
+                        // 绝大多数广播都是"有人改了别处的设置，与我们无关"或"值早就一样"。
+                        // 没有差异就不许去多读一遍用户的盘。
+                        continue;
+                    }
+                    // 自定义命令的**路径四态**：`%VAR%` 展开与 PATH 查找都读进程环境，
+                    // 环境一变，原来"找不到"的那条可能立刻就能找到了。
+                    // 偏差登记：此刻已有一波检查在飞时这一脚会被丢弃（同一时刻只跑一波），
+                    // 靠可见期每 3 秒的兜底刷新补上；隐藏态本来就不跑循环，下次呼出必然强刷。
+                    self.refresh_path_states(true);
+                    // 文件索引的根目录里有环境派生的路径（`default_roots` 读 HOME/USERPROFILE），
+                    // 环境变了它就可能是另一张表 ⇒ 与内置动作「重建文件索引」同一道开关闸。
+                    if self.prefs.source_on(source::SourceId::Files) {
+                        for s in self.sources.iter_mut() {
+                            if s.id() == source::SourceId::Files {
+                                s.rebuild();
+                            }
+                        }
+                    }
+                    ui.ctx().request_repaint();
+                }
+                // ②（NFR-06）系统要关机 / 注销。问询那一头已经无条件放行，这里只做告别。
+                SysSignal::EndSession => {
+                    // 本程序没有"不落盘就丢"的数据：配置每改一次写一次，写的还是
+                    // "同目录临时文件 + 改名"的原子替换（`write_atomic`）。
+                    // 会话结束真正欠着的只有 `on_hide` 里那份窗口位置（拖窗期间不落盘），
+                    // 所以收尾整个挂在它上面，再走与托盘「退出」同一条关闭路径。
+                    log_info!("会话结束：执行收尾并退出（与托盘「退出」同一路径）");
+                    self.on_hide();
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
         // FR-WIN-08：启动时带多个 SendTo 路径 → 首帧批量入库（此时已有 ctx 可刷新）。
         if !self.pending_batch.is_empty() {
             let paths = std::mem::take(&mut self.pending_batch);
@@ -14579,6 +14761,9 @@ impl eframe::App for LauncherApp {
         // 录制态会把本帧的按键事件清空，后面那块整体收不到键；即便如此仍显式加 `!recording` 门，
         // 让"录制时不响应任何快捷键"这件事读得出来，而不是依赖清事件这个隐式效果。
         self.hotkey_frame(ui);
+        // 批次「系统消息三件」（FR-SYS-01）：托盘显隐与提示串。紧跟 `hotkey_frame`——
+        // 那里刚按线程回执校正过 `hotkey_active`，提示要的是校正后的键。
+        self.sync_tray();
         // 批次 FR-WIN-06：呼出抢跑期间截住的字符，赶在搜索框渲染之前补进去——
         // 这一帧画出来的框里就该有它们。
         self.drain_sprint(ui.ctx());
@@ -18778,12 +18963,39 @@ fn create_tray_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, w, h).expect("Failed to create tray icon")
 }
 
+/// 批次「系统消息三件」（FR-SYS-01）：托盘悬停提示 = 产品名 + 版本号 + **真正生效的**呼出键；
+/// 以管理员身份运行时追加 `(Administrator)`（原文那句「管理员运行时提示与版本号后缀」）。
+/// 纯函数——键串与提权标志都由调用方给，Win32 只留在 `set_tooltip` 那一句，所以能单测。
+/// 串不翻（两种语言写法相同，与批次 F13 对 tooltip 的旧裁定一致）；`Ctrl+Alt+Space` 这类
+/// 键名本来就是英文形态，翻成「控制+alt+空格」反而认不出来。
+fn tray_tooltip(hotkey_display: &str, admin: bool) -> String {
+    let mut s = format!(
+        "egui Launcher v{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        hotkey_display
+    );
+    if admin {
+        s.push_str(" (Administrator)");
+    }
+    s
+}
+
+/// 本进程是否以管理员身份运行。`IsUserAnAdmin` 问的是**当前进程的令牌**，不是"这台机器开没开 UAC"：
+/// 双击绿色 exe ⇒ `false`，右键「以管理员身份运行」⇒ `true`。
+/// 收在 `OnceLock` 里：托盘提示每帧都要比一次是否变了，没必要每帧再问一次 Shell。
+fn is_admin() -> bool {
+    static ADMIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ADMIN.get_or_init(|| unsafe { IsUserAnAdmin().as_bool() })
+}
+
 /// 批次 F13（FR-SYS-04）：托盘菜单的文字要能在运行时跟着界面语言换。
 /// `muda::MenuItem` 是 Rc 后端——克隆出来的是同一个菜单项，`set_text` 改的就是托盘里那一行；
 /// 菜单本身归 `TrayIcon` 所有（`with_menu(Box::new(menu))`），所以这里留图标 + 七个句柄。
 /// 托盘图标随 `LauncherApp` 走完整个进程（App 没有 `Send` 约束，收得下这两种 `!Send` 类型）。
 pub struct TrayMenu {
-    _tray: TrayIcon,
+    /// 批次「系统消息三件」（FR-SYS-01）起要有名：显隐与悬停提示都走它。
+    /// 原来叫 `_tray`（只负责"活着"，Drop 时删图标），改名后 `Drop` 语义一个字没变。
+    tray: TrayIcon,
     show: MenuItem,
     import: MenuItem,
     settings: MenuItem,
@@ -18804,9 +19016,22 @@ impl TrayMenu {
         self.update.set_text(i18n::t("tray.check_update"));
         self.exit.set_text(i18n::t("tray.exit"));
     }
+
+    /// `show_tray_icon = false` ⇒ 从通知区摘掉图标。进程照跑、全局热键照装、菜单句柄照翻；
+    /// tray-icon 内部是 `SendMessageW(WM_USER_HIDE_TRAYICON)`，回来时再 `SHOW` 一次，
+    /// 不重建图标，所以 `TaskbarCreated` 那条路不受影响。
+    fn set_shown(&self, shown: bool) {
+        let _ = self.tray.set_visible(shown);
+    }
+
+    fn set_tip(&self, tip: &str) {
+        let _ = self.tray.set_tooltip(Some(tip));
+    }
 }
 
-fn init_tray() -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
+/// 批次「系统消息三件」（FR-SYS-01）：`tip` 由调用方拼好——建托盘时呼出键与提权标志已经定了
+/// （`main` 里先读设置再 `init_tray`），所以图标一挂上去提示就是对的，不必等第一帧再补。
+fn init_tray(tip: &str) -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
     let (tx, rx) = mpsc::channel();
     let show_id = muda::MenuId("show".to_string());
     let import_id = muda::MenuId("import".to_string());
@@ -18863,14 +19088,15 @@ fn init_tray() -> (TrayMenu, mpsc::Receiver<TrayEvent>) {
     let icon = create_tray_icon();
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        // 提示串是产品名 + 按键名，两种语言下写法相同，不翻。
-        .with_tooltip("egui Launcher (Ctrl+Alt+Space)")
+        // 提示串由调用方按"当前配置的呼出键 + 是否管理员"拼好（见 `tray_tooltip`）；
+        // 真正生效的键可能与配置不同（注册失败退回出厂值），那一版由 `sync_tray` 在首帧校正。
+        .with_tooltip(tip)
         .with_icon(icon)
         .with_menu_on_left_click(true)
         .build()
         .expect("Failed to create tray icon");
     let menu = TrayMenu {
-        _tray: tray,
+        tray,
         show: show_item,
         import: import_item,
         settings: settings_item,
@@ -19011,6 +19237,9 @@ fn main() -> eframe::Result {
     let (selection_tx, selection_rx) = mpsc::channel();
     let (ipc_tx, ipc_rx) = mpsc::channel();
     IPC_TX.set(ipc_tx).ok();
+    // 批次「系统消息三件」：消息窗 → UI 的系统广播通道（环境变量变了 / 会话要结束）。
+    let (sys_tx, sys_rx) = mpsc::channel();
+    SYS_TX.set(sys_tx).ok();
     let (notify_tx, notify_rx) = mpsc::channel();
     // 批次 Q：热键在设置里可改，而注册发生在 `LauncherApp::new` 之前（热键线程自己那条消息循环），
     // 所以这里读一次 settings.json。批次 R 起这一次读还要带出补字符热键。
@@ -19046,7 +19275,13 @@ fn main() -> eframe::Result {
             "跟随系统"
         }
     );
-    let (tray_menu, tray_rx) = init_tray();
+    // 批次「系统消息三件」（FR-SYS-01）：托盘提示带真实呼出键与管理员后缀。
+    // 这里先按**配置值**拼一版（托盘必须在建窗之前挂好，而热键线程的回执还没回来）；
+    // 注册失败退回出厂值那一档由 `sync_tray` 在首帧按 `hotkey_active` 改正。
+    let (tray_menu, tray_rx) = init_tray(&tray_tooltip(
+        &configured.toggle_hotkey.display(),
+        is_admin(),
+    ));
     match &broken {
         Some(Corrupted::Kept(p)) => log_info!(
             "配置损坏：热键线程用的 settings.json 解析失败，已隔离为 {}，本轮按出厂热键注册",
@@ -19147,6 +19382,7 @@ fn main() -> eframe::Result {
                 configured,
                 broken,
                 selection_rx,
+                sys_rx,
             );
             // 批次 F9（FR-UIX-06）：窗口已经建好、`self_hwnd` 已经在手，趁首帧还没跑
             // 把 DWM 属性设上（关过渡动画 + 先藏），这一帧画完才露。
@@ -19162,6 +19398,26 @@ mod nav_tests {
     // 批次 Q 这里有一句单独的 `use crate::source::application::HKF_WIN;`，理由是"只有测试断言
     // 录制路径不许产出 Win 位，运行期没人读它"。批次 R 把这个前提推翻了（补字符卡片上的复选框
     // 就在运行期读它），所以改成靠上面那条 glob 带进来。
+
+    /// 批次「系统消息三件」（FR-SYS-01）：悬停提示里的三件——产品名带版本号、写的是**真正生效的**
+    /// 呼出键、只有提权时才追加 `(Administrator)`。这三件全在这一个纯函数里，
+    /// 所以断言只盯它的输出就够了（`set_tooltip` 那一句留给真机）。
+    /// 旧版把 `"egui Launcher (Ctrl+Alt+Space)"` 写死在字面量里：用户把键改成 F6，提示还是那句
+    /// ——这一条断言就是这个缺陷的回归护栏（`F6` 那条）。
+    #[test]
+    fn tray_tooltip_carries_version_hotkey_and_admin_suffix() {
+        let t = tray_tooltip("Ctrl+Alt+Space", false);
+        assert!(
+            t.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "提示里要有版本号，实得：{t}"
+        );
+        assert!(t.contains("Ctrl+Alt+Space"), "提示里要有呼出键，实得：{t}");
+        assert!(!t.contains("Administrator"), "普通权限不得出现后缀，实得：{t}");
+        assert!(tray_tooltip("F6", false).contains("(F6)"), "键串要照传进来的值走");
+        let a = tray_tooltip("Ctrl+Alt+Space", true);
+        assert!(a.ends_with(" (Administrator)"), "后缀挂在末尾，实得：{a}");
+        assert!(a.contains("Ctrl+Alt+Space"), "加了后缀不能把键挤掉");
+    }
 
     /// 批次 G3：快照要把"内存块格式"抄字节、把"句柄格式"跳过。跳错一侧的后果不对称——
     /// 漏跳一格句柄格式，还原时往剪贴板里放一个已失效的号码（读者可能崩）；多跳一格内存
