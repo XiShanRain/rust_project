@@ -2779,6 +2779,57 @@ fn param_row_mark(item: &LaunchItem) -> &'static str {
     }
 }
 
+/// 批次 HL（FR-QRY-03 右半列 / FR-UIX-04）：把标题按命中区间切成若干段，**一次排版**后分段着色。
+///
+/// 普通段用 `Color32::PLACEHOLDER`：`Painter::galley` 会把它换成按钮当前状态的文字色
+/// （未选中 `input_text`、选中 `selected_title`），所以悬停 / 选中不必另写一套颜色。
+/// 命中段用主题的 `highlight` / `selected_highlight`。
+///
+/// 字体与行高必须**显式写死**成 `WidgetText::Text` 那条路的同一口径：
+/// LayoutJob 分支不套按钮的 fallback 字体，漏写就掉回默认字号、行高也跟着错。
+/// 区间是相对 `item.name` 的字符下标，`* ` / `✓ ` 前缀按字符数整体右移。
+fn highlighted_title(
+    ui: &egui::Ui,
+    shown: &str,
+    spans: &[(usize, usize)],
+    prefix_chars: usize,
+    accent: egui::Color32,
+) -> egui::WidgetText {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let line_height =
+        ui.ctx().fonts_mut(|f| f.row_height(&font_id)) + ui.spacing().extra_text_line_spacing;
+    let format = |color| egui::TextFormat {
+        font_id: font_id.clone(),
+        color,
+        valign: ui.text_valign(),
+        line_height: Some(line_height),
+        ..Default::default()
+    };
+    let chars: Vec<char> = shown.chars().collect();
+    let mut job = egui::text::LayoutJob::default();
+    let mut at = 0usize;
+    for &(a, b) in spans {
+        let (a, b) = (a + prefix_chars, b + prefix_chars);
+        if a < at || b > chars.len() || a >= b {
+            continue;
+        }
+        if at < a {
+            push_title_seg(&mut job, &chars[at..a], format(egui::Color32::PLACEHOLDER));
+        }
+        push_title_seg(&mut job, &chars[a..b], format(accent));
+        at = b;
+    }
+    if at < chars.len() {
+        push_title_seg(&mut job, &chars[at..], format(egui::Color32::PLACEHOLDER));
+    }
+    job.into()
+}
+
+fn push_title_seg(job: &mut egui::text::LayoutJob, chars: &[char], format: egui::TextFormat) {
+    let s: String = chars.iter().collect();
+    job.append(&s, 0.0, format);
+}
+
 /// FR-SRC-06：路径四态在行尾的颜色。Offline 是"介质不在"（提示性），Not found 才像"写错了"。
 fn path_state_color(state: source::pathcheck::PathState) -> egui::Color32 {
     match state {
@@ -16491,11 +16542,33 @@ impl eframe::App for LauncherApp {
                                 // 批次 E4：标记项用名称前 `✓` 前缀，不另开列宽。
                                 // 批次 B6：带参项在名称前加 `*`（最近名字，先于 ✓）。
                                 let marked = is_marked(&self.marked, &item.path);
-                                let mut shown = format!("{}{}", param_row_mark(item), item.name);
+                                let mark = param_row_mark(item);
+                                let mut shown = format!("{}{}", mark, item.name);
                                 if marked {
                                     shown = format!("✓ {shown}");
                                 }
-                                let sel = ui.selectable_label(is_sel, shown);
+                                // 批次 HL（FR-UIX-04）：主题把高亮色设成与标题同色即等于关闭
+                                // 高亮（FR-UIX-02 的既有规则），此时完全走旧的整串渲染。
+                                let accent = if is_sel {
+                                    (self.theme.selected_highlight != self.theme.selected_title)
+                                        .then_some(self.theme.selected_highlight)
+                                } else {
+                                    (self.theme.highlight != self.theme.title)
+                                        .then_some(self.theme.highlight)
+                                };
+                                let spans = self.index.spans_of(hit);
+                                let prefix_chars = mark.chars().count() + if marked { 2 } else { 0 };
+                                let title: egui::WidgetText = match accent {
+                                    Some(color) if !spans.is_empty() => highlighted_title(
+                                        ui,
+                                        &shown,
+                                        spans,
+                                        prefix_chars,
+                                        color,
+                                    ),
+                                    _ => shown.into(),
+                                };
+                                let sel = ui.selectable_label(is_sel, title);
                                 if is_sel && follow_selection {
                                     sel.scroll_to_me(Some(egui::Align::Center));
                                 }

@@ -214,6 +214,9 @@ pub struct MatchIndex {
     keys: Vec<MatchKeys>,
     /// FR-QRY-09：通配符查询的编译缓存，键是**整串查询原文**。
     wild_cache: Option<(String, Option<WildPattern>)>,
+    /// FR-QRY-03 右半列：上一次 `search` 的标题命中区间，**只覆盖榜上有名且能证实的条目**。
+    /// 按条目下标存而不是整表对齐——每帧重建 N 个空 Vec 是白烧内存；查表只扫 ≤50 条。
+    spans: Vec<(usize, Vec<(usize, usize)>)>,
 }
 
 impl MatchIndex {
@@ -249,6 +252,8 @@ impl MatchIndex {
     ) -> Vec<usize> {
         let p = parse(raw);
         self.ensure(items);
+        // 每次搜索都重算区间：查询一清空，上一帧的区间必须跟着作废，否则标题会留着旧染色。
+        self.spans.clear();
 
         // 空输入：不分桶，只让置顶/常用浮顶；三键全平的项保持清单原序（sort_by 稳定）。
         // 不截断——这是「浏览整张清单」，不是搜索结果；截 50 会把用户已有的项静默藏掉。
@@ -275,7 +280,27 @@ impl MatchIndex {
                 .then_with(|| keys[a.2].name_chars().cmp(&keys[b.2].name_chars()))
         });
         hits.truncate(MAX_RESULTS);
+        // FR-QRY-03 右半列：区间只算榜上这 ≤50 条，跟着排序结果一起产出。
+        let mut spans: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+        for (_, _, idx) in &hits {
+            if let Some(item) = items.get(*idx) {
+                let sp = title_highlight(&p, &self.keys[*idx], &item.name, wild);
+                if !sp.is_empty() {
+                    spans.push((*idx, sp));
+                }
+            }
+        }
+        self.spans = spans;
         hits.into_iter().map(|(_, _, idx)| idx).collect()
+    }
+
+    /// 上一次 `search` 在这一条**标题**上命中的字符区间（升序、互不相邻、互不重叠）。
+    /// 只有「名称赢下匹配、非通配符、且逐字能对上原文」时才有内容；其余一律空。
+    pub fn spans_of(&self, idx: usize) -> &[(usize, usize)] {
+        match self.spans.iter().find(|(i, _)| *i == idx) {
+            Some((_, v)) => v,
+            None => &[],
+        }
     }
 }
 
@@ -335,6 +360,216 @@ pub fn score_text(p: &Parsed, text: &str) -> Option<(u8, f32)> {
     let k = Key::new(text)?;
     let hit = score_key(p, &k, None);
     (hit.1 > 0.0).then_some(hit)
+}
+
+// ---- FR-QRY-03 右半列：命中区间（需求书 §5.2 字段 `highlight`）----
+//
+// 口径（FR-UIX-04）：**只高亮标题里真正对上查询的那几个字**。关键字 / 拼音 / 目标名
+// 命中都不在标题上，因此不产出区间（否则会给一个"整串标蓝"的假命中）。
+// 区间是**字符下标**（不是字节），因为绘制端按字符切 LayoutJob。
+// 宁可不高亮也不画错：拿不准（大小写折叠改了宽度、拆词对不上）就返回空。
+
+/// 这一条最终是哪把键赢的：名称还是别名。
+/// 必须和 [`score_item`] 的严格 `>` 完全同口径——平分时名称先遍历、先占位，别名不夺。
+fn name_won(p: &Parsed, keys: &MatchKeys, wild: Option<&WildPattern>) -> bool {
+    let Some(name) = &keys.name else {
+        return false;
+    };
+    let name_hit = score_key(p, name, wild);
+    if name_hit.1 <= 0.0 {
+        return false;
+    }
+    !keys.aliases.iter().any(|a| {
+        let hit = score_key(p, a, wild);
+        hit.1 > 0.0 && hit > name_hit
+    })
+}
+
+/// 标题的命中区间。`name` 是原件（带大小写的标题），`keys` 是同一条目的匹配键。
+fn title_highlight(
+    p: &Parsed,
+    keys: &MatchKeys,
+    name: &str,
+    wild: Option<&WildPattern>,
+) -> Vec<(usize, usize)> {
+    // 通配符 / 正则不是七档命中，标题上"哪几个字算命中"没有定义。
+    if wild.is_some() {
+        return Vec::new();
+    }
+    let Some(k) = &keys.name else {
+        return Vec::new();
+    };
+    if !name_won(p, keys, None) {
+        return Vec::new();
+    }
+    // 大小写折叠必须逐字符一对一：`İ` 会折成两个字符，那种标题的区间会整体错位。
+    if !lower_maps_one_to_one(name, &k.lower) {
+        return Vec::new();
+    }
+    let ranges = word_ranges(name);
+    if ranges.len() != k.words.len() {
+        return Vec::new();
+    }
+    let lower_chars: Vec<char> = k.lower.chars().collect();
+    // 拆词范围必须逐词对得上 `Key.words`——camel 拆分与 `split_words` 是两份代码，
+    // 一处口径漂移就会把高亮画到别的词上。
+    for (i, r) in ranges.iter().enumerate() {
+        if text_of(&lower_chars, *r) != k.words[i] {
+            return Vec::new();
+        }
+    }
+    let initials: String = ranges
+        .iter()
+        .filter_map(|r| lower_chars.get(r.0).copied())
+        .collect();
+    if initials != k.initials {
+        return Vec::new();
+    }
+
+    let hit = score_key(p, k, None);
+    if hit.1 <= 0.0 {
+        return Vec::new();
+    }
+    if hit.0 == T_WORDS {
+        // 多词档：每个查询词各找各的命中段，再合并重叠/相邻。
+        let mut all = Vec::new();
+        for w in &p.words {
+            all.extend(spans_for_word(
+                w,
+                &k.lower,
+                &lower_chars,
+                &ranges,
+                &k.words,
+                &k.initials,
+            ));
+        }
+        merge_spans(all)
+    } else {
+        merge_spans(spans_for_word(
+            &p.full,
+            &k.lower,
+            &lower_chars,
+            &ranges,
+            &k.words,
+            &k.initials,
+        ))
+    }
+}
+
+/// 查询是不是可逐字符折叠到标题上（`İ` 这类扩展折叠会破坏一一对应）。
+fn lower_maps_one_to_one(name: &str, lower: &str) -> bool {
+    if name.chars().count() != lower.chars().count() {
+        return false;
+    }
+    name.chars()
+        .zip(lower.chars())
+        .all(|(a, b)| a.to_lowercase().eq(std::iter::once(b)))
+}
+
+/// 与 [`split_words`] 同一套拆法（先驼峰、再非字母数字），但返回各词在**原串字符下标**上的范围。
+/// 必须跑原件而不是 `Key.lower`：`lower` 里没有大写，驼峰边界已经消失。
+fn word_ranges(src: &str) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut cur: Option<(usize, usize)> = None;
+    let mut prev = '\0';
+    for (i, c) in src.chars().enumerate() {
+        if !c.is_alphanumeric() {
+            if let Some(r) = cur.take() {
+                out.push(r);
+            }
+        } else {
+            if prev.is_ascii_lowercase() && c.is_ascii_uppercase() {
+                if let Some(r) = cur.take() {
+                    out.push(r);
+                }
+            }
+            match &mut cur {
+                Some(r) => r.1 = i + 1,
+                None => cur = Some((i, i + 1)),
+            }
+        }
+        prev = c;
+    }
+    if let Some(r) = cur {
+        out.push(r);
+    }
+    out
+}
+
+fn text_of(chars: &[char], r: (usize, usize)) -> String {
+    chars[r.0.min(chars.len())..r.1.min(chars.len())]
+        .iter()
+        .collect()
+}
+
+/// 单个查询串在一把键上的命中区间——逐档镜像 [`score_word`] 的判定顺序。
+/// 两处必须同序：先命中哪一档，决定高亮是整串、前缀、词头还是散点。
+fn spans_for_word(
+    q: &str,
+    lower: &str,
+    lower_chars: &[char],
+    ranges: &[(usize, usize)],
+    words: &[String],
+    initials: &str,
+) -> Vec<(usize, usize)> {
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let ql = q.chars().count();
+    if lower == q {
+        return vec![(0, lower_chars.len())];
+    }
+    if lower.starts_with(q) {
+        return vec![(0, ql)];
+    }
+    if let Some(i) = words.iter().position(|w| w.starts_with(q)) {
+        return vec![(ranges[i].0, ranges[i].0 + ql)];
+    }
+    if ql >= 2 && initials.starts_with(q) && ranges.len() >= ql {
+        return ranges[..ql].iter().map(|r| (r.0, r.0 + 1)).collect();
+    }
+    if let Some(byte_pos) = lower.find(q) {
+        let pos = lower[..byte_pos].chars().count();
+        return vec![(pos, pos + ql)];
+    }
+    if ql >= 3
+        && lower
+            .chars()
+            .next()
+            .zip(q.chars().next())
+            .is_some_and(|(a, b)| a == b)
+        && is_subsequence(q, lower)
+    {
+        return subseq_spans(q, lower);
+    }
+    Vec::new()
+}
+
+/// 子序列命中时每一颗字的位置（散点，随后由 [`merge_spans`] 合并相邻）。
+fn subseq_spans(q: &str, lower: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut hay = lower.chars().enumerate();
+    for c in q.chars() {
+        match hay.find(|(_, h)| *h == c) {
+            Some((i, _)) => out.push((i, i + 1)),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// 排序后合并重叠或首尾相接的区间——相邻两段在排版上就是一段，分开画只会多切一刀。
+fn merge_spans(mut v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    v.retain(|(a, b)| b > a);
+    v.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in v {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 /// Tab 补全判据（FR-ACT-06，2026-10-18 与用户裁定的「可观测条件分流」）：
@@ -1133,6 +1368,117 @@ mod tests {
         // always ＝ 原 true：恒执行（打不出空格，代价由用户自己认）
         assert!(run(SpaceRun::Always, "js", &r_two));
         assert!(run(SpaceRun::Always, "", &none));
+    }
+
+    /// FR-QRY-03 右半列：单条清单里这一条的标题区间（空结果 = 不高亮）。
+    fn hl(name: &str, keyword: &str, q: &str) -> Vec<(usize, usize)> {
+        let items = vec![item(name, keyword, "p", false, 0, 0)];
+        let mut idx = MatchIndex::default();
+        let hits = idx.search(q, &items, LearnRank::Count, NOW);
+        if hits.is_empty() {
+            return Vec::new();
+        }
+        idx.spans_of(hits[0]).to_vec()
+    }
+
+    // ---- FR-QRY-03 右半列：命中区间逐档覆盖 ----
+
+    #[test]
+    fn highlight_spans_mirror_seven_tiers() {
+        // 100 完全相等 ⇒ 整串
+        assert_eq!(hl("计算器", "", "计算器"), vec![(0, 3)]);
+        // 90 前缀 ⇒ 查询那几个字
+        assert_eq!(hl("计算器专业版", "", "计算器"), vec![(0, 3)]);
+        // 80 词首 ⇒ 该词的开头 ql 个字
+        assert_eq!(hl("Visual Studio Code", "", "studio"), vec![(7, 13)]);
+        // 75 首字母 ⇒ 每个词的第一颗字（FR-QRY-04 驼峰拆分）
+        assert_eq!(
+            hl("AutoHotkey", "", "ah"),
+            vec![(0, 1), (4, 5)],
+            "AutoHotkey 拆成 Auto|Hotkey 两词"
+        );
+        // 60 包含 ⇒ 命中的那一段
+        assert_eq!(hl("Notepad", "", "ote"), vec![(1, 4)]);
+        // 45 多词 ⇒ 每个词各标各的
+        assert_eq!(
+            hl("Visual Studio Code", "", "visual code"),
+            vec![(0, 6), (14, 18)]
+        );
+        // 30 子序列 ⇒ 散点，相邻才合并
+        assert_eq!(
+            hl("calculator", "", "cltr"),
+            vec![(0, 1), (2, 3), (7, 8), (9, 10)]
+        );
+    }
+
+    #[test]
+    fn highlight_skips_non_title_hits() {
+        // 别名（关键字）命中：标题里没有那段字，不能整串标蓝。
+        assert_eq!(hl("计算器", "jsq", "jsq"), Vec::new());
+        // 目标名（exe 名）命中也一样：标题写「记事本」，命中来自 `notepad.exe`。
+        let cmd = vec![LaunchItem {
+            name: "记事本".to_string(),
+            path: "notepad.exe".to_string(),
+            kind: crate::source::application::ItemKind::Command,
+            ..Default::default()
+        }];
+        let mut idx = MatchIndex::default();
+        let hits = idx.search("notepad", &cmd, LearnRank::Count, NOW);
+        assert_eq!(hits, vec![0], "目标名命中仍要出这一行");
+        assert!(idx.spans_of(0).is_empty(), "命中的不是标题 ⇒ 不高亮");
+        // 通配符 / 正则是整串模式，「哪几个字算命中」没有定义 ⇒ 不高亮。
+        assert_eq!(hl("calculator", "", "calc*"), Vec::new());
+        assert_eq!(hl("calculator", "", "^calc"), Vec::new());
+    }
+
+    #[test]
+    fn highlight_prefers_the_name_on_a_tie() {
+        // 名称与别名同分：`score_item` 严格 `>`、名称先遍历 ⇒ 名称赢，高亮照出。
+        assert_eq!(hl("calc", "calc", "calc"), vec![(0, 4)]);
+    }
+
+    #[test]
+    fn highlight_guards_unstable_case_folding() {
+        // `İ` 折叠成两个字符（i + 组合点），区间会整体错位 ⇒ 宁可不高亮。
+        let items = vec![item("İstanbul", "", "p", false, 0, 0)];
+        let mut idx = MatchIndex::default();
+        let hits = idx.search("stanbul", &items, LearnRank::Count, NOW);
+        assert_eq!(hits, vec![0], "这一行仍应命中");
+        assert!(idx.spans_of(0).is_empty(), "折叠改宽度 ⇒ 不产出区间");
+    }
+
+    #[test]
+    fn word_ranges_follow_camel_and_punctuation() {
+        // 与 split_words 同序：驼峰先拆，非字母数字再拆，中文是独立词。
+        assert_eq!(
+            word_ranges("AutoHotkey 2"),
+            vec![(0, 4), (4, 10), (11, 12)]
+        );
+        assert_eq!(word_ranges("my_file-name"), vec![(0, 2), (3, 7), (8, 12)]);
+        assert_eq!(word_ranges("计算器 专业版"), vec![(0, 3), (4, 7)]);
+    }
+
+    #[test]
+    fn merge_spans_joins_overlapping_and_touching() {
+        assert_eq!(
+            merge_spans(vec![(2, 4), (0, 2), (3, 5)]),
+            vec![(0, 5)],
+            "重叠与首尾相接都并成一段"
+        );
+        assert_eq!(merge_spans(vec![(0, 1), (2, 3)]), vec![(0, 1), (2, 3)]);
+        assert_eq!(merge_spans(vec![(4, 4)]), Vec::new(), "空区间丢掉");
+    }
+
+    #[test]
+    fn spans_are_cleared_when_the_query_changes() {
+        let items = vec![item("calculator", "", "p", false, 0, 0)];
+        let mut idx = MatchIndex::default();
+        idx.search("calc", &items, LearnRank::Count, NOW);
+        assert_eq!(idx.spans_of(0).to_vec(), vec![(0, 4)]);
+        idx.search("", &items, LearnRank::Count, NOW);
+        assert!(idx.spans_of(0).is_empty(), "清空查询后旧区间必须作废");
+        idx.search("zzz", &items, LearnRank::Count, NOW);
+        assert!(idx.spans_of(0).is_empty(), "零命中同样不留旧区间");
     }
 
     /// FR-QRY-06 验收（NFR-01 首字符 ≤16ms）：1000 条清单的单次过滤计时。
