@@ -19543,15 +19543,110 @@ mod nav_tests {
     /// 于是「内嵌资源不依赖外部文件」这条验收会自己给自己打勾。
     /// 只扫非注释行——`.rc` 第 3 行的注释里同样写着 `1 ICON "app.ico"`，整文件抓数字会跟着
     /// 注释走；将来有人把 id 改成 2 而注释没改，这种"扫到两个 id"必须当场失败而不是挑第一个。
+    /// 【2026-11-02 批次 VER 收紧口径：原来这条只按「行首第一个 token 能不能解析成 `u16`」筛行，
+    ///  加进 `1 VERSIONINFO` 之后它立刻报 `left: [1, 1]`（版本资源也占 id 1，且必须是 1）。
+    ///  那不是版本段的错——这条测的是 ICON，就让它只认 ICON 语句；红本身是好消息，说明这行
+    ///  真在扫这些文本而不是空转。】
     #[test]
     fn tray_icon_resource_id_matches_the_rc() {
         let ids: Vec<u16> = include_str!("../assets/app.rc")
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .filter(|line| !line.starts_with("//") && line.split_whitespace().nth(1) == Some("ICON"))
             .filter_map(|line| line.split_whitespace().next()?.parse::<u16>().ok())
             .collect();
         assert_eq!(ids, vec![TRAY_ICON_RESOURCE_ID], "资源脚本里有效的 id 行要与常量一致");
+    }
+
+    /// 批次 VER：`assets\app.rc` 里那段 VERSIONINFO 的每一个版本号，都必须与 `Cargo.toml`
+    /// 的 `[package] version` 对上。这一格是全套资源里**唯一「同一件事写在两个地方」**的：
+    /// `Cargo.toml` 那份是程序自己报的版本（`update.rs` 比的就是它），`.rc` 那份是右键属性里
+    /// 显示的数字。抄旧的后果不是编译失败、不是运行报错，是属性页安安静静写着 `0.0.9`——
+    /// 而那时打包脚本用 `Cargo.toml` 的版本号命名 zip，两边对不上也没人喊。
+    /// 顺带钉两件事：① `Translation` 那两个数必须与 `StringFileInfo` 下那个语言块名（8 位十六进制）
+    ///   指的是同一个「语言 0 + 代码页 1200」——块名与 Translation 不一致时资源照样编得进去，
+    ///   只是外壳按当前 UI 语言找不到那块字符串 ⇒ 属性页那几格又是空的（与「非 0 句柄什么都
+    ///   证明不了」同一条坑的 .rc 版）。② `VALUE` 一共八格（语言块下七格字符串 ＋ `VarFileInfo` 里
+    ///   一格 Translation），删掉哪一格都要在这里红，而不是等肉眼。
+    #[test]
+    fn version_resource_strings_match_the_cargo_manifest() {
+        let rc = include_str!("../assets/app.rc");
+        let version = env!("CARGO_PKG_VERSION");
+        let name = env!("CARGO_PKG_NAME");
+        let exe_name = format!("{name}.exe");
+
+        // `.rc` 里的 FILEVERSION / PRODUCTVERSION 是四段、逗号分隔；Cargo 的版本可能只有三段，
+        // 缺的段按 .rc 的惯例补 0。
+        let mut parts: Vec<String> = version.split('.').map(str::to_owned).collect();
+        while parts.len() < 4 {
+            parts.push("0".to_owned());
+        }
+        let quad = parts.join(",");
+        for kw in ["FILEVERSION", "PRODUCTVERSION"] {
+            let value = rc
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(kw))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_else(|| panic!("资源脚本里没有 {kw} 行"));
+            assert_eq!(value, quad, "{kw} 与 Cargo.toml 的 {version} 不一致");
+        }
+
+        // 逐条 `VALUE "键", 值`：键在头一对双引号里；值可能是带引号的串（`"0.1.0"`），也可能是
+        // 不带引号的一串数（`0x0, 1200`）。按第一个键闭引号之后的全部内容取，两种写法共用一条路。
+        let mut values: Vec<(&str, &str)> = Vec::new();
+        for line in rc.lines().map(str::trim) {
+            if !line.starts_with("VALUE ") {
+                continue;
+            }
+            let key = line.split('"').nth(1).unwrap_or_default();
+            let tail = line.splitn(3, '"').nth(2).unwrap_or_default();
+            let value = tail.trim().trim_start_matches(',').trim().trim_matches('"');
+            values.push((key, value));
+        }
+        assert_eq!(values.len(), 8, "VALUE 应该有八格（七格字符串 ＋ 一格 Translation），实数 {}", values.len());
+        for (key, want) in [
+            ("FileVersion", version),
+            ("ProductVersion", version),
+            ("ProductName", name),
+            ("OriginalFilename", exe_name.as_str()),
+        ] {
+            let found = values
+                .iter()
+                .find(|(k, _)| *k == key)
+                .unwrap_or_else(|| panic!("资源脚本里没有 VALUE \"{key}\" 那一格"));
+            assert_eq!(found.1, want, "属性页的 {key} 与 Cargo.toml 不一致");
+        }
+
+        // 语言块名与 Translation 必须互相对得上（都是「语言 0、代码页 1200」）。
+        let lang_block = rc
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("BLOCK \""))
+            .filter_map(|line| line.split('"').nth(1))
+            .find(|key| key.chars().all(|c| c.is_ascii_hexdigit()))
+            .unwrap_or_else(|| panic!("没找到 StringFileInfo 下那个十六进制语言块名"));
+        let translation = values
+            .iter()
+            .find(|(k, _)| *k == "Translation")
+            .map(|(_, v)| *v)
+            .unwrap_or_default();
+        let nums: Vec<u32> = translation
+            .split(',')
+            .filter_map(|tok| {
+                let tok = tok.trim();
+                match tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => tok.parse().ok(),
+                }
+            })
+            .collect();
+        assert_eq!(nums.len(), 2, "Translation 应该是两个数，实数 {:?}", nums);
+        assert_eq!(
+            lang_block.to_ascii_lowercase(),
+            format!("{:04x}{:04x}", nums[0], nums[1]),
+            "语言块名与 Translation 不一致：外壳会找不到字符串块，属性页那几格全空"
+        );
     }
 
     /// 批次 TRAY：向 `LoadImageW` 要尺寸时传 0 不等于"随便"——它带 `LR_DEFAULTSIZE`，

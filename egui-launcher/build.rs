@@ -1,7 +1,8 @@
 // 本批「给程序加自己的图标」的资源脚本。
 //
-// 只做一件事：把 assets/app.ico 编成 app.res，再作为链接输入递给 link.exe，
-// 让 exe 的资源段里真的出现 RT_ICON / RT_GROUP_ICON —— 文件管理器那张白纸就是这么来的。
+// 只做一件事：把 assets/app.rc 编成 app.res，再作为链接输入递给 link.exe，
+// 让 exe 的资源段里真的出现 RT_ICON / RT_GROUP_ICON（文件管理器那张白纸就是这么来的）
+// 与 RT_VERSION（右键「属性 → 详细信息」里那几格，批次 VER 加进同一个 .rc 的）。
 //
 // 为什么调 rc.exe 而不是加 crate：本仓「不新增第三方依赖」是硬规，rc.exe 是 Windows SDK
 // 自带工具（本机实测存在于 Windows Kits\10\bin\<版本>\<架构>\rc.exe），不进依赖面。
@@ -76,9 +77,12 @@ fn find_rc() -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// 跳过时喊的两句。批次 ICON 起这段话写的是「只影响 exe 的文件图标」——批次 VER 把
+/// VERSIONINFO 也挂进同一个 `assets/app.rc` 之后那句话不再成立，所以前缀一并改成「资源脚本跳过」：
+/// 少了这一段，文件图标和右键属性里那几格版本信息一起没有，其余不受影响。
 fn skip(msg: &str) {
-    println!("cargo:warning=图标资源跳过：{msg}");
-    println!("cargo:warning=跳过只影响 exe 的文件图标，功能与测试不受影响。");
+    println!("cargo:warning=资源脚本跳过：{msg}");
+    println!("cargo:warning=跳过影响 exe 的文件图标与版本信息（右键属性里那几格），功能与测试不受影响。");
 }
 
 fn main() {

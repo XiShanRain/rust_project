@@ -16,8 +16,12 @@
 #   每次构建都付这笔钱；也用独立 `--target-dir`，免得把日常那份动态 CRT 的缓存冲掉。
 #
 # 两条刻意的不做（登记在发布说明，不在这里偷偷补）：
-#   · 不嵌 exe 文件图标：本仓库现在没有 `.ico`，补它要新增 build-dependency，待裁定；
-#   · 不做安装器 / 不做代码签名：NFR-10 把 MSI 与签名都列为可选。
+#   · ~~不嵌 exe 文件图标：本仓库现在没有 `.ico`，补它要新增 build-dependency，待裁定；~~
+#     【2026-11-01 批次 ICON 结掉：图标走 `assets/app.rc` + Windows SDK 自带的 rc.exe，没有新增依赖。】
+#   · 不做安装器 / 不做代码签名：NFR-10 把 MSI 与签名都列为可选。（这条仍然成立）
+#
+# 批次 VER（2026-11-02）又往同一个 `assets/app.rc` 里加了 VERSIONINFO，所以这份 zip 里的 exe
+#   右键「属性 → 详细信息」那几格也不再是空的——发布面「不依赖外部文件」到此是图标 + 版本信息两样。
 #
 # 用法：`powershell -NoProfile -ExecutionPolicy Bypass -File pack-release.ps1`
 # 已有现成的**静态 CRT** release 二进制时加 `-SkipBuild`（跳过 cargo build）；

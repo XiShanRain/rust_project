@@ -5,6 +5,49 @@
 // 图标组"当文件图标，靠的就是这个组；少一个字段都不会出图。
 //
 // "app.ico" 按相对本文件的路径解析，所以 .ico 必须和 .rc 同在 assets\ 下。
-// 这里刻意不加 VERSIONINFO：那是另一件事（右键属性里的产品名/版本号），不在本批范围内。
+// ~~这里刻意不加 VERSIONINFO：那是另一件事（右键属性里的产品名/版本号），不在本批范围内。~~
+// 【2026-11-02 批次 VER 结掉这一格：下面那段 VERSIONINFO 就是右键「属性 → 详细信息」里那几行。
+//  三个刻意的写法，改之前先读完再动：
+//  ① 全用裸数字常量（FILEOS 0x40004L、FILETYPE 0x1L、FILEFLAGSMASK 0x3fL），不写 VS_VERSION_INFO
+//     这类宏，也就不 #include "winres.h" —— 那样要多一条「rc.exe 能不能搜到 SDK 的 rc 头目录」
+//     的失败面，而那正好是本批最不该依赖的东西。
+//  ② VALUE 串全 ASCII 英文。rc.exe 读无 BOM 文件按系统 ANSI 码页走（本仓那条同源坑：PowerShell 5.1
+//     读无 BOM 的 UTF-8 脚本会把中文当 ANSI 直接崩解析），中文「文件说明」大概率落成乱码；
+//     【2026-11-02 本批把这条测掉了：把 ProductName 换成「西山雨启动器」（UTF-8 无 BOM）再交给
+//     同一个 rc.exe ⇒ 退出码 0、一句 warning 都没有，`.res` 里那格变成 9 个字（GBK 把 18 个 UTF-8
+//     字节按两字节一对重新配了），第一个码点 U+7457、中间那对 `B1 B1` 正好是「北」。
+//     所以后果不是构建失败，是静默乱码 ⇒ 更要避开。工装 target/ver-res-peek.ps1。】
+//  ③ 版本号在这里是手抄的第二份（第一份是 Cargo.toml 的 [package] version）。抄旧了不会编译失败、
+//     也不会运行报错，只会让属性页显示 0.0.9 —— 所以 src/main.rs 里那条
+//     version_resource_strings_match_the_cargo_manifest 拿 include_str! 读回本文件逐字段对表。
+//  】
 
 1 ICON "app.ico"
+
+1 VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "000004b0"
+        BEGIN
+            VALUE "CompanyName", "XiShanRain"
+            VALUE "FileDescription", "egui-launcher (ALTRun rewrite in Rust)"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 XiShanRain"
+            VALUE "OriginalFilename", "egui-launcher.exe"
+            VALUE "ProductName", "egui-launcher"
+            VALUE "ProductVersion", "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0, 1200
+    END
+END
