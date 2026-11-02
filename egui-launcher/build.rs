@@ -78,17 +78,22 @@ fn find_rc() -> Option<PathBuf> {
 }
 
 /// 跳过时喊的两句。批次 ICON 起这段话写的是「只影响 exe 的文件图标」——批次 VER 把
-/// VERSIONINFO 也挂进同一个 `assets/app.rc` 之后那句话不再成立，所以前缀一并改成「资源脚本跳过」：
-/// 少了这一段，文件图标和右键属性里那几格版本信息一起没有，其余不受影响。
+/// VERSIONINFO 也挂进同一个 `assets/app.rc` 之后那句话不再成立，所以前缀一并改成「资源脚本跳过」；
+/// 批次 SKIN 再加了一条 `1 WAVE`，同一个文件、同一次 rc.exe，所以少了这一段现在是三样一起没有：
+/// 文件图标、右键属性里那几格版本信息、呼出提示音。其余不受影响。
 fn skip(msg: &str) {
     println!("cargo:warning=资源脚本跳过：{msg}");
-    println!("cargo:warning=跳过影响 exe 的文件图标与版本信息（右键属性里那几格），功能与测试不受影响。");
+    println!("cargo:warning=跳过影响 exe 的文件图标、版本信息（右键属性里那几格）与内嵌提示音，功能与测试不受影响。");
 }
 
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     println!("cargo:rerun-if-changed=assets/app.rc");
     println!("cargo:rerun-if-changed=assets/app.ico");
+    // 批次 SKIN：`1 WAVE "popup.wav"` 引的是 .rc 同目录下的那颗 wav。rc.exe 只认文件在不在，
+    // 换掉 wav 的内容不会碰到 app.rc / app.ico，没有下面这一行 cargo 就不会重跑 rc.exe，
+    // 产物里的提示音还是旧的那串字节（批次 TRAY 就是被 `rerun-if-changed` 没触发坑过一次）。
+    println!("cargo:rerun-if-changed=assets/popup.wav");
     // 窗口/任务栏图标走的是 `include_bytes!`，cargo 不会自动跟踪那条路径，
     // 贴片重画后必须靠这一行才会重编。
     println!("cargo:rerun-if-changed=assets/app-icon-64.rgba");
@@ -99,12 +104,20 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
     let rc_file: PathBuf = manifest.join("assets").join("app.rc");
     let ico_file: PathBuf = manifest.join("assets").join("app.ico");
+    let wav_file: PathBuf = manifest.join("assets").join("popup.wav");
     if !rc_file.is_file() {
         skip("缺 assets/app.rc");
         return;
     }
     if !ico_file.is_file() {
         skip("缺 assets/app.ico");
+        return;
+    }
+    // 这颗不在的话 rc.exe 自己会报 `error RC2135 : file not found` 并留一个非零退出码，结局与
+    // 这里主动跳过完全一样（整段资源都不产），只是喊出来的是「退出码 1」而不是原因。提前查一下，
+    // 把那两句 warning 换成能读懂的那一句。
+    if !wav_file.is_file() {
+        skip("缺 assets/popup.wav");
         return;
     }
     let Some(rc_exe) = find_rc() else {

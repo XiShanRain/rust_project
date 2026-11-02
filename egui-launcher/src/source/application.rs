@@ -1887,6 +1887,17 @@ pub struct Appearance {
     /// 主题仍是默认来源，这一格只在用户不动主题文件时提供一个能拖的入口；点「跟随主题」
     /// 就回到 `None`，主题里那个数立刻重新生效。范围见 [`OPACITY_MIN`] / [`OPACITY_MAX`]。
     pub opacity: Option<u8>,
+    /// 批次 SKIN（FR-UIX-11）：背景图的**路径**。`None` = 用户没挑过。
+    ///
+    /// 存路径不存字节：一张壁纸几 MB，塞进 `settings.json` 就是把配置当仓库。字节由
+    /// `src/skin.rs` 的 WIC 解码现取，图没了／读失败就在日志里留一行然后照常画纯色面板。
+    pub bg_image: Option<String>,
+    /// 背景图总闸。关着时**路径不动**——和 `snippet_auto_expand` 同一条理由：闸与数据分开，
+    /// 关闸不该删掉用户挑好的那张图。FR-UIX-11 原文就要求「可关」，默认关。
+    pub show_bg_image: bool,
+    /// 呼出时放一声内嵌提示音（FR-UIX-11 第二项）。默认关：静默是启动器的默认礼貌，
+    /// 而且这声音每呼一次响一次，比界面里任何一个开关都更容易变成骚扰。
+    pub popup_sound: bool,
 }
 
 pub const WINDOW_WIDTH_MIN: f32 = 360.0;
@@ -1907,6 +1918,10 @@ impl Default for Appearance {
             status_bar: true,
             fade: false,
             opacity: None,
+            // 批次 SKIN：三格全默认关（FR-UIX-11「可选，默认关」）。
+            bg_image: None,
+            show_bg_image: false,
+            popup_sound: false,
         }
     }
 }
@@ -4360,6 +4375,22 @@ mod dedup_tests {
             s.appearance.opacity, None,
             "不透明度默认跟随主题（批次 F2：老配置没有这一格时主题里的数说了算）"
         );
+        // 批次 SKIN 三格：用户的老 `settings.json` 里连 `appearance` 段都没有 ⇒ 全默认关。
+        assert_eq!(s.appearance.bg_image, None, "背景图默认没挑过");
+        assert!(!s.appearance.show_bg_image, "背景图闸默认关（FR-UIX-11「可选，默认关」）");
+        assert!(!s.appearance.popup_sound, "提示音默认关");
+        // 更贴真相的另一形态：段在、但段里没有这三格（用户某年存下的文件就是长这样）。
+        // 这一格必须靠 `#[serde(default)]` 逐键补，而不是整段被判无效丢掉——
+        // 后者的症状是「升级一次设置，宽度/状态栏全回默认」。
+        let t: AppSettings =
+            serde_json::from_str("{\"appearance\":{\"width\":640.0,\"fade\":true}}").unwrap();
+        assert_eq!(t.appearance.width, 640.0, "段里已有的键不能被新键缺失冲掉");
+        assert!(t.appearance.fade, "同上：fade");
+        assert_eq!(t.appearance.bg_image, None, "段里没有 bg_image ⇒ 取字段默认");
+        assert!(
+            !t.appearance.show_bg_image && !t.appearance.popup_sound,
+            "段里没有两个闸 ⇒ 取字段默认（关）"
+        );
     }
 
     /// 批次 F2（FR-UIX-06）：覆盖值优先、`None` 交给主题、越界夹回 100–255。
@@ -5935,6 +5966,11 @@ mod config_tests {
             fade: true,
             // 批次 F2：特值进、特值出——`appearance` 走 serde 递归合并，这一格也一样。
             opacity: Some(180),
+            // 批次 SKIN 的三格：`bg_image` 用 `Some` 才区分得出「读回来了」与「没读」，
+            // 两个闸出厂是 false，特值必须给 true——false 恰好用 None 表达不了这一格的牙。
+            bg_image: Some("C:\\probe-scope\\bg.jpg".to_string()),
+            show_bg_image: true,
+            popup_sound: true,
             ..Default::default()
         };
 
@@ -5996,6 +6032,16 @@ mod config_tests {
             Some(180),
             "appearance.opacity（批次 F2：覆盖值要能读回来，读成 None 就退回主题了）"
         );
+        // 批次 SKIN 的三格。`appearance` 整段是 serde 递归读的，所以这三行不靠 `take_field!`
+        // 的表——它们抓的是另一种漏法：字段加了、`#[serde(default)]` 让缺键静默取默认，
+        // 写回去能读回来才证明这一格真进了结构。
+        assert_eq!(
+            got.appearance.bg_image.as_deref(),
+            Some("C:\\probe-scope\\bg.jpg"),
+            "appearance.bg_image（读成 None 就是设置页挑完图、下次启动背景没了）"
+        );
+        assert!(got.appearance.show_bg_image, "appearance.show_bg_image");
+        assert!(got.appearance.popup_sound, "appearance.popup_sound");
         assert_eq!(got.history_size, 7, "history_size");
         assert_eq!(got.history_limit(), 7, "history_limit：配置值小于上限时原样");
         assert_eq!(

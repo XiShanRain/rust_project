@@ -31,6 +31,13 @@ features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    # 批次 SKIN（FR-UIX-11 皮肤与提示音）两条，各自的理由写在旁边。
+    # `PlaySoundW` 在 **Media::Audio**，不在 Media::Multimedia——动手前的清单里我记的是 Multimedia，
+    # 探针实测编译不过的正是那条（`Win32_Media_Audio` 才是 0.62.2 里的真名字）。
+    "Win32_Media_Audio",
+    # WIC：背景图解码（bmp/png/jpg/tif/gif…）全在这一条里。零新增 crate —— 开 `image` 的 jpeg
+    # 特性会带进一串编译面，「不新增第三方依赖」这条挡着。
+    "Win32_Graphics_Imaging",
     # 批次 F13（FR-SYS-04 多语言）：`language = auto` 要跟随系统 UI 语言，
     # `GetUserDefaultLocaleName` 在 Globalization 模块里。
     "Win32_Globalization",

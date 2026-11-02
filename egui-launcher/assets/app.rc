@@ -24,6 +24,39 @@
 
 1 ICON "app.ico"
 
+// 批次 SKIN（FR-UIX-11）：呼出提示音。写法与上面 ICON 同一条通道——内嵌，不读外部文件。
+// 【2026-11-02 四条实测，工装 target/skin-rc-probe/（res-entries.ps1 直接解 .res 的条目表）：
+//  ① 引号里的路径**先按本文件所在目录**解析，再退回调用方的当前目录。做法是给三个候选文件按
+//     大小打标（真 wav 13,274 / 副本 26,548 / 三合一 39,822），从 alt\ 目录下编一次，读回 .res
+//     里那块数据的字节数就知道 rc.exe 取走了哪一份：`popup.wav` 落 13,274（本目录赢了 cwd，
+//     那时 alt\popup.wav 是 39,822）；`assets/popup.wav` 在本目录压根没有 assets\ 子目录时也能
+//     编过、落 26,548 ⇒ 走的是 cwd 那条退路。所以**别把本行写成 "assets/popup.wav"**：上面这两次
+//     探针的 cwd 都是仓库根，而仓库根下面真有 assets\popup.wav ⇒ 它编得过是靠 cwd 兜住的巧合，
+//     换个 cwd 就断——与 ICON 那行同形、只靠本目录解析，才是确定的。
+//  ② 文件名字写错不是静默少一个资源，是 `error RC2135 : file not found` + 退出码 1 + 不产出 .res。
+//     build.rs 把非零退出码记成「资源脚本跳过」，代价是**整段资源一起没**：批次 ICON 的文件图标、
+//     批次 TRAY 的托盘资源、批次 VER 的右键属性三格，全跟着这一行陪葬，而 cargo 只喊两句 warning、
+//     构建照样绿。这一行的爆炸半径比它看起来大。
+//  ③ rc.exe 把 WAVE 的类型写成**字符串 "WAVE"**，不是数字 id（同一次编译里 ICON 那五条却被写成
+//     数字 3 = RT_ICON）。这格本来是最危险的：类型对不上，`FindResourceW` 就是找不到，而
+//     PlaySoundW 找不到只返回 0，一声都不响。SKIN-甲 的探针把这条测掉了——同一份 `1 WAVE "popup.wav"`
+//     链进 exe 后 `FindResourceW(id=1, WAVE)` 返回 OK、`SizeofResource=13274`，
+//     `PlaySoundW(整数编码的 1, SND_RESOURCE|SND_ASYNC|SND_NODEFAULT)` 返回 1。写法照它来。
+//     同一份产物还在 PE 的资源目录层复核过一遍（`target/res-names.ps1`：第一层列类型、第二层列名字）
+//     ——`type=NAMED:WAVE level2_ids=1`，挨着它的是批次 ICON/TRAY/VER 那三条原样不动
+//     （`type=3 level2_ids=1,2,3,4,5`、`type=14 level2_ids=1`、`type=16 level2_ids=1`）。
+//     类型那一头确实是字符串、名字那一头确实是整数 1，两头合起来正好是 `SOUND_RESOURCE_ID`
+//     按 `MAKEINTRESOURCEW(整数)` 的读法。
+//     （顺带一条工装账：res-names.ps1 解「字符串名」的那条分支本仓建仓以来一次没走到过——以前四种
+//     类型全是数字 id——第一次走到就炸：分支里两处 `U16 $so` 少传了数组参数，PowerShell 把一个偏移
+//     当成 `[byte[]]$b` 转，报「无法将值 57647600 转换为类型 System.Byte[]」。四处都补成
+//     `U16 $bytes …` 才读得出来。**绿了四个批次的工具，里面有一条从没执行过的分支**。）
+//  ④ 这个 1 与 `src/skin.rs` 的 `SOUND_RESOURCE_ID` 是手抄的两份，抄错的后果同上（静默没声），
+//     由 src/skin.rs 里 wave_resource_id_matches_the_rc 拿 include_str! 读回本文件对表；
+//     筛的是「第二个 token == WAVE」——第一个 token 是 1 的行这里有三条（ICON / WAVE / VERSIONINFO）。
+// 】
+1 WAVE "popup.wav"
+
 1 VERSIONINFO
  FILEVERSION 0,1,0,0
  PRODUCTVERSION 0,1,0,0

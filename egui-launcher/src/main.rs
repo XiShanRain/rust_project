@@ -111,6 +111,7 @@ mod large_type;
 mod matching;
 mod mem;
 mod selection;
+mod skin;
 mod source;
 mod sprint;
 mod sysinfo;
@@ -1149,6 +1150,24 @@ struct LauncherApp {
     site_icon_tx: mpsc::Sender<(String, Result<source::siteicon::DownloadedIcon, String>)>,
     /// 正在下载的那条引擎（id）。有值时设置页的「下载图标」按钮禁用，避免同一条连点几下发几次。
     site_icon_pending: Option<String>,
+    // ---- 批次 SKIN（FR-UIX-11）：背景图 ----
+    /// 解码线程 → 主线程的回执：那张图的路径 + `None`＝解不开。解码不放本线程：
+    /// 4K 图 native 一次要 36,864,000 字节、缩放后仍要 73~106 ms（`src/skin.rs` 顶部实测第 2 条），
+    /// 搁在 `ui()` 里就是每次换图卡一帧。
+    bg_rx: mpsc::Receiver<(String, Option<(Vec<u8>, u32, u32)>)>,
+    bg_tx: mpsc::Sender<(String, Option<(Vec<u8>, u32, u32)>)>,
+    /// 就一张纹理（不像图标那样要缓存：同一时刻全屏只用得上这一张）。
+    bg_texture: Option<egui::TextureHandle>,
+    /// 纹理对应原图的宽高，画扇形时算 `cover_uv` 的裁切窗口。
+    bg_src_size: Option<(u32, u32)>,
+    /// 已经落定的那一张：`Some`＝画上了，或者记下了「这张解不开」；`None`＝闸关着／没挑过图。
+    /// 每帧拿 `appearance` 现算的目标键跟它比，不一样才做一次决策（比的是字符串，不起线程）。
+    bg_applied: Option<String>,
+    /// 在飞那次解码的键。回执回来时键对不上就直接丢——那是被换掉／被关掉之后才到的迟到货，
+    /// 收下它会把用户刚刚关掉的东西翻回来（与批次 F12 那条 `px != self.icon_px` 同一路判据）。
+    bg_loading: Option<String>,
+    /// 「这张解不开」的那条路径，只在设置页那一行显示；不进配置、下次换图就覆盖掉。
+    bg_error: Option<String>,
     // ---- 批次 G5（FR-SYS-01）：检查更新（只查不换）----
     /// 后台线程 → 主线程的回执。联网最长 8 s 一档，所以不能在 `ui()` 里同步等。
     update_rx: mpsc::Receiver<update::Status>,
@@ -1430,6 +1449,30 @@ fn spawn_icon_loader(tx: mpsc::Sender<IconDone>, jobs: Vec<IconJob>, px: u32) {
         }
         log_info!("icon loader: {ok}/{total} 图标提取成功（目标 {px}px）");
     });
+}
+
+/// 批次 SKIN（FR-UIX-11）：把背景图的 WIC 解码丢到后台线程，回执走 `tx`。
+///
+/// 返回 `Result` 而不是像 [`spawn_icon_loader`] 那样直接 `thread::spawn`：后者在系统起不来
+/// 线程时是**panic**，而这里调它的是 UI 线程——一次 panic 会把整个面板带走，代价与「背景图
+/// 没换成」完全不成比例。起不来就当场把这次解码判成"解不开"：`bg_loading` 照样落定，
+/// 挂在飞的解码会让 120ms 自唤醒一直转（批次 F12 那条 `request_repaint_after` 的账）。
+fn spawn_bg_decode(
+    tx: mpsc::Sender<(String, Option<(Vec<u8>, u32, u32)>)>,
+    path: String,
+) -> Result<(), String> {
+    let key = path.clone();
+    std::thread::Builder::new()
+        .name("skin-bg".to_string())
+        .spawn(move || {
+            let hit = skin::decode(&path).map(|d| (d.rgba, d.w, d.h));
+            if tx.send((key, hit)).is_err() {
+                // 通道另一头已经没了（进程正在退）——不值得为这条再开一层日志判据。
+                log_debug!("skin: 背景图解码完成，但回执没人收（窗口已退）");
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// FR-SRC-19 学习排序的时间戳源：UNIX 毫秒，落盘后可跨进程比较。
@@ -2577,6 +2620,51 @@ fn paint_window_shadow(ui: &egui::Ui, panel: egui::Rect, corner: u8, alpha: u8) 
     };
     ui.painter()
         .add(shadow.as_shape(panel, egui::CornerRadius::same(corner)));
+}
+
+/// 批次 SKIN（FR-UIX-11）：把背景图切成一张带圆角的 `Shape::Mesh`。
+///
+/// 不用 `PaintCallback`、也不先把整张图刷成圆角：mesh 的顶点就是圆角扇形的边界，
+/// 角外一个三角形都没有 ⇒ GL 后端下那四个角真的透出桌面（E-18 那条呈现路径没换）。
+///
+/// `opacity` **只乘主题不透明度这一层**，淡入不乘在这里：`Painter::add` 会走
+/// `transform_shape → multiply_opacity → adjust_colors`，它对 `Shape::Mesh` 逐个改写顶点色
+/// （`epaint-0.36.2/src/shape_transform.rs:103`），而面板闭包里已经 `ui.set_opacity(fade)`
+/// ⇒ 淡入自动作用到这张 mesh。这里再乘一次就是乘两遍，淡入会提前结束。
+///
+/// 顶点色要的是"整张图等比变透明"，写法 [`egui::Color32::from_white_alpha`]：`Color32`
+/// 内部存的就是**预乘**字节（`Self([a, a, a, a])`，见 ecolor `from_rgba_premultiplied`
+/// 是原样存、`from_rgba_unmultiplied` 会把 rgb 乘进 alpha），而 GL 那条链是
+/// `frag = vertex_color × texture_sample` 配 `blend(ONE, ONE_MINUS_SRC_ALPHA)`
+/// （`egui_glow-0.36.2/src/shader/fragment.glsl:50` + `painter.rs:316`）⇒ rgb 必须跟着
+/// 一起降。**踩过的写法**：`from_rgb(255,255,255)` 配一个自算的 alpha 通道＝"白 × alpha"，
+/// 在未预乘的空间里看着对，落进这条预乘管线就变成只降 alpha 不降 rgb ⇒ 图不暗、边缘发白发糊。
+/// `from_white_alpha(v)` 与 `from_rgba_premultiplied(v,v,v,v)` 是同一个数（后者存 [v,v,v,v]）。
+fn background_shape(
+    texture: &egui::TextureHandle,
+    rect: egui::Rect,
+    radius: f32,
+    src_w: u32,
+    src_h: u32,
+    opacity: u8,
+) -> egui::Shape {
+    let fan = skin::image_fan(rect, radius, src_w, src_h);
+    let tint = egui::Color32::from_white_alpha(opacity);
+    let vertices = fan
+        .pos
+        .iter()
+        .zip(fan.uv.iter())
+        .map(|(p, u)| egui::epaint::Vertex {
+            pos: *p,
+            uv: *u,
+            color: tint,
+        })
+        .collect();
+    egui::Shape::mesh(egui::epaint::Mesh {
+        vertices,
+        indices: fan.tri,
+        texture_id: texture.id(),
+    })
 }
 
 /// 输入框的最小高度（2026-10-24 用户正文：「输入框大一点，像 ahk 版的输入框一样，大气一点」）。
@@ -6503,6 +6591,8 @@ impl LauncherApp {
         let (icon_tx, icon_rx) = mpsc::channel();
         // 批次 D2 第二半：「下载站点图标」的回执通道（下载在后台线程，主线程只收）。
         let (site_icon_tx, site_icon_rx) = mpsc::channel();
+        // 批次 SKIN（FR-UIX-11）：背景图解码的回执通道（WIC 在后台线程，主线程只收 + 上传纹理）。
+        let (bg_tx, bg_rx) = mpsc::channel();
         // 批次 G5（FR-SYS-01）：检查更新的回执通道（联网在后台线程，主线程只收）。
         let (update_tx, update_rx) = mpsc::channel();
         // `data_dir()` 每次调用都写一次探针文件 ⇒ 取一次留在结构体里，别按帧调。
@@ -6781,6 +6871,14 @@ impl LauncherApp {
             site_icon_rx,
             site_icon_tx,
             site_icon_pending: None,
+            bg_rx,
+            bg_tx,
+            bg_texture: None,
+            bg_src_size: None,
+            // 启动时全是空：第一帧的 `sync_background` 拿配置算出目标键，才发现对不上、才起那次解码。
+            bg_applied: None,
+            bg_loading: None,
+            bg_error: None,
             update_rx,
             update_tx,
             update_pending: false,
@@ -7134,6 +7232,83 @@ impl LauncherApp {
             }
         );
         ctx.request_repaint();
+    }
+
+    /// 批次 SKIN（FR-UIX-11）：把配置里那张背景图追平成"手上这一张纹理"。
+    ///
+    /// 每帧都调，但两条重活各自只在**该做的那一帧**做：解码只在目标键变了时起线程，
+    /// 上传纹理只在回执到了时做。键（= 路径字符串）是唯一的对表依据：
+    /// 回执里的键对不上当前在飞的那次就直接丢——与批次 F12 那条 `px != self.icon_px`
+    /// 是同一条判据（用户连点两次「选择图片」时，慢的那次不能把新图盖掉）。
+    fn sync_background(&mut self, ctx: &egui::Context) {
+        let want = if self.prefs.appearance.show_bg_image {
+            self.prefs.appearance.bg_image.clone()
+        } else {
+            None
+        };
+        if want != self.bg_applied {
+            match want {
+                Some(path) => {
+                    if self.bg_loading.as_deref() != Some(path.as_str()) {
+                        // 换图＝上一条"解不开"的说明跟着作废：它说的是另一张图。
+                        self.bg_error = None;
+                        self.bg_loading = Some(path.clone());
+                        if let Err(e) = spawn_bg_decode(self.bg_tx.clone(), path.clone()) {
+                            log_info!(
+                                "skin: 背景图解码线程起不来（{e}），这张按解不开处理：{}",
+                                skin::log_label(&path)
+                            );
+                            self.bg_loading = None;
+                            self.bg_applied = Some(path);
+                            self.bg_texture = None;
+                            self.bg_src_size = None;
+                            self.bg_error = self.bg_applied.clone();
+                        }
+                    }
+                }
+                None => {
+                    // 闸关了 / 图清了：在飞那次一起作废。不作废的两种后果都是"关了还看得见"——
+                    // 回执晚一步落地时闸已经关了，但它会把 `bg_applied` 写成那张图，
+                    // 下一次开闸就以为"已经是它了"，于是纹理永远缺那一次上传。
+                    self.bg_loading = None;
+                    self.bg_applied = None;
+                    self.bg_error = None;
+                    self.bg_texture = None;
+                    self.bg_src_size = None;
+                    ctx.request_repaint();
+                }
+            }
+        }
+        while let Ok((key, hit)) = self.bg_rx.try_recv() {
+            if Some(key.as_str()) != self.bg_loading.as_deref() {
+                continue; // 过期回执：闸关过、图换过，这一张丢掉。
+            }
+            self.bg_loading = None;
+            self.bg_applied = Some(key);
+            match hit {
+                Some((rgba, w, h)) => {
+                    self.bg_src_size = Some((w, h));
+                    self.bg_texture = Some(ctx.load_texture(
+                        "skin:bg",
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &rgba,
+                        ),
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                None => {
+                    self.bg_texture = None;
+                    self.bg_src_size = None;
+                    self.bg_error = self.bg_applied.clone();
+                }
+            }
+            ctx.request_repaint();
+        }
+        if self.bg_loading.is_some() {
+            // egui 是反应式的：后台线程丢进通道的回执不会自己叫醒 `ui()`（同一坑第 ㉔ 条）。
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
     }
 
     /// 把窗口高度设成"正好一屏 [`LIST_ROWS`] 行"（宽度保持现状，不小于 [`MIN_W`]）。
@@ -11788,6 +11963,104 @@ impl LauncherApp {
                                 .weak()
                                 .small(),
                             );
+                            ui.add_space(8.0);
+                            ui.separator();
+                            // 批次 SKIN（FR-UIX-11）：背景图 + 呼出提示音。两个闸默认都关，
+                            // 按成规「设置页开关类不另配键」不配快捷键。
+                            ui.label(
+                                egui::RichText::new(i18n::t("appearance.skin_title")).strong(),
+                            );
+                            let mut show_bg = self.prefs.appearance.show_bg_image;
+                            if ui
+                                .checkbox(&mut show_bg, i18n::t("appearance.bg_switch"))
+                                .changed()
+                            {
+                                self.prefs.appearance.show_bg_image = show_bg;
+                                source::application::save_settings(&self.prefs);
+                                log_info!(
+                                    "设置页：show_bg_image = {show_bg}（已写 settings.json）"
+                                );
+                                ui.ctx().request_repaint();
+                            }
+                            // 按钮放同一行、用 `horizontal_wrapped`：360px 最小宽度下
+                            // 「选择图片… + 清除」加间距正好顶到右边缘（批次 F16 那条裁切的账）。
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(i18n::t("appearance.bg_pick")).clicked() {
+                                    // 起点 = 当前那张图所在的目录（批次 B2 同一口径）。
+                                    let initial = self
+                                        .prefs
+                                        .appearance
+                                        .bg_image
+                                        .as_deref()
+                                        .map(std::path::Path::new)
+                                        .and_then(|p| p.parent())
+                                        .and_then(|d| d.to_str());
+                                    match pick_path(false, initial) {
+                                        Ok(Some(path)) => {
+                                            self.prefs.appearance.bg_image = Some(path.clone());
+                                            // 挑完自动开闸：刚选了一张却看不见，比看不见更让人
+                                            // 以为程序坏了；闸留着只是给"临时关掉"用。
+                                            self.prefs.appearance.show_bg_image = true;
+                                            source::application::save_settings(&self.prefs);
+                                            log_info!(
+                                                "设置页：背景图 → {}（自动开闸，已写 settings.json）",
+                                                skin::log_label(&path)
+                                            );
+                                        }
+                                        Ok(None) => log_info!(
+                                            "设置页：背景图 — 用户在文件选择框里取消，未换图"
+                                        ),
+                                        Err(e) => {
+                                            self.internal_toast(
+                                                ui.ctx(),
+                                                &format!("⚠ {e}"),
+                                                false,
+                                            );
+                                        }
+                                    }
+                                    ui.ctx().request_repaint();
+                                }
+                                if self.prefs.appearance.bg_image.is_some()
+                                    && ui.button(i18n::t("appearance.bg_clear")).clicked()
+                                {
+                                    self.prefs.appearance.bg_image = None;
+                                    self.prefs.appearance.show_bg_image = false;
+                                    source::application::save_settings(&self.prefs);
+                                    log_info!("设置页：背景图已清除（连闸一起关）");
+                                    ui.ctx().request_repaint();
+                                }
+                            });
+                            // 三态各一条：解不开／在飞／已画上。挑完图到画上之间那段解码时间
+                            // 必须有个说法，否则用户只会觉得"点了没反应"（批次 D2 图标那条同口径）。
+                            let bg_state = if let Some(err) = &self.bg_error {
+                                i18n::tf("appearance.bg_failed", &[&skin::log_label(err)])
+                            } else if self.bg_loading.is_some() {
+                                i18n::t("appearance.bg_loading").to_string()
+                            } else if let Some(cur) = &self.prefs.appearance.bg_image {
+                                i18n::tf("appearance.bg_current", &[&skin::log_label(cur)])
+                            } else {
+                                i18n::t("appearance.bg_none").to_string()
+                            };
+                            ui.label(egui::RichText::new(bg_state).weak().small());
+                            let mut sound = self.prefs.appearance.popup_sound;
+                            if ui
+                                .checkbox(&mut sound, i18n::t("appearance.sound_switch"))
+                                .changed()
+                            {
+                                self.prefs.appearance.popup_sound = sound;
+                                source::application::save_settings(&self.prefs);
+                                log_info!("设置页：popup_sound = {sound}（已写 settings.json）");
+                            }
+                            ui.label(
+                                egui::RichText::new(i18n::t("appearance.sound_help"))
+                                    .weak()
+                                    .small(),
+                            );
+                            ui.label(
+                                egui::RichText::new(i18n::t("appearance.skin_help"))
+                                    .weak()
+                                    .small(),
+                            );
                         }
                         SettingsTab::Advanced => {
                             // 批次 G5（FR-SYS-01）：检查更新（只查不换，见 `update` 模块）。
@@ -12072,6 +12345,13 @@ impl LauncherApp {
         // FR-SRC-06：每次呼出强制重算一轮（刚插上的 U 盘 / 刚恢复的网络盘要立刻反映），
         // 放在 hwnd 早退之前——没有窗口句柄时四态也该刷新。
         self.refresh_path_states(true);
+        // 批次 SKIN（FR-UIX-11）：呼出提示音。也放在 hwnd 早退之前——出声不需要窗口句柄，
+        // 而 `self_hwnd` 还没设上的那一次呼出恰恰是最需要声音的一次（窗口刚建、找不到它）。
+        // `SND_ASYNC` ⇒ 不等播完就返回，这一帧不会被音频拖住；返回值只证明"资源被取走了"，
+        // 不证明人耳听见（`src/skin.rs` 里那条实测钉着），所以这里不因 false 弹任何提示。
+        if self.prefs.appearance.popup_sound {
+            skin::play_popup_sound();
+        }
         let Some(hwnd) = self.self_hwnd else { return };
         let ime_wnd = unsafe { ImmGetDefaultIMEWnd(hwnd) };
         if ime_wnd.0.is_null() {
@@ -16054,16 +16334,19 @@ impl eframe::App for LauncherApp {
         // 透明带里只放阴影。阴影先画、面板后画 ⇒ 面板把它压在下面，圆角外那圈才露得出来。
         // alpha 与底色同乘淡入进度和不透明度，两层的衰减才不会脱节。
         let shadow_alpha = shadow_alpha(self.theme.opacity, fade);
-        paint_window_shadow(
-            ui,
-            ui.max_rect().shrink(SHADOW_MARGIN),
-            theme::WINDOW_RADIUS,
-            shadow_alpha,
-        );
+        // 批次 SKIN（FR-UIX-11）：面板矩形抄成一份，阴影与背景图共用同一个数——
+        // 两者必须以同一条边为齐，各算各的会在阴影与图之间漏出一圈。
+        let panel_rect = ui.max_rect().shrink(SHADOW_MARGIN);
+        // 背景图的解码/上传闸（每帧调；起线程只在键变了时，上传只在回执到了时）。
+        self.sync_background(ui.ctx());
+        paint_window_shadow(ui, panel_rect, theme::WINDOW_RADIUS, shadow_alpha);
         let mut frame = self
             .theme
             .central_frame()
             .outer_margin(egui::Margin::same(SHADOW_MARGIN as i8));
+        // 背景图内缩这一条描边的宽度：底色与描边是同一个 shape、排在图的下层，
+        // 铺满的图会把主题那圈 1px 边框盖掉（主题靠它勾轮廓）。
+        let border_w = frame.stroke.width;
         if let Some(t) = fade {
             frame.fill = with_alpha(frame.fill, t);
             frame.stroke.color = with_alpha(frame.stroke.color, t);
@@ -16072,6 +16355,24 @@ impl eframe::App for LauncherApp {
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             if let Some(t) = fade {
                 ui.set_opacity(t);
+            }
+            // 批次 SKIN（FR-UIX-11）：背景图画在面板底色之上、内容之下。层级不用特殊处理：
+            // `Frame::begin` 先占一个 `Shape::Noop` 槽位、`Prepared::paint` 事后才把底色
+            // `set` 回那个槽（`egui-0.36.2/src/containers/frame.rs`），而这个 add 的序更大。
+            // 要处理的只有裁剪：内容 Ui 的 clip 是「面板 − 内边距」，照它画就成了镶在框里的
+            // 一幅画 ⇒ 克隆一支画笔、只把这一笔的裁剪放宽到整个面板矩形（`set_clip_rect` 是
+            // 替换而不是相交，`with_clip_rect` 那种相交的写法放宽不了）。
+            if let (Some(tex), Some((sw, sh))) = (&self.bg_texture, self.bg_src_size) {
+                let mut painter = ui.painter().clone();
+                painter.set_clip_rect(panel_rect);
+                painter.add(background_shape(
+                    tex,
+                    panel_rect.shrink(border_w),
+                    theme::WINDOW_RADIUS as f32,
+                    sw,
+                    sh,
+                    self.theme.opacity,
+                ));
             }
             // 设置页整页模式（2026-10-17）：小窗口内独立弹窗会被裁剪，直接替换搜索页渲染。
             if self.settings_open {
