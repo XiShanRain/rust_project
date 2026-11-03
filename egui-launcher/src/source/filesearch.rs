@@ -72,6 +72,123 @@ pub fn default_scope_exclude() -> Vec<String> {
     EXCLUDE_DIRS.iter().map(|s| s.to_string()).collect()
 }
 
+/// `re:` 前缀：这一行的剩下的部分原样交给正则（批次 REGX）。
+pub const REGEX_PREFIX: &str = "re:";
+
+/// 一条编译好的排除规则，比的是**条目名**（`entry.file_name()`），不是整条路径。
+///
+/// 三态的分工是「旧行含义一字不动、新能力只有显形的那两条」：
+/// - [`ExcludeRule::Exact`]：行里没有 `*` 也没有 `?`，也不带 `re:` ⇒ 整名不区分大小写相等。
+///   **这就是批次 X 到今天的全部行为**，出厂那七条走这一档。
+/// - [`ExcludeRule::Glob`]：行里有 `*` 或 `?` ⇒ 逐字符转义后 `*`→`.*`、`?`→`.`，
+///   两端锚死 ⇒ 匹配的是**整个名字**。所以 `*.tmp` 中 `a.tmp`、不中 `a.tmpx`；
+///   `~$*` 中 `~$W1234`；想「名字里含 x」就写 `*x*`。
+/// - [`ExcludeRule::Regex`]：行首 `re:` ⇒ 剩下的当正则，**不锚定**（照 AHK
+///   `RegExMatch(A_LoopFileFullPath, exclude)` 的"出现就算"口径，只是这里比的是名字）。
+///
+/// 两档的语义差（锚不锚）是故意的，也是这张表唯一需要用户记住的一件事：通配符那一档
+/// 的直觉是「这个名字长成什么样」，正则那一档的直觉是「名字里出现这一段就算」——
+/// 把后者也锚上，用户就得写 `re:.*git.*`，而参考项目里存下来的那些正则直接搬过来会失效。
+///
+/// 大小写折叠同样分两档，这是零漂移的代价、不打算抹平：Exact 用 `eq_ignore_ascii_case`
+/// （与 D7 之前那颗调用点同一个函数），两条正则用 `(?i)`（Unicode 折叠）。
+enum ExcludeRule {
+    Exact(String),
+    Glob(regex::Regex),
+    Regex(regex::Regex),
+}
+
+/// 编译好的整张排除表。[`build_index`] **每轮只编译一次**，不进逐条目热路径——
+/// 一轮索引是三万条名字，每条再走一遍 `Regex::new` 是白烧 CPU
+/// （开发计划 §563 那条依赖备注写的就是这件事）。
+pub struct ExcludeSet {
+    rules: Vec<ExcludeRule>,
+    /// 被忽略的行在**整张表里**的行号（1 基，与设置页看到的第几行是同一个数）。
+    /// 只有两种来路：`re:` 后面是空的，或那行的正则语法非法。
+    /// 只带行号不带原文：FR-SYS-03 那条「日志不落用户输入」对手改过的配置文件同样成立。
+    pub skipped: Vec<usize>,
+}
+
+impl ExcludeSet {
+    /// 行首尾空白先去掉（设置页失焦时已经洗过一次，这里兜的是手改 `settings.json` 那条路），
+    /// 空行与纯空白行直接不收——一条规则都不生成。
+    pub fn compile(lines: &[String]) -> ExcludeSet {
+        let mut rules = Vec::new();
+        let mut skipped = Vec::new();
+        for (i, raw) in lines.iter().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(body) = line.strip_prefix(REGEX_PREFIX) {
+                let body = body.trim();
+                // 空的正则不锚定 ⇒ `is_match` 对任何名字都是真 ⇒ 整张索引会空掉。
+                // 这不是「用户想要一个匹配一切的模式」（那条写 `re:.`），是漏写了后半截。
+                if body.is_empty() {
+                    skipped.push(i + 1);
+                    continue;
+                }
+                match regex::Regex::new(&format!("(?i){body}")) {
+                    Ok(re) => rules.push(ExcludeRule::Regex(re)),
+                    Err(_) => skipped.push(i + 1),
+                }
+                continue;
+            }
+            if line.contains('*') || line.contains('?') {
+                match regex::Regex::new(&format!("(?i){}", glob_to_regex(line))) {
+                    Ok(re) => rules.push(ExcludeRule::Glob(re)),
+                    // 理论上到不了：`glob_to_regex` 转义了每一个元字符，只有表达式长度
+                    // 撞上限才会失败。真失败了也不能整表作废，只当这一行没写。
+                    Err(_) => skipped.push(i + 1),
+                }
+                continue;
+            }
+            rules.push(ExcludeRule::Exact(line.to_string()));
+        }
+        ExcludeSet { rules, skipped }
+    }
+
+    /// 这个名字要不要整段跳过（目录则是连它下面的文件一起不进索引）。
+    pub fn is_excluded(&self, name: &str) -> bool {
+        self.rules.iter().any(|r| match r {
+            ExcludeRule::Exact(x) => name.eq_ignore_ascii_case(x),
+            ExcludeRule::Glob(re) | ExcludeRule::Regex(re) => re.is_match(name),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+}
+
+/// 通配符转正则：逐字符 `regex::escape`，只有 `*`→`.*`、`?`→`.`，两端加锚。
+///
+/// 与 [`crate::matching`] 里 FR-QRY-09 那条查询通配符**不是同一个函数**，差在两笔：
+/// 那条把「用户自己敲的其余字符」原样交给正则（所以查询里能写 `^` `$` `\d`），
+/// 这一条全量转义（所以 `.git` 里的点是**字面量的点**）；那条不锚定，这一条锚定整名。
+/// 两条各自对齐自己的参照物：查询照 Delphi `FilterKeyWord`，排除照「这行写的就是名字」。
+pub fn glob_to_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut lit = String::new();
+    out.push('^');
+    for ch in pattern.chars() {
+        if ch != '*' && ch != '?' {
+            lit.push(ch);
+            continue;
+        }
+        if !lit.is_empty() {
+            out.push_str(&regex::escape(&lit));
+            lit.clear();
+        }
+        out.push_str(if ch == '*' { ".*" } else { "." });
+    }
+    if !lit.is_empty() {
+        out.push_str(&regex::escape(&lit));
+    }
+    out.push('$');
+    out
+}
+
 /// 出厂范围目录：`Desktop` 在实机上常被重定向到 OneDrive，所以两个位置都试，
 /// 存在才算进范围（[`build_index`] 会滤掉不存在的）。存 `%USERPROFILE%` 形态的原始串——
 /// 设置文件里不落机器相关的绝对路径，展开与存在性过滤都在建索引时做。
@@ -93,7 +210,8 @@ pub struct ScanScope {
     pub folders: Vec<String>,
     /// 递归层数：1 = 只列直接子项。
     pub depth: usize,
-    /// 按目录名整段跳过（大小写不敏感，[`walk`] 里比对）。
+    /// 排除表：**每行一条**，编成 [`ExcludeSet`] 后按条目名整段跳过（三种写法见那里）。
+    /// 存原文行而不是编译结果：设置页给用户看和改的就是这些行，两边同一份文本。
     pub exclude: Vec<String>,
     /// 整张索引的条目上限（也是单目录浏览的读入上限，见 [`scan_dir`]）。
     pub max_entries: usize,
@@ -688,6 +806,21 @@ pub fn parent_query(dir: &str) -> Option<String> {
 // ---- 索引构建（后台线程）----
 
 pub fn build_index(scope: &ScanScope) -> Vec<FileEntry> {
+    let exclude = ExcludeSet::compile(&scope.exclude);
+    if !exclude.skipped.is_empty() {
+        // 只报行号，不报原文：FR-SYS-03「日志不落用户输入」对手改过的 settings.json 一样成立。
+        let rows: Vec<String> = exclude
+            .skipped
+            .iter()
+            .map(|i| i.to_string())
+            .collect();
+        log_info!(
+            "文件排除表：{} 行没编过、已整行忽略（表里第 {} 行），其余 {} 条规则照常生效",
+            exclude.skipped.len(),
+            rows.join("、"),
+            exclude.len()
+        );
+    }
     let mut out = Vec::new();
     for raw in &scope.folders {
         if out.len() >= scope.max_entries {
@@ -697,7 +830,7 @@ pub fn build_index(scope: &ScanScope) -> Vec<FileEntry> {
         if !root.is_dir() {
             continue;
         }
-        walk(&root, scope.depth, scope.max_entries, &scope.exclude, &mut out);
+        walk(&root, scope.depth, scope.max_entries, &exclude, &mut out);
     }
     out.truncate(scope.max_entries);
     out
@@ -707,7 +840,7 @@ fn walk(
     dir: &Path,
     depth: usize,
     max_entries: usize,
-    exclude: &[String],
+    exclude: &ExcludeSet,
     out: &mut Vec<FileEntry>,
 ) {
     if depth == 0 || out.len() >= max_entries {
@@ -723,7 +856,7 @@ fn walk(
             return;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if exclude.iter().any(|x| name.eq_ignore_ascii_case(x)) {
+        if exclude.is_excluded(&name) {
             continue;
         }
         // `DirEntry::file_type` 在 Windows 上直接取自目录枚举，不是再一次 stat。
@@ -1227,20 +1360,162 @@ mod tests {
     }
 
     #[test]
+    fn plain_rows_still_mean_the_whole_name_and_nothing_else() {
+        // 批次 REGX 的零漂移主证，也是「下界」那一道闸：出厂那七条编出来的还是整名相等，
+        // **不像正则**。`.git` 若被当成正则（那个点＝任意字符）就会顺手吃掉 `agit`、`xgit`——
+        // 编译不报错、索引安静少一批目录，只有这条断言抓得到。
+        let set = ExcludeSet::compile(&default_scope_exclude());
+        assert_eq!(set.len(), 7, "七条都该编成规则，一条都没被忽略");
+        assert!(set.skipped.is_empty());
+        assert!(set.is_excluded("node_modules"));
+        assert!(set.is_excluded("Node_Modules"), "不区分大小写");
+        assert!(set.is_excluded(".GIT"), "不区分大小写走 ASCII，与 D7 之前同一个函数");
+        for near in ["agit", "xgit", "git", ".gitx", "node_modules2", "__pycache__x"] {
+            assert!(!set.is_excluded(near), "整名相等不认 `{near}`");
+        }
+    }
+
+    #[test]
+    fn glob_rows_escape_literals_and_cover_the_whole_name() {
+        // 通配符那一档：`*`→`.*`、`?`→`.`，**其余字符逐个转义**，两端锚定整名。
+        let set = ExcludeSet::compile(&["*.tmp".to_string(), "~$*".to_string()]);
+        assert!(set.is_excluded("a.tmp") && set.is_excluded("X.TMP"));
+        assert!(!set.is_excluded("a.tmpx"), "锚定掉了，尾巴多一个字符就不该中");
+        assert!(!set.is_excluded("atmp"), "那个点是字面量的点，不是任意字符");
+        assert!(!set.is_excluded("x~$y"), "开头的 `~$` 必须落在名字开头");
+        assert!(set.is_excluded("~$W1234.docx"));
+    }
+
+    #[test]
+    fn glob_question_mark_takes_exactly_one_char() {
+        // 上限与下界两道闸一起写：`file?.log` 中 `file1.log`，
+        // 但既不中 `file12.log`（多了字符），也不中 `file.log`（少了字符）。
+        let set = ExcludeSet::compile(&["file?.log".to_string()]);
+        assert!(set.is_excluded("file1.log"));
+        assert!(!set.is_excluded("file12.log"), "`?` 只管一颗字符");
+        assert!(!set.is_excluded("file.log"), "`?` 不能空着");
+    }
+
+    #[test]
+    fn re_prefix_matches_inside_the_name_without_anchoring() {
+        // `re:` 那一档故意**不锚定**（照 AHK `RegExMatch` 的"出现就算"），
+        // 与通配符那一档相反。这条与上一条并排读才看得出差别是真的、不是抄错：
+        // 同一个 `git`，写成整名档就不中 `mygit2`，写成 `re:` 就中。
+        let re_only = ExcludeSet::compile(&["re:git".to_string()]);
+        assert!(re_only.is_excluded("mygit2"));
+        assert!(re_only.is_excluded(".GIT"));
+        let exact = ExcludeSet::compile(&["git".to_string()]);
+        assert!(!exact.is_excluded("mygit2"), "不带 `re:` 的行不该悄悄变成子串匹配");
+        // 元字符在这一档是真的：`\d+` 中 `tmp123`；同一串不带 `re:` 只是四个字符。
+        assert!(ExcludeSet::compile(&[r"re:\d+".to_string()]).is_excluded("tmp123"));
+        assert!(!ExcludeSet::compile(&[r"\d+".to_string()]).is_excluded("tmp123"));
+    }
+
+    #[test]
+    fn a_bad_row_is_dropped_without_taking_the_table_down() {
+        // 坏行只忽略它自己：`re:(` 语法非法 ⇒ 表里第 1 行进 `skipped`，
+        // 第 2 行那条好规则照常拦得住，且**不会**退化成"什么都不拦"。
+        let set = ExcludeSet::compile(&["re:(".to_string(), "node_modules".to_string()]);
+        assert_eq!(set.skipped, vec![1]);
+        assert_eq!(set.len(), 1);
+        assert!(set.is_excluded("node_modules"));
+        assert!(!set.is_excluded("node_modulesx"));
+    }
+
+    #[test]
+    fn a_bare_re_prefix_excludes_nothing_rather_than_everything() {
+        // 证伪实验的正身：空的正则不锚定时对任何名字都是真。
+        // 不挡住这一条，用户在表里手滑留一行 `re:` 就是**整张索引空掉**，
+        // 而构建、单测、日志四路全绿。挡住之后它只是一行被忽略的规则。
+        let set = ExcludeSet::compile(&["re:".to_string(), "re:   ".to_string()]);
+        assert_eq!(set.skipped, vec![1, 2]);
+        assert_eq!(set.len(), 0);
+        assert!(!set.is_excluded("anything"));
+        // 想要"匹配一切"得明写出来，那样它是真生效的。
+        assert!(ExcludeSet::compile(&["re:.".to_string()]).is_excluded("anything"));
+    }
+
+    #[test]
+    fn skipped_row_numbers_are_the_rows_the_settings_page_shows() {
+        // 行号按**整张表**数（空行也数），与设置页那排输入框的第几行同一个数——
+        // 报"第 4 行"而用户改的是第 6 个框，这条日志就是白记。
+        let set = ExcludeSet::compile(&[
+            "".to_string(),
+            "re:(".to_string(),
+            "node_modules".to_string(),
+            "re:)".to_string(),
+        ]);
+        assert_eq!(set.skipped, vec![2, 4]);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn blank_rows_are_not_rules() {
+        // 空行不生成规则，也不占 `skipped`：它不是"写坏了"，是"没写"。
+        let set = ExcludeSet::compile(&[
+            "".to_string(),
+            "   ".to_string(),
+            "  .git  ".to_string(),
+        ]);
+        assert_eq!(set.len(), 1);
+        assert!(set.skipped.is_empty());
+        assert!(set.is_excluded(".git"), "手改 settings.json 留下的空白先洗掉");
+    }
+
+    #[test]
+    fn glob_translation_is_pure_and_escapes_every_metacharacter() {
+        // 直接断翻译结果，不只是断行为：这样「锚定／转义」两笔各有一颗自己的钉子，
+        // 任一笔被改动（漏了 `^$`、或把 escape 换成原样拼接）都会红在同一处。
+        assert_eq!(glob_to_regex("*.tmp"), r"^.*\.tmp$");
+        assert_eq!(glob_to_regex("a?b"), r"^a.b$");
+        assert_eq!(glob_to_regex("$RECYCLE.BIN"), r"^\$RECYCLE\.BIN$");
+        assert_eq!(glob_to_regex("(x)"), r"^\(x\)$");
+        assert_eq!(glob_to_regex("*"), "^.*$");
+    }
+
+    #[test]
+    fn build_index_skips_a_glob_named_dir_and_its_children() {
+        // 「连它下面的文件一起不进索引」这条到今天仍然成立，只是写法多了通配符。
+        // 目录与文件都比名字：`logs.tmp/` 整段不进气，里面的 `inside.txt` 跟着没了。
+        let dir = std::env::temp_dir().join("egui-launcher-filesearch-glob");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs.tmp")).expect("建排除目录");
+        std::fs::write(dir.join("logs.tmp").join("inside.txt"), b"x").expect("写子文件");
+        std::fs::write(dir.join("keep.txt"), b"x").expect("写测试文件");
+        let scope = ScanScope {
+            folders: vec![dir.to_string_lossy().into_owned()],
+            exclude: vec!["*.tmp".to_string()],
+            ..ScanScope::default()
+        };
+        let index = build_index(&scope);
+        assert!(index.iter().any(|e| e.name == "keep.txt"));
+        assert!(
+            !index.iter().any(|e| e.name == "logs.tmp"),
+            "目录名命中通配符 ⇒ 整段跳过"
+        );
+        assert!(
+            !index.iter().any(|e| e.name == "inside.txt"),
+            "被跳过目录下面的文件不该从别的路径进来"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn walk_depth_limit_and_entry_cap_hold() {
         // 深度 1 ⇒ 只到直接子项，孙子不进索引。这里不用缺省深度而是显式传 1，
         // 因为深度是"范围有多大"的策略，不是"递归能不能停"的正确性。
         let scope = ScanScope::default();
+        let exclude = ExcludeSet::compile(&scope.exclude);
         let dir = std::env::temp_dir().join("egui-launcher-filesearch-walk");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("child")).expect("建两层目录");
         std::fs::write(dir.join("child").join("leaf.txt"), b"x").expect("写测试文件");
         let mut out = Vec::new();
-        walk(&dir, 2, scope.max_entries, &scope.exclude, &mut out);
+        walk(&dir, 2, scope.max_entries, &exclude, &mut out);
         assert!(out.iter().any(|e| e.name == "child" && e.is_dir));
         assert!(out.iter().any(|e| e.name == "leaf.txt"));
         let mut shallow = Vec::new();
-        walk(&dir, 1, scope.max_entries, &scope.exclude, &mut shallow);
+        walk(&dir, 1, scope.max_entries, &exclude, &mut shallow);
         assert!(shallow.iter().any(|e| e.name == "child"));
         assert!(
             !shallow.iter().any(|e| e.name == "leaf.txt"),

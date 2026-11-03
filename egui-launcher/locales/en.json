@@ -282,7 +282,7 @@
   "files.exclude_title": "Excluded folder names",
   "files.add_exclude": "Add folder name",
   "files.restore_exclude": "Restore default exclusions",
-  "files.exclude_help": "Excluded names skip the whole folder (case-insensitive), and files beneath it stay out of the index. \"Restore default exclusions\" writes the seven factory entries back (node_modules / .git and so on) — your own entries are wiped, and anything removed by mistake can be added again.",
+  "files.exclude_help": "Excluded rows are matched against entry names (case-insensitive); a folder takes everything beneath it out of the index.\nThree ways to write a row: a plain name matches the whole name, exactly as before; * stands for any run of characters and ? for exactly one, still matched against the whole name (e.g. *.tmp); a row starting with re: is handed to the regex engine as written and is not anchored, so it fires on any occurrence (e.g. re:~$).\nA row that fails to compile is dropped on its own and the rest of the table still applies; the log records which row number was skipped, never the text you wrote. \"Restore default exclusions\" writes the seven factory entries back (node_modules / .git and so on) — your own entries are wiped, and anything removed by mistake can be added again.",
   "files.tiers_title": "Tiers",
   "files.depth_label": "Recursion depth",
   "files.depth_4": "4 (default)",

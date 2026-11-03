@@ -924,7 +924,7 @@ pub struct AppSettings {
     #[serde(default = "default_file_depth")]
     pub file_depth: usize,
 
-    /// 按目录名排除（`scope_exclude`）。缺省＝[`filesearch::default_scope_exclude`] 那七条；
+    /// 排除表（`scope_exclude`），每行一条。缺省＝[`filesearch::default_scope_exclude`] 那七条；
     /// 设置页可增删，「恢复默认排除」写回缺省。
     #[serde(default = "default_file_exclude")]
     pub file_exclude: Vec<String>,
