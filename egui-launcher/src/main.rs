@@ -4348,13 +4348,13 @@ fn open_log_file() {
     let path = source::application::log_path();
     if !path.exists() {
         // 首行必须是日期锚，否则这份文件将来归档时读不出自己属于哪天。
-        let note = format!(
-            "{}{} ｜ 本文件由「打开日志」补写：此前它不存在，说明这台机器还没发生过没有控制台的\
-             启动（从终端或脚本启动时日志直接刷在控制台、不写文件）。\n",
-            source::application::LOG_DATE_TAG,
-            source::application::local_now_stamp()
+        // 批次 PNCS：正文与行尾戳的组成挪进 `log_absent_note`，让它和三条日志漏斗共用
+        // 同一个 `stamped_line`——这一行是全仓最后一处「有正文没时间」的落笔点。
+        let note = source::application::log_absent_note(
+            &source::application::local_now_stamp(),
+            &source::application::local_now_clock_ms(),
         );
-        let _ = std::fs::write(&path, note);
+        let _ = std::fs::write(&path, format!("{note}\n"));
     }
     let file = path.display().to_string();
     match shell_execute(&file, "", None) {
@@ -19533,6 +19533,8 @@ fn main() -> eframe::Result {
     // 批次 G5（NFR-01）：放在 redirect 之前——`perf: startup` 要的是整条启动链的耗时。
     let _ = PROCESS_START.get_or_init(Instant::now);
     redirect_stderr_if_orphan(); // 必须在第一条日志之前：换句柄只管之后的写
+    // 批次 PNCS：紧接着装，理由同上一句——钩子写的是 stderr，stderr 的接管发生在这一行之前。
+    logging::install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = cli::parse(&args);
 

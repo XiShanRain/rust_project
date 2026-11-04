@@ -3,9 +3,12 @@
 //! 本程序不引 `tracing`（取向：零新增依赖面，见需求书 FR-SYS-03 的 2026-10-19 注记），
 //! 日志仍是 stderr —— GUI 子系统下由 `redirect_stderr_if_orphan()` 牵到 `launcher.log`。
 //! 这里只加一层**级别闸门**：全部调用点过 `log_debug!` / `log_info!`，`eprintln!` 只活在
-//! 两个宏体与 [`perf`] 那一处（`src/` 其余位置 `grep -c 'eprintln!('` 归零就是这条纪律的判据）。
-//! 批次 LOGTS 起，这三个漏斗是**唯一**给日志加行尾送达戳的地方（见 [`stamped_line`]）：
-//! 正文由调用点写，戳由漏斗加，中间没有人能把戳漏掉。
+//! 两个宏体、[`perf`] 与 [`install_panic_hook`] 那四处（`src/` 其余位置 `grep -c 'eprintln!('`
+//! 归零就是这条纪律的判据）。
+//! 批次 LOGTS 起，行尾送达戳只由 [`stamped_line`] 一个人加：正文由调用点写，戳由漏斗加，
+//! 中间没有人能把戳漏掉。批次 PNCS 把 §一百零四 庚 登记的两处「不覆盖」补了进来
+//! （[`install_panic_hook`] 的摘要行、`application.rs` 的 `log_absent_note`），所以判据从
+//! 「三个漏斗」换成「`stamped_line` 的调用点清单」：它有几处，全仓就长几处戳。
 //!
 //! 两档够用的理由：本程序的日志不是给终端用户读的故事，是**排障证据**。「标准」保留
 //! 生命周期、用户动作、写盘结果与失败；「详细」再加逐条 / 逐帧 / 逐键的诊断与 `perf:`
@@ -168,6 +171,62 @@ pub fn perf_line_with_budget(label: &str, dur: Duration, extra: &str) -> String 
         Some(budget) if ms > budget => format!("{line}（超预算 {:.2} ms）", ms - budget),
         _ => line,
     }
+}
+
+/// panic 摘要行的形态（批次 PNCS）：`panic：‹载荷›｜‹文件:行:列› [HH:MM:SS.mmm]`。
+///
+/// 走 [`stamped_line`] 同一个组成律 ⇒ 「全仓的戳只有一个人加」这条不因新漏斗而破。载荷先压平
+/// （[`flatten_newlines`]）：一条 panic 只占日志一行，否则戳会掉到载荷最后一行、`[戳]` 不再在行尾。
+///
+/// 纯函数（不读时钟、不装钩子）⇒ 单测能一次钉住位置缺失的兜底与压平律。
+pub fn panic_report_line(message: &str, location: &str, clock: &str) -> String {
+    stamped_line(
+        &format!("panic：{}｜{}", flatten_newlines(message), location),
+        clock,
+    )
+}
+
+/// 换行压成字面量 `\n`；先归一 `\r\n`，否则 Windows 载荷会在行中留一个裸回车。
+fn flatten_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\n', "\\n")
+}
+
+/// panic 载荷转文本：`String` / `&str` 两种形态各一条，剩下的一律给固定标注。
+///
+/// 这里不试图把非字符串载荷打印出来（`dyn Any` 没有 `Debug`，拿 `TypeId` 的哈希数字填进日志
+/// 也没有判据价值）——紧跟其后的默认钩子多行块本来就以 `{:?}` 打印同一份载荷，细节一个字没丢。
+fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else {
+        "<非字符串载荷>".to_string()
+    }
+}
+
+/// 装 panic 摘要钩子（批次 PNCS：结掉 §一百零四 庚①「panic 那几行没有戳」）。
+///
+/// 调用位置有硬约束：必须在 `redirect_stderr_if_orphan()` **之后**——换句柄只管之后的写，
+/// 早于它装钩子会让这条摘要行流向一个没人接的控制台。
+///
+/// 链式而不是替换：`take_hook` 先取走默认钩子存下来，本钩子写完带戳摘要行后把同一份
+/// `PanicHookInfo` 原样交回。默认那块多行输出（`panicked at …` 与 `RUST_BACKTRACE` 的栈）
+/// 一个字不少 ⇒ 现有按 `panicked at` 取样的取证通道不受影响，净增的只有「这一炸发生在
+/// 几点几分几秒几毫秒」这一行。
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = match info.location() {
+            Some(l) => format!("{}:{}:{}", l.file(), l.line(), l.column()),
+            None => "位置未知".to_string(),
+        };
+        eprintln!(
+            "{}",
+            panic_report_line(&payload_text(info.payload()), &location, &stamp_now())
+        );
+        default(info);
+    }));
 }
 
 /// 详细档才打。
@@ -339,5 +398,123 @@ mod tests {
 
         let unbounded = perf_line_with_budget("index", Duration::from_millis(900), "");
         assert_eq!(unbounded, "perf: index 900.00 ms", "没有预算的标签不加尾巴");
+    }
+
+    /// 批次 PNCS 的形状闸：panic 摘要行走 [`stamped_line`] 同一个组成律——行首 `panic：`、
+    /// 载荷之后接位置、戳收尾。写死一整句字面量，三个部件换任何一边都红。
+    #[test]
+    fn a_panic_summary_line_is_body_then_location_then_the_clock() {
+        let line = panic_report_line("attempt to subtract with overflow", "src/main.rs:19535:5", "07:08:09.010");
+        assert_eq!(
+            line,
+            "panic：attempt to subtract with overflow｜src/main.rs:19535:5 [07:08:09.010]"
+        );
+        assert!(line.starts_with("panic："), "行首要一眼认出这是一次炸，不是一行普通日志");
+        let body = "panic：attempt to subtract with overflow｜src/main.rs:19535:5";
+        assert_eq!(line.len(), body.len() + 15, "加戳只多 15 字节，正文一个字符没动");
+    }
+
+    /// 载荷三种形态各有去处。第三种不硬凑文本：`dyn Any` 没有 `Debug`，而紧跟其后的默认钩子块
+    /// 本来就以 `{:?}` 打印同一份载荷——这里塞一个 `TypeId` 哈希数字只会多一条读不懂的行。
+    #[test]
+    fn payload_text_takes_string_and_str_and_labels_everything_else() {
+        let owned: String = " owned ".into();
+        assert_eq!(payload_text(&owned), " owned ", "String 载荷原样");
+        let lit: &str = "lit";
+        assert_eq!(payload_text(&lit), "lit", "&str 载荷（panic!(\"字面量\") 走这一条）");
+        assert_eq!(payload_text(&7u32), "<非字符串载荷>", "非字符串给固定标注，不给猜的");
+    }
+
+    /// 压平律：一条 panic 只占日志一行，否则 `[戳]` 会掉到载荷最后一行、`^` 取样锚也不再是行首。
+    #[test]
+    fn a_multiline_payload_collapses_so_the_clock_stays_at_the_line_end() {
+        let line = panic_report_line("甲\n乙\r\n丙", "src/main.rs:1:2", "23:59:59.999");
+        assert_eq!(line, "panic：甲\\n乙\\n丙｜src/main.rs:1:2 [23:59:59.999]");
+        assert!(
+            !line.contains('\n') && !line.contains('\r'),
+            "裸换行/回车一个都不许留下（CRLF 先归一再压，Windows 载荷不在行中留裸回车）"
+        );
+        assert!(line.ends_with(" [23:59:59.999]"), "压平后戳仍在行尾");
+    }
+
+    /// 位置缺失不是「没有位置这一段」：给一个字面量，行首判据与戳的位置都不变。
+    #[test]
+    fn a_panic_without_a_location_still_makes_one_line() {
+        assert_eq!(
+            panic_report_line("x", "位置未知", "00:00:00.000"),
+            "panic：x｜位置未知 [00:00:00.000]"
+        );
+    }
+
+    /// 端到端那一案：**它自己会炸**，只作为子进程里的那一案跑（父案见下一格）。
+    /// 装钩子用 `take_hook` 取走的是 libtest 自己的钩子 ⇒ 这一案同时验了链式没吞掉原生块。
+    #[test]
+    #[ignore]
+    fn the_child_panics_on_purpose() {
+        install_panic_hook();
+        panic!("PNCS-自炸 {}\n第二行", 42);
+    }
+
+    /// 批次 PNCS 的端到端一条：摘要行真打出来了、戳是活的时钟，且默认那块 `panicked at` 一个字没少。
+    ///
+    /// 子进程是**本测试二进制自己**（`current_exe`），不是产品 exe ⇒ 零窗口、零产品进程。
+    /// 两条 stdout/stderr 合并后判：libtest 在 `--nocapture` 下把 panic 打到 stderr，但「钩子链没断」
+    /// 这一句的判据不依赖它落哪条流；「戳真进了 `launcher.log`」属另一件事——那是 stderr 被
+    /// `redirect_stderr_if_orphan()` 接管之后的口径，本条不证（真机待验）。
+    #[test]
+    fn the_panic_hook_emits_one_stamped_line_and_keeps_the_default_block() {
+        let exe = std::env::current_exe().expect("拿不到当前测试二进制的路径");
+        let out = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "logging::tests::the_child_panics_on_purpose",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .expect("子进程（测试二进制自身）起不来");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // 先钉「那一案真的跑了」：否则下面任何一条缺失都可能只是过滤器没命中（没算 ≠ 算了没说）。
+        assert!(text.contains("running 1 test"), "子进程一个测试都没跑：{text}");
+        assert!(
+            text.contains("the_child_panics_on_purpose"),
+            "过滤器没命中那一案，后面三条判据不成立：{text}"
+        );
+        assert!(
+            !out.status.success(),
+            "自炸案却成功退出了 ⇒ 它没炸成，下面的行当然也不该有：{text}"
+        );
+
+        let hits: Vec<&str> = text.lines().filter(|l| l.starts_with("panic：")).collect();
+        assert_eq!(hits.len(), 1, "带戳摘要行该恰好一条，实测 {hits:?}");
+        let line = hits[0];
+        assert!(
+            line.contains("PNCS-自炸 42\\n第二行"),
+            "载荷没压平或丢了：{line}"
+        );
+        assert!(line.contains("logging.rs"), "位置段没带上源文件名：{line}");
+        assert!(
+            text.contains("panicked at"),
+            "默认钩子那块没了 ⇒ take_hook 的链式调用断了：{text}"
+        );
+
+        // 戳是当场取的时钟，不是字面量：形状同 `stamp_now`（宽 12、两处冒号、一个点）。
+        let clock = line
+            .rsplit_once(" [")
+            .map(|(_, c)| c.strip_suffix(']').unwrap_or(c))
+            .expect("行尾没有 ` [戳]` 这一段");
+        let b = clock.as_bytes();
+        assert_eq!(b.len(), 12, "戳宽 12：{clock:?}");
+        assert!(b[2] == b':' && b[5] == b':' && b[8] == b'.', "戳的分隔符位置错了：{clock:?}");
+        assert!(
+            clock.chars().enumerate().all(|(i, c)| matches!(i, 2 | 5 | 8) || c.is_ascii_digit()),
+            "戳里除两个冒号一个点外必须全是数字：{clock:?}"
+        );
+        println!("panic 摘要行实测：{line}");
     }
 }

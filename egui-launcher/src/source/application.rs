@@ -2024,6 +2024,25 @@ pub fn local_now_clock_ms() -> String {
     )
 }
 
+/// 「打开日志」补写的那一首行（批次 PNCS：结掉 §一百零四 庚②「这一行没有送达戳」）。
+///
+/// 它是全仓唯一一条**不走日志宏**落盘的正文：`std::fs::write` 直接写文件、绕过 stderr 句柄，
+/// 所以「戳只由 [`crate::logging::stamped_line`] 一个人加」这条纪律在这里得显式过一遍同一个函数，
+/// 而不是让调用点手搓 `format!`。日期与时刻分开传：`date_stamp` 喂行首的日期锚（既有判据），
+/// `clock` 喂行尾的送达戳，两个取时函数各调一次，纯函数本身不读时钟 ⇒ 单测钉得住组成律。
+///
+/// 行首前缀一个字不动 ⇒ `log_content_date` 的 `strip_prefix(LOG_DATE_TAG)` 照旧读得出归档名；
+/// 戳落在行尾，回归测试见 `anchor_line_carrying_a_clock_tail_still_names_its_archive`。
+pub fn log_absent_note(date_stamp: &str, clock: &str) -> String {
+    crate::logging::stamped_line(
+        &format!(
+            "{LOG_DATE_TAG}{date_stamp} ｜ 本文件由「打开日志」补写：此前它不存在，说明这台机器还没发生过没有控制台的\
+             启动（从终端或脚本启动时日志直接刷在控制台、不写文件）。"
+        ),
+        clock,
+    )
+}
+
 /// 备份文件名用的紧凑本地时间 `YYYYMMDD-HHMMSS`（批次 F7）。
 /// 与 [`local_now_stamp`] 同一个来源：不引日期库，也不拿 UTC 冒充本地时间。
 fn local_now_compact() -> String {
@@ -5031,6 +5050,39 @@ mod dedup_tests {
         rotate_at(&log, "2026-10-19");
         assert!(
             dir.join("launcher-2026-10-18.log").exists(),
+            "归档名取锚里的日期，不取戳里的时刻"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 批次 PNCS：「打开日志」补写的首行也长上戳了，而日期锚那条判据一个字没动——
+    /// `log_content_date` 读的是 `strip_prefix(LOG_DATE_TAG)` 之后的 10 个字符，戳在行尾碰不到它。
+    ///
+    /// 这里把「正文逐字节不变」也钉住：这一批对该行的改动只有「行尾多 15 字节」，
+    /// 谁顺手改了文案（那是给终端用户看的一句话，不是本批范围），这条立刻红。
+    #[test]
+    fn the_absent_log_note_keeps_its_anchor_and_grows_only_a_clock() {
+        let date = "2026-11-04 22:07";
+        let note = log_absent_note(date, "22:07:03.415");
+        let body = format!(
+            "{LOG_DATE_TAG}{date} ｜ 本文件由「打开日志」补写：此前它不存在，说明这台机器还没发生过没有控制台的\
+             启动（从终端或脚本启动时日志直接刷在控制台、不写文件）。"
+        );
+        assert!(note.starts_with(&body), "正文一字不许动，更不许被戳挤出行首");
+        assert_eq!(note.len(), body.len() + 15, "加戳只多 15 字节");
+        assert!(note.ends_with(" [22:07:03.415]"));
+
+        let dir = temp_log_dir("absent-note");
+        let log = dir.join("launcher.log");
+        std::fs::write(&log, format!("{note}\n")).unwrap();
+        assert_eq!(
+            log_content_date(&log).as_deref(),
+            Some("2026-11-04"),
+            "补写的首行仍要读得出日期锚"
+        );
+        rotate_at(&log, "2026-11-05");
+        assert!(
+            dir.join("launcher-2026-11-04.log").exists(),
             "归档名取锚里的日期，不取戳里的时刻"
         );
         let _ = std::fs::remove_dir_all(&dir);
