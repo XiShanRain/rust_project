@@ -224,10 +224,10 @@ mod tests {
 
     #[test]
     fn fallback_follows_the_build_kind() {
-        // `cargo test` 默认是 debug 构建 ⇒ 缺省该是「详细」；这条断言同时钉住
-        // `cfg!(debug_assertions)` 没有被写反（写反了在这里一眼可见）。
-        assert_eq!(LogLevel::fallback(), LogLevel::Debug);
-        assert_eq!(LogLevel::fallback().label(), "详细");
+        // 批次 PRIC：原先写死 `Debug`＋"详细"（前提句是「`cargo test` 默认 debug 构建」），`--release` 一跑就红。
+        let (want, label) = if cfg!(debug_assertions) { (LogLevel::Debug, "详细") } else { (LogLevel::Info, "标准") };
+        assert_eq!(LogLevel::fallback(), want, "缺省级别跟着构建形态走");
+        assert_eq!(LogLevel::fallback().label(), label, "两头各钉一个字面量，标签换边也红");
     }
 
     #[test]
@@ -318,7 +318,7 @@ mod tests {
         std::hint::black_box(&sink);
         assert!(per > 0.0, "这一趟一个纳秒都没花 ⇒ 循环被优化掉了，数不可信");
         assert!(per < 20.0, "实测 {per:.3} µs/条，已经贵到会改写被观测的时序");
-        println!("line stamp 实测：{per:.3} µs/条（{N} 次，合计 {total:.0} µs）");
+        println!("line stamp 实测：{per:.3} µs/条（{N} 次，合计 {total:.0} µs｜构建形态自报 debug_assertions={} rel_opt={} dev_opt={}）", cfg!(debug_assertions), option_env!("CARGO_PROFILE_RELEASE_OPT_LEVEL").unwrap_or("-"), option_env!("CARGO_PROFILE_DEV_OPT_LEVEL").unwrap_or("-"));
     }
 
     #[test]
