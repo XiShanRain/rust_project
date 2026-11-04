@@ -2012,6 +2012,18 @@ pub fn local_now_stamp() -> String {
     )
 }
 
+/// 本地时刻 `HH:MM:SS.mmm`（批次 LOGTS：日志每行行尾的送达戳）。
+/// 与前两个函数同一条来源（`GetLocalTime`，毫秒就在 `wMilliseconds` 里，不另开 feature）。
+/// **日期不进戳**：日志按天归档，「这份属于哪天」由首行那条日期锚一个人说——行尾再抄一遍
+/// 日期只是把每行 12 字符换成 23 字符的噪声，而跨天判据一个都没多。
+pub fn local_now_clock_ms() -> String {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
+}
+
 /// 备份文件名用的紧凑本地时间 `YYYYMMDD-HHMMSS`（批次 F7）。
 /// 与 [`local_now_stamp`] 同一个来源：不引日期库，也不拿 UTC 冒充本地时间。
 fn local_now_compact() -> String {
@@ -4997,6 +5009,30 @@ mod dedup_tests {
             "同名归档该加序号，不该覆盖"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 批次 LOGTS 的回归闸：首行现在长得像
+    /// `# log 日期: 2026-11-04 22:07 ｜ … [22:07:03.415]`——**戳在行尾**，
+    /// 所以 `strip_prefix(LOG_DATE_TAG)` 这条判据一个字都不用改。这条测试钉住的就是这一点：
+    /// 谁把戳改放到行首，这里立刻红（归档名会退化成「无日期」）。
+    #[test]
+    fn anchor_line_carrying_a_clock_tail_still_names_its_archive() {
+        let dir = temp_log_dir("rotate-clock");
+        let log = dir.join("launcher.log");
+        let body = format!("{LOG_DATE_TAG}2026-10-18 22:07 ｜ 昨天的");
+        let line = crate::logging::stamped_line(&body, "22:07:03.415");
+        std::fs::write(&log, format!("{line}\n")).unwrap();
+        assert_eq!(
+            log_content_date(&log).as_deref(),
+            Some("2026-10-18"),
+            "带尾戳的首行仍要读得出日期锚"
+        );
+        rotate_at(&log, "2026-10-19");
+        assert!(
+            dir.join("launcher-2026-10-18.log").exists(),
+            "归档名取锚里的日期，不取戳里的时刻"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

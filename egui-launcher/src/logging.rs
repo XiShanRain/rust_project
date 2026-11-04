@@ -3,7 +3,9 @@
 //! 本程序不引 `tracing`（取向：零新增依赖面，见需求书 FR-SYS-03 的 2026-10-19 注记），
 //! 日志仍是 stderr —— GUI 子系统下由 `redirect_stderr_if_orphan()` 牵到 `launcher.log`。
 //! 这里只加一层**级别闸门**：全部调用点过 `log_debug!` / `log_info!`，`eprintln!` 只活在
-//! 两个宏体里（`src/` 其余位置 `grep -c 'eprintln!('` 归零就是这条纪律的判据）。
+//! 两个宏体与 [`perf`] 那一处（`src/` 其余位置 `grep -c 'eprintln!('` 归零就是这条纪律的判据）。
+//! 批次 LOGTS 起，这三个漏斗是**唯一**给日志加行尾送达戳的地方（见 [`stamped_line`]）：
+//! 正文由调用点写，戳由漏斗加，中间没有人能把戳漏掉。
 //!
 //! 两档够用的理由：本程序的日志不是给终端用户读的故事，是**排障证据**。「标准」保留
 //! 生命周期、用户动作、写盘结果与失败；「详细」再加逐条 / 逐帧 / 逐键的诊断与 `perf:`
@@ -126,10 +128,32 @@ pub fn perf_budget(label: &str) -> Option<f64> {
     }
 }
 
+/// 一条日志的落笔形态：正文 + 行尾送达戳 `‹正文› [HH:MM:SS.mmm]`（批次 LOGTS）。
+///
+/// 戳放**行尾**不是随手选的：两处判据都钉在行首——`launcher.log` 首行靠
+/// `strip_prefix(LOG_DATE_TAG)` 取归档名（`application.rs` 的 `log_content_date`），
+/// `perf:` 那一族脚本按 `^perf: <label> <数> ms` 取样。放行首就得连这两条一起改，
+/// 放行尾则两条一个字都不动，而「这一行是什么时候落盘的」照样拿得到。
+///
+/// 纯函数（不读时钟）⇒ 单测能钉住组成律；时钟只活在 [`stamp_now`] 一处。
+pub fn stamped_line(body: &str, clock: &str) -> String {
+    format!("{body} [{clock}]")
+}
+
+/// 现在的本地时刻戳。走 `application.rs` 那条唯一取时间的路（`GetLocalTime`），
+/// 不在这里另起一条 UTC 或 `SystemTime` 的换算。
+pub fn stamp_now() -> String {
+    crate::source::application::local_now_clock_ms()
+}
+
 /// 打一条性能日志（详细档）。`extra` 为空的常见形态见 [`perf_line`]。
 pub fn perf(label: &str, dur: Duration, extra: &str) {
     if enabled(LogLevel::Debug) {
-        eprintln!("{}", perf_line_with_budget(label, dur, extra));
+        let clock = stamp_now();
+        eprintln!(
+            "{}",
+            stamped_line(&perf_line_with_budget(label, dur, extra), &clock)
+        );
     }
 }
 
@@ -150,7 +174,11 @@ pub fn perf_line_with_budget(label: &str, dur: Duration, extra: &str) -> String 
 macro_rules! log_debug {
     ($($arg:tt)*) => {
         if $crate::logging::enabled($crate::logging::LogLevel::Debug) {
-            eprintln!($($arg)*);
+            let __clock = $crate::logging::stamp_now();
+            eprintln!(
+                "{}",
+                $crate::logging::stamped_line(&format!($($arg)*), &__clock)
+            );
         }
     };
 }
@@ -159,7 +187,11 @@ macro_rules! log_debug {
 macro_rules! log_info {
     ($($arg:tt)*) => {
         if $crate::logging::enabled($crate::logging::LogLevel::Info) {
-            eprintln!($($arg)*);
+            let __clock = $crate::logging::stamp_now();
+            eprintln!(
+                "{}",
+                $crate::logging::stamped_line(&format!($($arg)*), &__clock)
+            );
         }
     };
 }
@@ -224,6 +256,69 @@ mod tests {
         assert_eq!(perf_budget("search"), Some(16.0), "NFR-01 单帧 16 ms");
         assert_eq!(perf_budget("startup"), Some(1000.0), "开发计划 1.1 热启动 ≤1s");
         assert_eq!(perf_budget("index"), None, "索引没有需求门槛，别自己造一个");
+    }
+
+    #[test]
+    fn stamp_now_reads_a_clock_not_a_date() {
+        // 真读一次系统时钟：形状恒为 `HH:MM:SS.mmm`＝12 字符，日期一个字符都不许进来。
+        let s = stamp_now();
+        let b = s.as_bytes();
+        assert_eq!(b.len(), 12, "戳恒宽 12：{s:?}");
+        for i in [2, 5] {
+            assert_eq!(b[i], b':', "第 {i} 格该是冒号：{s:?}");
+        }
+        assert_eq!(b[8], b'.', "秒与毫秒之间一个点：{s:?}");
+        for i in [0, 1, 3, 4, 6, 7, 9, 10, 11] {
+            assert!(b[i].is_ascii_digit(), "第 {i} 格该是数字：{s:?}");
+        }
+        let hour: u8 = s[0..2].parse().unwrap();
+        let min: u8 = s[3..5].parse().unwrap();
+        let sec: u8 = s[6..8].parse().unwrap();
+        let ms: u16 = s[9..12].parse().unwrap();
+        assert!(hour < 24 && min < 60 && sec < 60 && ms < 1000, "越界的时钟：{s:?}");
+        assert_eq!(s.find('-'), None, "戳里不许有日期分隔符");
+    }
+
+    #[test]
+    fn stamped_line_moves_the_body_byte_for_byte_and_puts_the_clock_last() {
+        let body = "perf: search 20.00 ms（超预算 4.00 ms）";
+        let line = stamped_line(body, "07:08:09.010");
+        assert_eq!(line, "perf: search 20.00 ms（超预算 4.00 ms） [07:08:09.010]");
+        assert!(line.starts_with(body), "正文一字不动、也不许被挪出行首");
+        assert!(line.ends_with(']'), "戳是这一行的最后一段");
+        // 行尾才是戳：从行尾倒着剥，剥掉的正好是 ` [HH:MM:SS.mmm]`＝15 字符。
+        assert_eq!(line.len(), body.len() + 15);
+    }
+
+    #[test]
+    fn the_stamp_survives_both_perf_and_gate_paths() {
+        // 三条漏斗共用同一个组成函数：`perf()` 的正文是 `perf_line_with_budget` 给的，
+        // 加了戳之后行首那条取样锚仍然完整（`^perf: <label> <数> ms`）。
+        let clock = "23:59:59.999";
+        let line = stamped_line(&perf_line_with_budget("search", Duration::from_millis(20), ""), clock);
+        assert!(line.starts_with("perf: search 20.00 ms"), "取样锚还在行首");
+        assert!(line.ends_with(" [23:59:59.999]"), "戳在行尾");
+        let plain = stamped_line("文件索引：本轮建成 8 条", clock);
+        assert!(plain.starts_with("文件索引："), "回执行的行首也没被挪走");
+    }
+
+    #[test]
+    fn a_line_stamp_is_cheap_enough_for_per_frame_logs() {
+        // 上限闸 + 下界闸（成规：上限型断言要两道闸）。这道成本账测的是「一次取时刻 + 一次
+        // format + 一次堆分配」；`black_box` 负责证明循环真跑了、没被优化成一趟空手。
+        // 上界放到 20 µs/条：真机若慢到这个量级，逐帧日志就会开始改变它自己要观测的时序。
+        const N: u32 = 50_000;
+        let t = std::time::Instant::now();
+        let mut sink = String::new();
+        for _ in 0..N {
+            sink = std::hint::black_box(stamp_now());
+        }
+        let total = t.elapsed().as_secs_f64() * 1e6; // µs
+        let per = total / N as f64;
+        std::hint::black_box(&sink);
+        assert!(per > 0.0, "这一趟一个纳秒都没花 ⇒ 循环被优化掉了，数不可信");
+        assert!(per < 20.0, "实测 {per:.3} µs/条，已经贵到会改写被观测的时序");
+        println!("line stamp 实测：{per:.3} µs/条（{N} 次，合计 {total:.0} µs）");
     }
 
     #[test]
