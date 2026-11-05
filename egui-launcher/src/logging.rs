@@ -517,4 +517,203 @@ mod tests {
         );
         println!("panic 摘要行实测：{line}");
     }
+
+    // ===================== 批次 WRIT：写那一条腿到底多少钱 =====================
+    //
+    // 历批把这一格一直登记成「做不了」（§一百零六 癸①原文：「工装要量它就得真往盘上写 50,000 行
+    // （还会污染日志目录），本批不写」）。本批把那两个前提各自换掉：**写的是 `target/writ/` 下的
+    // 沙箱文件**（数据目录里那份 `launcher.log` 一个字节都不碰），**跑的是测试二进制自己**
+    // （`current_exe`，零窗口、零产品进程）。
+    //
+    // 句柄形状对着产品抄：`redirect_stderr_if_orphan()` 走 `OpenOptions::append(true)` 再把
+    // `file.as_raw_handle()` 交给 `SetStdHandle(STD_ERROR_HANDLE, …)` ⇒ 之后每一句 `eprintln!`
+    // 都是「无缓冲地往一条 append 句柄 WriteFile」。父案用 `Stdio::from(同样形状的 File)` 接管
+    // 子进程的 stderr，复现的就是同一条路径：同一个句柄种类、同样的 append 访问、同样不过缓冲区。
+    //
+    // 口径限制（先写在这儿，免得读数被读大）：量到的是**到系统文件缓存**的成本，不是耐久介质的
+    // 成本——产品和本工装都不调 `FlushFileBuffers`，`WriteFile` 返回只证明字节交给了内核。
+
+    /// 七条腿的名字。父案与 `target/writ/` 工装读同一张表，两边不许各写一份。
+    const WRIT_LEGS: [&str; 7] = ["W0", "W1", "W1b", "W2", "W3", "W4", "W5"];
+
+    /// 一条腿的循环体付什么（判据全在注释里，读数只在报告行里）：
+    /// - `W0` 组成腿：`stamped_line(&format!(…), &stamp_now())`，一个字不写盘。
+    /// - `W1` 写腿·单次：`write_all(整行含换行)` ⇒ 每行一次 WriteFile，循环内不组行。
+    /// - `W1b` 写腿·两次：正文一次 + 换行一次 ⇒ 与 W1 只差多一次 WriteFile，与 W2 只差没有 `format_args`。
+    /// - `W2` 写腿·宏形态：`eprintln!("{}", 预合成整行)` ⇒ 走产品那句的打印分发。
+    /// - `W3` 全腿：真 `log_info!`（闸门 + 组行 + 盖戳 + 打印）——产品每行实际付的就是这个。
+    /// - `W4` 批处理对照：循环内只 `push_str`，循环外一次 `write_all` 把 n 行一起交出去。
+    /// - `W5` 闸门抑制档：Info 档下的 `log_debug!` ⇒ 一条都不该落盘，付的是「被挡」那一小段。
+    ///
+    /// 首尾两条哨兵走真漏斗（`log_info!`）：文件里「有这两条」＝句柄通了、这一案真跑了；
+    /// 「只有这两条」＝这条腿一个字没写（W0/W5 的判据就靠它，否则「挡住了」与「没跑」同形）。
+    #[test]
+    #[ignore]
+    fn writ_child_leg() {
+        use std::io::Write;
+        let Ok(leg) = std::env::var("WRIT_LEG") else {
+            println!("WRIT-SKIP｜没给 WRIT_LEG，子进程一个字都没干");
+            return;
+        };
+        assert!(WRIT_LEGS.contains(&leg.as_str()), "未知腿名：{leg}");
+        let n: usize = std::env::var("WRIT_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let warm: usize = std::env::var("WRIT_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+
+        // 档位写死，不靠构建缺省：W3 要 Info 档下的 `log_info!`，W5 要 Debug 行被闸门挡下来。
+        set_level(LogLevel::Info);
+        log_info!("WRIT-哨兵 {leg} 起");
+
+        // 预合成的整行：W1 / W1b / W2 / W4 落盘字节完全一致（宽度可逐行核，才算「只量写」）。
+        let pre_line = stamped_line("文件索引：本轮建成 512 条", &stamp_now());
+        let pre_full = format!("{pre_line}\n");
+
+        // `buf` 由调用方拿着、按 `&mut` 交给循环体：W4 要在计时段结束后自己把缓冲区写出去，
+        // 关进闭包里就拿不回来了。其余腿忽略这个参数。
+        let mut buf = String::new();
+        let mut sink: Box<dyn FnMut(usize, &mut String)> = match leg.as_str() {
+            "W0" => Box::new(|i: usize, _: &mut String| {
+                std::hint::black_box(stamped_line(&format!("文件索引：本轮建成 {i} 条"), &stamp_now()));
+            }),
+            "W1" => Box::new(|_: usize, _: &mut String| {
+                let _ = std::io::stderr().write_all(pre_full.as_bytes());
+            }),
+            "W1b" => Box::new(|_: usize, _: &mut String| {
+                let mut e = std::io::stderr();
+                let _ = e.write_all(pre_line.as_bytes());
+                let _ = e.write_all(b"\n");
+            }),
+            "W2" => Box::new(|_: usize, _: &mut String| {
+                eprintln!("{pre_line}");
+            }),
+            "W3" => Box::new(|i: usize, _: &mut String| {
+                log_info!("文件索引：本轮建成 {i} 条");
+            }),
+            "W4" => Box::new(|_: usize, b: &mut String| b.push_str(&pre_full)),
+            "W5" => Box::new(|i: usize, _: &mut String| {
+                log_debug!("文件索引：本轮建成 {i} 条");
+            }),
+            other => unreachable!("未知腿名：{other}"),
+        };
+
+        // 预热跑同一份循环体，读数丢弃、字节照落（行数判据把 warm 一起算进去）。
+        let _ = loop_us(warm, &mut buf, &mut sink);
+        if leg == "W4" {
+            // 预热那一段整块交出去（不计入读数），缓冲区清空后计时段才只剩「一次写 n 行」。
+            let _ = std::io::stderr().write_all(buf.as_bytes());
+            buf.clear();
+        }
+        let loop_us_ = loop_us(n, &mut buf, &mut sink);
+
+        // W4 的尾巴：一次 WriteFile 把 n 行全交出去。它和 `loop_us` 分开报，合不合算由工装算，
+        // 不在子进程里替读数做决定。
+        let mut extra_us = 0.0f64;
+        if leg == "W4" {
+            let t = std::time::Instant::now();
+            let _ = std::io::stderr().write_all(buf.as_bytes());
+            extra_us = t.elapsed().as_secs_f64() * 1e6;
+        }
+
+        log_info!("WRIT-哨兵 {leg} 止");
+        let per = if n == 0 { "NA".to_string() } else { format!("{:.4}", loop_us_ / n as f64) };
+        println!(
+            "WRIT-REPORT｜leg={leg}｜n={n}｜warm={warm}｜level={}｜loop_us={loop_us_:.3}｜us_per_line={per}｜extra_us={extra_us:.3}",
+            level().as_str()
+        );
+    }
+
+    /// 跑 `iters` 次循环体，返回总微秒。单独拉出来是为了让「预热」与「计时」两趟用同一个函数、
+    /// 同一个闭包——两趟代码不同，读数就没有意义。
+    fn loop_us(iters: usize, buf: &mut String, f: &mut dyn FnMut(usize, &mut String)) -> f64 {
+        let t = std::time::Instant::now();
+        for i in 0..iters {
+            f(i, buf);
+        }
+        t.elapsed().as_secs_f64() * 1e6
+    }
+
+    /// 父案：工装的**自检片**（小 n，进 `cargo test` 的常规绿检）。它证三件事——
+    /// ① 子进程 stderr 真被接到 `target/writ/` 下的文件（哨兵行在、且产品在位）；
+    /// ② 落盘行数与「哨兵 2 + warm + n」逐条相等 ⇒ 写这条腿没被静默吞掉，也没多写；
+    /// ③ W0 与 W5 只留 2 行哨兵 ⇒ 「这条腿不写盘」是量出来的，不是假设的。
+    ///
+    /// 零窗口、零产品进程：子进程是本测试二进制自己，文件在构建目录下。
+    #[test]
+    fn the_write_leg_rig_lands_exactly_the_lines_it_claims() {
+        const N: usize = 400;
+        const WARM: usize = 3;
+        let dir = std::path::Path::new("target/writ");
+        std::fs::create_dir_all(dir).expect("target/writ 建不出来");
+
+        // (腿, 这条腿的循环体写不写盘)。不写的腿（W0 只组行、W5 被闸门挡）连预热都不落盘，
+        // 期望只剩 2 行哨兵——「2」在这里是判据不是空转，因为同案里哨兵必须 2 行在场。
+        let plan = [("W0", false), ("W1", true), ("W3", true), ("W5", false)];
+        let mut readings = Vec::new();
+        for (leg, writes) in plan {
+            let expect_body = if writes { WARM + N } else { 0 };
+            let path = dir.join(format!("rig-{leg}-{}.log", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("沙箱日志文件打不开");
+            let exe = std::env::current_exe().expect("拿不到当前测试二进制的路径");
+            let out = std::process::Command::new(&exe)
+                .args(["--exact", "logging::tests::writ_child_leg", "--ignored", "--nocapture"])
+                .env("WRIT_LEG", leg)
+                .env("WRIT_LINES", N.to_string())
+                .env("WRIT_WARM", WARM.to_string())
+                .env("RUST_BACKTRACE", "0")
+                .stderr(std::process::Stdio::from(file))
+                .output()
+                .expect("子进程（测试二进制自身）起不来");
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            // 先钉「那一案真跑了」：报告行缺失时下面所有判据都不成立（没算 ≠ 算了没说）。
+            assert!(text.contains("running 1 test"), "{leg}：子进程一个测试都没跑：{text}");
+            assert!(out.status.success(), "{leg}：子进程退出码非 0：{text}");
+            let report = text
+                .lines()
+                .find(|l| l.starts_with("WRIT-REPORT"))
+                .unwrap_or_else(|| panic!("{leg}：没有 WRIT-REPORT 行，工装没跑到读数：{text}"));
+            let fields: std::collections::HashMap<_, _> = report
+                .split('｜')
+                .filter_map(|kv| kv.split_once('='))
+                .collect();
+            assert_eq!(fields.get("leg").copied(), Some(leg), "{leg}：报告行报的是别的腿");
+            assert_eq!(fields.get("level").copied(), Some("info"), "{leg}：档位不是 Info，W3/W5 的判据不成立");
+            assert_ne!(fields.get("us_per_line").copied(), Some("NA"), "{leg}：n=0 却跑进了这一案 ⇒ 环境变量没传下去");
+            let per: f64 = fields["us_per_line"].parse().expect("us_per_line 不是数");
+            assert!(per > 0.0, "{leg}：每条 0 µs ⇒ 循环被优化掉了，读数不可信（实测 {per}）");
+
+            let lines: Vec<String> = std::fs::read_to_string(&path)
+                .expect("沙箱文件读不回来")
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
+            let sentinel = lines.iter().filter(|l| l.contains("WRIT-哨兵")).count();
+            assert_eq!(sentinel, 2, "{leg}：哨兵行该恰好 2 条（起 + 止），实测 {sentinel} ⇒ 句柄没通或漏斗没跑");
+            assert_eq!(
+                lines.len(),
+                2 + expect_body,
+                "{leg}：落盘行数不对（要 2 哨兵 + {expect_body} 条循环体落的行）"
+            );
+            readings.push(format!("{leg}: {per:.4} us/条, 行数 {}", lines.len()));
+
+            // 只量写的腿：正文行逐字节相同（循环里没组行）；全腿：首尾两行内容不同（循环真在动 i）。
+            let body_lines: Vec<&String> = lines
+                .iter()
+                .filter(|l| !l.contains("WRIT-哨兵"))
+                .collect();
+            if leg == "W1" {
+                assert_eq!(body_lines.iter().collect::<std::collections::HashSet<_>>().len(), 1, "W1：预合成行不该逐条不同");
+            }
+            if leg == "W3" {
+                assert!(body_lines[0].contains("本轮建成 0 条"), "W3：第一条正文不是 i=0：{}", body_lines[0]);
+                assert!(body_lines[WARM].contains("本轮建成 0 条"), "W3：预热段之后第一条正文不是 i=0");
+                assert!(body_lines[WARM + N - 1].contains("本轮建成 399 条"), "W3：最后一条正文不是 i=399 ⇒ 中间丢了行");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        println!("写腿工装自检：{}", readings.join(" | "));
+    }
 }
