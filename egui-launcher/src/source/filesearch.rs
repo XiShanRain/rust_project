@@ -1730,6 +1730,90 @@ mod tests {
         assert!(src.hits_cache.is_some(), "词表没变就不该动缓存");
     }
 
+    /// 等到后台那一轮自己回来为止，返回这一趟采纳了几枚回报。
+    ///
+    /// 批次 FLAKE 之前没有这一步。派出去的是真线程，它送回的回报落在哪一次 [`Self::poll`]
+    /// 里全看调度——`poll` 的 `while let` 又要求「一帧把队列清空」，于是回报可能在同一次
+    /// 调用里连吃几枚。负载实测（8 路满载、`--exact` 单跑 25 遍）红过 1 遍，那一遍
+    /// `target/flake116/oldload18.txt` 里三行『本轮建成』落在同一毫秒里。
+    fn drain_until_quiet(src: &mut FileSource) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut adopted = 0u32;
+        loop {
+            if src.poll() {
+                adopted += 1;
+            }
+            if !src.rebuild_in_flight && !src.scope_pending {
+                return adopted;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "10 秒没等到后台那一轮回来：在途={} 待扫账={}",
+                src.rebuild_in_flight,
+                src.scope_pending
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// 把「一次 `poll()` 连吃几枚回报」从调度运气换成不靠线程快慢的读数。
+    ///
+    /// 历批那颗红的机制面在这里被整条复现，而且不派线程、不碰磁盘：直接往队列里塞三枚
+    /// 回报，同一帧连吃三枚就成为必然。末态三格（在途／索引还是注入那一枚／快照换成新
+    /// 范围）全是假 ⇒ 「派出去了所以还在途」这句话只在两帧之间成立，不该钉成读数。
+    #[test]
+    fn one_poll_frame_adopts_every_queued_index_report() {
+        let mut src = FileSource::default();
+        let older = ScanScope {
+            depth: 1,
+            ..ScanScope::default()
+        };
+        src.rebuild_in_flight = true;
+        src.in_flight_scope = Some(older);
+        src.scope_pending = false;
+
+        let tx = src.tx.clone();
+        for n in 1..=3usize {
+            let entries: Vec<FileEntry> = (0..n)
+                .map(|i| FileEntry {
+                    name: format!("queued{i}.txt"),
+                    path: std::env::temp_dir()
+                        .join(format!("egui-launcher-flake116-queued{i}"))
+                        .to_string_lossy()
+                        .into_owned(),
+                    is_dir: false,
+                })
+                .collect();
+            tx.send(FileUpdate::Index {
+                entries,
+                elapsed: Duration::from_millis(1),
+            })
+            .expect("注回报");
+        }
+
+        assert!(src.poll(), "这一帧采纳了回报");
+        // 一枚一吃的话 index 只会是第 1 枚那 1 条；现读是第 3 枚那 3 条 ⇒ 三次采纳都在同一次调用里。
+        assert_eq!(src.index.len(), 3, "一次 poll() 把队列里三枚回报连吃掉");
+
+        let legacy_still_in_flight = src.rebuild_in_flight;
+        let legacy_keeps_first_report = src.index.len() == 1;
+        let legacy_snapshot_switched = src.in_flight_scope.as_ref().is_some();
+        assert!(
+            !legacy_still_in_flight,
+            "flag 被后两枚各清一次，末态是空闲——历批那句『补派的新一轮在途』在这种帧里就是假"
+        );
+        assert!(
+            !legacy_keeps_first_report,
+            "末态的 index 是最后一枚那 3 条，历批那句『索引还是注入那一枚』跟着假"
+        );
+        assert!(
+            !legacy_snapshot_switched,
+            "每采纳一枚就 take 走一次快照，第三枚之后没有在途的轮，历批那句『快照换成新范围』也假"
+        );
+        assert!(!src.scope_pending, "没欠账：这一帧只在清队列");
+        assert!(!src.poll(), "队列已经空了：下一帧没有回报可采纳");
+    }
+
     #[test]
     fn set_scope_schedules_a_forced_rescan_and_dedupes() {
         let mut src = FileSource::default();
@@ -1743,6 +1827,10 @@ mod tests {
         let root = std::env::temp_dir().join("egui-launcher-filesearch-setscope");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("建临时目录");
+        // 批次 FLAKE：目录里留一颗能按名认出来的文件。历批那格是空目录，于是回报里的「0 条」
+        // 既不指向补派那一轮、也不指向空闲时派出那一轮，谁也不证明谁；有了这颗名字，
+        // 「补派那轮真按新范围扫过」第一次由索引内容本身说话。
+        std::fs::write(root.join("rescan-marker.txt"), b"x").expect("放标记文件");
         let changed = ScanScope {
             folders: vec![root.to_string_lossy().into_owned()],
             depth: 1,
@@ -1758,6 +1846,17 @@ mod tests {
             src.in_flight_scope.as_ref(),
             Some(&changed),
             "日志的「范围＝清单 N 个目录」读这一份快照，不读活动 scope"
+        );
+
+        // 批次 FLAKE：先把这一轮自己送回的回报吃掉。历批没有这一步——那枚回报一直留在队列里，
+        // 撞上后面哪一次 poll() 全看线程快慢，负载实测 25 遍红 1 遍那一遍（`target/flake116/
+        // oldload18.txt`）就同时吃了它、注入那枚和补派那枚，三行『本轮建成』落在同一毫秒。
+        let drained = drain_until_quiet(&mut src);
+        assert_eq!(drained, 1, "空闲时派出的那一轮只回来一枚回报");
+        let names: Vec<&str> = src.index.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"rescan-marker.txt"),
+            "空闲时派出的那轮按新范围扫出来了：{names:?}"
         );
 
         // 在途时改值 ⇒ 只记账，派不出去（闸门挡着）；旧范围的回报到达那帧补派新范围。
@@ -1788,15 +1887,25 @@ mod tests {
             elapsed: std::time::Duration::from_millis(1),
         })
         .expect("注一条回报");
-        src.poll();
+        assert!(src.poll(), "注入的那枚回报被采纳");
         assert!(!src.scope_pending, "回报采纳后待扫账清零");
-        assert!(src.rebuild_in_flight, "补派的新一轮在途");
-        assert_eq!(src.index.len(), 1);
-        assert_eq!(
-            src.in_flight_scope.as_ref(),
-            Some(&changed),
-            "补派那轮的快照换成新范围"
+        // 批次 FLAKE：下面不再断「在途」「索引还是注入那一枚」「快照已换成新范围」这三格。
+        // 补派派出去的是真线程，它扫这颗目录只要零点几毫秒，一回到同一帧里这三格就一起翻掉
+        // ——历批把它们钉成读数，红的正是第一格（`assert!(src.rebuild_in_flight)`）。
+        // 换成等它回来再断终态：三格都由「补派真的按新范围重扫过」这一件事推出，不靠调度。
+        let drained = drain_until_quiet(&mut src);
+        assert!(drained <= 1, "补派那一轮到顶只回来一枚，现读 {drained}");
+        let names: Vec<&str> = src.index.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"rescan-marker.txt"),
+            "补派那轮按新范围扫过：{names:?}"
         );
+        assert!(
+            !names.contains(&"stub"),
+            "注入那枚被补派的结果换掉了：{names:?}"
+        );
+        assert!(!src.rebuild_in_flight, "末态空闲");
+        assert!(src.in_flight_scope.is_none(), "末态没有在途的轮");
 
         let _ = std::fs::remove_dir_all(&root);
     }
